@@ -291,7 +291,8 @@ fn parent_blocks_on_an_empty_pipe_until_the_child_writes() {
         .filter(|l| l.starts_with("R: ") || l.starts_with("W: "))
         .collect();
     // The timer is off, so the writer runs only because the reader blocked on the empty pipe, and the reader runs
-    // again only once the writer exited.
+    // again only once the writer exited. The second writer prints nothing (its handle 0 is a write end without write)
+    // and exits while the reader waits on a pipe whose only write end it holds: exit must wake the reader.
     assert_eq!(
         rw,
         [
@@ -304,6 +305,7 @@ fn parent_blocks_on_an_empty_pipe_until_the_child_writes() {
             "R: writer exited with 7",
             "R: budget returned: spawned writer again",
             "R: stale process handle: EBADF",
+            "R: EOF once the second writer exits",
             "R: second writer exited with 7",
         ]
     );

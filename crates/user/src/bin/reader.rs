@@ -1,5 +1,5 @@
 //! `test=pipe`'s init: reads a pipe whose only writer left is `writer`, waits for it, then spawns it again into
-//! its old slot.
+//! its old slot with a write end it cannot write, and reads end of file once it exits.
 #![no_std]
 #![no_main]
 
@@ -8,7 +8,8 @@ use user::*;
 /// init's boot-archive directory handle.
 const DIR: u64 = 2;
 /// Over half of the 15 frames left of 25 after the reader's 9 (3 tables, text, stack, 4 kernel stack) and the pipe's
-/// page, so a second spawn fits only once `wait` gave the first writer's budget back; `writer` needs 9.
+/// page, so a second spawn (after a second pipe's page) fits only once `wait` gave the first writer's budget back;
+/// `writer` needs 9.
 const CHILD_BUDGET: usize = 12;
 
 /// Writes `line` to the console if `ok`; otherwise exits, so a wrong result shows as missing lines.
@@ -35,9 +36,18 @@ extern "C" fn _start() -> ! {
     write(CONSOLE, &buf[..n as usize]);
     check(read(read_end, &mut buf) == 0, b"R: EOF\n");
     check(wait(child) == 7, b"R: writer exited with 7\n");
-    let again = spawn(exe, &[], CHILD_BUDGET);
-    check(again >= 0, b"R: budget returned: spawned writer again\n");
+    // The second writer gets the only write end of a new pipe, without the write right: it exits while this reads.
+    let (read_end, write_end) = pipe();
+    let silent = dup(write_end, TRANSFER) as u64;
+    close(write_end);
+    let again = spawn(exe, &[silent], CHILD_BUDGET);
+    check(
+        read_end >= 0 && again >= 0,
+        b"R: budget returned: spawned writer again\n",
+    );
     check(wait(child) == EBADF, b"R: stale process handle: EBADF\n");
+    let eof = read(read_end as u64, &mut buf) == 0;
+    check(eof, b"R: EOF once the second writer exits\n");
     check(wait(again as u64) == 7, b"R: second writer exited with 7\n");
     exit(0)
 }
