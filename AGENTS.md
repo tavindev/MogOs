@@ -70,7 +70,7 @@ Every new `.md` file must be linked from its parent so it stays reachable from t
 
 - Speed is a feature, so it is measured, not assumed. Details and baselines: `docs/BENCHMARKS.md`.
 - Every hot path gets a benchmark when it lands. Every change to a hot path reports before/after numbers.
-- A tracked benchmark slowing down by more than 5% needs an explicit justification; otherwise treat it as a failure.
+- A tracked benchmark slowing down by more than 5% (hvf or host medians, never TCG) needs an explicit justification; otherwise treat it as a failure.
 
 ## Code rules
 

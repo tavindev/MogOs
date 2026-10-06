@@ -16,8 +16,10 @@ Speed is a primary goal, so performance is tested like behavior: measured, recor
 
 ## Workflow
 
+- Kernel comparisons use hvf (`-accel hvf -cpu cortex-a72`): TCG run-to-run noise is about 10%, so TCG numbers are informational only and never gate a change.
+- Compare medians of at least 21 runs, before and after interleaved, on an otherwise idle machine.
 - Any change to a hot path includes before/after numbers from the relevant benchmark, run on the same machine and mode.
-- A slowdown above 5% on a tracked benchmark needs an explicit justification in the change; otherwise it is a failing result.
+- A slowdown above 5% (hvf median for kernel benchmarks, host median for host benchmarks) needs an explicit justification in the change; otherwise it is a failing result. If the before/after spread itself exceeds 5%, rerun before concluding.
 - New hot paths (each roadmap step that adds one) get a benchmark when they land, alongside their end-to-end test.
 - Record the current numbers in the Baselines table below whenever they change.
 
