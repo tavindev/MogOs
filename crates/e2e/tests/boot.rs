@@ -229,15 +229,20 @@ fn map_stops_at_budget_and_exit_returns_every_frame() {
     // Budget 25 minus 9 fixed frames (3 tables, code, stack, 4 kernel stack) minus the map region's level-3 table;
     // a rollback leak in the failed 16-page map before the loop would lower it.
     assert_eq!(m, ["M: ENOMEM after 15 pages", "M: still running"]);
+    assert_no_leak(&lines, "budget");
+    assert!(status.success(), "QEMU exited with {status}");
+}
+
+/// Asserts the kernel's `<test>: free frames <n> before, <n> after` line shows the same count twice.
+fn assert_no_leak(lines: &[String], test: &str) {
     let (before, after) = lines
         .iter()
         .find_map(|l| {
-            l.strip_prefix("budget: free frames ")?
+            l.strip_prefix(&format!("{test}: free frames "))?
                 .split_once(" before, ")
         })
-        .expect("missing budget line");
+        .unwrap_or_else(|| panic!("missing {test} free frames line"));
     assert_eq!(after, format!("{before} after"), "frames leaked");
-    assert!(status.success(), "QEMU exited with {status}");
 }
 
 #[test]
@@ -256,13 +261,20 @@ fn spawn_moves_handles_and_budget_to_the_child() {
         s,
         [
             "S: open missing: ENOENT",
+            "S: empty write: 0",
             "S: spawn non-ELF: ENOEXEC",
             "S: spawn over budget: ENOMEM",
+            "S: spawn without handles over budget: ENOMEM",
+            "S: spawn one frame short: ENOMEM",
+            "S: console not moved",
             "S: spawned child with the console",
             "S: moved console: EBADF",
             "C: hello through handle 0",
+            "C: statics work",
             "C: handle 1 not given: EBADF",
         ]
     );
+    // The one-frame-short spawn fails after mapping everything but the kernel stack, so this checks its rollback.
+    assert_no_leak(&lines, "spawn");
     assert!(status.success(), "QEMU exited with {status}");
 }

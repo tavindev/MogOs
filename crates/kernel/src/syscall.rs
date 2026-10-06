@@ -58,7 +58,7 @@ const MAX_MAP: u64 = 16 * 4096;
 
 pub enum Call {
     Exit,
-    /// Write to the console; `ptr..ptr + len` lies in `USER` but may be unmapped.
+    /// Write to the console; `ptr..ptr + len` lies in `USER` unless empty, but may be unmapped.
     Write {
         ptr: u64,
         len: usize,
@@ -67,13 +67,13 @@ pub enum Call {
     Map {
         pages: usize,
     },
-    /// Open the boot archive's file whose name is at `ptr..ptr + len` (in `USER`, maybe unmapped) with `rights`.
+    /// Open the boot archive's file whose name is at `ptr..ptr + len` (in `USER` unless empty, maybe unmapped) with `rights`.
     Open {
         ptr: u64,
         len: usize,
         rights: u64,
     },
-    /// Spawn the boot archive's file `file`, moving the `len` handles at `ptr` (in `USER`, maybe unmapped) and `budget`.
+    /// Spawn the boot archive's file `file`, moving the `len` handles at `ptr` (in `USER` unless empty, maybe unmapped) and `budget`.
     Spawn {
         file: Range<usize>,
         ptr: u64,
@@ -141,8 +141,12 @@ pub fn dispatch(nr: u64, args: &[u64; 6], handles: &mut Handles) -> Result<Call,
     }
 }
 
-/// `EFAULT` unless `ptr..ptr + len` lies in `USER` and `len` is at most `MAX_BUFFER`.
+/// `EFAULT` unless `len` is 0 (any `ptr`, as Rust passes empty slices) or `ptr..ptr + len` lies in `USER` and `len`
+/// is at most `MAX_BUFFER`.
 fn user_buffer(ptr: u64, len: u64) -> Result<(), i64> {
+    if len == 0 {
+        return Ok(());
+    }
     let end = ptr.checked_add(len).ok_or(EFAULT)?;
     if len > MAX_BUFFER || ptr < USER.start || end > USER.end {
         return Err(EFAULT);

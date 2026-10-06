@@ -110,6 +110,8 @@ fn elf_rejects_segments_that_could_harm_the_kernel_or_each_other() {
         ("writable and executable", elf(&[(7, base, 0, 0x10)])),
         ("file size over memory size", elf(&[(5, base, 0x20, 0x10)])),
         ("data past the file", elf(&[(5, base, 0x1001, 0x2000)])),
+        ("entry in a writable segment", elf(&[(6, base, 0, 0x10)])),
+        ("entry in no segment", elf(&[(5, base + 0x1000, 0, 0x10)])),
     ];
     for (why, f) in rejected {
         assert!(Elf::parse(&f, REGION).is_none(), "{why}");

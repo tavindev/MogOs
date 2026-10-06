@@ -2,9 +2,6 @@ use std::path::Path;
 use std::process::Command;
 use std::{env, fs};
 
-/// The boot archive's files: `crates/user`'s programs, plus a non-ELF entry for `test=spawn`.
-const PROGRAMS: [&str; 2] = ["spawner", "child"];
-
 fn main() {
     let dir = env::var("CARGO_MANIFEST_DIR").unwrap();
     println!("cargo:rustc-link-arg-bins=-T{dir}/linker.ld");
@@ -34,19 +31,26 @@ fn main() {
     assert!(status.success(), "user programs failed to build");
 
     let bin = target_dir.join("aarch64-unknown-none-softfloat/release");
-    let mut files: Vec<_> = PROGRAMS
-        .iter()
-        .map(|name| (*name, fs::read(bin.join(name)).unwrap()))
+    // The boot archive's files: every `crates/user` program, sorted so the archive is reproducible, plus a non-ELF.
+    let mut files: Vec<_> = fs::read_dir(user.join("src/bin"))
+        .unwrap()
+        .map(|entry| {
+            let path = entry.unwrap().path();
+            let name = path.file_stem().unwrap().to_str().unwrap().to_string();
+            let data = fs::read(bin.join(&name)).unwrap();
+            (name, data)
+        })
         .collect();
-    files.push(("bad", b"not an ELF".to_vec()));
+    files.sort();
+    files.push(("bad".into(), b"not an ELF".to_vec()));
     let out = Path::new(&env::var("OUT_DIR").unwrap()).join("boot.cpio");
     fs::write(out, cpio(&files)).unwrap();
 }
 
 /// A cpio archive in the newc format: per file, a 110-byte ASCII header, the name, the data, each padded to 4 bytes.
-fn cpio(files: &[(&str, Vec<u8>)]) -> Vec<u8> {
+fn cpio(files: &[(String, Vec<u8>)]) -> Vec<u8> {
     let mut out = Vec::new();
-    let trailer = ("TRAILER!!!", Vec::new());
+    let trailer = ("TRAILER!!!".into(), Vec::new());
     for (ino, (name, data)) in files.iter().chain([&trailer]).enumerate() {
         let mode = if data.is_empty() { 0 } else { 0o100_755 };
         // ino, mode, uid, gid, nlink, mtime, filesize, devmajor, devminor, rdevmajor, rdevminor, namesize, check

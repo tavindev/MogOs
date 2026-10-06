@@ -129,8 +129,14 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
             "test=bench-syscall" => run_alone(board, Program::SyscallBench),
             "test=handles" => run_alone(board, Program::Handles),
             "test=spawn" => {
+                let before = board.free_frames();
                 board.spawn_archived("spawner", BOOT_BUDGET).expect("spawn");
                 wait(board);
+                let after = board.free_frames();
+                let _ = writeln!(
+                    board.console(),
+                    "spawn: free frames {before} before, {after} after"
+                );
             }
             "test=budget" => {
                 let before = board.free_frames();

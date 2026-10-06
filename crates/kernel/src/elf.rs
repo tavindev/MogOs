@@ -24,8 +24,9 @@ pub struct Elf<'a> {
 }
 
 impl<'a> Elf<'a> {
-    /// Checks every header of `file`: a little-endian ELF64 AArch64 executable whose entry and `PT_LOAD` segments lie
-    /// in `region`, page-aligned, in address order, never sharing a page, none both writable and executable.
+    /// Checks every header of `file`: a little-endian ELF64 AArch64 executable whose `PT_LOAD` segments lie in
+    /// `region`, page-aligned, in address order, never sharing a page, none both writable and executable, and whose
+    /// entry lies in an executable one.
     pub fn parse(file: &'a [u8], region: Range<u64>) -> Option<Self> {
         let header = file.get(..64)?;
         let ident_ok = header[..7] == *b"\x7fELF\x02\x01\x01";
@@ -47,6 +48,7 @@ impl<'a> Elf<'a> {
             entry: u64_at(header, 24)?,
         };
         let mut free = region.start;
+        let mut entered = false;
         for ph in phdrs {
             if u32_at(ph, 0)? != PT_LOAD {
                 continue;
@@ -58,9 +60,11 @@ impl<'a> Elf<'a> {
             {
                 return None;
             }
+            let executable = u32_at(ph, 4)? & PF_X != 0;
+            entered |= executable && (s.vaddr..s.vaddr + s.size).contains(&elf.entry);
             free = (s.vaddr + s.size).next_multiple_of(PAGE);
         }
-        region.contains(&elf.entry).then_some(elf)
+        entered.then_some(elf)
     }
 
     /// The `PT_LOAD` segments, as `parse` checked them.

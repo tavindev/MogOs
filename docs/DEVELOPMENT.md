@@ -26,9 +26,9 @@
 | dev `opt-level = 1` | root `Cargo.toml` | Opt-level 0 kernel code has bloated stack frames and slow MMIO loops; measured build cost is zero. Trade-off: some locals show as optimized out in the debugger. |
 | release `lto = true`, `codegen-units = 1` | root `Cargo.toml` | Smallest/fastest release image; release only, so the inner loop does not pay for it. |
 | `unsafe_code = "forbid"` | `[workspace.lints.rust]` | Every crate is safe Rust by default; the compiler rejects `unsafe` outside `arch` and board crates. |
-| `unsafe_op_in_unsafe_fn = "deny"` | `qemu-virt`, `arch` `[lints.rust]` | Each unsafe op inside an `unsafe fn` needs its own `unsafe {}` block and justification. |
-| `clippy::undocumented_unsafe_blocks = "deny"` | `qemu-virt`, `arch` `[lints.clippy]` | Enforces the `// SAFETY:` comment rule mechanically. |
-| `clippy::multiple_unsafe_ops_per_block = "warn"` | `qemu-virt`, `arch` `[lints.clippy]` | Keeps unsafe blocks small so each `SAFETY` comment covers one operation. |
+| `unsafe_op_in_unsafe_fn = "deny"` | `qemu-virt`, `arch`, `user` `[lints.rust]` | Each unsafe op inside an `unsafe fn` needs its own `unsafe {}` block and justification. |
+| `clippy::undocumented_unsafe_blocks = "deny"` | `qemu-virt`, `arch`, `user` `[lints.clippy]` | Enforces the `// SAFETY:` comment rule mechanically. |
+| `clippy::multiple_unsafe_ops_per_block = "warn"` | `qemu-virt`, `arch`, `user` `[lints.clippy]` | Keeps unsafe blocks small so each `SAFETY` comment covers one operation. |
 
 Evaluated and not applied (all within noise on this crate): `debug = "line-tables-only"`, dev `codegen-units`, toggling `incremental`. No `rustfmt.toml`: defaults already pass.
 
@@ -54,7 +54,7 @@ cargo run -- -append test=user       # EL0 process A writes A: 0..9 to its conso
 cargo run -- -append test=bench-syscall  # EL0 loop of no-op syscalls, prints the round trip in ns
 cargo run -- -append test=handles    # EL0 process writes via its console handle, then a no-write duplicate, a closed and a stale handle fail (H: lines)
 cargo run -- -append test=budget     # EL0 process maps pages until ENOMEM (M: lines), exits; free frames before/after its lifetime match
-cargo run -- -append test=spawn      # spawner (from the boot archive) spawns child with only the console (S: and C: lines)
+cargo run -- -append test=spawn      # spawner (from the boot archive) checks failing spawns move nothing, spawns child with only the console (S: and C: lines); free frames before/after match
 cargo run -- -s -S     # boot halted, gdbstub on localhost:1234; attach lldb/gdb
 cargo build --release  # LTO release image
 ```

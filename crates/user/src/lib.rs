@@ -27,7 +27,9 @@ fn syscall(nr: u64, args: [u64; 4]) -> i64 {
 
 pub fn exit(code: u64) -> ! {
     syscall(0, [code, 0, 0, 0]);
-    unreachable!()
+    loop {
+        core::hint::spin_loop()
+    }
 }
 
 pub fn write(handle: u64, bytes: &[u8]) -> i64 {

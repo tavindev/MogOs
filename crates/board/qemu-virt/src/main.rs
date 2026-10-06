@@ -239,6 +239,7 @@ fn spawn_process(
     let stack = (|| {
         for segment in segments {
             let data = &file[segment.data];
+            // No read-only non-executable access kind yet, so a read-only segment (flags R) maps executable.
             let access = match segment.writable {
                 true => UserAccess::ReadWrite,
                 false => UserAccess::ReadExecute,
@@ -388,9 +389,12 @@ fn user_program(program: Program) -> (&'static [u8], u64) {
     (code, va)
 }
 
-/// The `len` bytes at user address `ptr` (in user space, checked by `dispatch`) if EL0 may read all of them; valid
-/// only until the trap returns.
+/// The `len` bytes at user address `ptr` (in user space unless `len` is 0, checked by `dispatch`) if EL0 may read all
+/// of them; valid only until the trap returns.
 fn user_bytes<'a>(ptr: u64, len: usize) -> Option<&'a [u8]> {
+    if len == 0 {
+        return Some(&[]);
+    }
     let first_page = ptr & !(PAGE as u64 - 1);
     if !(first_page..ptr + len as u64)
         .step_by(PAGE)
