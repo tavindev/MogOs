@@ -118,3 +118,25 @@ fn unmapped_access_reports_data_abort() {
     );
     assert!(status.success(), "QEMU exited with {status}");
 }
+
+#[test]
+fn tasks_alternate_on_yield() {
+    let (status, lines) = boot(&["-append", "test=yield"]);
+    let tasks: Vec<_> = lines.iter().filter(|l| l.starts_with("task ")).collect();
+    assert_eq!(
+        tasks,
+        [
+            "task a: 0",
+            "task b: 0",
+            "task a: 1",
+            "task b: 1",
+            "task a: 2",
+            "task b: 2",
+        ]
+    );
+    assert!(
+        !lines.iter().any(|l| l.starts_with("panic:")),
+        "kernel panicked"
+    );
+    assert!(status.success(), "QEMU exited with {status}");
+}
