@@ -25,7 +25,7 @@ fn boot(extra: &[&str]) -> (ExitStatus, Vec<String>) {
             "-nographic",
             "-kernel",
         ])
-        .arg(root.join("target/aarch64-unknown-none/debug/mog_os"))
+        .arg(root.join("target/aarch64-unknown-none-softfloat/debug/mog_os"))
         .args(extra)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -86,6 +86,10 @@ fn boots_and_powers_off() {
         .expect("missing boot line")
         .parse::<u64>()
         .unwrap();
+    assert!(
+        !lines.iter().any(|l| l.starts_with("panic:")),
+        "kernel panicked"
+    );
     assert!(status.success(), "QEMU exited with {status}");
 }
 

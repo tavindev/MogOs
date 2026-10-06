@@ -1,0 +1,20 @@
+use core::arch::asm;
+
+/// DAIF as it was before `disable`.
+pub struct State(u64);
+
+/// Masks IRQs and returns the previous mask state.
+pub fn disable() -> State {
+    let daif: u64;
+    // SAFETY: saving DAIF and setting its I bit only masks IRQs; no `nomem`, so it orders memory accesses like a lock.
+    unsafe {
+        asm!("mrs {}, daif", "msr daifset, #2", out(reg) daif, options(nostack, preserves_flags))
+    };
+    State(daif)
+}
+
+/// Puts back the IRQ mask saved by `disable`.
+pub fn restore(state: State) {
+    // SAFETY: writes back a DAIF value read by `disable`; no `nomem`, so it orders memory accesses like an unlock.
+    unsafe { asm!("msr daif, {}", in(reg) state.0, options(nostack, preserves_flags)) };
+}

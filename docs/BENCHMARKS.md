@@ -29,4 +29,4 @@ Speed is a primary goal, so performance is tested like behavior: measured, recor
 | --- | --- | --- | --- | --- |
 | `mm` frames: alloc+free of 1000 frames, 128 MiB allocator (ns/op) | Host, M4 Pro | 4.6 | 5.2 | uncommitted |
 | Kernel boot, kmain to end of init (us) | QEMU TCG, dev build | 2928 | 3140 | uncommitted |
-| Kernel boot, kmain to end of init (us) | QEMU hvf (`-cpu cortex-a72`), dev build | 171 | 190 | uncommitted |
+| Kernel boot, kmain to end of init (us) | QEMU hvf (`-cpu cortex-a72`), dev build | 170 | 192 | uncommitted |

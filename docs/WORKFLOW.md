@@ -5,6 +5,7 @@ The loop every change follows. Agents live in `.claude/agents/`; the orchestrato
 | # | Step | Who |
 | --- | --- | --- |
 | 1 | Plan: the behavior, the test that proves it, the smallest change. Check the phase doc. | Orchestrator |
+| 1b | Review the plan (phase-doc steps, done-whens, prescribed design) for simplicity and speed before any code is written. | `reviewer` |
 | 2 | Write the failing test: QEMU boot test (`crates/e2e/tests/boot.rs`) first, crate public API next. | `implementor` |
 | 3 | Implement the smallest diff that makes it pass. | `implementor` |
 | 4 | `cargo fmt`, `cargo clippy` clean, `cargo test-host` green; before/after benchmark if a hot path changed (`docs/BENCHMARKS.md`). | `implementor` (or `test-runner`) |

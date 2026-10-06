@@ -1,5 +1,6 @@
 use core::arch::{asm, global_asm};
 
+pub mod irq;
 mod mmu;
 mod trap;
 

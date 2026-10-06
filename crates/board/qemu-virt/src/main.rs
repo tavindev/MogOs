@@ -3,15 +3,18 @@
 
 mod uart;
 
+use core::alloc::{GlobalAlloc, Layout};
+use core::cell::UnsafeCell;
 use core::fmt::Write;
 use core::ops::Range;
 use core::panic::PanicInfo;
+use core::ptr::{self, NonNull};
 use core::slice;
 use core::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
 use arch::{MemoryType, l1_block};
 use dtb::Dtb;
-use linked_list_allocator::LockedHeap;
+use linked_list_allocator::Heap;
 use mm::PhysAddr;
 use uart::Uart;
 
@@ -25,8 +28,37 @@ const GIB: u64 = 1 << 30;
 const UNMAPPED: PhysAddr = PhysAddr(0x8000_0000);
 
 #[global_allocator]
-static HEAP: LockedHeap = LockedHeap::empty();
+static HEAP: KernelHeap = KernelHeap(UnsafeCell::new(Heap::empty()));
 static HEAP_READY: AtomicBool = AtomicBool::new(false);
+
+struct KernelHeap(UnsafeCell<Heap>);
+
+// SAFETY: one core, and the heap is only touched with IRQs masked, so accesses never overlap.
+unsafe impl Sync for KernelHeap {}
+
+// SAFETY: `Heap` hands out non-overlapping blocks of at least `layout` from the region `init_heap` gave it.
+unsafe impl GlobalAlloc for KernelHeap {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let irq = arch::irq::disable();
+        // SAFETY: IRQs are masked on the only core, so this is the sole reference.
+        let ptr = unsafe { &mut *self.0.get() }
+            .allocate_first_fit(layout)
+            .map_or(ptr::null_mut(), NonNull::as_ptr);
+        arch::irq::restore(irq);
+        ptr
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // SAFETY: `GlobalAlloc` only passes pointers that `alloc` returned, which are non-null.
+        let ptr = unsafe { NonNull::new_unchecked(ptr) };
+        let irq = arch::irq::disable();
+        // SAFETY: IRQs are masked on the only core, so this is the sole reference.
+        let heap = unsafe { &mut *self.0.get() };
+        // SAFETY: `ptr` was allocated from this heap with `layout`.
+        unsafe { heap.deallocate(ptr, layout) }
+        arch::irq::restore(irq);
+    }
+}
 
 struct QemuVirt {
     uart: Uart,
@@ -68,8 +100,10 @@ impl kernel::Board for QemuVirt {
     fn init_heap(&mut self, region: Range<PhysAddr>) {
         assert!(!HEAP_READY.swap(true, Relaxed), "heap already initialized");
         let size = (region.end.0 - region.start.0) as usize;
+        // SAFETY: boot runs with IRQs still masked on the only core, so this is the sole reference.
+        let heap = unsafe { &mut *HEAP.0.get() };
         // SAFETY: init runs once (guard above); `region` being unused, mapped RAM is the `Board::init_heap` contract the kernel upholds.
-        unsafe { HEAP.lock().init(region.start.0 as *mut u8, size) }
+        unsafe { heap.init(region.start.0 as *mut u8, size) }
     }
 
     fn uptime_us(&self) -> u64 {

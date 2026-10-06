@@ -2,7 +2,7 @@
 
 ## Toolchain
 
-- Pinned to Rust `1.99.0` in `rust-toolchain.toml` with target `aarch64-unknown-none` and components `clippy`, `rustfmt`.
+- Pinned to Rust `1.99.0` in `rust-toolchain.toml` with target `aarch64-unknown-none-softfloat` and components `clippy`, `rustfmt`.
 - Pinned on purpose: the host's `stable` rustup toolchain is corrupted. Never modify `~/.rustup`'s stable toolchain or global rustup config.
 - Do not add `llvm-tools` or `rust-src` components (they conflicted). Stable only; no nightly flags.
 - Links with the bundled `rust-lld`; no system linker needed. QEMU (`qemu-system-aarch64`) is the runner.
@@ -11,13 +11,14 @@
 
 | Setting | Where | Reason |
 | --- | --- | --- |
+| target `aarch64-unknown-none-softfloat` | `rust-toolchain.toml`, `.cargo/config.toml` | No FP/SIMD in the kernel, so traps and context switches never save v-registers (and boot needs no `CPACR_EL1` FP enable). |
 | `jobs = 6` | `.cargo/config.toml` | Half of the 12 host cores so builds never take the whole CPU; rustc codegen threads share this jobserver. |
 | `link-arg=--threads=6` | `.cargo/config.toml` | `rust-lld` ignores cargo's jobserver and would otherwise use every core. |
 | `-T linker.ld` | `crates/board/qemu-virt/build.rs` | Kernel memory layout (load address, BSS, stack); binary only. |
 | load address `0x4020_0000` | `crates/board/qemu-virt/linker.ld` | QEMU only places its 1 MiB DTB at RAM base (`0x4000_0000`) if it fits below the ELF image. |
 | `test-host` alias | `.cargo/config.toml` | Runs tests for the host target, excluding the bare-metal-only `qemu-virt` and `arch`. |
 | `bench-host` alias | `.cargo/config.toml` | Runs the host `benches/*.rs` targets (`--bench '*'`) for the same crates as `test-host`. |
-| `linked_list_allocator` (`use_spin` only) | `crates/board/qemu-virt` | Kernel heap with `free` (phase 2 task stacks need it); `use_spin` pulls `spinning_top`/`lock_api`/`scopeguard` for `LockedHeap`. In the board crate because it is the binary that owns `#[global_allocator]` and `unsafe` heap init. |
+| `linked_list_allocator` (no features) | `crates/board/qemu-virt` | Kernel heap with `free` (phase 2 task stacks need it); a bare `Heap` with IRQs masked around each call (`arch::irq`), not its spinlock, which could deadlock on one core. In the board crate because it is the binary that owns `#[global_allocator]` and `unsafe` heap init. |
 | `panic = "abort"` | both profiles | No unwinding in a kernel. |
 | dev `opt-level = 1` | root `Cargo.toml` | Opt-level 0 kernel code has bloated stack frames and slow MMIO loops; measured build cost is zero. Trade-off: some locals show as optimized out in the debugger. |
 | release `lto = true`, `codegen-units = 1` | root `Cargo.toml` | Smallest/fastest release image; release only, so the inner loop does not pay for it. |

@@ -5,8 +5,10 @@ A small operating system written in Rust. Goals, in priority order: **simple, fa
 ## Core decisions
 
 - Monolithic kernel built from safe subsystem crates (`forbid(unsafe_code)`); `unsafe` only in `arch` and `board`.
-- POSIX-compatible at the source level: native MogOs syscall ABI, a ported libc (relibc or musl) and a Rust `std` target. Programs are recompiled for `aarch64-unknown-mogos`.
+- POSIX-compatible at the source level: native MogOs syscall ABI, a ported libc (musl) and a Rust `std` target. Programs are recompiled for `aarch64-unknown-mogos`.
 - Optional Linux binary-compatibility layer later, translating Linux syscalls to native ones; it must never shape kernel internals.
+- Built to beat Linux where its legacy blocks it: memory safety by construction, capabilities instead of ambient authority (handles with rights, no global namespace in the native ABI), a small async-first syscall ABI (`spawn`, completion-based I/O; `fork` and signals live in libc), no overcommit (allocation fails explicitly, never an OOM killer), deterministic scheduling, and MogFS (checksummed copy-on-write). Schedule: `docs/ROADMAP.md`.
+- Kernel allocation is fallible: out-of-memory returns an error, never a panic.
 
 ## Docs (memory tree)
 
@@ -27,7 +29,7 @@ Every new `.md` file must be linked from its parent so it stays reachable from t
 
 - Architecture: AArch64 (matches the Apple Silicon host).
 - Machine: QEMU `virt`, `cortex-a72`, 1 core, 128 MiB RAM.
-- Toolchain: stable Rust, target `aarch64-unknown-none` (pinned in `rust-toolchain.toml`, links with bundled `rust-lld`).
+- Toolchain: stable Rust, target `aarch64-unknown-none-softfloat` (pinned in `rust-toolchain.toml`, links with bundled `rust-lld`).
 
 ## Commands
 
