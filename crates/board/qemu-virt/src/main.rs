@@ -10,6 +10,7 @@ use core::ops::Range;
 use core::panic::PanicInfo;
 use core::ptr::{self, NonNull};
 use core::slice;
+use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 use arch::{MemoryType, l1_block};
 use dtb::Dtb;
@@ -25,6 +26,13 @@ const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
 const GIB: u64 = 1 << 30;
 /// Outside both mapped GiBs.
 const UNMAPPED: PhysAddr = PhysAddr(0x8000_0000);
+/// EL1 virtual timer PPI.
+const TIMER_IRQ: u32 = 27;
+const TICK_US: u64 = 10_000;
+
+/// GIC CPU interface base, set before the first IRQ is unmasked.
+static GIC_CPU: AtomicU64 = AtomicU64::new(0);
+static TICKS: AtomicU64 = AtomicU64::new(0);
 
 #[global_allocator]
 static HEAP: KernelHeap = KernelHeap(UnsafeCell::new(Heap::empty()));
@@ -60,6 +68,8 @@ unsafe impl GlobalAlloc for KernelHeap {
 
 struct QemuVirt {
     uart: Uart,
+    /// GICv2 distributor and CPU interface.
+    gic: (PhysAddr, PhysAddr),
     entry_us: u64,
 }
 
@@ -110,6 +120,22 @@ impl kernel::Board for QemuVirt {
         arch::uptime_us() - self.entry_us
     }
 
+    fn start_timer(&mut self) {
+        let (dist, cpu) = self.gic;
+        GIC_CPU.store(cpu.0, Relaxed);
+        // SAFETY: the DTB's GICv2 registers, in the device-mapped GiB 0.
+        unsafe { arch::gic::enable(dist, cpu, TIMER_IRQ) };
+        arch::timer::arm(TICK_US);
+    }
+
+    fn ticks(&self) -> u64 {
+        TICKS.load(Relaxed)
+    }
+
+    fn idle(&mut self) {
+        arch::irq::wait()
+    }
+
     fn power_off(&mut self) -> ! {
         shutdown()
     }
@@ -137,15 +163,30 @@ extern "C" fn kmain() -> ! {
 
     let dtb = Dtb::new(blob).expect("bad DTB");
     let uart = dtb.uart().expect("no PL011 in DTB");
+    let gic = dtb.gic().expect("no GICv2 in DTB");
 
     kernel::run(
         &mut QemuVirt {
             uart: Uart::new(uart),
+            gic,
             entry_us,
         },
         dtb,
         &[image, dtb_range],
     )
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn board_irq() {
+    let cpu = PhysAddr(GIC_CPU.load(Relaxed));
+    // SAFETY: IRQs are unmasked only after `start_timer` stored the DTB's GIC CPU interface.
+    let iar = unsafe { arch::gic::ack(cpu) };
+    if iar == TIMER_IRQ {
+        arch::timer::arm(TICK_US);
+        TICKS.fetch_add(1, Relaxed);
+    }
+    // SAFETY: as above.
+    unsafe { arch::gic::eoi(cpu, iar) };
 }
 
 fn shutdown() -> ! {

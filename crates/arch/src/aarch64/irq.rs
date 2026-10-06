@@ -19,3 +19,17 @@ pub fn restore(state: State) {
     // SAFETY: writes back a DAIF value read by `disable`; no `nomem`, so it orders memory accesses like an unlock.
     unsafe { asm!("msr daif, {}", in(reg) state.0, options(nostack, preserves_flags)) };
 }
+
+/// With IRQs masked, sleeps until an interrupt is pending, then briefly unmasks so its handler runs.
+pub fn wait() {
+    // SAFETY: `wfi` wakes on a pending IRQ even while masked; the `isb` makes sure it is taken before re-masking.
+    unsafe {
+        asm!(
+            "wfi",
+            "msr daifclr, #2",
+            "isb",
+            "msr daifset, #2",
+            options(nostack)
+        )
+    };
+}

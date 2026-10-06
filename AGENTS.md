@@ -48,7 +48,7 @@ Every new `.md` file must be linked from its parent so it stays reachable from t
 - `crates/kernel` — OS logic, `#![no_std]`, **no `unsafe`** (`forbid`). Defines ports (traits) like `Board`.
 - `crates/mm` — arch-independent memory management (`PhysAddr`, frame allocator). Safe, host-tested.
 - `crates/dtb` — minimal FDT parser. Safe, host-tested.
-- `crates/arch` — the only arch-specific crate, `unsafe` allowed; AArch64 code in `src/aarch64/` (boot, traps, MMU).
+- `crates/arch` — the only arch-specific crate, `unsafe` allowed; AArch64 code in `src/aarch64/` (boot, traps, MMU, GICv2, timer).
 - `crates/board/qemu-virt` — board crate, `unsafe` allowed: drivers, memory map, `linker.ld`, `#[global_allocator]`; builds the `mog_os` binary.
 - `crates/e2e` — host-only QEMU boot tests (`tests/boot.rs`).
 - `.cargo/config.toml` — default target, build/link thread caps, QEMU runners.

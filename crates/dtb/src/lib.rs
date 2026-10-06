@@ -41,24 +41,35 @@ impl<'a> Dtb<'a> {
             if p.depth != 2 || !memory || p.name != b"reg" {
                 return None;
             }
-            let (start, size) = p.reg()?;
+            let (start, size) = p.reg(0)?;
             Some(PhysAddr(start)..PhysAddr(start + size))
         })
     }
 
     /// Base address of the first top-level node compatible with `arm,pl011`.
     pub fn uart(&self) -> Option<PhysAddr> {
-        let (mut node, mut reg, mut pl011) = (0, None, false);
+        Some(PhysAddr(self.reg_of(b"arm,pl011")?.reg(0)?.0))
+    }
+
+    /// Distributor and CPU interface bases of the first top-level GICv2 (`arm,cortex-a15-gic`).
+    pub fn gic(&self) -> Option<(PhysAddr, PhysAddr)> {
+        let reg = self.reg_of(b"arm,cortex-a15-gic")?;
+        Some((PhysAddr(reg.reg(0)?.0), PhysAddr(reg.reg(1)?.0)))
+    }
+
+    /// `reg` property of the first top-level node compatible with `compatible`.
+    fn reg_of(&self, compatible: &[u8]) -> Option<Prop<'a>> {
+        let (mut node, mut reg, mut found) = (0, None, false);
         self.find(|p| {
             if p.node_offset != node {
-                (node, reg, pl011) = (p.node_offset, None, false);
+                (node, reg, found) = (p.node_offset, None, false);
             }
             match p.name {
-                b"reg" if p.depth == 2 => reg = p.reg(),
-                b"compatible" => pl011 = p.value.split(|&b| b == 0).any(|c| c == b"arm,pl011"),
+                b"reg" if p.depth == 2 => reg = Some(*p),
+                b"compatible" => found = p.value.split(|&b| b == 0).any(|c| c == compatible),
                 _ => {}
             }
-            Some(PhysAddr(reg.filter(|_| pl011)?.0))
+            reg.filter(|_| found)
         })
     }
 
@@ -119,6 +130,7 @@ impl<'a> Dtb<'a> {
     }
 }
 
+#[derive(Clone, Copy)]
 struct Prop<'a> {
     depth: usize,
     node: &'a [u8],
@@ -131,12 +143,13 @@ struct Prop<'a> {
 }
 
 impl Prop<'_> {
-    /// First (address, size) pair of a `reg` value, decoded with the root's cell counts.
-    fn reg(&self) -> Option<(u64, u64)> {
-        let start = cells(self.value, 0, self.address_cells)?;
+    /// The `i`th (address, size) pair of a `reg` value, decoded with the root's cell counts.
+    fn reg(&self, i: usize) -> Option<(u64, u64)> {
+        let first = i * (self.address_cells + self.size_cells);
+        let start = cells(self.value, first, self.address_cells)?;
         Some((
             start,
-            cells(self.value, self.address_cells, self.size_cells)?,
+            cells(self.value, first + self.address_cells, self.size_cells)?,
         ))
     }
 }

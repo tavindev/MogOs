@@ -25,6 +25,12 @@ pub trait Board {
     fn init_heap(&mut self, region: Range<PhysAddr>);
     /// Microseconds since the board entered the kernel.
     fn uptime_us(&self) -> u64;
+    /// Starts the periodic timer interrupt; IRQs stay masked outside `idle`.
+    fn start_timer(&mut self);
+    /// Timer interrupts handled since `start_timer`.
+    fn ticks(&self) -> u64;
+    /// Sleeps until an interrupt arrives and handles it.
+    fn idle(&mut self);
     fn power_off(&mut self) -> !;
 }
 
@@ -69,6 +75,13 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
 
     let boot_us = board.uptime_us();
     let _ = writeln!(board.console(), "boot: {boot_us} us");
+
+    board.start_timer();
+    while board.ticks() < 3 {
+        board.idle();
+    }
+    let ticks = board.ticks();
+    let _ = writeln!(board.console(), "ticks: {ticks}");
 
     board.power_off()
 }

@@ -96,6 +96,7 @@ const SOURCES: [&str; 4] = [
     "lower EL (AArch32)",
 ];
 const SYNC_CURRENT_SPX: u64 = 4;
+const IRQ_CURRENT_SPX: u64 = 5;
 const EC_BRK64: u64 = 0x3c;
 
 /// Points `VBAR_EL1` at this crate's vector table.
@@ -118,8 +119,17 @@ pub fn breakpoint_self_test() {
     unsafe { asm!("brk #0", clobber_abi("C")) };
 }
 
+// SAFETY: the board defines `board_irq` with this signature; it runs with IRQs masked by exception entry.
+unsafe extern "C" {
+    safe fn board_irq();
+}
+
 #[unsafe(no_mangle)]
 extern "C" fn aarch64_exception(frame: &mut TrapFrame, index: u64) {
+    if index == IRQ_CURRENT_SPX {
+        board_irq();
+        return;
+    }
     let esr: u64;
     // SAFETY: reading ESR_EL1 has no side effects.
     unsafe { asm!("mrs {}, esr_el1", out(reg) esr) };
