@@ -35,8 +35,9 @@ const TICK_US: u64 = 10_000;
 
 /// GIC CPU interface base, set before the first IRQ can be delivered.
 static GIC_CPU: AtomicU64 = AtomicU64::new(0);
-/// Boot context included.
+/// Boot context included; a task's slot is its ASID (8 bits).
 const MAX_TASKS: usize = 8;
+const _: () = assert!(MAX_TASKS <= 256);
 /// 16 KiB, 16-byte aligned.
 const TASK_STACK: Layout = Layout::new::<[u128; 1024]>();
 
@@ -85,7 +86,27 @@ unsafe impl Sync for Sched {}
 #[unsafe(no_mangle)]
 unsafe extern "C" fn task_switch(frame: usize) -> usize {
     // SAFETY: the caller masked IRQs on the only core, so this is the sole reference.
-    unsafe { &mut *SCHED.0.get() }.switch(frame)
+    let sched = unsafe { &mut *SCHED.0.get() };
+    let (_, from) = sched.current();
+    let next = sched.switch(frame);
+    let (slot, space) = sched.current();
+    if space != from {
+        // SAFETY: `frame` came from the trap path and `next` from the scheduler, so both are trap frames.
+        unsafe { arch::switch_sp_el0(frame, next) };
+        load_space(slot, space);
+    }
+    next
+}
+
+/// Loads the address space of the task in `slot`: space 0 is the boot table with ASID 0, any other is a
+/// process's level-1 table, tagged with ASID `slot`.
+fn load_space(slot: usize, space: usize) {
+    let (table, asid) = match space {
+        0 => (arch::boot_table(), 0),
+        _ => (PhysAddr(space as u64), slot),
+    };
+    // SAFETY: every space's table holds the kernel blocks, and ASID `slot` is used only by the task in that slot.
+    unsafe { arch::set_ttbr0(table, asid) }
 }
 
 /// What a new task's first frame hands to `task_start`; lives at the top of its stack.
@@ -186,7 +207,7 @@ impl kernel::Board for QemuVirt {
         let frame = unsafe { arch::new_task(start, task_start, start) };
         let irq = arch::irq::disable();
         // SAFETY: IRQs are masked on the only core, so this is the sole reference.
-        let added = unsafe { &mut *SCHED.0.get() }.add(frame);
+        let added = unsafe { &mut *SCHED.0.get() }.add(frame, 0);
         arch::irq::restore(irq);
         if added.is_err() {
             // SAFETY: `stack` came from `alloc` with this layout and was never handed to the scheduler.

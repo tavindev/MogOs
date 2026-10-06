@@ -1,37 +1,52 @@
-/// No room for the task: the run queue is full or its stack could not be allocated.
+/// No room for the task: the run queue is full or its memory could not be allocated.
 #[derive(Debug)]
 pub struct Full;
 
-/// Round-robin run queue of up to `N` tasks, each known by its saved trap frame address.
+/// Round-robin run queue of up to `N` tasks, each known by its saved trap frame address and address space.
 pub struct Scheduler<const N: usize> {
-    frames: [usize; N],
-    len: usize,
+    /// Frame address and address space per slot; frame 0 marks a free slot (never slot 0).
+    tasks: [(usize, usize); N],
+    /// One past the highest slot ever used.
+    end: usize,
     current: usize,
 }
 
 impl<const N: usize> Scheduler<N> {
-    /// Slot 0 is the boot context; its frame is recorded on its first switch.
+    /// Slot 0 is the boot context in space 0; its frame is recorded on its first switch.
     pub const fn new() -> Self {
         Self {
-            frames: [0; N],
-            len: 1,
+            tasks: [(0, 0); N],
+            end: 1,
             current: 0,
         }
     }
 
-    /// Queues a new task whose first frame is at `frame`.
-    pub fn add(&mut self, frame: usize) -> Result<(), Full> {
-        let slot = self.frames.get_mut(self.len).ok_or(Full)?;
-        *slot = frame;
-        self.len += 1;
+    /// Queues a new task whose first frame is at `frame` in address space `space`.
+    pub fn add(&mut self, frame: usize, space: usize) -> Result<(), Full> {
+        let slot = 1 + self.tasks[1..].iter().position(|t| t.0 == 0).ok_or(Full)?;
+        self.tasks[slot] = (frame, space);
+        self.end = self.end.max(slot + 1);
         Ok(())
     }
 
     /// Saves the current task's `frame` and returns the next task's.
     pub fn switch(&mut self, frame: usize) -> usize {
-        self.frames[self.current] = frame;
-        self.current = (self.current + 1) % self.len;
-        self.frames[self.current]
+        self.tasks[self.current].0 = frame;
+        self.advance()
+    }
+
+    /// The current task's slot and address space.
+    pub fn current(&self) -> (usize, usize) {
+        (self.current, self.tasks[self.current].1)
+    }
+
+    fn advance(&mut self) -> usize {
+        loop {
+            self.current = (self.current + 1) % self.end;
+            if self.current == 0 || self.tasks[self.current].0 != 0 {
+                return self.tasks[self.current].0;
+            }
+        }
     }
 }
 

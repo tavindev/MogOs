@@ -6,7 +6,8 @@ struct TrapFrame {
     x: [u64; 31],
     elr: u64,
     spsr: u64,
-    _pad: u64,
+    /// Not touched by the vector asm: the kernel never uses SP_EL0, so only `switch_sp_el0` saves and loads it.
+    sp_el0: u64,
 }
 
 const _: () = assert!(size_of::<TrapFrame>() == 272);
@@ -149,10 +150,28 @@ pub unsafe fn new_task(stack_top: usize, entry: extern "C" fn(usize) -> !, arg: 
             x,
             elr: entry as usize as u64,
             spsr: SPSR_EL1H_IRQ_ON,
-            _pad: 0,
+            sp_el0: 0,
         })
     };
     frame as usize
+}
+
+/// Saves SP_EL0 into the frame at `from` and loads it from the frame at `to`; needed only when switching
+/// between address spaces, since user tasks are the only users of SP_EL0.
+///
+/// # Safety
+///
+/// `from` and `to` must be trap frames: saved by the trap path or written by `new_task`.
+pub unsafe fn switch_sp_el0(from: usize, to: usize) {
+    let sp: u64;
+    // SAFETY: SP_EL0 is not the running stack (EL1h), so reading it has no effect.
+    unsafe { asm!("mrs {}, sp_el0", out(reg) sp, options(nomem, nostack, preserves_flags)) };
+    // SAFETY: the caller guarantees `from` is a trap frame.
+    unsafe { (*(from as *mut TrapFrame)).sp_el0 = sp };
+    // SAFETY: the caller guarantees `to` is a trap frame.
+    let sp = unsafe { (*(to as *const TrapFrame)).sp_el0 };
+    // SAFETY: as above, writing SP_EL0 does not move the running stack.
+    unsafe { asm!("msr sp_el0, {}", in(reg) sp, options(nomem, nostack, preserves_flags)) };
 }
 
 /// Executes `svc #0`: switches to the next task; returns when the scheduler picks this one again.
