@@ -8,7 +8,6 @@ pub struct Full;
 
 /// A task's kernel stack and, for a process, its budget and where its next `map` goes. Handle tables are fixed arrays
 /// in the scheduler, so they are not charged.
-#[derive(Clone, Copy)]
 pub struct Memory {
     /// First frame of the kernel stack.
     pub stack: PhysAddr,
@@ -73,9 +72,8 @@ impl<const N: usize> Scheduler<N> {
     /// memory, whose frames the caller frees.
     pub fn exit(&mut self) -> (usize, Memory) {
         assert!(self.current != 0, "the boot context cannot exit");
-        let memory = self.memory[self.current];
+        let memory = core::mem::replace(&mut self.memory[self.current], NO_MEMORY);
         self.tasks[self.current] = (0, PhysAddr(0));
-        self.memory[self.current] = NO_MEMORY;
         self.handles[self.current] = Handles::new();
         (self.advance(), memory)
     }

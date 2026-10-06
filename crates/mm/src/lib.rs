@@ -99,7 +99,6 @@ impl<const WORDS: usize> FrameAllocator<WORDS> {
 }
 
 /// Frames a process may hold; every frame taken through it is charged at allocation time.
-#[derive(Clone, Copy, Debug)]
 pub struct Budget {
     limit: usize,
     used: usize,

@@ -27,7 +27,7 @@ pub const ENOMEM: i64 = -12;
 pub const EACCES: i64 = -13;
 /// Bad address: outside user space, unmapped, or longer than `MAX_WRITE`.
 pub const EFAULT: i64 = -14;
-/// Invalid argument: a zero-length `map`.
+/// Invalid argument: a `map` of zero bytes or more than `MAX_MAP`.
 const EINVAL: i64 = -22;
 /// The handle table is full.
 pub const EMFILE: i64 = -24;
@@ -38,6 +38,8 @@ const ENOSYS: i64 = -38;
 const USER: Range<u64> = 1 << 32..1 << 39;
 /// Longest `write`, so the syscall's IRQs-masked work stays bounded.
 const MAX_WRITE: u64 = 4096;
+/// Longest `map` (16 pages), so its IRQs-masked zeroing stays bounded.
+const MAX_MAP: u64 = 16 * 4096;
 
 pub enum Call {
     Exit,
@@ -77,6 +79,7 @@ pub fn dispatch(nr: u64, args: &[u64; 6], handles: &mut Handles) -> Result<Call,
         CLOSE => handles.close(args[0]).map(|()| Call::Done(0)),
         MAP => match args[0] {
             0 => Err(EINVAL),
+            len if len > MAX_MAP => Err(EINVAL),
             len => Ok(Call::Map {
                 pages: len.div_ceil(4096) as usize,
             }),

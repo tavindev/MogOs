@@ -163,7 +163,8 @@ fn map_zeroed(
 ) -> Option<PhysAddr> {
     let page = zeroed(frames, budget)?;
     let leaf = user_page(page, access);
-    // SAFETY: `l1` is a process's table built from zeroed frames like these, and `va` is a user address it leaves unmapped.
+    // SAFETY: `l1` is a process's table built from zeroed frames like these, and `va` is a user address it leaves unmapped;
+    // map's `next` only grows, by at most the budget, and budgets stay within RAM, so `va` stays far below 512 GiB.
     if unsafe { arch::map_page(l1, va, leaf, || zeroed(frames, budget)) }.is_none() {
         budget.free(frames, page);
         return None;

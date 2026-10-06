@@ -186,9 +186,8 @@ user_handles_end:
 .balign 4
 .global user_budget, user_budget_end
 user_budget:
-    // map of the 23 frames left after the fixed 9 needs 24 with its level-3 table: ENOMEM, the 22 mapped pages undone.
-    movz x0, #0x7000
-    movk x0, #1, lsl #16
+    // map of the 16 frames left after the fixed 9 needs 17 with its level-3 table: ENOMEM, the 15 mapped pages undone.
+    mov x0, #0x10000
     mov x8, #4
     svc #0
     cmn x0, #12

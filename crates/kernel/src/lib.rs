@@ -76,7 +76,7 @@ pub const FRAME_WORDS: usize = 512;
 /// 1 MiB kernel heap.
 const HEAP_FRAMES: usize = 256;
 /// Each boot-spawned process's budget in frames, until spawn moves budget from parent to child (step 14).
-const BOOT_BUDGET: usize = 32;
+const BOOT_BUDGET: usize = 25;
 
 /// `reserved` lists physical ranges in use (kernel image, DTB).
 pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> ! {
