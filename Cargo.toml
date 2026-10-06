@@ -1,0 +1,21 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+# Every crate is safe Rust by default; only `qemu-virt` opts out.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[profile.dev]
+panic = "abort"
+# opt-level 0 kernel code has bloated stack frames and slow MMIO loops; build cost is unchanged.
+opt-level = 1
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1

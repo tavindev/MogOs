@@ -1,0 +1,74 @@
+# MogOs
+
+A small operating system written in Rust. Goals, in priority order:** simple, fast, efficient**.
+
+## Docs (memory tree)
+
+This file is the root. Load child docs only when the task needs them.
+
+```
+AGENTS.md
+├── docs/DEVELOPMENT.md               toolchain, build/lint settings, test commands, rules for agents
+├── docs/BENCHMARKS.md                benchmark kinds, workflow, regression rule, baselines
+├── docs/WORKFLOW.md                  development loop, which agent does each step, reviewer pass
+└── docs/ROADMAP.md                   phases, status, open decisions
+    └── docs/phases/phase-N-*.md      steps, done-when, what was done
+```
+
+Every new `.md` file must be linked from its parent so it stays reachable from this root, and this tree must be updated when one is added.
+
+## Target
+
+- Architecture: AArch64 (matches the Apple Silicon host).
+- Machine: QEMU `virt`, `cortex-a72`, 1 core, 128 MiB RAM.
+- Toolchain: stable Rust, target `aarch64-unknown-none` (pinned in `rust-toolchain.toml`, links with bundled `rust-lld`).
+
+## Commands
+
+- Build: `cargo build`
+- Run in QEMU: `cargo run` (prints to the terminal via PL011 UART, exits via PSCI `SYSTEM_OFF`)
+- Run in a QEMU window: `cargo window` (mouse stays free; Ctrl+Option+G releases a grab)
+- Quit a hung QEMU: `Ctrl-A` then `X`
+- Test: `cargo test-host` (host tests plus the QEMU boot tests in `crates/e2e`; must pass)
+- Benchmarks: `cargo bench-host` (host); kernel boot time is the `boot: <N> us` line
+- Debug: `cargo run -- -s -S`, then attach `lldb` / `gdb` to `localhost:1234`
+- Lint/format: `cargo clippy`, `cargo fmt` (must be clean). Settings, rules for agents: `docs/DEVELOPMENT.md`
+- Roadmap and current phase: `docs/ROADMAP.md` (one doc per phase in `docs/phases/`; update "What was done" when a step lands)
+
+## Layout
+
+- `crates/kernel` — OS logic, `#![no_std]`, **no `unsafe`** (`forbid`). Defines ports (traits) like `Board`.
+- `crates/mm` — `PhysAddr`, bitmap 4 KiB frame allocator, level-1 block descriptor and `MAIR` encoding. Safe, host-tested; `benches/frames.rs`.
+- `crates/dtb` — minimal FDT parser (memory node, PL011 base, `/chosen/bootargs`). Safe, host-tested against `tests/virt.dtb`.
+- `crates/aarch64` — arch crate, `unsafe` allowed: exception vectors, trap frame, `VBAR_EL1`, MMU enable with the static level-1 table, generic-timer uptime. No board addresses.
+- `crates/qemu-virt` — board crate, `unsafe` allowed: boot asm (`_start`), `kmain`, panic handler, drivers (`uart.rs`, PL011 base from the DTB; the panic path uses `0x0900_0000`), identity map (GiB 0 device, GiB 1 RAM), `#[global_allocator]`, `linker.ld` (loads at `0x4020_0000`; DTB at `0x4000_0000`). Implements the kernel's ports and builds the `mog_os` binary.
+- `crates/e2e` — host-only boot tests (`tests/boot.rs`): builds the kernel, boots QEMU, asserts serial output (normal boot and `-append test=mmu-fault`).
+- `.cargo/config.toml` — default target, build/link thread caps, QEMU runners.
+
+## Architecture
+
+- Cargo workspace. Dependencies point inward: board crates depend on `kernel`, never the reverse. New subsystems (`mm`, `sched`, ...) get their own crate.
+- `unsafe_code = "forbid"` is a workspace lint, so every crate is safe by default. Only board/arch crates opt out, and they expose safe wrappers.
+- Hardware sits behind small traits (ports) implemented per board (adapters), so core logic stays hardware-free and testable on the host.
+- Static dispatch (generics) across boundaries; no `dyn`, `Arc`, or heap in hot paths (exception entry, context switch, page faults).
+
+## Development philosophy: test-driven
+
+- Test-driven: write the failing test that states the expected behavior first, then the code that makes it pass.
+- Prefer end-to-end and integration tests over unit tests. The main test is booting the kernel in QEMU and asserting on its serial output; next is testing a crate through its public API.
+- Unit tests are for tricky pure logic only (parsers, allocators, encodings). Don't unit-test every function.
+- A step is done when its end-to-end test passes, not when the code compiles.
+- Every change follows `docs/WORKFLOW.md`: failing test, smallest diff, checks, then a `reviewer` pass for correctness and simplicity.
+
+## Performance: benchmark-driven
+
+- Speed is a feature, so it is measured, not assumed. Details and baselines: `docs/BENCHMARKS.md`.
+- Every hot path gets a benchmark when it lands. Every change to a hot path reports before/after numbers.
+- A tracked benchmark slowing down by more than 5% needs an explicit justification; otherwise treat it as a failure.
+
+## Code rules
+
+- `#![no_std]`. Edition 2024: use `#[unsafe(no_mangle)]`, `unsafe extern`.
+- Host-testable crates use `#![cfg_attr(not(test), no_std)]`.
+- `unsafe` only in `crates/qemu-virt` and `crates/aarch64` (or a future arch/board crate), each block with a one-line `// SAFETY:` reason.
+- After editing `linker.ld`, `crates/qemu-virt/build.rs` triggers a relink automatically.

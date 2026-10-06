@@ -1,0 +1,12 @@
+[package]
+name = "e2e"
+version.workspace = true
+edition.workspace = true
+
+# Host-only: boots the kernel in QEMU from `tests/boot.rs`.
+[lib]
+test = false
+doctest = false
+
+[lints]
+workspace = true

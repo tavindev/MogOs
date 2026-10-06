@@ -1,0 +1,10 @@
+[package]
+name = "dtb"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+mm = { path = "../mm" }
+
+[lints]
+workspace = true
