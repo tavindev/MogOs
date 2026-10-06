@@ -16,7 +16,7 @@ Later: Linux binary-compatibility layer, multicore (SMP), networking, graphics, 
 - Host tests: pure-logic crates are `cargo test`-ed on macOS.
 - QEMU integration: `cargo run` boots, prints progress, and powers off.
 - Debugging: LLDB over QEMU's gdbstub; readable panic and fault dumps.
-- Benchmarks ([BENCHMARKS.md](BENCHMARKS.md)): each hot path gets one when it lands (phase 1: frame allocation, boot time; phase 2: yield round trip; phase 3: syscall, pipe; phase 4: I/O ring).
+- Benchmarks ([BENCHMARKS.md](BENCHMARKS.md)): each hot path gets one when it lands (phase 1: frame allocation, boot time; phase 2: yield round trip; phase 3: syscall, pipe; phase 4: virtio-blk throughput).
 
 ## Differentiators vs Linux (when each lands)
 
@@ -25,12 +25,12 @@ Core decisions live in AGENTS.md; this is where each differentiator is scheduled
 | Differentiator | Lands in |
 | --- | --- |
 | Memory safety by construction (`unsafe` only in `arch`/`board`) | Phase 1 (done) |
-| No overcommit: fallible allocation, per-process memory budgets, no OOM killer | Rule now; budgets in phase 3 step 13 |
+| No overcommit: fallible allocation, per-process memory budgets, no OOM killer | Rule now; fixed-capacity kernel object tables and budgets in phase 3 step 13 |
 | Capabilities: per-process handle table with rights, no ambient authority | Phase 3 step 12 |
-| Small, async-first native ABI: about 20-30 syscalls, `spawn` not `fork`, completion-based I/O | Phase 3 (ABI, spawn); phase 4 step 20 (I/O ring) |
-| Deterministic scheduling: priorities, priority inheritance, bounded IRQ latency | Phase 3 step 16; latency measured once a meaningful measurement exists |
-| MogFS: checksummed copy-on-write filesystem with atomic transactions | Phase 4 step 21 |
+| Small, async-first native ABI: about 20-30 syscalls, `spawn` not `fork`, completion-based I/O | Phase 3 steps 11-15 (completion I/O from the first pipe) |
+| Deterministic scheduling: priorities, priority inheritance, bounded IRQ latency | Phase 3 step 16; IRQ latency bounded by the longest syscall (measured under hvf from phase 3) |
+| MogFS: checksummed copy-on-write filesystem with atomic commits | Phase 4 steps 21a-c |
 
 ## Open decisions
 
-- Rust `std` for MogOs: a custom OS target needs nightly (`build-std`) or upstreaming the target into rustc, but the toolchain rule is stable-only. Decide before phase 4.
+- Rust `std` for MogOs programs: a custom OS target needs nightly (`build-std`) or upstreaming into rustc, against the stable-only rule. Not needed by phases 3-4 (user programs are `no_std` Rust or C on musl). A stable route to verify: build for `aarch64-unknown-linux-musl` and link against MogOs' musl, relying on its Linux-number dispatcher.
