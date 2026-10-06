@@ -3,6 +3,7 @@
 extern crate alloc;
 
 mod sched;
+pub mod syscall;
 
 pub use sched::{Full, Scheduler};
 
@@ -38,6 +39,22 @@ pub trait Board {
     fn spawn(&mut self, entry: fn(&mut Self, usize) -> !, arg: usize) -> Result<(), Full>;
     /// Runs the other tasks in turn; returns when this one is scheduled again.
     fn yield_now(&mut self);
+    /// Queues `program` as a process at EL0 in its own address space, its tables and pages taken from `frame`.
+    fn spawn_user(
+        &mut self,
+        program: Program,
+        frame: impl FnMut() -> Option<PhysAddr>,
+    ) -> Result<(), Full>;
+    /// Tasks in the run queue, the boot context included.
+    fn tasks(&self) -> usize;
+}
+
+/// User programs the board provides until the boot archive (step 14).
+pub enum Program {
+    /// Checks that `print` rejects bad pointers, prints `A: 0`..`A: 9` with a spin after each, exits.
+    Counter,
+    /// Reads the counter's code address, which its own address space does not map.
+    Intruder,
 }
 
 /// Round trips timed by `test=bench`.
@@ -90,6 +107,7 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
             "test=yield" => yield_demo(board),
             "test=bench" => yield_bench(board),
             "test=preempt" => preempt_demo(board),
+            "test=user" => user_demo(board, &mut frames),
             _ => {}
         }
     }
@@ -138,6 +156,20 @@ fn print_and_power_off<B: Board>(board: &mut B, _: usize) -> ! {
         board.yield_now();
     }
     board.power_off()
+}
+
+/// The timer preempts process A between its lines; B faults on A's address and is killed; returns once both are gone.
+fn user_demo<B: Board, const W: usize>(board: &mut B, frames: &mut FrameAllocator<W>) {
+    board
+        .spawn_user(Program::Counter, || frames.alloc())
+        .expect("spawn A");
+    board
+        .spawn_user(Program::Intruder, || frames.alloc())
+        .expect("spawn B");
+    board.start_timer();
+    while board.tasks() > 1 {
+        board.idle();
+    }
 }
 
 /// Each boot-task yield is one round trip through a task that only yields back.

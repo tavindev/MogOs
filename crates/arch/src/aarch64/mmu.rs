@@ -188,3 +188,46 @@ pub fn flush_asid(asid: usize) {
         )
     };
 }
+
+/// Whether EL0 may read `va` in the current address space.
+pub fn user_readable(va: u64) -> bool {
+    let par: u64;
+    // SAFETY: an address translation only writes PAR_EL1, which nothing else reads.
+    unsafe {
+        asm!(
+            "at s1e0r, {va}",
+            "isb",
+            "mrs {par}, par_el1",
+            va = in(reg) va,
+            par = out(reg) par,
+            options(nostack, preserves_flags),
+        )
+    };
+    par & 1 == 0
+}
+
+/// Makes instructions written to `start..start + len` visible to instruction fetch.
+///
+/// # Safety
+///
+/// The range must be mapped.
+pub unsafe fn sync_icache(start: usize, len: usize) {
+    let ctr: usize;
+    // SAFETY: reading CTR_EL0 has no side effects.
+    unsafe { asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack, preserves_flags)) };
+    let line = 4 << ((ctr >> 16) & 0xf);
+    for addr in (start & !(line - 1)..start + len).step_by(line) {
+        // SAFETY: cleaning a mapped line to the point of unification does not change memory contents.
+        unsafe { asm!("dc cvau, {}", in(reg) addr, options(nostack, preserves_flags)) };
+    }
+    // SAFETY: barriers and an I-cache invalidate only discard stale instructions.
+    unsafe {
+        asm!(
+            "dsb ish",
+            "ic iallu",
+            "dsb ish",
+            "isb",
+            options(nostack, preserves_flags)
+        )
+    };
+}

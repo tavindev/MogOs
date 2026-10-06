@@ -17,16 +17,20 @@ impl Uart {
         // SAFETY: `base` is the MMIO data register of a PL011 on this board.
         unsafe { (self.base.0 as *mut u32).write_volatile(byte as u32) }
     }
-}
 
-impl fmt::Write for Uart {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        for b in s.bytes() {
+    pub fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
             if b == b'\n' {
                 self.put(b'\r');
             }
             self.put(b);
         }
+    }
+}
+
+impl fmt::Write for Uart {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        self.write(s.as_bytes());
         Ok(())
     }
 }

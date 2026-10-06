@@ -2,8 +2,8 @@ use core::arch::{asm, global_asm};
 
 /// Registers saved on exception entry; the layout is fixed by the vector asm below.
 #[repr(C)]
-struct TrapFrame {
-    x: [u64; 31],
+pub struct TrapFrame {
+    pub x: [u64; 31],
     elr: u64,
     spsr: u64,
     /// Not touched by the vector asm: the kernel never uses SP_EL0, so only `switch_sp_el0` saves and loads it.
@@ -99,10 +99,14 @@ const SOURCES: [&str; 4] = [
 ];
 const SYNC_CURRENT_SPX: u64 = 4;
 const IRQ_CURRENT_SPX: u64 = 5;
+const SYNC_LOWER64: u64 = 8;
+const IRQ_LOWER64: u64 = 9;
 const EC_SVC64: u64 = 0x15;
 const EC_BRK64: u64 = 0x3c;
 /// EL1h with IRQs unmasked; D, A and F masked.
 const SPSR_EL1H_IRQ_ON: u64 = 0x345;
+/// EL0t with IRQs unmasked; D, A and F masked.
+const SPSR_EL0T_IRQ_ON: u64 = 0x340;
 
 unsafe extern "C" {
     /// The board's scheduler: saves the yielding task's frame address and returns the next task's.
@@ -133,6 +137,10 @@ pub fn breakpoint_self_test() {
 unsafe extern "C" {
     /// Handles the pending IRQ; returns the frame to resume, `frame` or the next task's. Requires IRQs masked.
     fn board_irq(frame: usize) -> usize;
+    /// Runs the syscall a process made with `svc`; returns the frame to resume. Requires IRQs masked.
+    fn board_syscall(frame: &mut TrapFrame) -> usize;
+    /// Kills the process whose instruction faulted at EL0; returns the next task's frame. Requires IRQs masked.
+    fn board_user_fault(frame: usize) -> usize;
 }
 
 /// Writes a frame just below `stack_top` that starts `entry(arg)` at EL1h with IRQs unmasked; returns its address for the scheduler.
@@ -156,12 +164,32 @@ pub unsafe fn new_task(stack_top: usize, entry: extern "C" fn(usize) -> !, arg: 
     frame as usize
 }
 
+/// Writes a frame just below `stack_top` (the process's kernel stack) that starts at user address `entry`
+/// at EL0 with IRQs unmasked and SP_EL0 = `sp`; returns its address for the scheduler.
+///
+/// # Safety
+///
+/// `stack_top` must be 16-byte aligned, with the memory below it a fresh stack owned by the new task.
+pub unsafe fn new_user_task(stack_top: usize, entry: u64, sp: u64) -> usize {
+    let frame = (stack_top - size_of::<TrapFrame>()) as *mut TrapFrame;
+    // SAFETY: the caller guarantees the bytes below `stack_top` are ours to write.
+    unsafe {
+        frame.write(TrapFrame {
+            x: [0; 31],
+            elr: entry,
+            spsr: SPSR_EL0T_IRQ_ON,
+            sp_el0: sp,
+        })
+    };
+    frame as usize
+}
+
 /// Saves SP_EL0 into the frame at `from` and loads it from the frame at `to`; needed only when switching
 /// between address spaces, since user tasks are the only users of SP_EL0.
 ///
 /// # Safety
 ///
-/// `from` and `to` must be trap frames: saved by the trap path or written by `new_task`.
+/// `from` and `to` must be trap frames: saved by the trap path or written by `new_task`/`new_user_task`.
 pub unsafe fn switch_sp_el0(from: usize, to: usize) {
     let sp: u64;
     // SAFETY: SP_EL0 is not the running stack (EL1h), so reading it has no effect.
@@ -182,7 +210,7 @@ pub fn yield_now() {
 
 #[unsafe(no_mangle)]
 extern "C" fn aarch64_exception(frame: &mut TrapFrame, index: u64) -> usize {
-    if index == IRQ_CURRENT_SPX {
+    if index == IRQ_CURRENT_SPX || index == IRQ_LOWER64 {
         // SAFETY: exception entry masked IRQs.
         return unsafe { board_irq(frame as *mut TrapFrame as usize) };
     }
@@ -190,6 +218,14 @@ extern "C" fn aarch64_exception(frame: &mut TrapFrame, index: u64) -> usize {
     // SAFETY: reading ESR_EL1 has no side effects.
     unsafe { asm!("mrs {}, esr_el1", out(reg) esr) };
     let ec = (esr >> 26) & 0x3f;
+    if index == SYNC_LOWER64 && ec == EC_SVC64 {
+        // SAFETY: the board defines `board_syscall`; exception entry masked IRQs.
+        return unsafe { board_syscall(frame) };
+    }
+    if index == SYNC_LOWER64 {
+        // SAFETY: the board defines `board_user_fault`; exception entry masked IRQs.
+        return unsafe { board_user_fault(frame as *mut TrapFrame as usize) };
+    }
     if index == SYNC_CURRENT_SPX && ec == EC_SVC64 && esr & 0xffff == 0 {
         // SAFETY: the board defines `task_switch`; exception entry masked IRQs.
         return unsafe { task_switch(frame as *mut TrapFrame as usize) };

@@ -151,3 +151,27 @@ fn timer_preempts_spinning_task() {
     );
     assert!(status.success(), "QEMU exited with {status}");
 }
+
+#[test]
+fn faulting_process_is_killed_and_others_keep_running() {
+    let (status, lines) = boot(&["-append", "test=user"]);
+    assert!(
+        !lines.iter().any(|l| l.starts_with("panic:")),
+        "kernel panicked"
+    );
+    let a: Vec<_> = lines
+        .iter()
+        .filter(|l| l.starts_with("A: "))
+        .cloned()
+        .collect();
+    let mut expected = vec!["A: bad pointers rejected".to_string()];
+    expected.extend((0..10).map(|i| format!("A: {i}")));
+    assert_eq!(a, expected);
+    let fault = lines
+        .iter()
+        .position(|l| l == "fault: 2")
+        .expect("missing fault line");
+    let last = lines.iter().position(|l| l == "A: 9").unwrap();
+    assert!(fault < last, "B was not killed while A was running");
+    assert!(status.success(), "QEMU exited with {status}");
+}

@@ -35,9 +35,21 @@ impl<const N: usize> Scheduler<N> {
         self.advance()
     }
 
+    /// Drops the current task (never slot 0) and returns the next task's frame.
+    pub fn exit(&mut self) -> usize {
+        assert!(self.current != 0, "the boot context cannot exit");
+        self.tasks[self.current] = (0, 0);
+        self.advance()
+    }
+
     /// The current task's slot and address space.
     pub fn current(&self) -> (usize, usize) {
         (self.current, self.tasks[self.current].1)
+    }
+
+    /// Tasks in the queue, the boot context included.
+    pub fn count(&self) -> usize {
+        1 + self.tasks[1..self.end].iter().filter(|t| t.0 != 0).count()
     }
 
     fn advance(&mut self) -> usize {
