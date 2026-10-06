@@ -40,7 +40,7 @@ cargo fmt              # format (CI-style check: cargo fmt --check)
 cargo build            # dev build
 cargo test-host        # host tests + QEMU boot e2e tests (crates/e2e); must pass
 cargo bench-host       # host benchmarks (min/median); see docs/BENCHMARKS.md
-cargo run              # boot in QEMU; prints hello, exceptions, mmu, ram, frames, heap, boot lines and powers off
+cargo run              # boot in QEMU; prints hello, exceptions, mmu, ram, frames, heap, boot, ticks lines and powers off
 cargo run -- -append test=mmu-fault  # reads an unmapped address after MMU on; prints the data abort
 cargo run -- -s -S     # boot halted, gdbstub on localhost:1234; attach lldb/gdb
 cargo build --release  # LTO release image

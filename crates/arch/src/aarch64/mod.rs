@@ -1,7 +1,9 @@
 use core::arch::{asm, global_asm};
 
+pub mod gic;
 pub mod irq;
 mod mmu;
+pub mod timer;
 mod trap;
 
 pub use mmu::*;

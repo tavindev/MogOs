@@ -67,6 +67,7 @@ fn boots_and_powers_off() {
         "ram: 0x40000000..0x48000000",
         "mmu: on",
         "heap: ok",
+        "ticks: 3",
     ] {
         assert!(
             lines.iter().any(|l| l == expected),
