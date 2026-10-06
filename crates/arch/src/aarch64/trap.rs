@@ -1,23 +1,25 @@
 use core::arch::{asm, global_asm};
 
 /// Registers saved on exception entry; the layout is fixed by the vector asm below.
-#[repr(C)]
+#[repr(C, align(16))]
 pub struct TrapFrame {
     pub x: [u64; 31],
     elr: u64,
     spsr: u64,
-    /// Not touched by the vector asm: the kernel never uses SP_EL0, so only `switch_sp_el0` saves and loads it.
+    /// Not touched by the vector asm: the kernel never uses SP_EL0 or TPIDR_EL0, so only `switch_el0_regs`
+    /// saves and loads them.
     sp_el0: u64,
+    tpidr_el0: u64,
 }
 
-const _: () = assert!(size_of::<TrapFrame>() == 272);
+const _: () = assert!(size_of::<TrapFrame>() == 288);
 
 // Each of the 16 entries saves x0/x1, puts its index in x1, and joins the common path.
 global_asm!(
     r#"
 .macro VECTOR index
     .balign 0x80
-    sub sp, sp, #272
+    sub sp, sp, #288
     stp x0, x1, [sp]
     mov x1, #\index
     b .Ltrap
@@ -85,7 +87,7 @@ aarch64_vectors:
     ldp x26, x27, [sp, #208]
     ldp x28, x29, [sp, #224]
     ldp x0, x1, [sp]
-    add sp, sp, #272
+    add sp, sp, #288
     eret
 "#
 );
@@ -139,8 +141,9 @@ unsafe extern "C" {
     fn board_irq(frame: usize) -> usize;
     /// Runs the syscall a process made with `svc`; returns the frame to resume. Requires IRQs masked.
     fn board_syscall(frame: &mut TrapFrame) -> usize;
-    /// Kills the process whose instruction faulted at EL0; returns the next task's frame. Requires IRQs masked.
-    fn board_user_fault(frame: usize) -> usize;
+    /// Kills the process whose instruction faulted at EL0 with exception class `ec` at address `far`; returns
+    /// the next task's frame. Requires IRQs masked.
+    fn board_user_fault(frame: usize, ec: u64, far: u64) -> usize;
 }
 
 /// Writes a frame just below `stack_top` that starts `entry(arg)` at EL1h with IRQs unmasked; returns its address for the scheduler.
@@ -159,6 +162,7 @@ pub unsafe fn new_task(stack_top: usize, entry: extern "C" fn(usize) -> !, arg: 
             elr: entry as usize as u64,
             spsr: SPSR_EL1H_IRQ_ON,
             sp_el0: 0,
+            tpidr_el0: 0,
         })
     };
     frame as usize
@@ -179,27 +183,33 @@ pub unsafe fn new_user_task(stack_top: usize, entry: u64, sp: u64) -> usize {
             elr: entry,
             spsr: SPSR_EL0T_IRQ_ON,
             sp_el0: sp,
+            tpidr_el0: 0,
         })
     };
     frame as usize
 }
 
-/// Saves SP_EL0 into the frame at `from` and loads it from the frame at `to`; needed only when switching
-/// between address spaces, since user tasks are the only users of SP_EL0.
+/// Saves SP_EL0 and TPIDR_EL0 into the frame at `from` and loads them from the frame at `to`; needed only
+/// when switching between address spaces, since user tasks are their only users.
 ///
 /// # Safety
 ///
 /// `from` and `to` must be trap frames: saved by the trap path or written by `new_task`/`new_user_task`.
-pub unsafe fn switch_sp_el0(from: usize, to: usize) {
-    let sp: u64;
-    // SAFETY: SP_EL0 is not the running stack (EL1h), so reading it has no effect.
-    unsafe { asm!("mrs {}, sp_el0", out(reg) sp, options(nomem, nostack, preserves_flags)) };
+pub unsafe fn switch_el0_regs(from: usize, to: usize) {
+    let (sp, tp): (u64, u64);
+    // SAFETY: SP_EL0 is not the running stack (EL1h) and the kernel never uses TPIDR_EL0, so reading them has no effect.
+    unsafe {
+        asm!("mrs {}, sp_el0", "mrs {}, tpidr_el0", out(reg) sp, out(reg) tp, options(nomem, nostack, preserves_flags))
+    };
     // SAFETY: the caller guarantees `from` is a trap frame.
-    unsafe { (*(from as *mut TrapFrame)).sp_el0 = sp };
+    let from = unsafe { &mut *(from as *mut TrapFrame) };
+    (from.sp_el0, from.tpidr_el0) = (sp, tp);
     // SAFETY: the caller guarantees `to` is a trap frame.
-    let sp = unsafe { (*(to as *const TrapFrame)).sp_el0 };
-    // SAFETY: as above, writing SP_EL0 does not move the running stack.
-    unsafe { asm!("msr sp_el0, {}", in(reg) sp, options(nomem, nostack, preserves_flags)) };
+    let to = unsafe { &*(to as *const TrapFrame) };
+    // SAFETY: as above, writing them does not move the running stack or touch kernel state.
+    unsafe {
+        asm!("msr sp_el0, {}", "msr tpidr_el0, {}", in(reg) to.sp_el0, in(reg) to.tpidr_el0, options(nomem, nostack, preserves_flags))
+    };
 }
 
 /// Executes `svc #0`: switches to the next task; returns when the scheduler picks this one again.
@@ -224,7 +234,7 @@ extern "C" fn aarch64_exception(frame: &mut TrapFrame, index: u64) -> usize {
     }
     if index == SYNC_LOWER64 {
         // SAFETY: the board defines `board_user_fault`; exception entry masked IRQs.
-        return unsafe { board_user_fault(frame as *mut TrapFrame as usize) };
+        return unsafe { board_user_fault(frame as *mut TrapFrame as usize, ec, far_el1()) };
     }
     if index == SYNC_CURRENT_SPX && ec == EC_SVC64 && esr & 0xffff == 0 {
         // SAFETY: the board defines `task_switch`; exception entry masked IRQs.
@@ -234,13 +244,18 @@ extern "C" fn aarch64_exception(frame: &mut TrapFrame, index: u64) -> usize {
         frame.elr += 4;
         return frame as *mut TrapFrame as usize;
     }
-    let far: u64;
-    // SAFETY: reading FAR_EL1 has no side effects.
-    unsafe { asm!("mrs {}, far_el1", out(reg) far) };
     panic!(
         "unhandled {} exception from {}: ESR_EL1={esr:#x} FAR_EL1={far:#x} ELR_EL1={:#x}",
         KINDS[index as usize % 4],
         SOURCES[index as usize / 4],
-        frame.elr
+        frame.elr,
+        far = far_el1(),
     );
+}
+
+fn far_el1() -> u64 {
+    let far: u64;
+    // SAFETY: reading FAR_EL1 has no side effects.
+    unsafe { asm!("mrs {}, far_el1", out(reg) far) };
+    far
 }

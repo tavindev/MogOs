@@ -33,7 +33,7 @@ pub const fn l1_block(addr: PhysAddr, ty: MemoryType) -> u64 {
 }
 
 /// Level-1 or level-2 descriptor pointing at the next-level table in the frame at `addr`.
-pub const fn table_entry(addr: PhysAddr) -> u64 {
+const fn table_entry(addr: PhysAddr) -> u64 {
     addr.0 & ADDR | VALID_TABLE_OR_PAGE
 }
 
@@ -59,7 +59,7 @@ pub const fn user_page(addr: PhysAddr, access: UserAccess) -> u64 {
         | VALID_TABLE_OR_PAGE
 }
 
-// Checked at build time: TCG ignores memory attributes and permissions, so a wrong bit would still boot.
+// Checked at build time: TCG enforces AP/XN but ignores cacheability attributes, so a wrong bit there would still boot.
 const _: () = assert!(l1_block(PhysAddr(0), MemoryType::Device) == 0x0060_0000_0000_0401);
 const _: () = assert!(l1_block(PhysAddr(0x4000_0000), MemoryType::Normal) == 0x0040_0000_4000_0705);
 const _: () = assert!(table_entry(PhysAddr(0x4000_3000)) == 0x0000_0000_4000_3003);
@@ -92,6 +92,12 @@ pub unsafe fn enable_mmu(l1: &[u64], mair: u64) {
         | 1 << 23 // EPD1: no TTBR1 walks
         | 0b10 << 30 // TG1 4 KiB, only to avoid the reserved encoding
         | (pa_range & 0x7) << 32;
+    let sctlr: u64 = 1 << 0 | 1 << 2 | 1 << 12 // M, C, I: MMU, data and instruction caches on
+        | 1 << 3 | 1 << 4 // SA, SA0: SP alignment checks at EL1 and EL0
+        | 1 << 16 | 1 << 18 // nTWI, nTWE: EL0 wfi/wfe not trapped; EL0 cannot mask IRQs (UMA = 0), so a tick ends them
+        | 1 << 23 // SPAN: PAN untouched on exception entry (print_user reads user memory directly)
+        | 1 << 11 | 1 << 20 | 1 << 22 | 1 << 28 | 1 << 29; // RES1 on ARMv8.0
+    // UMA, DZE, UCT, UCI = 0: EL0 cannot mask interrupts, zero or query caches, or maintain them; E0E, EE = 0: little endian.
     // SAFETY: the table is written and the caller guarantees it maps everything in use.
     unsafe {
         asm!(
@@ -103,15 +109,12 @@ pub unsafe fn enable_mmu(l1: &[u64], mair: u64) {
             "tlbi vmalle1",
             "dsb ish",
             "isb",
-            "mrs {t}, sctlr_el1",
-            "orr {t}, {t}, {m_c_i}",
-            "msr sctlr_el1, {t}",
+            "msr sctlr_el1, {sctlr}",
             "isb",
             mair = in(reg) mair,
             tcr = in(reg) tcr,
             ttbr = in(reg) &raw const L1,
-            m_c_i = in(reg) 1u64 << 0 | 1 << 2 | 1 << 12,
-            t = out(reg) _,
+            sctlr = in(reg) sctlr,
         )
     }
 }

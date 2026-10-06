@@ -167,12 +167,18 @@ fn faulting_process_is_killed_and_others_keep_running() {
     let mut expected = vec!["A: bad pointers rejected".to_string()];
     expected.extend((0..10).map(|i| format!("A: {i}")));
     assert_eq!(a, expected);
-    let fault = lines
-        .iter()
-        .position(|l| l == "fault: 2")
-        .expect("missing fault line");
-    let last = lines.iter().position(|l| l == "A: 9").unwrap();
-    assert!(fault < last, "B was not killed while A was running");
+    let fault = |line: &str| {
+        lines
+            .iter()
+            .position(|l| l == line)
+            .unwrap_or_else(|| panic!("missing line: {line}"))
+    };
+    // B: data abort (EC 0x24) on A's code address; C, in B's reused slot and ASID: on kernel RAM.
+    let b = fault("fault: 2 ec=0x24 far=0x100000000");
+    let c = fault("fault: 2 ec=0x24 far=0x40000000");
+    let last = fault("A: 9");
+    assert!(b < last, "B was not killed while A was running");
+    assert!(b < c, "C ran before B was killed");
     assert!(status.success(), "QEMU exited with {status}");
 }
 

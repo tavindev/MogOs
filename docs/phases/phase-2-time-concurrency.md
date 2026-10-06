@@ -22,7 +22,7 @@ Each done-when is an e2e assertion on the serial output. Clean-boot tests also a
 
 ## Notes
 
-- Scheduler state needs no lock on one core: every access runs with IRQs masked (trap context, or `spawn` masking explicitly). It lives in a board `static` (`SCHED`, next to `GIC_CPU`); `arch` calls the board through `#[unsafe(no_mangle)]` symbols (`task_switch`, `board_irq`) whose safety contract is "IRQs masked".
+- Scheduler state needs no lock on one core: every access runs with IRQs masked (trap context, or `spawn` masking explicitly). It lives in a board `static` (`SCHED`, next to `GIC_CPU`); `arch` calls the board through `#[unsafe(no_mangle)]` symbols (`task_switch`, `board_irq`, `board_syscall`, `board_user_fault`) whose safety contract is "IRQs masked".
 - Multicore spinning is out of scope.
 
 ## What was done

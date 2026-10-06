@@ -55,6 +55,8 @@ pub enum Program {
     Counter,
     /// Reads the counter's code address, which its own address space does not map.
     Intruder,
+    /// Reads kernel RAM, which every address space maps for EL1 only; same address as `Intruder`.
+    KernelReader,
     /// Times 100000 no-op syscalls (`print` of 0 bytes) with the virtual counter, prints `syscall: <ns> ns/round-trip`.
     SyscallBench,
 }
@@ -161,7 +163,8 @@ fn print_and_power_off<B: Board>(board: &mut B, _: usize) -> ! {
     board.power_off()
 }
 
-/// The timer preempts process A between its lines; B faults on A's address and is killed; returns once both are gone.
+/// The timer preempts process A between its lines; B faults on A's address and is killed; C then takes B's
+/// slot (and ASID) and is killed for reading kernel memory; returns once all are gone.
 fn user_demo<B: Board, const W: usize>(board: &mut B, frames: &mut FrameAllocator<W>) {
     board
         .spawn_user(Program::Counter, || frames.alloc())
@@ -170,6 +173,12 @@ fn user_demo<B: Board, const W: usize>(board: &mut B, frames: &mut FrameAllocato
         .spawn_user(Program::Intruder, || frames.alloc())
         .expect("spawn B");
     board.start_timer();
+    while board.tasks() > 2 {
+        board.idle();
+    }
+    board
+        .spawn_user(Program::KernelReader, || frames.alloc())
+        .expect("spawn C");
     while board.tasks() > 1 {
         board.idle();
     }

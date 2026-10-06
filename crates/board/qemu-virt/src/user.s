@@ -50,11 +50,21 @@ user_counter_end:
 .global user_intruder, user_intruder_end
 user_intruder:
     // The counter's code address: mapped only in the counter's address space.
-    movz x9, #1, lsl #32
+    movz x9, #({USER_BASE} >> 32), lsl #32
     ldr x0, [x9]
     mov x8, #0
     svc #0
 user_intruder_end:
+
+.balign 4
+.global user_kernel_reader, user_kernel_reader_end
+user_kernel_reader:
+    // Kernel RAM: in every address space's tables, but EL1-only.
+    mov x9, #0x40000000
+    ldr x0, [x9]
+    mov x8, #0
+    svc #0
+user_kernel_reader_end:
 
 .balign 4
 .global user_bench, user_bench_end

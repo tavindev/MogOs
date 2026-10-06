@@ -123,18 +123,18 @@ unsafe fn task_exit(frame: usize) -> usize {
     next
 }
 
-/// Moves SP_EL0 and TTBR0 from the task that saved `frame` to the scheduler's current task, whose frame is
-/// `next`: space 0 is the boot table with ASID 0, any other a process's level-1 table with ASID = its slot.
+/// Moves SP_EL0, TPIDR_EL0 and TTBR0 from the task that saved `frame` to the scheduler's current task, whose frame is
+/// `next`: the boot table keeps ASID 0, a process's level-1 table has ASID = its slot.
 ///
 /// # Safety
 /// `frame` and `next` must be trap frames.
 unsafe fn enter(sched: &Scheduler<MAX_TASKS>, frame: usize, next: usize) {
     let (slot, space) = sched.current();
     // SAFETY: the caller guarantees both are trap frames.
-    unsafe { arch::switch_sp_el0(frame, next) };
+    unsafe { arch::switch_el0_regs(frame, next) };
     let (table, asid) = match space {
-        0 => (arch::boot_table(), 0),
-        _ => (PhysAddr(space as u64), slot),
+        PhysAddr(0) => (arch::boot_table(), 0),
+        table => (table, slot),
     };
     // SAFETY: every space's table holds the kernel blocks, and ASID `slot` is used only by the task in that slot.
     unsafe { arch::set_ttbr0(table, asid) }
@@ -142,7 +142,7 @@ unsafe fn enter(sched: &Scheduler<MAX_TASKS>, frame: usize, next: usize) {
 
 /// Allocates a kernel stack, lets `first_frame(stack_top)` write the task's first frame on it, and queues
 /// the task in address space `space`.
-fn queue_task(space: usize, first_frame: impl FnOnce(usize) -> usize) -> Result<(), Full> {
+fn queue_task(space: PhysAddr, first_frame: impl FnOnce(usize) -> usize) -> Result<(), Full> {
     // SAFETY: the layout has a nonzero size.
     let stack = unsafe { alloc::alloc::alloc(TASK_STACK) };
     if stack.is_null() {
@@ -160,13 +160,15 @@ fn queue_task(space: usize, first_frame: impl FnOnce(usize) -> usize) -> Result<
     added
 }
 
-global_asm!(include_str!("user.s"));
+global_asm!(include_str!("user.s"), USER_BASE = const USER_BASE);
 
 unsafe extern "C" {
     static user_counter: u8;
     static user_counter_end: u8;
     static user_intruder: u8;
     static user_intruder_end: u8;
+    static user_kernel_reader: u8;
+    static user_kernel_reader_end: u8;
     static user_bench: u8;
     static user_bench_end: u8;
 }
@@ -182,6 +184,11 @@ fn user_program(program: Program) -> (&'static [u8], u64) {
         Program::Intruder => (
             &raw const user_intruder,
             &raw const user_intruder_end,
+            USER_BASE + PAGE as u64,
+        ),
+        Program::KernelReader => (
+            &raw const user_kernel_reader,
+            &raw const user_kernel_reader_end,
             USER_BASE + PAGE as u64,
         ),
         Program::SyscallBench => (&raw const user_bench, &raw const user_bench_end, USER_BASE),
@@ -289,7 +296,7 @@ impl kernel::Board for QemuVirt {
 
     fn spawn(&mut self, entry: fn(&mut Self, usize) -> !, arg: usize) -> Result<(), Full> {
         let board = self.clone();
-        queue_task(0, |stack_top| {
+        queue_task(PhysAddr(0), |stack_top| {
             let start = (stack_top - size_of::<Start>()) & !15;
             // SAFETY: `start` is 16-byte aligned and inside the fresh stack, which nothing else references.
             unsafe { (start as *mut Start).write(Start { board, entry, arg }) };
@@ -322,7 +329,7 @@ impl kernel::Board for QemuVirt {
         // SAFETY: `code` fits in the fresh frame `text`.
         unsafe { ptr::copy_nonoverlapping(code.as_ptr(), text.0 as *mut u8, code.len()) };
         // SAFETY: `text` is identity-mapped RAM.
-        unsafe { arch::sync_icache(text.0 as usize, code.len()) };
+        unsafe { arch::sync_icache(text.0 as usize, PAGE) };
         let stack = page().ok_or(Full)?;
         for (va, leaf) in [
             (entry, user_page(text, UserAccess::ReadExecute)),
@@ -334,7 +341,7 @@ impl kernel::Board for QemuVirt {
             // SAFETY: `l1` and every frame `page` returns are fresh, zeroed and only this address space's; `va` is a user address.
             unsafe { arch::map_page(l1, va, leaf, &mut page) }.ok_or(Full)?;
         }
-        queue_task(l1.0 as usize, |stack_top| {
+        queue_task(l1, |stack_top| {
             // SAFETY: the kernel stack below `stack_top` is fresh and owned by the new process.
             unsafe { arch::new_user_task(stack_top, entry, USER_STACK_TOP) }
         })
@@ -410,7 +417,7 @@ unsafe extern "C" fn board_irq(frame: usize) -> usize {
 #[unsafe(no_mangle)]
 unsafe extern "C" fn board_syscall(frame: &mut arch::TrapFrame) -> usize {
     let x = &mut frame.x;
-    x[0] = match kernel::syscall::decode(x[8], &x[..6]) {
+    x[0] = match kernel::syscall::decode(x[8], x.first_chunk().unwrap()) {
         // SAFETY: the caller masked IRQs, and `frame` is the current process's.
         Ok(Call::Exit) => return unsafe { task_exit(frame as *mut arch::TrapFrame as usize) },
         Ok(Call::Print { ptr, len }) if print_user(ptr, len) => 0,
@@ -423,10 +430,10 @@ unsafe extern "C" fn board_syscall(frame: &mut arch::TrapFrame) -> usize {
 /// # Safety
 /// IRQs must be masked (trap context), and `frame` the current process's.
 #[unsafe(no_mangle)]
-unsafe extern "C" fn board_user_fault(frame: usize) -> usize {
+unsafe extern "C" fn board_user_fault(frame: usize, ec: u64, far: u64) -> usize {
     // SAFETY: the caller masked IRQs on the only core, so this is the sole reference.
     let (slot, _) = unsafe { &*SCHED.0.get() }.current();
-    let _ = writeln!(Uart::new(UART0), "fault: {slot}");
+    let _ = writeln!(Uart::new(UART0), "fault: {slot} ec={ec:#x} far={far:#x}");
     // SAFETY: as above; `frame` is the current process's.
     unsafe { task_exit(frame) }
 }
