@@ -19,8 +19,8 @@ use arch::{MemoryType, UserAccess, l1_block, user_page};
 use dtb::Dtb;
 use kernel::elf::{Elf, Segment};
 use kernel::handle::{Handles, KILL, MAX_HANDLES, Object, WAIT};
-use kernel::syscall::{Call, EAGAIN, EFAULT, ENOENT, ENOEXEC, ENOMEM};
-use kernel::{FRAME_WORDS, Full, Memory, Program, Scheduler};
+use kernel::syscall::{Call, EAGAIN, EFAULT, ENOENT, ENOEXEC, ENOMEM, KILLED};
+use kernel::{Event, FRAME_WORDS, Full, Memory, Program, Scheduler};
 use linked_list_allocator::Heap;
 use mm::{Budget, FrameAllocator, PhysAddr};
 use uart::Uart;
@@ -115,6 +115,15 @@ unsafe impl Sync for Global {}
 unsafe extern "C" fn task_switch(frame: usize) -> usize {
     // SAFETY: the caller masked IRQs on the only core, so this is the sole reference.
     let sched = unsafe { &mut (*KERNEL.0.get()).sched };
+    // SAFETY: the caller masked IRQs, and `frame` came from the trap path.
+    unsafe { switch(sched, frame) }
+}
+
+/// Saves the current task's `frame` and enters the next ready one; returns its frame.
+///
+/// # Safety
+/// IRQs must be masked (trap context), and `frame` the current task's trap frame.
+unsafe fn switch(sched: &mut Scheduler<MAX_TASKS>, frame: usize) -> usize {
     let (_, from) = sched.current();
     let next = sched.switch(frame);
     if sched.current().1 != from {
@@ -124,22 +133,22 @@ unsafe extern "C" fn task_switch(frame: usize) -> usize {
     next
 }
 
-/// Drops the current process, returns all its frames, and returns the next task's frame.
+/// Ends the current process with `code`, returns all its frames, and returns the next task's frame.
 ///
 /// # Safety
 /// IRQs must be masked (trap context), the current task must be a process, and `frame` its trap frame.
-unsafe fn task_exit(frame: usize) -> usize {
+unsafe fn task_exit(frame: usize, code: u64) -> usize {
     // SAFETY: the caller masked IRQs on the only core, so this is the sole reference.
     let Kernel { sched, frames } = unsafe { &mut *KERNEL.0.get() };
     let (asid, l1) = sched.current();
-    let (next, memory) = sched.exit();
+    let (next, stack) = sched.exit(code);
     // SAFETY: `frame` is the exiting process's trap frame and `next` came from the scheduler.
     unsafe { enter(sched, frame, next) };
     arch::flush_asid(asid);
     // Frees the kernel stack this runs on: sound only while nothing allocates before the trap returns to `next`.
     // SAFETY: TTBR0 left `l1` above, and its tables hold only this process's frames.
     unsafe { arch::free_space(l1, |f| frames.free(f)) };
-    free_stack(frames, memory.stack);
+    free_stack(frames, stack);
     next
 }
 
@@ -231,7 +240,7 @@ fn spawn_process(
     frames: &mut FrameAllocator<FRAME_WORDS>,
     (file, segments, entry): (&[u8], impl Iterator<Item = Segment>, u64),
     mut budget: Budget,
-    handles: impl FnOnce(usize) -> Handles,
+    handles: impl FnOnce(usize, u64) -> Handles,
 ) -> Result<(), i64> {
     let l1 = zeroed(frames, &mut budget).ok_or(ENOMEM)?;
     // SAFETY: `l1` is a fresh, zeroed frame.
@@ -329,9 +338,9 @@ fn spawn(
     if budget > sched.memory().budget.remaining() {
         return Err(ENOMEM);
     }
-    let slot = sched.free_slot().ok_or(EAGAIN)?;
-    let process = parent.insert(Object::Process(slot), WAIT | KILL)?;
-    spawn_process(sched, frames, executable, Budget::new(budget), |_| child)?;
+    let (slot, generation) = sched.free_slot().ok_or(EAGAIN)?;
+    let process = parent.insert(Object::Process { slot, generation }, WAIT | KILL)?;
+    spawn_process(sched, frames, executable, Budget::new(budget), |_, _| child)?;
     sched.memory().budget.shrink(budget);
     *sched.handles() = parent;
     Ok(process)
@@ -506,7 +515,7 @@ impl kernel::Board for QemuVirt {
                     budget: Budget::new(0),
                     next: 0,
                 };
-                let added = sched.add(frame, PhysAddr(0), memory, |_| Handles::new());
+                let added = sched.add(frame, PhysAddr(0), memory, |_, _| Handles::new());
                 if added.is_err() {
                     free_stack(frames, stack.start);
                 }
@@ -517,6 +526,14 @@ impl kernel::Board for QemuVirt {
     }
 
     fn yield_now(&mut self) {
+        arch::yield_now()
+    }
+
+    fn run_others(&mut self) {
+        let irq = arch::irq::disable();
+        // SAFETY: IRQs are masked on the only core, so this is the sole reference.
+        unsafe { &mut (*KERNEL.0.get()).sched }.block(Event::Idle);
+        arch::irq::restore(irq);
         arch::yield_now()
     }
 
@@ -622,10 +639,12 @@ unsafe extern "C" fn board_irq(frame: usize) -> usize {
 unsafe extern "C" fn board_syscall(frame: &mut arch::TrapFrame) -> usize {
     // SAFETY: the caller masked IRQs on the only core, so this is the sole reference.
     let Kernel { sched, frames } = unsafe { &mut *KERNEL.0.get() };
-    let x = &mut frame.x;
-    x[0] = match kernel::syscall::dispatch(x[8], x.first_chunk().unwrap(), sched.handles()) {
-        // SAFETY: the caller masked IRQs, and `frame` is the current process's.
-        Ok(Call::Exit) => return unsafe { task_exit(frame as *mut arch::TrapFrame as usize) },
+    let args = frame.x.first_chunk().unwrap();
+    frame.x[0] = match kernel::syscall::dispatch(frame.x[8], args, sched.handles()) {
+        Ok(Call::Exit(code)) => {
+            // SAFETY: the caller masked IRQs, and `frame` is the current process's.
+            return unsafe { task_exit(frame as *mut arch::TrapFrame as usize, code) };
+        }
         Ok(Call::Write { ptr, len }) => match user_bytes(ptr, len) {
             Some(bytes) => {
                 Uart::new(UART0).write(bytes);
@@ -662,7 +681,7 @@ unsafe extern "C" fn board_user_fault(frame: usize, ec: u64, far: u64) -> usize 
     let (slot, _) = unsafe { &(*KERNEL.0.get()).sched }.current();
     let _ = writeln!(Uart::new(UART0), "fault: {slot} ec={ec:#x} far={far:#x}");
     // SAFETY: as above; `frame` is the current process's.
-    unsafe { task_exit(frame) }
+    unsafe { task_exit(frame, KILLED) }
 }
 
 fn shutdown() -> ! {

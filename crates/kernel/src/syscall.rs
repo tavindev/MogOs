@@ -4,7 +4,7 @@ use core::ops::Range;
 
 use crate::handle::{EXEC, Handles, MAX_HANDLES, Object, READ};
 
-/// `exit(code)`: ends the calling process.
+/// `exit(code)`: ends the calling process; `wait` reports the low 8 bits of `code`.
 const EXIT: u64 = 0;
 /// `write(handle, ptr, len)`: writes `len` bytes at `ptr` through `handle` (write right); returns `len`.
 const WRITE: u64 = 1;
@@ -23,6 +23,9 @@ const OPEN: u64 = 5;
 /// it the `handles_len` handles at `handles_ptr` (transfer right; values 0, 1, ... in the child) and `budget` frames of
 /// the caller's budget; returns a handle to the process (wait, kill). On failure nothing moves.
 const SPAWN: u64 = 6;
+
+/// The exit code `wait` reports for a process a fault killed: outside `exit`'s 0..=255.
+pub const KILLED: u64 = 256;
 
 // Errors are negated musl errno values.
 
@@ -57,22 +60,14 @@ const MAX_BUFFER: u64 = 4096;
 const MAX_MAP: u64 = 16 * 4096;
 
 pub enum Call {
-    Exit,
+    /// End the caller with this code.
+    Exit(u64),
     /// Write to the console; `ptr..ptr + len` lies in `USER` unless empty, but may be unmapped.
-    Write {
-        ptr: u64,
-        len: usize,
-    },
+    Write { ptr: u64, len: usize },
     /// Map this many pages into the caller's address space.
-    Map {
-        pages: usize,
-    },
+    Map { pages: usize },
     /// Open the boot archive's file whose name is at `ptr..ptr + len` (in `USER` unless empty, maybe unmapped) with `rights`.
-    Open {
-        ptr: u64,
-        len: usize,
-        rights: u64,
-    },
+    Open { ptr: u64, len: usize, rights: u64 },
     /// Spawn the boot archive's file `file`, moving the `len` handles at `ptr` (in `USER` unless empty, maybe unmapped) and `budget`.
     Spawn {
         file: Range<usize>,
@@ -88,7 +83,7 @@ pub enum Call {
 /// that touch hardware or tasks; `Err` holds the result to return.
 pub fn dispatch(nr: u64, args: &[u64; 6], handles: &mut Handles) -> Result<Call, i64> {
     match nr {
-        EXIT => Ok(Call::Exit),
+        EXIT => Ok(Call::Exit(args[0] & 0xff)),
         WRITE => {
             let (handle, ptr, len) = (args[0], args[1], args[2]);
             let Object::Console = handles.get(handle, crate::handle::WRITE)? else {
@@ -101,7 +96,7 @@ pub fn dispatch(nr: u64, args: &[u64; 6], handles: &mut Handles) -> Result<Call,
             })
         }
         DUP => Ok(Call::Done(handles.dup(args[0], args[1])?)),
-        CLOSE => handles.close(args[0]).map(|()| Call::Done(0)),
+        CLOSE => handles.close(args[0]).map(|_| Call::Done(0)),
         MAP => match args[0] {
             0 => Err(EINVAL),
             len if len > MAX_MAP => Err(EINVAL),

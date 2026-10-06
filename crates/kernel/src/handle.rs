@@ -24,8 +24,11 @@ pub const KILL: Rights = 1 << 7;
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Object {
     Console,
-    /// The process in this scheduler slot.
-    Process(usize),
+    /// The process in this scheduler slot with this generation; a later process in the slot has another.
+    Process {
+        slot: usize,
+        generation: u64,
+    },
     /// The boot archive, a directory.
     Archive,
     /// A file in the boot archive, its data at these byte offsets.
@@ -43,12 +46,12 @@ impl Handles {
         Self([(0, None); MAX_HANDLES])
     }
 
-    /// init's handles: 0 is the console (write, duplicate, transfer), 1 is process `slot` itself (kill), 2 is the
-    /// boot archive (read, exec).
-    pub fn init(slot: usize) -> Self {
+    /// init's handles: 0 is the console (write, duplicate, transfer), 1 is the process itself (kill), in `slot` with
+    /// `generation`, 2 is the boot archive (read, exec).
+    pub fn init(slot: usize, generation: u64) -> Self {
         let mut handles = Self::new();
         handles.0[0].1 = Some((Object::Console, WRITE | DUPLICATE | TRANSFER));
-        handles.0[1].1 = Some((Object::Process(slot), KILL));
+        handles.0[1].1 = Some((Object::Process { slot, generation }, KILL));
         handles.0[2].1 = Some((Object::Archive, READ | EXEC));
         handles
     }
@@ -97,11 +100,17 @@ impl Handles {
         Ok((rest, moved))
     }
 
-    pub fn close(&mut self, handle: u64) -> Result<(), i64> {
-        self.entry(handle)?;
+    /// Closes `handle`; returns the object it reached.
+    pub fn close(&mut self, handle: u64) -> Result<Object, i64> {
+        let (object, _) = self.entry(handle)?;
         let entry = &mut self.0[handle as u32 as usize];
         *entry = (entry.0 + 1, None);
-        Ok(())
+        Ok(object)
+    }
+
+    /// The objects the open handles reach.
+    pub fn objects(&self) -> impl Iterator<Item = Object> + '_ {
+        self.0.iter().filter_map(|e| Some(e.1?.0))
     }
 
     fn entry(&self, handle: u64) -> Result<(Object, Rights), i64> {

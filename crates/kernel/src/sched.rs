@@ -1,6 +1,7 @@
 use mm::{Budget, PhysAddr};
 
 use crate::handle::Handles;
+use crate::syscall::EBADF;
 
 /// No room for the task: the run queue is full or its memory could not be allocated.
 #[derive(Debug)]
@@ -21,11 +22,35 @@ const NO_MEMORY: Memory = Memory {
     next: 0,
 };
 
+/// What a blocked task waits for; `wake` makes every task waiting for it ready.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Event {
+    /// Data, room or a closed end in the pipe at this table index.
+    Pipe(usize),
+    /// The process in this slot exiting.
+    Exit(usize),
+    /// Nothing: the boot context, which runs only once no other task is ready.
+    Idle,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum State {
+    Ready,
+    Blocked(Event),
+    /// A free slot; the task that last ran in it exited with this code.
+    Exited(u64),
+}
+
 /// Round-robin run queue of up to `N` tasks, each known by its saved trap frame address and address space
-/// (its level-1 table; `PhysAddr(0)` is the boot table), its memory and its handle table.
+/// (its level-1 table; `PhysAddr(0)` is the boot table), its memory and its handle table. Blocked tasks are skipped;
+/// with none ready, the boot context (slot 0) runs.
 pub struct Scheduler<const N: usize> {
-    /// Frame address and address space per slot; frame 0 marks a free slot (never slot 0).
+    /// Frame address and address space per slot.
     tasks: [(usize, PhysAddr); N],
+    state: [State; N],
+    /// Bumped by each `add`, so a process handle reaches one task, never a later one in the same slot.
+    generation: [u64; N],
+    /// An exited task's budget stays here until `reap`.
     memory: [Memory; N],
     handles: [Handles; N],
     /// One past the highest slot ever used.
@@ -36,8 +61,12 @@ pub struct Scheduler<const N: usize> {
 impl<const N: usize> Scheduler<N> {
     /// Slot 0 is the boot context in the boot table; its frame is recorded on its first switch.
     pub const fn new() -> Self {
+        let mut state = [State::Exited(0); N];
+        state[0] = State::Ready;
         Self {
             tasks: [(0, PhysAddr(0)); N],
+            state,
+            generation: [0; N],
             memory: [NO_MEMORY; N],
             handles: [Handles::new(); N],
             end: 1,
@@ -45,26 +74,31 @@ impl<const N: usize> Scheduler<N> {
         }
     }
 
-    /// Queues a new task whose first frame is at `frame` in address space `space`, with `memory`, and `handles(slot)`
-    /// as its handles.
+    /// Queues a new task whose first frame is at `frame` in address space `space`, with `memory`, and
+    /// `handles(slot, generation)` as its handles.
     pub fn add(
         &mut self,
         frame: usize,
         space: PhysAddr,
         memory: Memory,
-        handles: impl FnOnce(usize) -> Handles,
+        handles: impl FnOnce(usize, u64) -> Handles,
     ) -> Result<(), Full> {
-        let slot = self.free_slot().ok_or(Full)?;
+        let (slot, generation) = self.free_slot().ok_or(Full)?;
         self.tasks[slot] = (frame, space);
+        self.state[slot] = State::Ready;
+        self.generation[slot] = generation;
         self.memory[slot] = memory;
-        self.handles[slot] = handles(slot);
+        self.handles[slot] = handles(slot, generation);
         self.end = self.end.max(slot + 1);
         Ok(())
     }
 
-    /// The slot the next `add` takes, if any is free.
-    pub fn free_slot(&self) -> Option<usize> {
-        Some(1 + self.tasks[1..].iter().position(|t| t.0 == 0)?)
+    /// The slot the next `add` takes, if any is free, and the generation it gives the task there.
+    pub fn free_slot(&self) -> Option<(usize, u64)> {
+        let slot = 1 + self.state[1..]
+            .iter()
+            .position(|s| matches!(s, State::Exited(_)))?;
+        Some((slot, self.generation[slot] + 1))
     }
 
     /// Saves the current task's `frame` and returns the next task's.
@@ -73,19 +107,58 @@ impl<const N: usize> Scheduler<N> {
         self.advance()
     }
 
-    /// Drops the current task (never slot 0) and its handles; returns the next task's frame and the dropped task's
-    /// memory, whose frames the caller frees.
-    pub fn exit(&mut self) -> (usize, Memory) {
+    /// Marks the current task blocked until `wake(event)`; the caller switches away.
+    pub fn block(&mut self, event: Event) {
+        self.state[self.current] = State::Blocked(event);
+    }
+
+    pub fn wake(&mut self, event: Event) {
+        for state in &mut self.state[..self.end] {
+            if *state == State::Blocked(event) {
+                *state = State::Ready;
+            }
+        }
+    }
+
+    /// Ends the current task (never slot 0) with `code` and wakes its waiters; returns the next task's frame and the
+    /// ended task's kernel stack, which the caller frees with its other frames. The caller first takes and releases
+    /// its handles; its budget stays for `reap`.
+    pub fn exit(&mut self, code: u64) -> (usize, PhysAddr) {
         assert!(self.current != 0, "the boot context cannot exit");
-        let memory = core::mem::replace(&mut self.memory[self.current], NO_MEMORY);
-        self.tasks[self.current] = (0, PhysAddr(0));
-        self.handles[self.current] = Handles::new();
-        (self.advance(), memory)
+        self.state[self.current] = State::Exited(code);
+        self.wake(Event::Exit(self.current));
+        let stack = self.memory[self.current].stack;
+        (self.advance(), stack)
+    }
+
+    /// For the process in `slot` with `generation`: `None` while it runs; once it exited, its code and its budget's
+    /// limit, which only the first call gets (later ones get 0); `EBADF` once a newer task took the slot.
+    pub fn reap(&mut self, slot: usize, generation: u64) -> Result<Option<(u64, usize)>, i64> {
+        if self.generation[slot] != generation {
+            return Err(EBADF);
+        }
+        let State::Exited(code) = self.state[slot] else {
+            return Ok(None);
+        };
+        let budget = core::mem::replace(&mut self.memory[slot].budget, Budget::new(0));
+        Ok(Some((code, budget.limit())))
+    }
+
+    /// The budget of the process in `slot` with `generation`, unless it exited.
+    pub fn budget(&mut self, slot: usize, generation: u64) -> Option<&mut Budget> {
+        let live =
+            self.generation[slot] == generation && !matches!(self.state[slot], State::Exited(_));
+        live.then_some(&mut self.memory[slot].budget)
     }
 
     /// The current task's slot and address space.
     pub fn current(&self) -> (usize, PhysAddr) {
         (self.current, self.tasks[self.current].1)
+    }
+
+    /// The current task's generation.
+    pub fn generation(&self) -> u64 {
+        self.generation[self.current]
     }
 
     /// The current task's memory.
@@ -100,16 +173,21 @@ impl<const N: usize> Scheduler<N> {
 
     /// Tasks in the queue, the boot context included.
     pub fn count(&self) -> usize {
-        1 + self.tasks[1..self.end].iter().filter(|t| t.0 != 0).count()
+        let exited = |s: &&State| matches!(s, State::Exited(_));
+        self.end - self.state[..self.end].iter().filter(exited).count()
     }
 
+    /// Moves to the next ready task after the current one (itself last); with none ready, to the boot context.
     fn advance(&mut self) -> usize {
-        loop {
+        for _ in 0..self.end {
             self.current = (self.current + 1) % self.end;
-            if self.current == 0 || self.tasks[self.current].0 != 0 {
+            if self.state[self.current] == State::Ready {
                 return self.tasks[self.current].0;
             }
         }
+        self.current = 0;
+        self.state[0] = State::Ready;
+        self.tasks[0].0
     }
 }
 

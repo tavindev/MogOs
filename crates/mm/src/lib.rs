@@ -145,6 +145,15 @@ impl Budget {
         self.limit -= frames;
     }
 
+    /// Raises the limit by `frames`, which came back from an exited child's budget.
+    pub fn grow(&mut self, frames: usize) {
+        self.limit += frames;
+    }
+
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+
     pub fn remaining(&self) -> usize {
         self.limit - self.used
     }

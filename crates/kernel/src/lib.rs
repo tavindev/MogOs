@@ -8,7 +8,7 @@ pub mod handle;
 mod sched;
 pub mod syscall;
 
-pub use sched::{Full, Memory, Scheduler};
+pub use sched::{Event, Full, Memory, Scheduler};
 
 use alloc::vec::Vec;
 use core::fmt::Write;
@@ -42,6 +42,8 @@ pub trait Board {
     fn spawn(&mut self, entry: fn(&mut Self, usize) -> !, arg: usize) -> Result<(), Full>;
     /// Runs the other tasks in turn; returns when this one is scheduled again.
     fn yield_now(&mut self);
+    /// Runs the other tasks until none is ready (each exited or blocked). Boot context only.
+    fn run_others(&mut self);
     /// Takes over the frame allocator: process memory and kernel stacks come from it from now on; call once.
     fn init_frames(&mut self, frames: FrameAllocator<FRAME_WORDS>);
     fn free_frames(&self) -> usize;
@@ -224,10 +226,12 @@ fn run_alone<B: Board>(board: &mut B, program: Program) {
     wait(board);
 }
 
-/// Yields until every other task has exited.
+/// Runs the other tasks until every one has exited; while all are blocked, sleeps until an interrupt.
 fn wait<B: Board>(board: &mut B) {
+    board.run_others();
     while board.tasks() > 1 {
-        board.yield_now();
+        board.idle();
+        board.run_others();
     }
 }
 
