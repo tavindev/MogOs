@@ -64,7 +64,8 @@ pub enum Program {
     Intruder,
     /// Reads kernel RAM, which every address space maps for EL1 only; same address as `Intruder`.
     KernelReader,
-    /// Times 100000 no-op syscalls (`write` of 0 bytes) with the virtual counter, prints `syscall: <ns> ns/round-trip`.
+    /// Times 100000 no-op syscalls (`io_submit_wait` writing 0 bytes) with the virtual counter, prints
+    /// `syscall: <ns> ns/round-trip`.
     SyscallBench,
     /// Writes to the console, then through a duplicate without write, a closed handle and a stale one (its entry
     /// reused), printing a line for each expected result.

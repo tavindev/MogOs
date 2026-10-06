@@ -32,8 +32,9 @@ pub fn exit(code: u64) -> ! {
     }
 }
 
+/// `io_submit_wait(handle, IO_WRITE, ...)`.
 pub fn write(handle: u64, bytes: &[u8]) -> i64 {
-    syscall(1, [handle, bytes.as_ptr() as u64, bytes.len() as u64, 0])
+    syscall(1, [handle, 1, bytes.as_ptr() as u64, bytes.len() as u64])
 }
 
 pub fn dup(handle: u64, rights: u64) -> i64 {

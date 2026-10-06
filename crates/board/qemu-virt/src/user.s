@@ -1,4 +1,5 @@
-// User programs, copied into process pages; position independent. x8 = syscall: 0 exit, 1 write, 2 dup, 3 close, 4 map.
+// User programs, copied into process pages; position independent. x8 = syscall: 0 exit, 1 io_submit_wait (op 1 =
+// write), 2 dup, 3 close, 4 map.
 // Each starts with init's handles: 0 is the console, 1 the process itself, 2 the boot archive.
 .section .rodata.user, "a"
 .balign 4
@@ -7,23 +8,26 @@
 user_counter:
     // write(console, kernel address) and write(console, unmapped user address) must both return EFAULT (-14).
     mov x0, #0
-    mov x1, #0x40000000
-    mov x2, #4
+    mov x2, #0x40000000
+    mov x3, #4
+    mov x1, #1
     mov x8, #1
     svc #0
     cmn x0, #14
     b.ne 9f
     mov x0, #0
-    movz x1, #0x8000, lsl #16
-    movk x1, #1, lsl #32
-    mov x2, #4
+    movz x2, #0x8000, lsl #16
+    movk x2, #1, lsl #32
+    mov x3, #4
+    mov x1, #1
     mov x8, #1
     svc #0
     cmn x0, #14
     b.ne 9f
     mov x0, #0
-    adr x1, 8f
-    mov x2, #25
+    adr x2, 8f
+    mov x3, #25
+    mov x1, #1
     mov x8, #1
     svc #0
     mov x19, #0
@@ -34,8 +38,9 @@ user_counter:
     add x9, x9, x19, lsl #24
     str x9, [sp, #-16]!
     mov x0, #0
-    mov x1, sp
-    mov x2, #5
+    mov x2, sp
+    mov x3, #5
+    mov x1, #1
     mov x8, #1
     svc #0
     add sp, sp, #16
@@ -74,15 +79,17 @@ user_kernel_reader_end:
 .balign 4
 .global user_bench, user_bench_end
 user_bench:
-    // Times 100000 write(console, sp, 0) round trips with the virtual counter, prints the ns per round trip.
+    // Times 100000 io_submit_wait(console, write, sp, 0) round trips with the virtual counter, prints the ns per
+    // round trip.
     mrs x20, cntfrq_el0
     isb
     mrs x21, cntvct_el0
     movz x19, #0x86a0
     movk x19, #1, lsl #16
 1:  mov x0, #0
-    mov x1, sp
-    mov x2, #0
+    mov x2, sp
+    mov x3, #0
+    mov x1, #1
     mov x8, #1
     svc #0
     subs x19, x19, #1
@@ -94,8 +101,9 @@ user_bench:
     mul x22, x22, x9
     udiv x22, x22, x20
     mov x0, #0
-    adr x1, 7f
-    mov x2, #9
+    adr x2, 7f
+    mov x3, #9
+    mov x1, #1
     mov x8, #1
     svc #0
     // decimal digits of x22, written backwards below sp
@@ -109,13 +117,15 @@ user_bench:
     mov x22, x13
     cbnz x22, 2b
     mov x0, #0
-    mov x1, x11
-    sub x2, x10, x11
+    mov x2, x11
+    sub x3, x10, x11
+    mov x1, #1
     mov x8, #1
     svc #0
     mov x0, #0
-    adr x1, 6f
-    mov x2, #15
+    adr x2, 6f
+    mov x3, #15
+    mov x1, #1
     mov x8, #1
     svc #0
     mov x0, #0
@@ -125,11 +135,12 @@ user_bench:
 6:  .ascii " ns/round-trip\n"
 user_bench_end:
 
-// x0 = write(\handle, \str, \len)
+// x0 = io_submit_wait(\handle, write, \str, \len)
 .macro write handle, str, len
     mov x0, \handle
-    adr x1, \str
-    mov x2, #\len
+    adr x2, \str
+    mov x3, #\len
+    mov x1, #1
     mov x8, #1
     svc #0
 .endm
@@ -224,8 +235,9 @@ user_budget:
     mov x19, x13
     cbnz x19, 3b
     mov x0, #0
-    mov x1, x11
-    sub x2, x10, x11
+    mov x2, x11
+    sub x3, x10, x11
+    mov x1, #1
     mov x8, #1
     svc #0
     write #0, 6f, 7

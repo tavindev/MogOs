@@ -6,8 +6,9 @@ use crate::handle::{EXEC, Handles, MAX_HANDLES, Object, READ};
 
 /// `exit(code)`: ends the calling process; `wait` reports the low 8 bits of `code`.
 const EXIT: u64 = 0;
-/// `write(handle, ptr, len)`: writes `len` bytes at `ptr` through `handle` (write right); returns `len`.
-const WRITE: u64 = 1;
+/// `io_submit_wait(handle, op, ptr, len)`: submits I/O on `handle` and waits for it to complete; returns the bytes
+/// moved. `op` is `IO_READ` (into `ptr`, read right) or `IO_WRITE` (from `ptr`, write right). libc's `read` and `write`.
+const IO: u64 = 1;
 /// `dup(handle, rights)`: returns a new handle to the same object with `rights`, a subset of `handle`'s (duplicate right).
 const DUP: u64 = 2;
 /// `close(handle)`: returns 0.
@@ -27,6 +28,9 @@ const SPAWN: u64 = 6;
 /// The exit code `wait` reports for a process a fault killed: outside `exit`'s 0..=255.
 pub const KILLED: u64 = 256;
 
+pub const IO_READ: u64 = 0;
+pub const IO_WRITE: u64 = 1;
+
 // Errors are negated musl errno values.
 
 /// No such file in the directory.
@@ -44,7 +48,8 @@ pub const ENOMEM: i64 = -12;
 pub const EACCES: i64 = -13;
 /// Bad address: outside user space, unmapped, or longer than `MAX_BUFFER`.
 pub const EFAULT: i64 = -14;
-/// Invalid argument: a `map` of zero bytes or more than `MAX_MAP`, a `spawn` of more than `MAX_HANDLES` handles.
+/// Invalid argument: a `map` of zero bytes or more than `MAX_MAP`, a `spawn` of more than `MAX_HANDLES` handles, an
+/// unknown I/O op.
 const EINVAL: i64 = -22;
 /// The handle table is full.
 pub const EMFILE: i64 = -24;
@@ -53,8 +58,8 @@ const ENOSYS: i64 = -38;
 
 /// User virtual addresses: 4 GiB up to the 39-bit VA limit.
 const USER: Range<u64> = 1 << 32..1 << 39;
-/// Longest user buffer a syscall reads (`write` data, `open` name, `spawn` handles), so its IRQs-masked work stays
-/// bounded.
+/// Longest user buffer a syscall reads or writes (I/O data, `open` name, `spawn` handles), so its IRQs-masked work
+/// stays bounded.
 const MAX_BUFFER: u64 = 4096;
 /// Longest `map` (16 pages), so its IRQs-masked zeroing stays bounded.
 const MAX_MAP: u64 = 16 * 4096;
@@ -84,16 +89,20 @@ pub enum Call {
 pub fn dispatch(nr: u64, args: &[u64; 6], handles: &mut Handles) -> Result<Call, i64> {
     match nr {
         EXIT => Ok(Call::Exit(args[0] & 0xff)),
-        WRITE => {
-            let (handle, ptr, len) = (args[0], args[1], args[2]);
-            let Object::Console = handles.get(handle, crate::handle::WRITE)? else {
-                return Err(EACCES);
+        IO => {
+            let (handle, op, ptr, len) = (args[0], args[1], args[2], args[3]);
+            let need = match op {
+                IO_READ => READ,
+                IO_WRITE => crate::handle::WRITE,
+                _ => return Err(EINVAL),
             };
+            let object = handles.get(handle, need)?;
             user_buffer(ptr, len)?;
-            Ok(Call::Write {
-                ptr,
-                len: len as usize,
-            })
+            let len = len as usize;
+            match object {
+                Object::Console if op == IO_WRITE => Ok(Call::Write { ptr, len }),
+                _ => Err(EACCES),
+            }
         }
         DUP => Ok(Call::Done(handles.dup(args[0], args[1])?)),
         CLOSE => handles.close(args[0]).map(|_| Call::Done(0)),
