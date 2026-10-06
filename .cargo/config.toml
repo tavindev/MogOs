@@ -14,5 +14,6 @@ runner = "qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -nographic -kernel
 test-host = "test --target aarch64-apple-darwin --workspace --exclude qemu-virt --exclude arch"
 # Host benchmarks (`benches/*.rs`, harness = false) for the same crates.
 bench-host = "bench --target aarch64-apple-darwin --workspace --exclude qemu-virt --exclude arch --bench *"
+# Array alias (its quoted runner can't be a string), so it doesn't work inside nested worktrees.
 # Same as `cargo run`, but in a QEMU window that doesn't grab the mouse and stays open after power-off.
 window = ["run", "--config", "target.aarch64-unknown-none-softfloat.runner='qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -device virtio-tablet-pci -display cocoa,show-cursor=on -serial vc -no-shutdown -kernel'"]

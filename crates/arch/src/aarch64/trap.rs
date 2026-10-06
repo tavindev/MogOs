@@ -128,10 +128,10 @@ pub fn breakpoint_self_test() {
     unsafe { asm!("brk #0", clobber_abi("C")) };
 }
 
-// SAFETY: the board defines `board_irq` with this signature; it runs with IRQs masked by exception entry.
+// SAFETY: the board defines `board_irq` with this signature.
 unsafe extern "C" {
-    /// Handles the pending IRQ; returns the frame to resume, `frame` or the next task's.
-    safe fn board_irq(frame: usize) -> usize;
+    /// Handles the pending IRQ; returns the frame to resume, `frame` or the next task's. Requires IRQs masked.
+    fn board_irq(frame: usize) -> usize;
 }
 
 /// Writes a frame just below `stack_top` that starts `entry(arg)` at EL1h with IRQs unmasked; returns its address for the scheduler.
@@ -164,7 +164,8 @@ pub fn yield_now() {
 #[unsafe(no_mangle)]
 extern "C" fn aarch64_exception(frame: &mut TrapFrame, index: u64) -> usize {
     if index == IRQ_CURRENT_SPX {
-        return board_irq(frame as *mut TrapFrame as usize);
+        // SAFETY: exception entry masked IRQs.
+        return unsafe { board_irq(frame as *mut TrapFrame as usize) };
     }
     let esr: u64;
     // SAFETY: reading ESR_EL1 has no side effects.

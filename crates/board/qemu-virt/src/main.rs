@@ -80,9 +80,11 @@ struct Sched(UnsafeCell<Scheduler<MAX_TASKS>>);
 // SAFETY: one core, and the scheduler is only touched with IRQs masked, so accesses never overlap.
 unsafe impl Sync for Sched {}
 
+/// # Safety
+/// IRQs must be masked (trap context), so this is the only reference to the scheduler.
 #[unsafe(no_mangle)]
-extern "C" fn task_switch(frame: usize) -> usize {
-    // SAFETY: called only from trap handlers, with IRQs masked on the only core, so this is the sole reference.
+unsafe extern "C" fn task_switch(frame: usize) -> usize {
+    // SAFETY: the caller masked IRQs on the only core, so this is the sole reference.
     unsafe { &mut *SCHED.0.get() }.switch(frame)
 }
 
@@ -233,8 +235,10 @@ extern "C" fn kmain() -> ! {
     )
 }
 
+/// # Safety
+/// IRQs must be masked (trap context), as `task_switch` requires.
 #[unsafe(no_mangle)]
-extern "C" fn board_irq(frame: usize) -> usize {
+unsafe extern "C" fn board_irq(frame: usize) -> usize {
     let cpu = PhysAddr(GIC_CPU.load(Relaxed));
     // SAFETY: IRQs are delivered only after `start_timer` stored the DTB's GIC CPU interface.
     let iar = unsafe { arch::gic::ack(cpu) };
@@ -244,7 +248,11 @@ extern "C" fn board_irq(frame: usize) -> usize {
     }
     // SAFETY: as above.
     unsafe { arch::gic::eoi(cpu, iar) };
-    if tick { task_switch(frame) } else { frame }
+    if !tick {
+        return frame;
+    }
+    // SAFETY: the caller masked IRQs.
+    unsafe { task_switch(frame) }
 }
 
 fn shutdown() -> ! {

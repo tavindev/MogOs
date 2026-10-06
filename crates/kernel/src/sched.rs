@@ -1,4 +1,4 @@
-/// The run queue is full.
+/// No room for the task: the run queue is full or its stack could not be allocated.
 #[derive(Debug)]
 pub struct Full;
 

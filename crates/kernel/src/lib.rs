@@ -31,7 +31,7 @@ pub trait Board {
     fn uptime_us(&self) -> u64;
     /// Starts the periodic timer interrupt; each tick switches to the next task. IRQs are unmasked only in tasks and `idle`.
     fn start_timer(&mut self);
-    /// Sleeps until an interrupt arrives and handles it.
+    /// Sleeps until an interrupt arrives and handles it. Boot context only: returns with IRQs masked.
     fn idle(&mut self);
     fn power_off(&mut self) -> !;
     /// Queues a task that runs `entry(board, arg)` on its own stack with its own board handle.
