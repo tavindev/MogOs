@@ -31,4 +31,4 @@ Speed is a primary goal, so performance is tested like behavior: measured, recor
 | Kernel boot, kmain to end of init (us) | QEMU TCG, dev build | 2928 | 3140 | uncommitted |
 | Kernel boot, kmain to end of init (us) | QEMU hvf (`-cpu cortex-a72`), dev build | 170 | 192 | uncommitted |
 | Yield round trip via `svc`, `test=bench`, 100000 trips (ns) | QEMU TCG, dev build, 11 boots | 1178 | 1218 | uncommitted |
-| Yield round trip via `svc`, `test=bench`, 100000 trips (ns) | QEMU hvf (`-cpu cortex-a72`), dev build, 21 boots | 62 | 67 | uncommitted |
+| Yield round trip via `svc`, `test=bench`, 100000 trips (ns) | QEMU hvf (`-cpu cortex-a72`), dev build, 21 boots | 58 | 61 | phase 2 step 9 |

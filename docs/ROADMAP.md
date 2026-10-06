@@ -5,7 +5,7 @@ Ordered by dependency: each phase builds on the previous one.
 | Phase | Goal | Doc | Status |
 | --- | --- | --- | --- |
 | 1 | Foundations: the kernel survives on its own | [phase-1-foundations.md](phases/phase-1-foundations.md) | Done |
-| 2 | Time and concurrency: the kernel multitasks | [phase-2-time-concurrency.md](phases/phase-2-time-concurrency.md) | In progress |
+| 2 | Time and concurrency: the kernel multitasks | [phase-2-time-concurrency.md](phases/phase-2-time-concurrency.md) | Done |
 | 3 | User space: isolated programs, capability-based native ABI | [phase-3-user-space.md](phases/phase-3-user-space.md) | Not started |
 | 4 | Shell, async I/O, MogFS | [phase-4-io-storage.md](phases/phase-4-io-storage.md) | Not started |
 

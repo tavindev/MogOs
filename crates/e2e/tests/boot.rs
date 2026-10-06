@@ -71,7 +71,6 @@ fn boots_and_powers_off() {
         "ram: 0x40000000..0x48000000",
         "mmu: on",
         "heap: ok",
-        "ticks: 3",
     ] {
         assert!(
             lines.iter().any(|l| l == expected),
@@ -134,6 +133,18 @@ fn tasks_alternate_on_yield() {
             "task b: 2",
         ]
     );
+    assert!(
+        !lines.iter().any(|l| l.starts_with("panic:")),
+        "kernel panicked"
+    );
+    assert!(status.success(), "QEMU exited with {status}");
+}
+
+#[test]
+fn timer_preempts_spinning_task() {
+    let (status, lines) = boot(&["-append", "test=preempt"]);
+    let tasks: Vec<_> = lines.iter().filter(|l| l.starts_with("task ")).collect();
+    assert_eq!(tasks, ["task b: 0", "task b: 1", "task b: 2"]);
     assert!(
         !lines.iter().any(|l| l.starts_with("panic:")),
         "kernel panicked"

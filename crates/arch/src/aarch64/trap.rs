@@ -100,8 +100,8 @@ const SYNC_CURRENT_SPX: u64 = 4;
 const IRQ_CURRENT_SPX: u64 = 5;
 const EC_SVC64: u64 = 0x15;
 const EC_BRK64: u64 = 0x3c;
-/// EL1h with D, A, I and F masked.
-const SPSR_EL1H_MASKED: u64 = 0x3c5;
+/// EL1h with IRQs unmasked; D, A and F masked.
+const SPSR_EL1H_IRQ_ON: u64 = 0x345;
 
 unsafe extern "C" {
     /// The board's scheduler: saves the yielding task's frame address and returns the next task's.
@@ -130,10 +130,11 @@ pub fn breakpoint_self_test() {
 
 // SAFETY: the board defines `board_irq` with this signature; it runs with IRQs masked by exception entry.
 unsafe extern "C" {
-    safe fn board_irq();
+    /// Handles the pending IRQ; returns the frame to resume, `frame` or the next task's.
+    safe fn board_irq(frame: usize) -> usize;
 }
 
-/// Writes a frame just below `stack_top` that starts `entry(arg)` at EL1h with DAIF masked; returns its address for the scheduler.
+/// Writes a frame just below `stack_top` that starts `entry(arg)` at EL1h with IRQs unmasked; returns its address for the scheduler.
 ///
 /// # Safety
 ///
@@ -147,7 +148,7 @@ pub unsafe fn new_task(stack_top: usize, entry: extern "C" fn(usize) -> !, arg: 
         frame.write(TrapFrame {
             x,
             elr: entry as usize as u64,
-            spsr: SPSR_EL1H_MASKED,
+            spsr: SPSR_EL1H_IRQ_ON,
             _pad: 0,
         })
     };
@@ -163,8 +164,7 @@ pub fn yield_now() {
 #[unsafe(no_mangle)]
 extern "C" fn aarch64_exception(frame: &mut TrapFrame, index: u64) -> usize {
     if index == IRQ_CURRENT_SPX {
-        board_irq();
-        return frame as *mut TrapFrame as usize;
+        return board_irq(frame as *mut TrapFrame as usize);
     }
     let esr: u64;
     // SAFETY: reading ESR_EL1 has no side effects.

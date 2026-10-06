@@ -29,10 +29,8 @@ pub trait Board {
     fn init_heap(&mut self, region: Range<PhysAddr>);
     /// Microseconds since the board entered the kernel.
     fn uptime_us(&self) -> u64;
-    /// Starts the periodic timer interrupt; IRQs stay masked outside `idle`.
+    /// Starts the periodic timer interrupt; each tick switches to the next task. IRQs are unmasked only in tasks and `idle`.
     fn start_timer(&mut self);
-    /// Timer interrupts handled since `start_timer`.
-    fn ticks(&self) -> u64;
     /// Sleeps until an interrupt arrives and handles it.
     fn idle(&mut self);
     fn power_off(&mut self) -> !;
@@ -91,16 +89,10 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
         match arg {
             "test=yield" => yield_demo(board),
             "test=bench" => yield_bench(board),
+            "test=preempt" => preempt_demo(board),
             _ => {}
         }
     }
-
-    board.start_timer();
-    while board.ticks() < 3 {
-        board.idle();
-    }
-    let ticks = board.ticks();
-    let _ = writeln!(board.console(), "ticks: {ticks}");
 
     board.power_off()
 }
@@ -122,6 +114,30 @@ fn print_and_yield<B: Board>(board: &mut B, name: usize) -> ! {
         i += 1;
         board.yield_now();
     }
+}
+
+/// Task a never yields, so each line task b prints needs a tick to preempt a; b powers off after three.
+fn preempt_demo<B: Board>(board: &mut B) -> ! {
+    board.spawn(spin, 0).expect("spawn a");
+    board.spawn(print_and_power_off, 0).expect("spawn b");
+    board.start_timer();
+    loop {
+        board.idle();
+    }
+}
+
+fn spin<B: Board>(_: &mut B, _: usize) -> ! {
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+fn print_and_power_off<B: Board>(board: &mut B, _: usize) -> ! {
+    for i in 0..3 {
+        let _ = writeln!(board.console(), "task b: {i}");
+        board.yield_now();
+    }
+    board.power_off()
 }
 
 /// Each boot-task yield is one round trip through a task that only yields back.

@@ -33,9 +33,8 @@ const UNMAPPED: PhysAddr = PhysAddr(0x8000_0000);
 const TIMER_IRQ: u32 = 27;
 const TICK_US: u64 = 10_000;
 
-/// GIC CPU interface base, set before the first IRQ is unmasked.
+/// GIC CPU interface base, set before the first IRQ can be delivered.
 static GIC_CPU: AtomicU64 = AtomicU64::new(0);
-static TICKS: AtomicU64 = AtomicU64::new(0);
 /// Boot context included.
 const MAX_TASKS: usize = 8;
 /// 16 KiB, 16-byte aligned.
@@ -83,7 +82,7 @@ unsafe impl Sync for Sched {}
 
 #[unsafe(no_mangle)]
 extern "C" fn task_switch(frame: usize) -> usize {
-    // SAFETY: called only from the `svc` trap handler, with IRQs masked on the only core, so this is the sole reference.
+    // SAFETY: called only from trap handlers, with IRQs masked on the only core, so this is the sole reference.
     unsafe { &mut *SCHED.0.get() }.switch(frame)
 }
 
@@ -163,10 +162,6 @@ impl kernel::Board for QemuVirt {
         arch::timer::arm(TICK_US);
     }
 
-    fn ticks(&self) -> u64 {
-        TICKS.load(Relaxed)
-    }
-
     fn idle(&mut self) {
         arch::irq::wait()
     }
@@ -239,16 +234,17 @@ extern "C" fn kmain() -> ! {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn board_irq() {
+extern "C" fn board_irq(frame: usize) -> usize {
     let cpu = PhysAddr(GIC_CPU.load(Relaxed));
-    // SAFETY: IRQs are unmasked only after `start_timer` stored the DTB's GIC CPU interface.
+    // SAFETY: IRQs are delivered only after `start_timer` stored the DTB's GIC CPU interface.
     let iar = unsafe { arch::gic::ack(cpu) };
-    if iar == TIMER_IRQ {
+    let tick = iar == TIMER_IRQ;
+    if tick {
         arch::timer::arm(TICK_US);
-        TICKS.fetch_add(1, Relaxed);
     }
     // SAFETY: as above.
     unsafe { arch::gic::eoi(cpu, iar) };
+    if tick { task_switch(frame) } else { frame }
 }
 
 fn shutdown() -> ! {
