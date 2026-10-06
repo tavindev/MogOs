@@ -16,3 +16,11 @@ pub fn arm(us: u64) {
         )
     };
 }
+
+/// Lets EL0 read the virtual counter (`CNTVCT_EL0`) and `CNTFRQ_EL0`; every other timer register stays EL1-only.
+pub fn allow_user_counter() {
+    // SAFETY: CNTKCTL_EL1.EL0VCTEN only grants EL0 read access to the virtual counter.
+    unsafe {
+        asm!("msr cntkctl_el1, {}", in(reg) 0b10u64, options(nomem, nostack, preserves_flags))
+    };
+}

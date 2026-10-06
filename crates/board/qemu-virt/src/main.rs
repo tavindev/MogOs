@@ -167,6 +167,8 @@ unsafe extern "C" {
     static user_counter_end: u8;
     static user_intruder: u8;
     static user_intruder_end: u8;
+    static user_bench: u8;
+    static user_bench_end: u8;
 }
 
 /// A user program's code and the address it is mapped and starts at.
@@ -182,6 +184,7 @@ fn user_program(program: Program) -> (&'static [u8], u64) {
             &raw const user_intruder_end,
             USER_BASE + PAGE as u64,
         ),
+        Program::SyscallBench => (&raw const user_bench, &raw const user_bench_end, USER_BASE),
     };
     // SAFETY: `user.s` places each program's bytes between its start and end labels in read-only data.
     let code = unsafe { slice::from_raw_parts(start, end as usize - start as usize) };
@@ -355,6 +358,7 @@ unsafe extern "C" {
 extern "C" fn kmain() -> ! {
     let entry_us = arch::uptime_us();
     arch::install_vectors();
+    arch::timer::allow_user_counter();
 
     // SAFETY: RAM base is mapped RAM; we only read the 8-byte FDT header there.
     let header = unsafe { slice::from_raw_parts(DTB.0 as *const u8, 8) };

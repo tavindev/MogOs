@@ -46,6 +46,7 @@ cargo run -- -append test=yield      # tasks a and b print 0..2 in turn via `svc
 cargo run -- -append test=bench      # prints the yield round trip in ns
 cargo run -- -append test=preempt    # timer preempts spinning task a; task b prints 0..2
 cargo run -- -append test=user       # EL0 process A prints A: 0..9 via syscalls; B reads A's address and is killed (fault: 2)
+cargo run -- -append test=bench-syscall  # EL0 loop of no-op syscalls, prints the round trip in ns
 cargo run -- -s -S     # boot halted, gdbstub on localhost:1234; attach lldb/gdb
 cargo build --release  # LTO release image
 ```

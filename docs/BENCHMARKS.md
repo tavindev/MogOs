@@ -29,6 +29,8 @@ Speed is a primary goal, so performance is tested like behavior: measured, recor
 | --- | --- | --- | --- | --- |
 | `mm` frames: alloc+free of 1000 frames, 128 MiB allocator (ns/op) | Host, M4 Pro | 4.6 | 5.2 | uncommitted |
 | Kernel boot, kmain to end of init (us) | QEMU TCG, dev build | 2928 | 3140 | uncommitted |
-| Kernel boot, kmain to end of init (us) | QEMU hvf (`-cpu cortex-a72`), dev build | 170 | 192 | uncommitted |
+| Kernel boot, kmain to end of init (us) | QEMU hvf (`-cpu cortex-a72`), dev build, 21 boots | 157 | 178 | phase 3 step 11 |
 | Yield round trip via `svc`, `test=bench`, 100000 trips (ns) | QEMU TCG, dev build, 11 boots | 1178 | 1218 | uncommitted |
-| Yield round trip via `svc`, `test=bench`, 100000 trips (ns) | QEMU hvf (`-cpu cortex-a72`), dev build, 21 boots | 58 | 61 | phase 2 step 9 |
+| Yield round trip via `svc`, `test=bench`, 100000 trips (ns) | QEMU hvf (`-cpu cortex-a72`), dev build, 21 boots | 60 | 65 | phase 3 step 11 |
+| Syscall round trip from EL0, `test=bench-syscall`, 100000 `print(sp, 0)` timed in user space (ns) | QEMU TCG, dev build, 11 boots | 621 | 637 | phase 3 step 11 |
+| Syscall round trip from EL0, `test=bench-syscall`, 100000 `print(sp, 0)` timed in user space (ns) | QEMU hvf (`-cpu cortex-a72`), dev build, 21 boots | 25 | 27 | phase 3 step 11 |

@@ -175,3 +175,19 @@ fn faulting_process_is_killed_and_others_keep_running() {
     assert!(fault < last, "B was not killed while A was running");
     assert!(status.success(), "QEMU exited with {status}");
 }
+
+#[test]
+fn syscall_bench_reports_round_trip() {
+    let (status, lines) = boot(&["-append", "test=bench-syscall"]);
+    assert!(
+        !lines.iter().any(|l| l.starts_with("panic:")),
+        "kernel panicked"
+    );
+    lines
+        .iter()
+        .find_map(|l| l.strip_prefix("syscall: ")?.strip_suffix(" ns/round-trip"))
+        .expect("missing syscall line")
+        .parse::<u64>()
+        .unwrap();
+    assert!(status.success(), "QEMU exited with {status}");
+}

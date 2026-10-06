@@ -55,6 +55,8 @@ pub enum Program {
     Counter,
     /// Reads the counter's code address, which its own address space does not map.
     Intruder,
+    /// Times 100000 no-op syscalls (`print` of 0 bytes) with the virtual counter, prints `syscall: <ns> ns/round-trip`.
+    SyscallBench,
 }
 
 /// Round trips timed by `test=bench`.
@@ -108,6 +110,7 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
             "test=bench" => yield_bench(board),
             "test=preempt" => preempt_demo(board),
             "test=user" => user_demo(board, &mut frames),
+            "test=bench-syscall" => syscall_bench(board, &mut frames),
             _ => {}
         }
     }
@@ -169,6 +172,16 @@ fn user_demo<B: Board, const W: usize>(board: &mut B, frames: &mut FrameAllocato
     board.start_timer();
     while board.tasks() > 1 {
         board.idle();
+    }
+}
+
+/// Runs the benchmark process until it exits; the timer stays off so nothing preempts it.
+fn syscall_bench<B: Board, const W: usize>(board: &mut B, frames: &mut FrameAllocator<W>) {
+    board
+        .spawn_user(Program::SyscallBench, || frames.alloc())
+        .expect("spawn");
+    while board.tasks() > 1 {
+        board.yield_now();
     }
 }
 

@@ -55,3 +55,53 @@ user_intruder:
     mov x8, #0
     svc #0
 user_intruder_end:
+
+.balign 4
+.global user_bench, user_bench_end
+user_bench:
+    // Times 100000 print(sp, 0) round trips with the virtual counter, prints the ns per round trip.
+    mrs x20, cntfrq_el0
+    isb
+    mrs x21, cntvct_el0
+    movz x19, #0x86a0
+    movk x19, #1, lsl #16
+1:  mov x0, sp
+    mov x1, #0
+    mov x8, #1
+    svc #0
+    subs x19, x19, #1
+    b.ne 1b
+    isb
+    mrs x22, cntvct_el0
+    sub x22, x22, x21
+    mov x9, #10000
+    mul x22, x22, x9
+    udiv x22, x22, x20
+    adr x0, 7f
+    mov x1, #9
+    mov x8, #1
+    svc #0
+    // decimal digits of x22, written backwards below sp
+    mov x10, sp
+    mov x11, sp
+    mov x12, #10
+2:  udiv x13, x22, x12
+    msub x14, x13, x12, x22
+    add x14, x14, #'0'
+    strb w14, [x11, #-1]!
+    mov x22, x13
+    cbnz x22, 2b
+    mov x0, x11
+    sub x1, x10, x11
+    mov x8, #1
+    svc #0
+    adr x0, 6f
+    mov x1, #15
+    mov x8, #1
+    svc #0
+    mov x0, #0
+    mov x8, #0
+    svc #0
+7:  .ascii "syscall: "
+6:  .ascii " ns/round-trip\n"
+user_bench_end:
