@@ -1,0 +1,39 @@
+use kernel::handle::{DUPLICATE, Handles, KILL, MAX_HANDLES, Object, READ, WRITE};
+use kernel::syscall::{EACCES, EBADF, EMFILE};
+
+#[test]
+fn closed_handle_and_its_reused_entry_reject_the_old_value() {
+    let mut handles = Handles::init(1);
+    let old = handles.dup(0, WRITE).unwrap();
+    handles.close(old).unwrap();
+    assert_eq!(handles.get(old, WRITE), Err(EBADF));
+    assert_eq!(handles.close(old), Err(EBADF));
+
+    let new = handles.dup(0, WRITE).unwrap();
+    assert_eq!(new as u32, old as u32, "the closed entry is reused");
+    assert_ne!(new, old);
+    assert_eq!(handles.get(old, WRITE), Err(EBADF));
+    assert_eq!(handles.get(new, WRITE), Ok(Object::Console));
+}
+
+#[test]
+fn dup_fails_when_the_table_is_full() {
+    let mut handles = Handles::init(1);
+    for _ in 2..MAX_HANDLES {
+        handles.dup(0, WRITE).unwrap();
+    }
+    assert_eq!(handles.dup(0, WRITE), Err(EMFILE));
+    assert_eq!(handles.get(1, KILL), Ok(Object::Process(1)));
+}
+
+#[test]
+fn dup_rights_must_be_a_subset_and_need_duplicate() {
+    let mut handles = Handles::init(1);
+    assert_eq!(handles.dup(0, WRITE | READ), Err(EACCES));
+    assert_eq!(handles.dup(0, 1 << 40), Err(EACCES));
+    let no_write = handles.dup(0, DUPLICATE).unwrap();
+    assert_eq!(handles.get(no_write, WRITE), Err(EACCES));
+    let none = handles.dup(no_write, 0).unwrap();
+    assert_eq!(handles.dup(none, 0), Err(EACCES), "no duplicate right");
+    assert_eq!(handles.dup(1, KILL), Err(EACCES), "self lacks duplicate");
+}

@@ -2,6 +2,7 @@
 
 extern crate alloc;
 
+pub mod handle;
 mod sched;
 pub mod syscall;
 
@@ -39,7 +40,8 @@ pub trait Board {
     fn spawn(&mut self, entry: fn(&mut Self, usize) -> !, arg: usize) -> Result<(), Full>;
     /// Runs the other tasks in turn; returns when this one is scheduled again.
     fn yield_now(&mut self);
-    /// Queues `program` as a process at EL0 in its own address space, its tables and pages taken from `frame`.
+    /// Queues `program` as a process at EL0 in its own address space, its tables and pages taken from `frame`, with
+    /// init's handles (`Handles::init`) until spawn passes handles (step 14).
     fn spawn_user(
         &mut self,
         program: Program,
@@ -51,14 +53,17 @@ pub trait Board {
 
 /// User programs the board provides until the boot archive (step 14).
 pub enum Program {
-    /// Checks that `print` rejects bad pointers, prints `A: 0`..`A: 9` with a spin after each, exits.
+    /// Checks that `write` rejects bad pointers, prints `A: 0`..`A: 9` with a spin after each, exits.
     Counter,
     /// Reads the counter's code address, which its own address space does not map.
     Intruder,
     /// Reads kernel RAM, which every address space maps for EL1 only; same address as `Intruder`.
     KernelReader,
-    /// Times 100000 no-op syscalls (`print` of 0 bytes) with the virtual counter, prints `syscall: <ns> ns/round-trip`.
+    /// Times 100000 no-op syscalls (`write` of 0 bytes) with the virtual counter, prints `syscall: <ns> ns/round-trip`.
     SyscallBench,
+    /// Writes to the console, then through a duplicate without write, a closed handle and a stale one (its entry
+    /// reused), printing a line for each expected result.
+    Handles,
 }
 
 /// Round trips timed by `test=bench`.
@@ -112,7 +117,8 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
             "test=bench" => yield_bench(board),
             "test=preempt" => preempt_demo(board),
             "test=user" => user_demo(board, &mut frames),
-            "test=bench-syscall" => syscall_bench(board, &mut frames),
+            "test=bench-syscall" => run_alone(board, &mut frames, Program::SyscallBench),
+            "test=handles" => run_alone(board, &mut frames, Program::Handles),
             _ => {}
         }
     }
@@ -184,11 +190,13 @@ fn user_demo<B: Board, const W: usize>(board: &mut B, frames: &mut FrameAllocato
     }
 }
 
-/// Runs the benchmark process until it exits; the timer stays off so nothing preempts it.
-fn syscall_bench<B: Board, const W: usize>(board: &mut B, frames: &mut FrameAllocator<W>) {
-    board
-        .spawn_user(Program::SyscallBench, || frames.alloc())
-        .expect("spawn");
+/// Runs `program` until it exits; the timer stays off so nothing preempts it.
+fn run_alone<B: Board, const W: usize>(
+    board: &mut B,
+    frames: &mut FrameAllocator<W>,
+    program: Program,
+) {
+    board.spawn_user(program, || frames.alloc()).expect("spawn");
     while board.tasks() > 1 {
         board.yield_now();
     }

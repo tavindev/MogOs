@@ -183,6 +183,26 @@ fn faulting_process_is_killed_and_others_keep_running() {
 }
 
 #[test]
+fn handles_enforce_rights_and_generations() {
+    let (status, lines) = boot(&["-append", "test=handles"]);
+    assert!(
+        !lines.iter().any(|l| l.starts_with("panic:")),
+        "kernel panicked"
+    );
+    let h: Vec<_> = lines.iter().filter(|l| l.starts_with("H: ")).collect();
+    assert_eq!(
+        h,
+        [
+            "H: console write ok",
+            "H: dup without write: EACCES",
+            "H: closed handle: EBADF",
+            "H: stale handle: EBADF",
+        ]
+    );
+    assert!(status.success(), "QEMU exited with {status}");
+}
+
+#[test]
 fn syscall_bench_reports_round_trip() {
     let (status, lines) = boot(&["-append", "test=bench-syscall"]);
     assert!(

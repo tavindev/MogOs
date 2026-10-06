@@ -1,25 +1,29 @@
-// User programs, copied into process pages; position independent. x8 = syscall, 0 exit, 1 print.
+// User programs, copied into process pages; position independent. x8 = syscall: 0 exit, 1 write, 2 dup, 3 close.
+// Each starts with init's handles: 0 is the console, 1 the process itself.
 .section .rodata.user, "a"
 .balign 4
 
 .global user_counter, user_counter_end
 user_counter:
-    // print(kernel address) and print(unmapped user address) must both return EFAULT (-14).
-    mov x0, #0x40000000
-    mov x1, #4
+    // write(console, kernel address) and write(console, unmapped user address) must both return EFAULT (-14).
+    mov x0, #0
+    mov x1, #0x40000000
+    mov x2, #4
     mov x8, #1
     svc #0
     cmn x0, #14
     b.ne 9f
-    movz x0, #0x8000, lsl #16
-    movk x0, #1, lsl #32
-    mov x1, #4
+    mov x0, #0
+    movz x1, #0x8000, lsl #16
+    movk x1, #1, lsl #32
+    mov x2, #4
     mov x8, #1
     svc #0
     cmn x0, #14
     b.ne 9f
-    adr x0, 8f
-    mov x1, #25
+    mov x0, #0
+    adr x1, 8f
+    mov x2, #25
     mov x8, #1
     svc #0
     mov x19, #0
@@ -29,8 +33,9 @@ user_counter:
     movk x9, #0x0a, lsl #32
     add x9, x9, x19, lsl #24
     str x9, [sp, #-16]!
-    mov x0, sp
-    mov x1, #5
+    mov x0, #0
+    mov x1, sp
+    mov x2, #5
     mov x8, #1
     svc #0
     add sp, sp, #16
@@ -69,14 +74,15 @@ user_kernel_reader_end:
 .balign 4
 .global user_bench, user_bench_end
 user_bench:
-    // Times 100000 print(sp, 0) round trips with the virtual counter, prints the ns per round trip.
+    // Times 100000 write(console, sp, 0) round trips with the virtual counter, prints the ns per round trip.
     mrs x20, cntfrq_el0
     isb
     mrs x21, cntvct_el0
     movz x19, #0x86a0
     movk x19, #1, lsl #16
-1:  mov x0, sp
-    mov x1, #0
+1:  mov x0, #0
+    mov x1, sp
+    mov x2, #0
     mov x8, #1
     svc #0
     subs x19, x19, #1
@@ -87,8 +93,9 @@ user_bench:
     mov x9, #10000
     mul x22, x22, x9
     udiv x22, x22, x20
-    adr x0, 7f
-    mov x1, #9
+    mov x0, #0
+    adr x1, 7f
+    mov x2, #9
     mov x8, #1
     svc #0
     // decimal digits of x22, written backwards below sp
@@ -101,12 +108,14 @@ user_bench:
     strb w14, [x11, #-1]!
     mov x22, x13
     cbnz x22, 2b
-    mov x0, x11
-    sub x1, x10, x11
+    mov x0, #0
+    mov x1, x11
+    sub x2, x10, x11
     mov x8, #1
     svc #0
-    adr x0, 6f
-    mov x1, #15
+    mov x0, #0
+    adr x1, 6f
+    mov x2, #15
     mov x8, #1
     svc #0
     mov x0, #0
@@ -115,3 +124,61 @@ user_bench:
 7:  .ascii "syscall: "
 6:  .ascii " ns/round-trip\n"
 user_bench_end:
+
+// x0 = write(\handle, \str, \len)
+.macro write handle, str, len
+    mov x0, \handle
+    adr x1, \str
+    mov x2, #\len
+    mov x8, #1
+    svc #0
+.endm
+
+.balign 4
+.global user_handles, user_handles_end
+user_handles:
+    // The console handle writes and returns the length.
+    write #0, 1f, 20
+    cmp x0, #20
+    b.ne 9f
+    // x19 = dup(console, duplicate): writing through it is EACCES (-13).
+    mov x0, #0
+    mov x1, #8
+    mov x8, #2
+    svc #0
+    mov x19, x0
+    write x19, 1f, 20
+    cmn x0, #13
+    b.ne 9f
+    write #0, 2f, 29
+    // After close(x19), writing through it is EBADF (-9).
+    mov x0, x19
+    mov x8, #3
+    svc #0
+    cbnz x0, 9f
+    write x19, 1f, 20
+    cmn x0, #9
+    b.ne 9f
+    write #0, 3f, 24
+    // x20 = dup(console, write) reuses x19's entry with a new generation; x19 stays EBADF.
+    mov x0, #0
+    mov x1, #2
+    mov x8, #2
+    svc #0
+    mov x20, x0
+    cmp w19, w20
+    b.ne 9f
+    cmp x19, x20
+    b.eq 9f
+    write x19, 1f, 20
+    cmn x0, #9
+    b.ne 9f
+    write x20, 4f, 23
+9:  mov x0, #0
+    mov x8, #0
+    svc #0
+1:  .ascii "H: console write ok\n"
+2:  .ascii "H: dup without write: EACCES\n"
+3:  .ascii "H: closed handle: EBADF\n"
+4:  .ascii "H: stale handle: EBADF\n"
+user_handles_end:

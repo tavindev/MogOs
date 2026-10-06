@@ -33,4 +33,4 @@ Speed is a primary goal, so performance is tested like behavior: measured, recor
 | Yield round trip via `svc`, `test=bench`, 100000 trips (ns) | QEMU TCG, dev build, 11 boots | 1178 | 1218 | uncommitted |
 | Yield round trip via `svc`, `test=bench`, 100000 trips (ns) | QEMU hvf (`-cpu cortex-a72`), dev build, 21 boots | 60 | 65 | phase 3 step 11 |
 | Syscall round trip from EL0, `test=bench-syscall`, 100000 `print(sp, 0)` timed in user space (ns) | QEMU TCG, dev build, 11 boots | 621 | 637 | phase 3 step 11 |
-| Syscall round trip from EL0, `test=bench-syscall`, 100000 `print(sp, 0)` timed in user space (ns) | QEMU hvf (`-cpu cortex-a72`), dev build, 21 boots | 25 | 27 | phase 3 step 11 |
+| Syscall round trip from EL0, `test=bench-syscall`, 100000 `write(console, sp, 0)` timed in user space (ns) | QEMU hvf (`-cpu cortex-a72`), dev build, 21 boots | 25 | 28 | phase 3 step 12 |

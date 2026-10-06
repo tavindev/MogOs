@@ -17,6 +17,7 @@ use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 use arch::{MemoryType, UserAccess, l1_block, user_page};
 use dtb::Dtb;
+use kernel::handle::Handles;
 use kernel::syscall::{Call, EFAULT};
 use kernel::{Full, Program, Scheduler};
 use linked_list_allocator::Heap;
@@ -141,8 +142,12 @@ unsafe fn enter(sched: &Scheduler<MAX_TASKS>, frame: usize, next: usize) {
 }
 
 /// Allocates a kernel stack, lets `first_frame(stack_top)` write the task's first frame on it, and queues
-/// the task in address space `space`.
-fn queue_task(space: PhysAddr, first_frame: impl FnOnce(usize) -> usize) -> Result<(), Full> {
+/// the task in address space `space` with `handles(slot)`.
+fn queue_task(
+    space: PhysAddr,
+    first_frame: impl FnOnce(usize) -> usize,
+    handles: impl FnOnce(usize) -> Handles,
+) -> Result<(), Full> {
     // SAFETY: the layout has a nonzero size.
     let stack = unsafe { alloc::alloc::alloc(TASK_STACK) };
     if stack.is_null() {
@@ -151,7 +156,7 @@ fn queue_task(space: PhysAddr, first_frame: impl FnOnce(usize) -> usize) -> Resu
     let frame = first_frame(stack as usize + TASK_STACK.size());
     let irq = arch::irq::disable();
     // SAFETY: IRQs are masked on the only core, so this is the sole reference.
-    let added = unsafe { &mut *SCHED.0.get() }.add(frame, space);
+    let added = unsafe { &mut *SCHED.0.get() }.add(frame, space, handles);
     arch::irq::restore(irq);
     if added.is_err() {
         // SAFETY: `stack` came from `alloc` with this layout and was never handed to the scheduler.
@@ -171,6 +176,8 @@ unsafe extern "C" {
     static user_kernel_reader_end: u8;
     static user_bench: u8;
     static user_bench_end: u8;
+    static user_handles: u8;
+    static user_handles_end: u8;
 }
 
 /// A user program's code and the address it is mapped and starts at.
@@ -192,6 +199,11 @@ fn user_program(program: Program) -> (&'static [u8], u64) {
             USER_BASE + PAGE as u64,
         ),
         Program::SyscallBench => (&raw const user_bench, &raw const user_bench_end, USER_BASE),
+        Program::Handles => (
+            &raw const user_handles,
+            &raw const user_handles_end,
+            USER_BASE,
+        ),
     };
     // SAFETY: `user.s` places each program's bytes between its start and end labels in read-only data.
     let code = unsafe { slice::from_raw_parts(start, end as usize - start as usize) };
@@ -199,7 +211,7 @@ fn user_program(program: Program) -> (&'static [u8], u64) {
 }
 
 /// Writes the `len` bytes at user address `ptr` to the console if EL0 may read all of them; false otherwise.
-fn print_user(ptr: u64, len: usize) -> bool {
+fn write_user(ptr: u64, len: usize) -> bool {
     let first_page = ptr & !(PAGE as u64 - 1);
     if !(first_page..ptr + len as u64)
         .step_by(PAGE)
@@ -296,13 +308,17 @@ impl kernel::Board for QemuVirt {
 
     fn spawn(&mut self, entry: fn(&mut Self, usize) -> !, arg: usize) -> Result<(), Full> {
         let board = self.clone();
-        queue_task(PhysAddr(0), |stack_top| {
-            let start = (stack_top - size_of::<Start>()) & !15;
-            // SAFETY: `start` is 16-byte aligned and inside the fresh stack, which nothing else references.
-            unsafe { (start as *mut Start).write(Start { board, entry, arg }) };
-            // SAFETY: `start` is 16-byte aligned and the stack below it is fresh and owned by the new task.
-            unsafe { arch::new_task(start, task_start, start) }
-        })
+        queue_task(
+            PhysAddr(0),
+            |stack_top| {
+                let start = (stack_top - size_of::<Start>()) & !15;
+                // SAFETY: `start` is 16-byte aligned and inside the fresh stack, which nothing else references.
+                unsafe { (start as *mut Start).write(Start { board, entry, arg }) };
+                // SAFETY: `start` is 16-byte aligned and the stack below it is fresh and owned by the new task.
+                unsafe { arch::new_task(start, task_start, start) }
+            },
+            |_| Handles::new(),
+        )
     }
 
     fn yield_now(&mut self) {
@@ -341,10 +357,14 @@ impl kernel::Board for QemuVirt {
             // SAFETY: `l1` and every frame `page` returns are fresh, zeroed and only this address space's; `va` is a user address.
             unsafe { arch::map_page(l1, va, leaf, &mut page) }.ok_or(Full)?;
         }
-        queue_task(l1, |stack_top| {
-            // SAFETY: the kernel stack below `stack_top` is fresh and owned by the new process.
-            unsafe { arch::new_user_task(stack_top, entry, USER_STACK_TOP) }
-        })
+        queue_task(
+            l1,
+            |stack_top| {
+                // SAFETY: the kernel stack below `stack_top` is fresh and owned by the new process.
+                unsafe { arch::new_user_task(stack_top, entry, USER_STACK_TOP) }
+            },
+            Handles::init,
+        )
     }
 
     fn tasks(&self) -> usize {
@@ -416,14 +436,17 @@ unsafe extern "C" fn board_irq(frame: usize) -> usize {
 /// IRQs must be masked (trap context), and `frame` the current process's.
 #[unsafe(no_mangle)]
 unsafe extern "C" fn board_syscall(frame: &mut arch::TrapFrame) -> usize {
+    // SAFETY: the caller masked IRQs on the only core, so this is the sole reference.
+    let handles = unsafe { &mut *SCHED.0.get() }.handles();
     let x = &mut frame.x;
-    x[0] = match kernel::syscall::decode(x[8], x.first_chunk().unwrap()) {
+    x[0] = match kernel::syscall::dispatch(x[8], x.first_chunk().unwrap(), handles) {
         // SAFETY: the caller masked IRQs, and `frame` is the current process's.
         Ok(Call::Exit) => return unsafe { task_exit(frame as *mut arch::TrapFrame as usize) },
-        Ok(Call::Print { ptr, len }) if print_user(ptr, len) => 0,
-        Ok(Call::Print { .. }) => EFAULT,
-        Err(error) => error,
-    } as u64;
+        Ok(Call::Write { ptr, len }) if write_user(ptr, len) => len as u64,
+        Ok(Call::Write { .. }) => EFAULT as u64,
+        Ok(Call::Done(value)) => value,
+        Err(error) => error as u64,
+    };
     frame as *mut arch::TrapFrame as usize
 }
 
