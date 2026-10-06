@@ -78,6 +78,8 @@ pub enum Program {
 
 /// Round trips timed by `test=bench`.
 const BENCH_YIELDS: u64 = 100_000;
+/// Round trips the boot archive's `ping` makes with `pong` under `test=bench-pipe`.
+const PIPE_ROUND_TRIPS: u64 = 100_000;
 
 /// Bitmap capacity in 64-frame words: 512 words cover 128 MiB.
 pub const FRAME_WORDS: usize = 512;
@@ -134,6 +136,7 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
             "test=handles" => run_alone(board, Program::Handles),
             "test=spawn" => run_archived(board, "spawn", "spawner"),
             "test=pipe" => run_archived(board, "pipe", "reader"),
+            "test=bench-pipe" => pipe_bench(board),
             "test=budget" => {
                 let before = board.free_frames();
                 run_alone(board, Program::Budget);
@@ -251,6 +254,16 @@ fn yield_bench<B: Board>(board: &mut B) {
     }
     let ns = (board.uptime_us() - start) * 1000 / BENCH_YIELDS;
     let _ = writeln!(board.console(), "yield: {ns} ns/round-trip");
+}
+
+/// Times `ping`, which sends `pong` a byte and reads it back over two pipes, from its spawn until both exited; spawn
+/// and exit are well under 1% of it.
+fn pipe_bench<B: Board>(board: &mut B) {
+    let start = board.uptime_us();
+    board.spawn_archived("ping", BOOT_BUDGET).expect("spawn");
+    wait(board);
+    let ns = (board.uptime_us() - start) * 1000 / PIPE_ROUND_TRIPS;
+    let _ = writeln!(board.console(), "pipe: {ns} ns/round-trip");
 }
 
 fn yield_forever<B: Board>(board: &mut B, _: usize) -> ! {

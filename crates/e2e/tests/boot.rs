@@ -310,3 +310,23 @@ fn parent_blocks_on_an_empty_pipe_until_the_child_writes() {
     assert_no_leak(&lines, "pipe");
     assert!(status.success(), "QEMU exited with {status}");
 }
+
+#[test]
+fn pipe_bench_reports_round_trip() {
+    let (status, lines) = boot(&["-append", "test=bench-pipe"]);
+    assert!(
+        !lines.iter().any(|l| l.starts_with("panic:")),
+        "kernel panicked"
+    );
+    assert!(
+        lines.iter().any(|l| l == "ping: done"),
+        "ping did not finish every round trip"
+    );
+    lines
+        .iter()
+        .find_map(|l| l.strip_prefix("pipe: ")?.strip_suffix(" ns/round-trip"))
+        .expect("missing pipe line")
+        .parse::<u64>()
+        .unwrap();
+    assert!(status.success(), "QEMU exited with {status}");
+}
