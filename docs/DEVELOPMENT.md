@@ -55,6 +55,8 @@ cargo run -- -append test=bench-syscall  # EL0 loop of no-op syscalls, prints th
 cargo run -- -append test=handles    # EL0 process writes via its console handle, then a no-write duplicate, a closed and a stale handle fail (H: lines)
 cargo run -- -append test=budget     # EL0 process maps pages until ENOMEM (M: lines), exits; free frames before/after its lifetime match
 cargo run -- -append test=spawn      # spawner (from the boot archive) checks failing spawns move nothing, spawns child with only the console (S: and C: lines); free frames before/after match
+cargo run -- -append test=pipe       # reader blocks on an empty pipe until its child writer writes, reads EOF, waits for exit code 7, respawns into the reused slot; a stale process handle is EBADF (R: and W: lines); free frames before/after match
+cargo run -- -append test=bench-pipe # ping and pong echo one byte over two pipes 100000 times; prints the round trip in ns
 cargo run -- -s -S     # boot halted, gdbstub on localhost:1234; attach lldb/gdb
 cargo build --release  # LTO release image
 ```
