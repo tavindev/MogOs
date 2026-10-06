@@ -64,6 +64,7 @@ aarch64_vectors:
     str x2, [sp, #256]
     mov x0, sp
     bl aarch64_exception
+    mov sp, x0
     ldp x30, x2, [sp, #240]
     msr elr_el1, x2
     ldr x2, [sp, #256]
@@ -96,7 +97,15 @@ const SOURCES: [&str; 4] = [
     "lower EL (AArch32)",
 ];
 const SYNC_CURRENT_SPX: u64 = 4;
+const EC_SVC64: u64 = 0x15;
 const EC_BRK64: u64 = 0x3c;
+/// EL1h with D, A, I and F masked.
+const SPSR_EL1H_MASKED: u64 = 0x3c5;
+
+unsafe extern "C" {
+    /// The board's scheduler: saves the yielding task's frame address and returns the next task's.
+    fn task_switch(frame: usize) -> usize;
+}
 
 /// Points `VBAR_EL1` at this crate's vector table.
 pub fn install_vectors() {
@@ -118,14 +127,46 @@ pub fn breakpoint_self_test() {
     unsafe { asm!("brk #0", clobber_abi("C")) };
 }
 
+/// Writes a frame just below `stack_top` that starts `entry(arg)` at EL1h with DAIF masked; returns its address for the scheduler.
+///
+/// # Safety
+///
+/// `stack_top` must be 16-byte aligned, with the memory below it a fresh stack owned by the new task.
+pub unsafe fn new_task(stack_top: usize, entry: extern "C" fn(usize) -> !, arg: usize) -> usize {
+    let frame = (stack_top - size_of::<TrapFrame>()) as *mut TrapFrame;
+    let mut x = [0; 31];
+    x[0] = arg as u64;
+    // SAFETY: the caller guarantees the bytes below `stack_top` are ours to write.
+    unsafe {
+        frame.write(TrapFrame {
+            x,
+            elr: entry as usize as u64,
+            spsr: SPSR_EL1H_MASKED,
+            _pad: 0,
+        })
+    };
+    frame as usize
+}
+
+/// Executes `svc #0`: switches to the next task; returns when the scheduler picks this one again.
+pub fn yield_now() {
+    // SAFETY: the sync handler saves and restores every register around the switch.
+    unsafe { asm!("svc #0") };
+}
+
 #[unsafe(no_mangle)]
-extern "C" fn aarch64_exception(frame: &mut TrapFrame, index: u64) {
+extern "C" fn aarch64_exception(frame: &mut TrapFrame, index: u64) -> usize {
     let esr: u64;
     // SAFETY: reading ESR_EL1 has no side effects.
     unsafe { asm!("mrs {}, esr_el1", out(reg) esr) };
-    if index == SYNC_CURRENT_SPX && (esr >> 26) & 0x3f == EC_BRK64 && esr & 0xffff == 0 {
+    let ec = (esr >> 26) & 0x3f;
+    if index == SYNC_CURRENT_SPX && ec == EC_SVC64 && esr & 0xffff == 0 {
+        // SAFETY: the board defines `task_switch`; exception entry masked IRQs.
+        return unsafe { task_switch(frame as *mut TrapFrame as usize) };
+    }
+    if index == SYNC_CURRENT_SPX && ec == EC_BRK64 && esr & 0xffff == 0 {
         frame.elr += 4;
-        return;
+        return frame as *mut TrapFrame as usize;
     }
     let far: u64;
     // SAFETY: reading FAR_EL1 has no side effects.

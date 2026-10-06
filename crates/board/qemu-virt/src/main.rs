@@ -1,6 +1,8 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 mod uart;
 
 use core::alloc::{GlobalAlloc, Layout};
@@ -14,6 +16,7 @@ use core::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
 use arch::{MemoryType, l1_block};
 use dtb::Dtb;
+use kernel::{Full, Scheduler};
 use linked_list_allocator::Heap;
 use mm::PhysAddr;
 use uart::Uart;
@@ -26,6 +29,10 @@ const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
 const GIB: u64 = 1 << 30;
 /// Outside both mapped GiBs.
 const UNMAPPED: PhysAddr = PhysAddr(0x8000_0000);
+/// Boot context included.
+const MAX_TASKS: usize = 8;
+/// 16 KiB, 16-byte aligned.
+const TASK_STACK: Layout = Layout::new::<[u128; 1024]>();
 
 #[global_allocator]
 static HEAP: KernelHeap = KernelHeap(UnsafeCell::new(Heap::empty()));
@@ -60,6 +67,34 @@ unsafe impl GlobalAlloc for KernelHeap {
     }
 }
 
+/// Task contexts; touched only with IRQs masked on the only core.
+static SCHED: Sched = Sched(UnsafeCell::new(Scheduler::new()));
+
+struct Sched(UnsafeCell<Scheduler<MAX_TASKS>>);
+
+// SAFETY: one core, and the scheduler is only touched with IRQs masked, so accesses never overlap.
+unsafe impl Sync for Sched {}
+
+#[unsafe(no_mangle)]
+extern "C" fn task_switch(frame: usize) -> usize {
+    // SAFETY: called only from the `svc` trap handler, with IRQs masked on the only core, so this is the sole reference.
+    unsafe { &mut *SCHED.0.get() }.switch(frame)
+}
+
+/// What a new task's first frame hands to `task_start`; lives at the top of its stack.
+struct Start {
+    board: QemuVirt,
+    entry: fn(&mut QemuVirt, usize) -> !,
+    arg: usize,
+}
+
+extern "C" fn task_start(start: usize) -> ! {
+    // SAFETY: `spawn` wrote a `Start` here, above the task's stack, and only this task uses it.
+    let start = unsafe { &mut *(start as *mut Start) };
+    (start.entry)(&mut start.board, start.arg)
+}
+
+#[derive(Clone)]
 struct QemuVirt {
     uart: Uart,
     entry_us: u64,
@@ -112,6 +147,33 @@ impl kernel::Board for QemuVirt {
 
     fn power_off(&mut self) -> ! {
         shutdown()
+    }
+
+    fn spawn(&mut self, entry: fn(&mut Self, usize) -> !, arg: usize) -> Result<(), Full> {
+        // SAFETY: the layout has a nonzero size.
+        let stack = unsafe { alloc::alloc::alloc(TASK_STACK) };
+        if stack.is_null() {
+            return Err(Full);
+        }
+        let start = (stack as usize + TASK_STACK.size() - size_of::<Start>()) & !15;
+        let board = self.clone();
+        // SAFETY: `start` is 16-byte aligned and inside the fresh stack, which nothing else references.
+        unsafe { (start as *mut Start).write(Start { board, entry, arg }) };
+        // SAFETY: `start` is 16-byte aligned and the stack below it is fresh and owned by the new task.
+        let frame = unsafe { arch::new_task(start, task_start, start) };
+        let irq = arch::irq::disable();
+        // SAFETY: IRQs are masked on the only core, so this is the sole reference.
+        let added = unsafe { &mut *SCHED.0.get() }.add(frame);
+        arch::irq::restore(irq);
+        if added.is_err() {
+            // SAFETY: `stack` came from `alloc` with this layout and was never handed to the scheduler.
+            unsafe { alloc::alloc::dealloc(stack, TASK_STACK) };
+        }
+        added
+    }
+
+    fn yield_now(&mut self) {
+        arch::yield_now()
     }
 }
 

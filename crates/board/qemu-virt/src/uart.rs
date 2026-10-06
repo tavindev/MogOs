@@ -3,6 +3,7 @@ use core::fmt;
 use mm::PhysAddr;
 
 /// PL011 UART on QEMU `virt` (identity mapped). QEMU accepts writes to DR without initialization.
+#[derive(Clone)]
 pub struct Uart {
     base: PhysAddr,
 }

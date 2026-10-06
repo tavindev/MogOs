@@ -42,6 +42,8 @@ cargo test-host        # host tests + QEMU boot e2e tests (crates/e2e); must pas
 cargo bench-host       # host benchmarks (min/median); see docs/BENCHMARKS.md
 cargo run              # boot in QEMU; prints hello, exceptions, mmu, ram, frames, heap, boot lines and powers off
 cargo run -- -append test=mmu-fault  # reads an unmapped address after MMU on; prints the data abort
+cargo run -- -append test=yield      # tasks a and b print 0..2 in turn via `svc` yield
+cargo run -- -append test=bench      # prints the yield round trip in ns
 cargo run -- -s -S     # boot halted, gdbstub on localhost:1234; attach lldb/gdb
 cargo build --release  # LTO release image
 ```
