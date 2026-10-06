@@ -11,7 +11,8 @@ pub const SIZE: usize = 4096;
 /// One end of the pipe at `index` with `generation`.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct End {
-    pub index: usize,
+    /// `u32`, not `usize`: it keeps copying an `Object` plain moves, not a `memcpy` on the syscall path.
+    pub index: u32,
     pub generation: u64,
     /// The write end; otherwise the read end.
     pub write: bool,
@@ -51,7 +52,7 @@ impl<const N: usize> Pipes<N> {
         let index = self.0.iter().position(|p| p.page.0 == 0)?;
         let generation = self.0[index].generation + 1;
         Some(End {
-            index,
+            index: index as u32,
             generation,
             write: false,
         })
@@ -60,7 +61,7 @@ impl<const N: usize> Pipes<N> {
     /// Makes the pipe whose read end is `read` (from `free`), with one handle to each end and its buffer at `page`,
     /// charged to `creator`.
     pub fn create(&mut self, read: End, page: PhysAddr, creator: (usize, u64)) {
-        self.0[read.index] = Pipe {
+        self.0[read.index as usize] = Pipe {
             page,
             creator,
             generation: read.generation,
@@ -72,7 +73,7 @@ impl<const N: usize> Pipes<N> {
 
     /// The open pipe `end` reaches.
     pub fn get(&mut self, end: End) -> Option<&mut Pipe> {
-        let pipe = self.0.get_mut(end.index)?;
+        let pipe = self.0.get_mut(end.index as usize)?;
         (pipe.page.0 != 0 && pipe.generation == end.generation).then_some(pipe)
     }
 

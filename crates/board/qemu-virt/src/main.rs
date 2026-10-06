@@ -197,7 +197,7 @@ fn release(
             None => frames.free(page),
         }
     }
-    sched.wake(Event::Pipe(end.index));
+    sched.wake(Event::Pipe(end.index as usize));
 }
 
 /// Creates a pipe whose page is charged to the current process, which gets a handle to each end (read, write).
@@ -754,12 +754,12 @@ unsafe extern "C" fn board_syscall(frame: &mut arch::TrapFrame) -> usize {
         Ok(Call::Pipe { end, ptr, len }) => match pipe_io(pipes, end, ptr, len) {
             Some(moved) => {
                 if moved > 0 {
-                    sched.wake(Event::Pipe(end.index));
+                    sched.wake(Event::Pipe(end.index as usize));
                 }
                 moved as u64
             }
             // SAFETY: the caller masked IRQs, and `frame` is the current process's.
-            None => return unsafe { block(sched, frame, Event::Pipe(end.index)) },
+            None => return unsafe { block(sched, frame, Event::Pipe(end.index as usize)) },
         },
         Ok(Call::NewPipe) => match new_pipe(sched, frames, pipes) {
             Ok((read, write)) => {
