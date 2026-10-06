@@ -40,16 +40,17 @@ Every new `.md` file must be linked from its parent so it stays reachable from t
 - Test: `cargo test-host` (host tests plus the QEMU boot tests in `crates/e2e`; must pass)
 - Benchmarks: `cargo bench-host` (host); kernel boot time is the `boot: <N> us` line
 - Debug: `cargo run -- -s -S`, then attach `lldb` / `gdb` to `localhost:1234`
-- Lint/format: `cargo clippy`, `cargo fmt` (must be clean). Settings, rules for agents: `docs/DEVELOPMENT.md`
+- Lint/format: `cargo clippy`, `cargo fmt` (must be clean; `crates/user` is outside the workspace, see `docs/DEVELOPMENT.md`). Settings, rules for agents: `docs/DEVELOPMENT.md`
 - Roadmap and current phase: `docs/ROADMAP.md` (one doc per phase in `docs/phases/`; update "What was done" when a step lands)
 
 ## Layout
 
-- `crates/kernel` — OS logic, `#![no_std]`, **no `unsafe`** (`forbid`). Defines ports (traits) like `Board`, the scheduler and syscall decoding.
+- `crates/kernel` — OS logic, `#![no_std]`, **no `unsafe`** (`forbid`). Defines ports (traits) like `Board`, the scheduler, handles, syscall decoding and the boot archive's cpio and ELF parsers.
 - `crates/mm` — arch-independent memory management (`PhysAddr`, frame allocator). Safe, host-tested.
 - `crates/dtb` — minimal FDT parser. Safe, host-tested.
 - `crates/arch` — the only arch-specific crate, `unsafe` allowed; AArch64 code in `src/aarch64/` (boot, traps, MMU and page tables, GICv2, timer).
-- `crates/board/qemu-virt` — board crate, `unsafe` allowed: drivers, memory map, `linker.ld`, `#[global_allocator]`, trap hooks (switch, syscall, fault), process setup, asm user programs (`user.s`); builds the `mog_os` binary.
+- `crates/board/qemu-virt` — board crate, `unsafe` allowed: drivers, memory map, `linker.ld`, `#[global_allocator]`, trap hooks (switch, syscall, fault), process setup and ELF loading, asm user programs (`user.s`); builds the `mog_os` binary. Its `build.rs` builds `crates/user` and bundles the programs as the boot archive (cpio).
+- `crates/user` — user programs (`src/bin/*.rs`, static ELFs at 4 GiB via `link.ld`) and their syscall stubs (`src/lib.rs`); user space, outside the workspace, `unsafe` only for `svc`.
 - `crates/e2e` — host-only QEMU boot tests (`tests/boot.rs`).
 - `.cargo/config.toml` — default target, build/link thread caps, QEMU runners.
 
@@ -78,5 +79,5 @@ Every new `.md` file must be linked from its parent so it stays reachable from t
 
 - `#![no_std]`. Edition 2024: use `#[unsafe(no_mangle)]`, `unsafe extern`.
 - Host-testable crates use `#![cfg_attr(not(test), no_std)]`.
-- `unsafe` only in `crates/arch` and board crates (`crates/board/*`), each block with a one-line `// SAFETY:` reason.
+- `unsafe` only in `crates/arch` and board crates (`crates/board/*`), each block with a one-line `// SAFETY:` reason; user space (`crates/user`) only for its syscall stubs.
 - After editing `linker.ld`, `crates/board/qemu-virt/build.rs` triggers a relink automatically.

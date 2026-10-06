@@ -17,8 +17,9 @@ use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 use arch::{MemoryType, UserAccess, l1_block, user_page};
 use dtb::Dtb;
-use kernel::handle::Handles;
-use kernel::syscall::{Call, EFAULT, ENOMEM};
+use kernel::elf::{Elf, Segment};
+use kernel::handle::{Handles, KILL, MAX_HANDLES, Object, WAIT};
+use kernel::syscall::{Call, EAGAIN, EFAULT, ENOENT, ENOEXEC, ENOMEM};
 use kernel::{FRAME_WORDS, Full, Memory, Program, Scheduler};
 use linked_list_allocator::Heap;
 use mm::{Budget, FrameAllocator, PhysAddr};
@@ -44,6 +45,10 @@ const USER_BASE: u64 = 1 << 32;
 const USER_STACK_TOP: u64 = USER_BASE + (2 << 20);
 /// Where a process's first `map` goes; later ones follow it.
 const MAP_BASE: u64 = USER_STACK_TOP;
+/// Where an executable's segments may go: below the stack page, so they share one level-3 table with it.
+const IMAGE: Range<u64> = USER_BASE..USER_STACK_TOP - PAGE as u64;
+/// The boot archive (cpio, newc), built by `build.rs` from `crates/user`.
+static ARCHIVE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/boot.cpio"));
 /// EL1 virtual timer PPI.
 const TIMER_IRQ: u32 = 27;
 const TICK_US: u64 = 10_000;
@@ -218,29 +223,42 @@ unsafe fn enter(sched: &Scheduler<MAX_TASKS>, frame: usize, next: usize) {
     unsafe { arch::set_ttbr0(table, asid) }
 }
 
-/// Builds a process for `code` (entered at `entry`): address space, pages and kernel stack, all charged to `budget`,
-/// and queues it; on failure returns every frame it took.
+/// Builds a process from `file`'s `segments` (entered at `entry`): address space, pages and kernel stack, all charged
+/// to `budget`, and queues it with `handles(slot)`; on failure (`ENOMEM`, or `EAGAIN` with no free slot) returns every
+/// frame it took.
 fn spawn_process(
     sched: &mut Scheduler<MAX_TASKS>,
     frames: &mut FrameAllocator<FRAME_WORDS>,
-    code: &[u8],
-    entry: u64,
+    (file, segments, entry): (&[u8], impl Iterator<Item = Segment>, u64),
     mut budget: Budget,
-) -> Result<(), Full> {
-    let l1 = zeroed(frames, &mut budget).ok_or(Full)?;
+    handles: impl FnOnce(usize) -> Handles,
+) -> Result<(), i64> {
+    let l1 = zeroed(frames, &mut budget).ok_or(ENOMEM)?;
     // SAFETY: `l1` is a fresh, zeroed frame.
     unsafe { (l1.0 as *mut [u64; 2]).write(KERNEL_L1) };
     let stack = (|| {
-        let text = map_zeroed(frames, &mut budget, l1, entry, UserAccess::ReadExecute)?;
-        // SAFETY: `code` fits in the fresh frame `text` (checked by the caller).
-        unsafe { ptr::copy_nonoverlapping(code.as_ptr(), text.0 as *mut u8, code.len()) };
-        // SAFETY: `text` is identity-mapped RAM.
-        unsafe { arch::sync_icache(text.0 as usize, PAGE) };
+        for segment in segments {
+            let data = &file[segment.data];
+            let access = match segment.writable {
+                true => UserAccess::ReadWrite,
+                false => UserAccess::ReadExecute,
+            };
+            for offset in (0..segment.size as usize).step_by(PAGE) {
+                let va = segment.vaddr + offset as u64;
+                let page = map_zeroed(frames, &mut budget, l1, va, access)?;
+                let bytes = data.get(offset..).unwrap_or_default();
+                let bytes = &bytes[..bytes.len().min(PAGE)];
+                // SAFETY: `bytes` fits in the fresh frame `page`.
+                unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), page.0 as *mut u8, bytes.len()) };
+                // SAFETY: `page` is identity-mapped RAM.
+                unsafe { arch::sync_icache(page.0 as usize, PAGE) };
+            }
+        }
         let stack_page = USER_STACK_TOP - PAGE as u64;
         map_zeroed(frames, &mut budget, l1, stack_page, UserAccess::ReadWrite)?;
         budget.alloc_contiguous(frames, TASK_STACK_FRAMES)
     })();
-    let added = stack.ok_or(Full).and_then(|stack| {
+    let added = stack.ok_or(ENOMEM).and_then(|stack| {
         // SAFETY: the kernel stack below `stack.end` is fresh and owned by the new process.
         let frame = unsafe { arch::new_user_task(stack.end.0 as usize, entry, USER_STACK_TOP) };
         let memory = Memory {
@@ -248,7 +266,7 @@ fn spawn_process(
             budget,
             next: MAP_BASE,
         };
-        let added = sched.add(frame, l1, memory, Handles::init);
+        let added = sched.add(frame, l1, memory, handles).map_err(|Full| EAGAIN);
         if added.is_err() {
             free_stack(frames, stack.start);
         }
@@ -259,6 +277,63 @@ fn spawn_process(
         unsafe { arch::free_space(l1, |f| frames.free(f)) };
     }
     added
+}
+
+/// The boot archive's executable at `file` (byte offsets), checked, as `spawn_process` takes it.
+fn executable(
+    file: Range<usize>,
+) -> Result<(&'static [u8], impl Iterator<Item = Segment>, u64), i64> {
+    let file = &ARCHIVE[file];
+    let elf = Elf::parse(file, IMAGE).ok_or(ENOEXEC)?;
+    let entry = elf.entry;
+    Ok((file, elf.segments(), entry))
+}
+
+/// Queues `executable` from boot context with init's handles and a budget of `budget` frames.
+fn spawn_init(
+    executable: (&[u8], impl Iterator<Item = Segment>, u64),
+    budget: usize,
+) -> Result<(), i64> {
+    let irq = arch::irq::disable();
+    // SAFETY: IRQs are masked on the only core, so this is the sole reference.
+    let Kernel { sched, frames } = unsafe { &mut *KERNEL.0.get() };
+    let added = spawn_process(
+        sched,
+        frames,
+        executable,
+        Budget::new(budget),
+        Handles::init,
+    );
+    arch::irq::restore(irq);
+    added
+}
+
+/// Spawns the boot archive's executable at `file` with the `len` handles at user address `ptr` and `budget` frames
+/// moved from the current process, which gets a handle to the child; on failure nothing moves.
+fn spawn(
+    sched: &mut Scheduler<MAX_TASKS>,
+    frames: &mut FrameAllocator<FRAME_WORDS>,
+    file: Range<usize>,
+    ptr: u64,
+    len: usize,
+    budget: usize,
+) -> Result<u64, i64> {
+    let executable = executable(file)?;
+    let bytes = user_bytes(ptr, len * 8).ok_or(EFAULT)?;
+    let mut list = [0; MAX_HANDLES];
+    for (handle, bytes) in list.iter_mut().zip(bytes.as_chunks::<8>().0) {
+        *handle = u64::from_le_bytes(*bytes);
+    }
+    let (mut parent, child) = sched.handles().split(&list[..len])?;
+    if budget > sched.memory().budget.remaining() {
+        return Err(ENOMEM);
+    }
+    let slot = sched.free_slot().ok_or(EAGAIN)?;
+    let process = parent.insert(Object::Process(slot), WAIT | KILL)?;
+    spawn_process(sched, frames, executable, Budget::new(budget), |_| child)?;
+    sched.memory().budget.shrink(budget);
+    *sched.handles() = parent;
+    Ok(process)
 }
 
 global_asm!(include_str!("user.s"), USER_BASE = const USER_BASE);
@@ -313,20 +388,19 @@ fn user_program(program: Program) -> (&'static [u8], u64) {
     (code, va)
 }
 
-/// Writes the `len` bytes at user address `ptr` to the console if EL0 may read all of them; false otherwise.
-fn write_user(ptr: u64, len: usize) -> bool {
+/// The `len` bytes at user address `ptr` (in user space, checked by `dispatch`) if EL0 may read all of them; valid
+/// only until the trap returns.
+fn user_bytes<'a>(ptr: u64, len: usize) -> Option<&'a [u8]> {
     let first_page = ptr & !(PAGE as u64 - 1);
     if !(first_page..ptr + len as u64)
         .step_by(PAGE)
         .all(arch::user_readable)
     {
-        return false;
+        return None;
     }
     // SAFETY: EL0 may read every page of the range, so it is mapped in the current address space, which
     // stays loaded and unchanged until the trap returns (IRQs masked, one core).
-    let bytes = unsafe { slice::from_raw_parts(ptr as *const u8, len) };
-    Uart::new(UART0).write(bytes);
-    true
+    Some(unsafe { slice::from_raw_parts(ptr as *const u8, len) })
 }
 
 /// What a new task's first frame hands to `task_start`; lives at the top of its stack.
@@ -457,15 +531,20 @@ impl kernel::Board for QemuVirt {
         free
     }
 
-    fn spawn_user(&mut self, program: Program, budget: usize) -> Result<(), Full> {
+    fn spawn_user(&mut self, program: Program, budget: usize) -> Result<(), i64> {
         let (code, entry) = user_program(program);
-        assert!(code.len() <= PAGE, "user program over one page");
-        let irq = arch::irq::disable();
-        // SAFETY: IRQs are masked on the only core, so this is the sole reference.
-        let Kernel { sched, frames } = unsafe { &mut *KERNEL.0.get() };
-        let added = spawn_process(sched, frames, code, entry, Budget::new(budget));
-        arch::irq::restore(irq);
-        added
+        let segment = Segment {
+            vaddr: entry,
+            data: 0..code.len(),
+            size: code.len() as u64,
+            writable: false,
+        };
+        spawn_init((code, [segment].into_iter(), entry), budget)
+    }
+
+    fn spawn_archived(&mut self, name: &str, budget: usize) -> Result<(), i64> {
+        let file = kernel::cpio::find(ARCHIVE, name.as_bytes()).ok_or(ENOENT)?;
+        spawn_init(executable(file)?, budget)
     }
 
     fn tasks(&self) -> usize {
@@ -543,9 +622,28 @@ unsafe extern "C" fn board_syscall(frame: &mut arch::TrapFrame) -> usize {
     x[0] = match kernel::syscall::dispatch(x[8], x.first_chunk().unwrap(), sched.handles()) {
         // SAFETY: the caller masked IRQs, and `frame` is the current process's.
         Ok(Call::Exit) => return unsafe { task_exit(frame as *mut arch::TrapFrame as usize) },
-        Ok(Call::Write { ptr, len }) if write_user(ptr, len) => len as u64,
-        Ok(Call::Write { .. }) => EFAULT as u64,
+        Ok(Call::Write { ptr, len }) => match user_bytes(ptr, len) {
+            Some(bytes) => {
+                Uart::new(UART0).write(bytes);
+                len as u64
+            }
+            None => EFAULT as u64,
+        },
         Ok(Call::Map { pages }) => map(sched, frames, pages).unwrap_or(ENOMEM as u64),
+        Ok(Call::Open { ptr, len, rights }) => user_bytes(ptr, len)
+            .ok_or(EFAULT)
+            .and_then(|name| kernel::cpio::find(ARCHIVE, name).ok_or(ENOENT))
+            .and_then(|file| {
+                let (start, end) = (file.start, file.end);
+                sched.handles().insert(Object::File { start, end }, rights)
+            })
+            .unwrap_or_else(|error| error as u64),
+        Ok(Call::Spawn {
+            file,
+            ptr,
+            len,
+            budget,
+        }) => spawn(sched, frames, file, ptr, len, budget).unwrap_or_else(|error| error as u64),
         Ok(Call::Done(value)) => value,
         Err(error) => error as u64,
     };

@@ -139,6 +139,12 @@ impl Budget {
         self.used -= 1;
     }
 
+    /// Lowers the limit by `frames`, which moved to a child's budget; panics if fewer remain.
+    pub fn shrink(&mut self, frames: usize) {
+        assert!(frames <= self.remaining(), "budget overdrawn");
+        self.limit -= frames;
+    }
+
     pub fn remaining(&self) -> usize {
         self.limit - self.used
     }

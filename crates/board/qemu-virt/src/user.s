@@ -1,5 +1,5 @@
 // User programs, copied into process pages; position independent. x8 = syscall: 0 exit, 1 write, 2 dup, 3 close, 4 map.
-// Each starts with init's handles: 0 is the console, 1 the process itself.
+// Each starts with init's handles: 0 is the console, 1 the process itself, 2 the boot archive.
 .section .rodata.user, "a"
 .balign 4
 
@@ -186,6 +186,13 @@ user_handles_end:
 .balign 4
 .global user_budget, user_budget_end
 user_budget:
+    // map(0x10001), one byte over MAX_MAP, is EINVAL (-22).
+    movz x0, #1
+    movk x0, #1, lsl #16
+    mov x8, #4
+    svc #0
+    cmn x0, #22
+    b.ne 9f
     // map of the 16 frames left after the fixed 9 needs 17 with its level-3 table: ENOMEM, the 15 mapped pages undone.
     mov x0, #0x10000
     mov x8, #4

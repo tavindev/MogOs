@@ -38,6 +38,7 @@ const fn table_entry(addr: PhysAddr) -> u64 {
 }
 
 /// What EL0 may do with a user page; EL1 never executes one.
+#[derive(Clone, Copy)]
 pub enum UserAccess {
     ReadExecute,
     ReadWrite,

@@ -239,3 +239,30 @@ fn map_stops_at_budget_and_exit_returns_every_frame() {
     assert_eq!(after, format!("{before} after"), "frames leaked");
     assert!(status.success(), "QEMU exited with {status}");
 }
+
+#[test]
+fn spawn_moves_handles_and_budget_to_the_child() {
+    let (status, lines) = boot(&["-append", "test=spawn"]);
+    assert!(
+        !lines.iter().any(|l| l.starts_with("panic:")),
+        "kernel panicked"
+    );
+    let s: Vec<_> = lines
+        .iter()
+        .filter(|l| l.starts_with("S: ") || l.starts_with("C: "))
+        .collect();
+    // The parent never yields and the timer is off, so all its lines precede the child's.
+    assert_eq!(
+        s,
+        [
+            "S: open missing: ENOENT",
+            "S: spawn non-ELF: ENOEXEC",
+            "S: spawn over budget: ENOMEM",
+            "S: spawned child with the console",
+            "S: moved console: EBADF",
+            "C: hello through handle 0",
+            "C: handle 1 not given: EBADF",
+        ]
+    );
+    assert!(status.success(), "QEMU exited with {status}");
+}

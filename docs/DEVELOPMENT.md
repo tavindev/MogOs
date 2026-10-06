@@ -15,6 +15,9 @@
 | `jobs = 6` | `.cargo/config.toml` | Half of the 12 host cores so builds never take the whole CPU; rustc codegen threads share this jobserver. |
 | `link-arg=--threads=6` | `.cargo/config.toml` | `rust-lld` ignores cargo's jobserver and would otherwise use every core. |
 | `-T linker.ld` | `crates/board/qemu-virt/build.rs` | Kernel memory layout (load address, BSS, stack); binary only. |
+| nested `cargo build` of `crates/user` | `crates/board/qemu-virt/build.rs` | The boot archive must exist before the kernel compiles (`include_bytes!`); stable cargo has no artifact dependencies, and QEMU `-initrd` would need DTB parsing, frame reservation and a runner change. So the board's build script builds the user programs (release, stripped, own `target/user` dir so it does not wait on the outer build's lock, wrappers removed so `cargo clippy` does not invalidate them) and writes a newc cpio into `OUT_DIR`; `cargo build`/`run` stay one command. |
+| `crates/user` excluded from the workspace | root `Cargo.toml` | Its bins would make `cargo run` ambiguous and get built for the host by `test-host`. Lint and format it with `--manifest-path crates/user/Cargo.toml` (commands below). |
+| `-T link.ld`, `-zmax-page-size=4096` | `crates/user/build.rs` | User programs: one RX `PT_LOAD` (text, rodata) and one RW (data, bss), page-aligned from 4 GiB; lld's 64 KiB default page size padded each program to 64 KiB. |
 | load address `0x4020_0000` | `crates/board/qemu-virt/linker.ld` | QEMU only places its 1 MiB DTB at RAM base (`0x4000_0000`) if it fits below the ELF image. |
 | `test-host` alias | `.cargo/config.toml` | Runs tests for the host target, excluding the bare-metal-only `qemu-virt` and `arch`. A string, not an array, so a nested worktree's copy overrides it instead of concatenating. |
 | `bench-host` alias | `.cargo/config.toml` | Runs the host `benches/*.rs` targets (`--bench '*'`) for the same crates as `test-host`. |
@@ -37,6 +40,8 @@ Re-measure (`time cargo build`, median) before changing any of the above.
 cargo check            # type-check only, fastest
 cargo clippy           # lints; must be clean
 cargo fmt              # format (CI-style check: cargo fmt --check)
+cargo clippy --manifest-path crates/user/Cargo.toml --target-dir target/user  # user programs (outside the workspace)
+cargo fmt --manifest-path crates/user/Cargo.toml
 cargo build            # dev build
 cargo test-host        # host tests + QEMU boot e2e tests (crates/e2e); must pass
 cargo bench-host       # host benchmarks (min/median); see docs/BENCHMARKS.md
@@ -49,6 +54,7 @@ cargo run -- -append test=user       # EL0 process A writes A: 0..9 to its conso
 cargo run -- -append test=bench-syscall  # EL0 loop of no-op syscalls, prints the round trip in ns
 cargo run -- -append test=handles    # EL0 process writes via its console handle, then a no-write duplicate, a closed and a stale handle fail (H: lines)
 cargo run -- -append test=budget     # EL0 process maps pages until ENOMEM (M: lines), exits; free frames before/after its lifetime match
+cargo run -- -append test=spawn      # spawner (from the boot archive) spawns child with only the console (S: and C: lines)
 cargo run -- -s -S     # boot halted, gdbstub on localhost:1234; attach lldb/gdb
 cargo build --release  # LTO release image
 ```
@@ -58,7 +64,7 @@ Quit a hung QEMU with `Ctrl-A` then `X`.
 ## Rules for agents
 
 - Run `cargo fmt` before finishing.
-- `cargo clippy` must be clean (no warnings, no errors).
+- `cargo clippy` must be clean (no warnings, no errors), and so must `crates/user` (command above).
 - `cargo test-host` must pass, including the e2e boot test; extend `crates/e2e/tests/boot.rs` when boot output changes.
 - `cargo run` must still boot and print the hello line.
 - Do not raise the `jobs` or linker `--threads` caps.

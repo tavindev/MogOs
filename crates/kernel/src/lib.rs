@@ -2,6 +2,8 @@
 
 extern crate alloc;
 
+pub mod cpio;
+pub mod elf;
 pub mod handle;
 mod sched;
 pub mod syscall;
@@ -44,13 +46,15 @@ pub trait Board {
     fn init_frames(&mut self, frames: FrameAllocator<FRAME_WORDS>);
     fn free_frames(&self) -> usize;
     /// Queues `program` as a process at EL0 in its own address space, with a budget of `budget` frames that pays for
-    /// its tables, pages and kernel stack, and init's handles (`Handles::init`) until spawn passes handles (step 14).
-    fn spawn_user(&mut self, program: Program, budget: usize) -> Result<(), Full>;
+    /// its tables, pages and kernel stack, and init's handles (`Handles::init`); `ENOMEM` or `EAGAIN` (no free slot).
+    fn spawn_user(&mut self, program: Program, budget: usize) -> Result<(), i64>;
+    /// As `spawn_user`, for the boot archive's executable `name`; `ENOENT` or `ENOEXEC` if it is missing or invalid.
+    fn spawn_archived(&mut self, name: &str, budget: usize) -> Result<(), i64>;
     /// Tasks in the run queue, the boot context included.
     fn tasks(&self) -> usize;
 }
 
-/// User programs the board provides until the boot archive (step 14).
+/// Hand-written asm user programs the board provides; newer ones are ELF files in the boot archive.
 pub enum Program {
     /// Checks that `write` rejects bad pointers, prints `A: 0`..`A: 9` with a spin after each, exits.
     Counter,
@@ -75,7 +79,7 @@ const BENCH_YIELDS: u64 = 100_000;
 pub const FRAME_WORDS: usize = 512;
 /// 1 MiB kernel heap.
 const HEAP_FRAMES: usize = 256;
-/// Each boot-spawned process's budget in frames, until spawn moves budget from parent to child (step 14).
+/// Each boot-spawned process's budget in frames; a process moves part of its own to each child it spawns.
 const BOOT_BUDGET: usize = 25;
 
 /// `reserved` lists physical ranges in use (kernel image, DTB).
@@ -124,6 +128,10 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
             "test=user" => user_demo(board),
             "test=bench-syscall" => run_alone(board, Program::SyscallBench),
             "test=handles" => run_alone(board, Program::Handles),
+            "test=spawn" => {
+                board.spawn_archived("spawner", BOOT_BUDGET).expect("spawn");
+                wait(board);
+            }
             "test=budget" => {
                 let before = board.free_frames();
                 run_alone(board, Program::Budget);
@@ -207,6 +215,11 @@ fn user_demo<B: Board>(board: &mut B) {
 /// Runs `program` until it exits; the timer stays off so nothing preempts it.
 fn run_alone<B: Board>(board: &mut B, program: Program) {
     board.spawn_user(program, BOOT_BUDGET).expect("spawn");
+    wait(board);
+}
+
+/// Yields until every other task has exited.
+fn wait<B: Board>(board: &mut B) {
     while board.tasks() > 1 {
         board.yield_now();
     }

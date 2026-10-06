@@ -54,12 +54,17 @@ impl<const N: usize> Scheduler<N> {
         memory: Memory,
         handles: impl FnOnce(usize) -> Handles,
     ) -> Result<(), Full> {
-        let slot = 1 + self.tasks[1..].iter().position(|t| t.0 == 0).ok_or(Full)?;
+        let slot = self.free_slot().ok_or(Full)?;
         self.tasks[slot] = (frame, space);
         self.memory[slot] = memory;
         self.handles[slot] = handles(slot);
         self.end = self.end.max(slot + 1);
         Ok(())
+    }
+
+    /// The slot the next `add` takes, if any is free.
+    pub fn free_slot(&self) -> Option<usize> {
+        Some(1 + self.tasks[1..].iter().position(|t| t.0 == 0)?)
     }
 
     /// Saves the current task's `frame` and returns the next task's.

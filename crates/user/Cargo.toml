@@ -1,0 +1,11 @@
+# User programs, built for the kernel's target by the board's build.rs and bundled into its boot archive.
+# Outside the workspace: its bins would break `cargo run` and host tests.
+[package]
+name = "user"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[profile.release]
+opt-level = "s"
+strip = true

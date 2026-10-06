@@ -8,6 +8,8 @@ members = [
     "crates/mm",
     "crates/board/*",
 ]
+# Built by the board's build.rs for the kernel target.
+exclude = ["crates/user"]
 
 [workspace.package]
 version = "0.1.0"

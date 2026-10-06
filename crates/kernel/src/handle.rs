@@ -26,6 +26,13 @@ pub enum Object {
     Console,
     /// The process in this scheduler slot.
     Process(usize),
+    /// The boot archive, a directory.
+    Archive,
+    /// A file in the boot archive, its data at these byte offsets.
+    File {
+        start: usize,
+        end: usize,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -36,11 +43,13 @@ impl Handles {
         Self([(0, None); MAX_HANDLES])
     }
 
-    /// init's handles: 0 is the console (write, duplicate), 1 is process `slot` itself (kill).
+    /// init's handles: 0 is the console (write, duplicate, transfer), 1 is process `slot` itself (kill), 2 is the
+    /// boot archive (read, exec).
     pub fn init(slot: usize) -> Self {
         let mut handles = Self::new();
-        handles.0[0].1 = Some((Object::Console, WRITE | DUPLICATE));
+        handles.0[0].1 = Some((Object::Console, WRITE | DUPLICATE | TRANSFER));
         handles.0[1].1 = Some((Object::Process(slot), KILL));
+        handles.0[2].1 = Some((Object::Archive, READ | EXEC));
         handles
     }
 
@@ -59,6 +68,11 @@ impl Handles {
         if held & DUPLICATE == 0 || rights & !held != 0 {
             return Err(EACCES);
         }
+        self.insert(object, rights)
+    }
+
+    /// A new handle to `object` with `rights`.
+    pub fn insert(&mut self, object: Object, rights: Rights) -> Result<u64, i64> {
         let index = self
             .0
             .iter()
@@ -66,6 +80,21 @@ impl Handles {
             .ok_or(EMFILE)?;
         self.0[index].1 = Some((object, rights));
         Ok((self.0[index].0 as u64) << 32 | index as u64)
+    }
+
+    /// Moves the handles in `list` (each needs the transfer right) out of a copy of this table into a new table, at
+    /// values 0, 1, ... in order; returns both, so a caller that fails later keeps this table unchanged.
+    pub fn split(&self, list: &[u64]) -> Result<(Self, Self), i64> {
+        let (mut rest, mut moved) = (*self, Self::new());
+        for &handle in list {
+            let (object, rights) = rest.entry(handle)?;
+            if rights & TRANSFER == 0 {
+                return Err(EACCES);
+            }
+            rest.close(handle)?;
+            moved.insert(object, rights)?;
+        }
+        Ok((rest, moved))
     }
 
     pub fn close(&mut self, handle: u64) -> Result<(), i64> {
