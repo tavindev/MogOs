@@ -51,6 +51,16 @@ pub fn close(handle: u64) -> i64 {
     syscall(3, [handle, 0, 0, 0])
 }
 
+/// `len` bytes of fresh zeroed memory, or `None` (`ENOMEM`, `EINVAL`).
+pub fn map(len: usize) -> Option<&'static mut [u8]> {
+    let addr = syscall(4, [len as u64, 0, 0, 0]);
+    if addr < 0 {
+        return None;
+    }
+    // SAFETY: the kernel mapped `len` zeroed read-write bytes at `addr` for this process alone and never unmaps them.
+    Some(unsafe { core::slice::from_raw_parts_mut(addr as *mut u8, len) })
+}
+
 pub fn open(dir: u64, name: &[u8], rights: u64) -> i64 {
     syscall(5, [dir, name.as_ptr() as u64, name.len() as u64, rights])
 }

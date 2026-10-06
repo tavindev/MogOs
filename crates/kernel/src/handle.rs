@@ -67,13 +67,13 @@ impl Handles {
         Ok(object)
     }
 
-    /// A new handle to `handle`'s object with `rights`, a subset of its own; needs the duplicate right.
-    pub fn dup(&mut self, handle: u64, rights: Rights) -> Result<u64, i64> {
+    /// A new handle to `handle`'s object with `rights`, a subset of its own, and the object; needs the duplicate right.
+    pub fn dup(&mut self, handle: u64, rights: Rights) -> Result<(u64, Object), i64> {
         let (object, held) = self.entry(handle)?;
         if held & DUPLICATE == 0 || rights & !held != 0 {
             return Err(EACCES);
         }
-        self.insert(object, rights)
+        Ok((self.insert(object, rights)?, object))
     }
 
     /// A new handle to `object` with `rights`.

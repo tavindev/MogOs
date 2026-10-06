@@ -292,7 +292,7 @@ fn parent_blocks_on_an_empty_pipe_until_the_child_writes() {
         .collect();
     // The timer is off, so the writer runs only because the reader blocked on the empty pipe, and the reader runs
     // again only once the writer exited. The second writer prints nothing (its handle 0 is a write end without write)
-    // and exits while the reader waits on a pipe whose only write end it holds: exit must wake the reader.
+    // and runs only because the reader's `wait` blocked on it. An 8 KiB write or read moves at most 4 KiB.
     assert_eq!(
         rw,
         [
@@ -305,11 +305,44 @@ fn parent_blocks_on_an_empty_pipe_until_the_child_writes() {
             "R: writer exited with 7",
             "R: budget returned: spawned writer again",
             "R: stale process handle: EBADF",
-            "R: EOF once the second writer exits",
             "R: second writer exited with 7",
+            "R: EOF after the second writer exited",
+            "R: 8 KiB write: 4096",
+            "R: 8 KiB read: 4096",
         ]
     );
     assert_no_leak(&lines, "pipe");
+    assert!(status.success(), "QEMU exited with {status}");
+}
+
+#[test]
+fn an_exited_child_keeps_its_slot_until_waited_for() {
+    let (status, lines) = boot(&["-append", "test=wait"]);
+    assert!(
+        !lines.iter().any(|l| l.starts_with("panic:")),
+        "kernel panicked"
+    );
+    let pc: Vec<_> = lines
+        .iter()
+        .filter(|l| l.starts_with("P: ") || l.starts_with("C: "))
+        .collect();
+    // A exits (waking the parent blocked on a pipe whose only write end A held) before B is spawned, so B would
+    // take A's slot if exit freed it. B runs only once the parent's `wait` on it blocks.
+    assert_eq!(
+        pc,
+        [
+            "P: spawned A",
+            "P: EOF once A exits",
+            "P: spawned B",
+            "P: A exited with 7",
+            "C: hello through handle 0",
+            "C: statics work",
+            "C: handle 1 not given: EBADF",
+            "P: B exited with 0",
+            "P: both budgets returned",
+        ]
+    );
+    assert_no_leak(&lines, "wait");
     assert!(status.success(), "QEMU exited with {status}");
 }
 

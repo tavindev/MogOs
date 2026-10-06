@@ -9,6 +9,7 @@ use crate::pipe::End;
 const EXIT: u64 = 0;
 /// `io_submit_wait(handle, op, ptr, len)`: submits I/O on `handle` and waits for it to complete; returns the bytes
 /// moved. `op` is `IO_READ` (into `ptr`, read right) or `IO_WRITE` (from `ptr`, write right). libc's `read` and `write`.
+/// A `len` over `MAX_BUFFER` moves at most `MAX_BUFFER` bytes (a short read or write).
 const IO: u64 = 1;
 /// `dup(handle, rights)`: returns a new handle to the same object with `rights`, a subset of `handle`'s (duplicate right).
 const DUP: u64 = 2;
@@ -27,11 +28,12 @@ const OPEN: u64 = 5;
 const SPAWN: u64 = 6;
 /// `pipe()`: returns a handle to a new pipe's read end (read, duplicate, transfer), and in `x1` one to its write end
 /// (write, duplicate, transfer). Its one-page buffer is charged to the caller's budget until the last handle to it
-/// closes. Reading it empty waits for data, or returns 0 once no write end is left; writing it full waits for room,
-/// or fails with `EPIPE` once no read end is left.
+/// closes. Reading it empty waits for data, or returns 0 once no write end is left; a write waits until all of it fits
+/// (so every write is atomic, as `MAX_BUFFER` is the buffer size), or fails with `EPIPE` once no read end is left.
 const PIPE: u64 = 7;
 /// `wait(process)`: waits for the process (wait right) to exit; returns its exit code (`KILLED` if a fault killed it)
-/// and moves what is left of its budget back to the caller. `EBADF` once a newer process took its slot.
+/// and moves what is left of its budget back to the caller. An exited process keeps its slot until waited for or its
+/// handle closes; after that, `EBADF` once a newer process took the slot.
 const WAIT: u64 = 8;
 
 /// The exit code `wait` reports for a process a fault killed: outside `exit`'s 0..=255.
@@ -55,7 +57,7 @@ pub const EAGAIN: i64 = -11;
 pub const ENOMEM: i64 = -12;
 /// The handle lacks a right the call needs.
 pub const EACCES: i64 = -13;
-/// Bad address: outside user space, unmapped, or longer than `MAX_BUFFER`.
+/// Bad address: outside user space, unmapped, or (except for `io_submit_wait`) longer than `MAX_BUFFER`.
 pub const EFAULT: i64 = -14;
 /// Invalid argument: a `map` of zero bytes or more than `MAX_MAP`, a `spawn` of more than `MAX_HANDLES` handles, an
 /// unknown I/O op.
@@ -74,6 +76,10 @@ const USER: Range<u64> = 1 << 32..1 << 39;
 /// Longest user buffer a syscall reads or writes (I/O data, `open` name, `spawn` handles), so its IRQs-masked work
 /// stays bounded.
 const MAX_BUFFER: u64 = 4096;
+const _: () = assert!(
+    MAX_BUFFER as usize <= crate::pipe::SIZE,
+    "a longer pipe write would never fit"
+);
 /// Longest `map` (16 pages), so its IRQs-masked zeroing stays bounded.
 const MAX_MAP: u64 = 16 * 4096;
 
@@ -118,6 +124,7 @@ pub fn dispatch(nr: u64, args: &[u64; 6], handles: &mut Handles) -> Result<Call,
                 _ => return Err(EINVAL),
             };
             let object = handles.get(handle, need)?;
+            let len = len.min(MAX_BUFFER);
             user_buffer(ptr, len)?;
             let len = len as usize;
             match object {
@@ -129,8 +136,7 @@ pub fn dispatch(nr: u64, args: &[u64; 6], handles: &mut Handles) -> Result<Call,
             }
         }
         DUP => {
-            let object = handles.get(args[0], 0)?;
-            let handle = handles.dup(args[0], args[1])?;
+            let (handle, object) = handles.dup(args[0], args[1])?;
             Ok(Call::Dup { handle, object })
         }
         CLOSE => handles.close(args[0]).map(Call::Close),

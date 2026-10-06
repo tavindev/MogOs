@@ -7,7 +7,7 @@ use user::*;
 
 /// init's boot-archive directory handle.
 const DIR: u64 = 2;
-/// The kernel's `PIPE_ROUND_TRIPS`.
+/// Must equal the kernel's `PIPE_ROUND_TRIPS`, which it divides the time by.
 const ROUND_TRIPS: usize = 100_000;
 /// `pong`'s 9 frames (3 tables, text, stack, 4 kernel stack).
 const PONG_BUDGET: usize = 9;

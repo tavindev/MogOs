@@ -180,16 +180,18 @@ unsafe fn block(
     unsafe { switch(sched, frame as *mut arch::TrapFrame as usize) }
 }
 
-/// Drops one handle to `object`: a pipe wakes its waiters and, once no handle reaches it, frees its page, refunding its
-/// creator if that still runs.
+/// Drops one handle to `object`: an exited process frees its slot; a pipe wakes its waiters and, once no handle reaches
+/// it, frees its page, refunding its creator if that still runs.
 fn release(
     sched: &mut Scheduler<MAX_TASKS>,
     frames: &mut FrameAllocator<FRAME_WORDS>,
     pipes: &mut Pipes<MAX_PIPES>,
     object: Object,
 ) {
-    let Object::Pipe(end) = object else {
-        return;
+    let end = match object {
+        Object::Pipe(end) => end,
+        Object::Process { slot, generation } => return sched.close(slot, generation),
+        _ => return,
     };
     if let Some((page, (slot, generation))) = pipes.close(end) {
         match sched.budget(slot, generation) {
@@ -314,14 +316,13 @@ unsafe fn enter(sched: &Scheduler<MAX_TASKS>, frame: usize, next: usize) {
 }
 
 /// Builds a process from `file`'s `segments` (entered at `entry`): address space, pages and kernel stack, all charged
-/// to `budget`, and queues it with `handles(slot)`; on failure (`ENOMEM`, or `EAGAIN` with no free slot) returns every
-/// frame it took.
+/// to `budget`, and queues it in the free `slot` with `handles`; on failure (`ENOMEM`) returns every frame it took.
 fn spawn_process(
     sched: &mut Scheduler<MAX_TASKS>,
     frames: &mut FrameAllocator<FRAME_WORDS>,
     (file, segments, entry): (&[u8], impl Iterator<Item = Segment>, u64),
     mut budget: Budget,
-    handles: impl FnOnce(usize, u64) -> Handles,
+    (slot, handles): ((usize, u64), Handles),
 ) -> Result<(), i64> {
     let l1 = zeroed(frames, &mut budget).ok_or(ENOMEM)?;
     // SAFETY: `l1` is a fresh, zeroed frame.
@@ -349,25 +350,20 @@ fn spawn_process(
         map_zeroed(frames, &mut budget, l1, stack_page, UserAccess::ReadWrite)?;
         budget.alloc_contiguous(frames, TASK_STACK_FRAMES)
     })();
-    let added = stack.ok_or(ENOMEM).and_then(|stack| {
-        // SAFETY: the kernel stack below `stack.end` is fresh and owned by the new process.
-        let frame = unsafe { arch::new_user_task(stack.end.0 as usize, entry, USER_STACK_TOP) };
-        let memory = Memory {
-            stack: stack.start,
-            budget,
-            next: MAP_BASE,
-        };
-        let added = sched.add(frame, l1, memory, handles).map_err(|Full| EAGAIN);
-        if added.is_err() {
-            free_stack(frames, stack.start);
-        }
-        added
-    });
-    if added.is_err() {
+    let Some(stack) = stack else {
         // SAFETY: no TTBR0 ever used `l1`, and its tables hold only frames taken above.
         unsafe { arch::free_space(l1, |f| frames.free(f)) };
-    }
-    added
+        return Err(ENOMEM);
+    };
+    // SAFETY: the kernel stack below `stack.end` is fresh and owned by the new process.
+    let frame = unsafe { arch::new_user_task(stack.end.0 as usize, entry, USER_STACK_TOP) };
+    let memory = Memory {
+        stack: stack.start,
+        budget,
+        next: MAP_BASE,
+    };
+    sched.add(slot, frame, l1, memory, handles);
+    Ok(())
 }
 
 /// The boot archive's executable at `file` (byte offsets), checked, as `spawn_process` takes it.
@@ -388,13 +384,10 @@ fn spawn_init(
     let irq = arch::irq::disable();
     // SAFETY: IRQs are masked on the only core, so this is the sole reference.
     let Kernel { sched, frames, .. } = unsafe { &mut *KERNEL.0.get() };
-    let added = spawn_process(
-        sched,
-        frames,
-        executable,
-        Budget::new(budget),
-        Handles::init,
-    );
+    let added = sched.free_slot().ok_or(EAGAIN).and_then(|slot| {
+        let init = (slot, Handles::init(slot.0, slot.1));
+        spawn_process(sched, frames, executable, Budget::new(budget), init)
+    });
     arch::irq::restore(irq);
     added
 }
@@ -421,7 +414,8 @@ fn spawn(
     }
     let (slot, generation) = sched.free_slot().ok_or(EAGAIN)?;
     let process = parent.insert(Object::Process { slot, generation }, WAIT | KILL)?;
-    spawn_process(sched, frames, executable, Budget::new(budget), |_, _| child)?;
+    let child = ((slot, generation), child);
+    spawn_process(sched, frames, executable, Budget::new(budget), child)?;
     sched.memory().budget.shrink(budget);
     *sched.handles() = parent;
     Ok(process)
@@ -596,26 +590,21 @@ impl kernel::Board for QemuVirt {
         let irq = arch::irq::disable();
         // SAFETY: IRQs are masked on the only core, so this is the sole reference.
         let Kernel { sched, frames, .. } = unsafe { &mut *KERNEL.0.get() };
-        let added = frames
-            .alloc_contiguous(TASK_STACK_FRAMES)
-            .ok_or(Full)
-            .and_then(|stack| {
-                let start = (stack.end.0 as usize - size_of::<Start>()) & !15;
-                // SAFETY: `start` is 16-byte aligned and inside the fresh stack, which nothing else references.
-                unsafe { (start as *mut Start).write(Start { board, entry, arg }) };
-                // SAFETY: `start` is 16-byte aligned and the stack below it is fresh and owned by the new task.
-                let frame = unsafe { arch::new_task(start, task_start, start) };
-                let memory = Memory {
-                    stack: stack.start,
-                    budget: Budget::new(0),
-                    next: 0,
-                };
-                let added = sched.add(frame, PhysAddr(0), memory, |_, _| Handles::new());
-                if added.is_err() {
-                    free_stack(frames, stack.start);
-                }
-                added
-            });
+        let added = sched.free_slot().ok_or(Full).and_then(|slot| {
+            let stack = frames.alloc_contiguous(TASK_STACK_FRAMES).ok_or(Full)?;
+            let start = (stack.end.0 as usize - size_of::<Start>()) & !15;
+            // SAFETY: `start` is 16-byte aligned and inside the fresh stack, which nothing else references.
+            unsafe { (start as *mut Start).write(Start { board, entry, arg }) };
+            // SAFETY: `start` is 16-byte aligned and the stack below it is fresh and owned by the new task.
+            let frame = unsafe { arch::new_task(start, task_start, start) };
+            let memory = Memory {
+                stack: stack.start,
+                budget: Budget::new(0),
+                next: 0,
+            };
+            sched.add(slot, frame, PhysAddr(0), memory, Handles::new());
+            Ok(())
+        });
         arch::irq::restore(irq);
         added
     }

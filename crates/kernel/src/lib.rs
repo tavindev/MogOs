@@ -78,7 +78,7 @@ pub enum Program {
 
 /// Round trips timed by `test=bench`.
 const BENCH_YIELDS: u64 = 100_000;
-/// Round trips the boot archive's `ping` makes with `pong` under `test=bench-pipe`.
+/// Round trips the boot archive's `ping` makes with `pong` under `test=bench-pipe`; must equal its `ROUND_TRIPS`.
 const PIPE_ROUND_TRIPS: u64 = 100_000;
 
 /// Bitmap capacity in 64-frame words: 512 words cover 128 MiB.
@@ -87,6 +87,8 @@ pub const FRAME_WORDS: usize = 512;
 const HEAP_FRAMES: usize = 256;
 /// Each boot-spawned process's budget in frames; a process moves part of its own to each child it spawns.
 const BOOT_BUDGET: usize = 25;
+/// `waiter`'s 9 frames and its two children's 9 and 10 at once.
+const WAITER_BUDGET: usize = 28;
 
 /// `reserved` lists physical ranges in use (kernel image, DTB).
 pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> ! {
@@ -134,8 +136,9 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
             "test=user" => user_demo(board),
             "test=bench-syscall" => run_alone(board, Program::SyscallBench),
             "test=handles" => run_alone(board, Program::Handles),
-            "test=spawn" => run_archived(board, "spawn", "spawner"),
-            "test=pipe" => run_archived(board, "pipe", "reader"),
+            "test=spawn" => run_archived(board, "spawn", "spawner", BOOT_BUDGET),
+            "test=pipe" => run_archived(board, "pipe", "reader", BOOT_BUDGET),
+            "test=wait" => run_archived(board, "wait", "waiter", WAITER_BUDGET),
             "test=bench-pipe" => pipe_bench(board),
             "test=budget" => {
                 let before = board.free_frames();
@@ -217,11 +220,11 @@ fn user_demo<B: Board>(board: &mut B) {
     }
 }
 
-/// Runs the boot archive's `program` until every task has exited; prints the free frames before and after as
-/// `<test>: free frames <n> before, <n> after`. The timer stays off.
-fn run_archived<B: Board>(board: &mut B, test: &str, program: &str) {
+/// Runs the boot archive's `program` with `budget` frames until every task has exited; prints the free frames before
+/// and after as `<test>: free frames <n> before, <n> after`. The timer stays off.
+fn run_archived<B: Board>(board: &mut B, test: &str, program: &str, budget: usize) {
     let before = board.free_frames();
-    board.spawn_archived(program, BOOT_BUDGET).expect("spawn");
+    board.spawn_archived(program, budget).expect("spawn");
     wait(board);
     let after = board.free_frames();
     let _ = writeln!(

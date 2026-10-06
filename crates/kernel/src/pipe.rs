@@ -124,16 +124,19 @@ impl Pipe {
         Some(n as i64)
     }
 
-    /// Moves as much of `data` as fits into the buffer in `page`; returns the count, `EPIPE` once no read end is
-    /// left, or `None` while it is full.
+    /// Moves all of `data` (at most `SIZE` bytes) into the buffer in `page`, never part of it; returns the count,
+    /// `EPIPE` once no read end is left, or `None` until it fits. Empty `data` returns 0, as on Linux.
     pub fn write(&mut self, page: &mut [u8; SIZE], data: &[u8]) -> Option<i64> {
+        if data.is_empty() {
+            return Some(0);
+        }
         if self.readers == 0 {
             return Some(EPIPE);
         }
-        if self.len == SIZE && !data.is_empty() {
+        if SIZE - self.len < data.len() {
             return None;
         }
-        let n = data.len().min(SIZE - self.len);
+        let n = data.len();
         let tail = (self.head + self.len) % SIZE;
         let first = n.min(SIZE - tail);
         page[tail..tail + first].copy_from_slice(&data[..first]);

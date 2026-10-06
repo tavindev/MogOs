@@ -1,6 +1,6 @@
 use mm::{Budget, PhysAddr};
 
-use crate::handle::Handles;
+use crate::handle::{Handles, Object};
 use crate::syscall::EBADF;
 
 /// No room for the task: the run queue is full or its memory could not be allocated.
@@ -39,6 +39,8 @@ enum State {
     Blocked(Event),
     /// A free slot; the task that last ran in it exited with this code.
     Exited(u64),
+    /// Exited with this code, its slot kept until its parent `reap`s it or closes its process handle.
+    Zombie(u64),
 }
 
 /// Round-robin run queue of up to `N` tasks, each known by its saved trap frame address and address space
@@ -74,23 +76,22 @@ impl<const N: usize> Scheduler<N> {
         }
     }
 
-    /// Queues a new task whose first frame is at `frame` in address space `space`, with `memory`, and
-    /// `handles(slot, generation)` as its handles.
+    /// Queues a new task in `slot` with `generation` (from `free_slot`), its first frame at `frame` in address space
+    /// `space`, with `memory` and `handles`.
     pub fn add(
         &mut self,
+        (slot, generation): (usize, u64),
         frame: usize,
         space: PhysAddr,
         memory: Memory,
-        handles: impl FnOnce(usize, u64) -> Handles,
-    ) -> Result<(), Full> {
-        let (slot, generation) = self.free_slot().ok_or(Full)?;
+        handles: Handles,
+    ) {
         self.tasks[slot] = (frame, space);
         self.state[slot] = State::Ready;
         self.generation[slot] = generation;
         self.memory[slot] = memory;
-        self.handles[slot] = handles(slot, generation);
+        self.handles[slot] = handles;
         self.end = self.end.max(slot + 1);
-        Ok(())
     }
 
     /// The slot the next `add` takes, if any is free, and the generation it gives the task there.
@@ -122,32 +123,53 @@ impl<const N: usize> Scheduler<N> {
 
     /// Ends the current task (never slot 0) with `code` and wakes its waiters; returns the next task's frame and the
     /// ended task's kernel stack, which the caller frees with its other frames. The caller first takes and releases
-    /// its handles; its budget stays for `reap`.
+    /// its handles; its budget stays for `reap`, and while another task holds a handle to it, so does its slot.
     pub fn exit(&mut self, code: u64) -> (usize, PhysAddr) {
         assert!(self.current != 0, "the boot context cannot exit");
-        self.state[self.current] = State::Exited(code);
+        let process = Object::Process {
+            slot: self.current,
+            generation: self.generation[self.current],
+        };
+        let held = self.handles[..self.end]
+            .iter()
+            .any(|h| h.objects().any(|o| o == process));
+        self.state[self.current] = match held {
+            true => State::Zombie(code),
+            false => State::Exited(code),
+        };
         self.wake(Event::Exit(self.current));
         let stack = self.memory[self.current].stack;
         (self.advance(), stack)
     }
 
     /// For the process in `slot` with `generation`: `None` while it runs; once it exited, its code and its budget's
-    /// limit, which only the first call gets (later ones get 0); `EBADF` once a newer task took the slot.
+    /// limit, which only the first call gets (later ones get 0), and its slot is freed; `EBADF` once a newer task took
+    /// the slot.
     pub fn reap(&mut self, slot: usize, generation: u64) -> Result<Option<(u64, usize)>, i64> {
         if self.generation[slot] != generation {
             return Err(EBADF);
         }
-        let State::Exited(code) = self.state[slot] else {
+        let (State::Exited(code) | State::Zombie(code)) = self.state[slot] else {
             return Ok(None);
         };
+        self.state[slot] = State::Exited(code);
         let budget = core::mem::replace(&mut self.memory[slot].budget, Budget::new(0));
         Ok(Some((code, budget.limit())))
     }
 
+    /// A handle to the process in `slot` with `generation` was closed: frees its slot if it exited.
+    pub fn close(&mut self, slot: usize, generation: u64) {
+        if let State::Zombie(code) = self.state[slot]
+            && self.generation[slot] == generation
+        {
+            self.state[slot] = State::Exited(code);
+        }
+    }
+
     /// The budget of the process in `slot` with `generation`, unless it exited.
     pub fn budget(&mut self, slot: usize, generation: u64) -> Option<&mut Budget> {
-        let live =
-            self.generation[slot] == generation && !matches!(self.state[slot], State::Exited(_));
+        let live = self.generation[slot] == generation
+            && matches!(self.state[slot], State::Ready | State::Blocked(_));
         live.then_some(&mut self.memory[slot].budget)
     }
 
@@ -173,8 +195,8 @@ impl<const N: usize> Scheduler<N> {
 
     /// Tasks in the queue, the boot context included.
     pub fn count(&self) -> usize {
-        let exited = |s: &&State| matches!(s, State::Exited(_));
-        self.end - self.state[..self.end].iter().filter(exited).count()
+        let queued = |s: &&State| matches!(s, State::Ready | State::Blocked(_));
+        self.state[..self.end].iter().filter(queued).count()
     }
 
     /// Moves to the next ready task after the current one (itself last); with none ready, to the boot context.
