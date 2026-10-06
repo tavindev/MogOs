@@ -18,8 +18,9 @@ use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use arch::{MemoryType, UserAccess, l1_block, user_page};
 use dtb::Dtb;
 use kernel::elf::{Elf, Segment};
-use kernel::handle::{Handles, KILL, MAX_HANDLES, Object, WAIT};
-use kernel::syscall::{Call, EAGAIN, EFAULT, ENOENT, ENOEXEC, ENOMEM, KILLED};
+use kernel::handle::{DUPLICATE, Handles, KILL, MAX_HANDLES, Object, READ, TRANSFER, WAIT, WRITE};
+use kernel::pipe::{self, End, Pipes};
+use kernel::syscall::{Call, EAGAIN, EBADF, EFAULT, ENFILE, ENOENT, ENOEXEC, ENOMEM, KILLED};
 use kernel::{Event, FRAME_WORDS, Full, Memory, Program, Scheduler};
 use linked_list_allocator::Heap;
 use mm::{Budget, FrameAllocator, PhysAddr};
@@ -60,6 +61,7 @@ const MAX_TASKS: usize = 8;
 const _: () = assert!(MAX_TASKS <= 256);
 /// Kernel stack per task: 16 KiB.
 const TASK_STACK_FRAMES: usize = 4;
+const MAX_PIPES: usize = 16;
 
 #[global_allocator]
 static HEAP: KernelHeap = KernelHeap(UnsafeCell::new(Heap::empty()));
@@ -93,15 +95,17 @@ unsafe impl GlobalAlloc for KernelHeap {
     }
 }
 
-/// Task contexts and free frames; touched only with IRQs masked on the only core.
+/// Task contexts, free frames and pipes; touched only with IRQs masked on the only core.
 static KERNEL: Global = Global(UnsafeCell::new(Kernel {
     sched: Scheduler::new(),
     frames: FrameAllocator::empty(),
+    pipes: Pipes::new(),
 }));
 
 struct Kernel {
     sched: Scheduler<MAX_TASKS>,
     frames: FrameAllocator<FRAME_WORDS>,
+    pipes: Pipes<MAX_PIPES>,
 }
 
 struct Global(UnsafeCell<Kernel>);
@@ -139,7 +143,15 @@ unsafe fn switch(sched: &mut Scheduler<MAX_TASKS>, frame: usize) -> usize {
 /// IRQs must be masked (trap context), the current task must be a process, and `frame` its trap frame.
 unsafe fn task_exit(frame: usize, code: u64) -> usize {
     // SAFETY: the caller masked IRQs on the only core, so this is the sole reference.
-    let Kernel { sched, frames } = unsafe { &mut *KERNEL.0.get() };
+    let Kernel {
+        sched,
+        frames,
+        pipes,
+    } = unsafe { &mut *KERNEL.0.get() };
+    // Before `exit` picks the next task, so a reader this wakes (end of file) can be it.
+    for object in core::mem::take(sched.handles()).objects() {
+        release(sched, frames, pipes, object);
+    }
     let (asid, l1) = sched.current();
     let (next, stack) = sched.exit(code);
     // SAFETY: `frame` is the exiting process's trap frame and `next` came from the scheduler.
@@ -150,6 +162,75 @@ unsafe fn task_exit(frame: usize, code: u64) -> usize {
     unsafe { arch::free_space(l1, |f| frames.free(f)) };
     free_stack(frames, stack);
     next
+}
+
+/// Blocks the current process on `event` with its `svc` rewound, so the call runs again once woken; returns the next
+/// task's frame.
+///
+/// # Safety
+/// IRQs must be masked (trap context), and `frame` the current process's.
+unsafe fn block(
+    sched: &mut Scheduler<MAX_TASKS>,
+    frame: &mut arch::TrapFrame,
+    event: Event,
+) -> usize {
+    frame.restart();
+    sched.block(event);
+    // SAFETY: the caller masked IRQs, and `frame` is the current process's.
+    unsafe { switch(sched, frame as *mut arch::TrapFrame as usize) }
+}
+
+/// Drops one handle to `object`: a pipe wakes its waiters and, once no handle reaches it, frees its page, refunding its
+/// creator if that still runs.
+fn release(
+    sched: &mut Scheduler<MAX_TASKS>,
+    frames: &mut FrameAllocator<FRAME_WORDS>,
+    pipes: &mut Pipes<MAX_PIPES>,
+    object: Object,
+) {
+    let Object::Pipe(end) = object else {
+        return;
+    };
+    if let Some((page, (slot, generation))) = pipes.close(end) {
+        match sched.budget(slot, generation) {
+            Some(budget) => budget.free(frames, page),
+            None => frames.free(page),
+        }
+    }
+    sched.wake(Event::Pipe(end.index));
+}
+
+/// Creates a pipe whose page is charged to the current process, which gets a handle to each end (read, write).
+fn new_pipe(
+    sched: &mut Scheduler<MAX_TASKS>,
+    frames: &mut FrameAllocator<FRAME_WORDS>,
+    pipes: &mut Pipes<MAX_PIPES>,
+) -> Result<(u64, u64), i64> {
+    let read = pipes.free().ok_or(ENFILE)?;
+    let write = End {
+        write: true,
+        ..read
+    };
+    let mut handles = *sched.handles();
+    let read_handle = handles.insert(Object::Pipe(read), READ | DUPLICATE | TRANSFER)?;
+    let write_handle = handles.insert(Object::Pipe(write), WRITE | DUPLICATE | TRANSFER)?;
+    let page = sched.memory().budget.alloc(frames).ok_or(ENOMEM)?;
+    pipes.create(read, page, (sched.current().0, sched.generation()));
+    *sched.handles() = handles;
+    Ok((read_handle, write_handle))
+}
+
+/// Moves bytes between the user buffer at `ptr` and the pipe `end` reaches; `None` if the caller must wait.
+fn pipe_io(pipes: &mut Pipes<MAX_PIPES>, end: End, ptr: u64, len: usize) -> Option<i64> {
+    let Some(pipe) = pipes.get(end) else {
+        return Some(EBADF);
+    };
+    // SAFETY: an open pipe's page is identity-mapped RAM that only it uses, never mapped to user space.
+    let page = unsafe { &mut *(pipe.page.0 as *mut [u8; pipe::SIZE]) };
+    match end.write {
+        true => user_bytes(ptr, len).map_or(Some(EFAULT), |data| pipe.write(page, data)),
+        false => user_bytes_mut(ptr, len).map_or(Some(EFAULT), |out| pipe.read(page, out)),
+    }
 }
 
 fn free_stack(frames: &mut FrameAllocator<FRAME_WORDS>, stack: PhysAddr) {
@@ -306,7 +387,7 @@ fn spawn_init(
 ) -> Result<(), i64> {
     let irq = arch::irq::disable();
     // SAFETY: IRQs are masked on the only core, so this is the sole reference.
-    let Kernel { sched, frames } = unsafe { &mut *KERNEL.0.get() };
+    let Kernel { sched, frames, .. } = unsafe { &mut *KERNEL.0.get() };
     let added = spawn_process(
         sched,
         frames,
@@ -398,22 +479,36 @@ fn user_program(program: Program) -> (&'static [u8], u64) {
     (code, va)
 }
 
+/// Whether `allowed` holds for each page of the `len` bytes at `ptr`.
+fn user_pages(ptr: u64, len: usize, allowed: fn(u64) -> bool) -> bool {
+    let first_page = ptr & !(PAGE as u64 - 1);
+    (first_page..ptr + len as u64).step_by(PAGE).all(allowed)
+}
+
 /// The `len` bytes at user address `ptr` (in user space unless `len` is 0, checked by `dispatch`) if EL0 may read all
 /// of them; valid only until the trap returns.
 fn user_bytes<'a>(ptr: u64, len: usize) -> Option<&'a [u8]> {
     if len == 0 {
         return Some(&[]);
     }
-    let first_page = ptr & !(PAGE as u64 - 1);
-    if !(first_page..ptr + len as u64)
-        .step_by(PAGE)
-        .all(arch::user_readable)
-    {
+    if !user_pages(ptr, len, arch::user_readable) {
         return None;
     }
     // SAFETY: EL0 may read every page of the range, so it is mapped in the current address space, which
     // stays loaded and unchanged until the trap returns (IRQs masked, one core).
     Some(unsafe { slice::from_raw_parts(ptr as *const u8, len) })
+}
+
+/// As `user_bytes`, if EL0 may write all of them.
+fn user_bytes_mut<'a>(ptr: u64, len: usize) -> Option<&'a mut [u8]> {
+    if len == 0 {
+        return Some(&mut []);
+    }
+    if !user_pages(ptr, len, arch::user_writable) {
+        return None;
+    }
+    // SAFETY: as in `user_bytes`; the pages are user memory, which no kernel reference aliases.
+    Some(unsafe { slice::from_raw_parts_mut(ptr as *mut u8, len) })
 }
 
 /// What a new task's first frame hands to `task_start`; lives at the top of its stack.
@@ -500,7 +595,7 @@ impl kernel::Board for QemuVirt {
         let board = self.clone();
         let irq = arch::irq::disable();
         // SAFETY: IRQs are masked on the only core, so this is the sole reference.
-        let Kernel { sched, frames } = unsafe { &mut *KERNEL.0.get() };
+        let Kernel { sched, frames, .. } = unsafe { &mut *KERNEL.0.get() };
         let added = frames
             .alloc_contiguous(TASK_STACK_FRAMES)
             .ok_or(Full)
@@ -638,7 +733,11 @@ unsafe extern "C" fn board_irq(frame: usize) -> usize {
 #[unsafe(no_mangle)]
 unsafe extern "C" fn board_syscall(frame: &mut arch::TrapFrame) -> usize {
     // SAFETY: the caller masked IRQs on the only core, so this is the sole reference.
-    let Kernel { sched, frames } = unsafe { &mut *KERNEL.0.get() };
+    let Kernel {
+        sched,
+        frames,
+        pipes,
+    } = unsafe { &mut *KERNEL.0.get() };
     let args = frame.x.first_chunk().unwrap();
     frame.x[0] = match kernel::syscall::dispatch(frame.x[8], args, sched.handles()) {
         Ok(Call::Exit(code)) => {
@@ -652,6 +751,44 @@ unsafe extern "C" fn board_syscall(frame: &mut arch::TrapFrame) -> usize {
             }
             None => EFAULT as u64,
         },
+        Ok(Call::Pipe { end, ptr, len }) => match pipe_io(pipes, end, ptr, len) {
+            Some(moved) => {
+                if moved > 0 {
+                    sched.wake(Event::Pipe(end.index));
+                }
+                moved as u64
+            }
+            // SAFETY: the caller masked IRQs, and `frame` is the current process's.
+            None => return unsafe { block(sched, frame, Event::Pipe(end.index)) },
+        },
+        Ok(Call::NewPipe) => match new_pipe(sched, frames, pipes) {
+            Ok((read, write)) => {
+                frame.x[1] = write;
+                read
+            }
+            Err(error) => error as u64,
+        },
+        Ok(Call::Wait { slot, generation }) => match sched.reap(slot, generation) {
+            Ok(Some((code, limit))) => {
+                // Pipes it created that are still open keep their page; a repeated `wait` gets a limit of 0.
+                let held = pipes.charged_to((slot, generation));
+                sched.memory().budget.grow(limit.saturating_sub(held));
+                code
+            }
+            // SAFETY: the caller masked IRQs, and `frame` is the current process's.
+            Ok(None) => return unsafe { block(sched, frame, Event::Exit(slot)) },
+            Err(error) => error as u64,
+        },
+        Ok(Call::Dup { handle, object }) => {
+            if let Object::Pipe(end) = object {
+                pipes.open(end);
+            }
+            handle
+        }
+        Ok(Call::Close(object)) => {
+            release(sched, frames, pipes, object);
+            0
+        }
         Ok(Call::Map { pages }) => map(sched, frames, pages).unwrap_or(ENOMEM as u64),
         Ok(Call::Open { ptr, len, rights }) => user_bytes(ptr, len)
             .ok_or(EFAULT)
@@ -667,7 +804,6 @@ unsafe extern "C" fn board_syscall(frame: &mut arch::TrapFrame) -> usize {
             len,
             budget,
         }) => spawn(sched, frames, file, ptr, len, budget).unwrap_or_else(|error| error as u64),
-        Ok(Call::Done(value)) => value,
         Err(error) => error as u64,
     };
     frame as *mut arch::TrapFrame as usize

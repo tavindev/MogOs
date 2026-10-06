@@ -2,6 +2,7 @@
 //! so a closed handle's value never reaches whatever reuses its entry. An entry is retired once its generation
 //! reaches 2^31, so handle values stay positive (never read as an error) and generations never wrap.
 
+use crate::pipe::End;
 use crate::syscall::{EACCES, EBADF, EMFILE};
 
 /// Handles per process.
@@ -36,6 +37,7 @@ pub enum Object {
         start: usize,
         end: usize,
     },
+    Pipe(End),
 }
 
 #[derive(Clone, Copy)]

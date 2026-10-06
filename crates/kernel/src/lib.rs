@@ -5,6 +5,7 @@ extern crate alloc;
 pub mod cpio;
 pub mod elf;
 pub mod handle;
+pub mod pipe;
 mod sched;
 pub mod syscall;
 
@@ -131,16 +132,8 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
             "test=user" => user_demo(board),
             "test=bench-syscall" => run_alone(board, Program::SyscallBench),
             "test=handles" => run_alone(board, Program::Handles),
-            "test=spawn" => {
-                let before = board.free_frames();
-                board.spawn_archived("spawner", BOOT_BUDGET).expect("spawn");
-                wait(board);
-                let after = board.free_frames();
-                let _ = writeln!(
-                    board.console(),
-                    "spawn: free frames {before} before, {after} after"
-                );
-            }
+            "test=spawn" => run_archived(board, "spawn", "spawner"),
+            "test=pipe" => run_archived(board, "pipe", "reader"),
             "test=budget" => {
                 let before = board.free_frames();
                 run_alone(board, Program::Budget);
@@ -219,6 +212,19 @@ fn user_demo<B: Board>(board: &mut B) {
     while board.tasks() > 1 {
         board.idle();
     }
+}
+
+/// Runs the boot archive's `program` until every task has exited; prints the free frames before and after as
+/// `<test>: free frames <n> before, <n> after`. The timer stays off.
+fn run_archived<B: Board>(board: &mut B, test: &str, program: &str) {
+    let before = board.free_frames();
+    board.spawn_archived(program, BOOT_BUDGET).expect("spawn");
+    wait(board);
+    let after = board.free_frames();
+    let _ = writeln!(
+        board.console(),
+        "{test}: free frames {before} before, {after} after"
+    );
 }
 
 /// Runs `program` until it exits; the timer stays off so nothing preempts it.

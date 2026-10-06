@@ -278,3 +278,35 @@ fn spawn_moves_handles_and_budget_to_the_child() {
     assert_no_leak(&lines, "spawn");
     assert!(status.success(), "QEMU exited with {status}");
 }
+
+#[test]
+fn parent_blocks_on_an_empty_pipe_until_the_child_writes() {
+    let (status, lines) = boot(&["-append", "test=pipe"]);
+    assert!(
+        !lines.iter().any(|l| l.starts_with("panic:")),
+        "kernel panicked"
+    );
+    let rw: Vec<_> = lines
+        .iter()
+        .filter(|l| l.starts_with("R: ") || l.starts_with("W: "))
+        .collect();
+    // The timer is off, so the writer runs only because the reader blocked on the empty pipe, and the reader runs
+    // again only once the writer exited.
+    assert_eq!(
+        rw,
+        [
+            "R: spawned writer",
+            "R: reading the empty pipe",
+            "W: writing to the pipe",
+            "W: exiting with 7",
+            "R: read: hello",
+            "R: EOF",
+            "R: writer exited with 7",
+            "R: budget returned: spawned writer again",
+            "R: stale process handle: EBADF",
+            "R: second writer exited with 7",
+        ]
+    );
+    assert_no_leak(&lines, "pipe");
+    assert!(status.success(), "QEMU exited with {status}");
+}

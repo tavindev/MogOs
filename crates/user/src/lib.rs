@@ -8,6 +8,7 @@ use core::panic::PanicInfo;
 pub const CONSOLE: u64 = 0;
 
 pub const WRITE: u64 = 1 << 1;
+pub const TRANSFER: u64 = 1 << 4;
 pub const EXEC: u64 = 1 << 5;
 
 pub const ENOENT: i64 = -2;
@@ -32,6 +33,11 @@ pub fn exit(code: u64) -> ! {
     }
 }
 
+/// `io_submit_wait(handle, IO_READ, ...)`: 0 at end of file.
+pub fn read(handle: u64, buf: &mut [u8]) -> i64 {
+    syscall(1, [handle, 0, buf.as_mut_ptr() as u64, buf.len() as u64])
+}
+
 /// `io_submit_wait(handle, IO_WRITE, ...)`.
 pub fn write(handle: u64, bytes: &[u8]) -> i64 {
     syscall(1, [handle, 1, bytes.as_ptr() as u64, bytes.len() as u64])
@@ -39,6 +45,10 @@ pub fn write(handle: u64, bytes: &[u8]) -> i64 {
 
 pub fn dup(handle: u64, rights: u64) -> i64 {
     syscall(2, [handle, rights, 0, 0])
+}
+
+pub fn close(handle: u64) -> i64 {
+    syscall(3, [handle, 0, 0, 0])
 }
 
 pub fn open(dir: u64, name: &[u8], rights: u64) -> i64 {
@@ -54,6 +64,21 @@ pub fn spawn(exe: u64, handles: &[u64], budget: usize) -> i64 {
         budget as u64,
     ];
     syscall(6, args)
+}
+
+/// Returns the read end (or an error) and the write end.
+pub fn pipe() -> (i64, u64) {
+    let (read, write);
+    // SAFETY: as in `syscall`; `pipe` writes only x0 and x1.
+    unsafe {
+        asm!("svc #0", lateout("x0") read, lateout("x1") write, in("x8") 7, options(nostack))
+    };
+    (read, write)
+}
+
+/// Blocks until `process` exits; returns its exit code.
+pub fn wait(process: u64) -> i64 {
+    syscall(8, [process, 0, 0, 0])
 }
 
 #[panic_handler]

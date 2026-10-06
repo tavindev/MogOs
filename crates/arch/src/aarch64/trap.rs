@@ -14,6 +14,13 @@ pub struct TrapFrame {
 
 const _: () = assert!(size_of::<TrapFrame>() == 288);
 
+impl TrapFrame {
+    /// Rewinds to the `svc` that trapped, so it runs again when this frame resumes.
+    pub fn restart(&mut self) {
+        self.elr -= 4;
+    }
+}
+
 // Each of the 16 entries saves x0/x1, puts its index in x1, and joins the common path.
 global_asm!(
     r#"

@@ -269,6 +269,23 @@ pub fn user_readable(va: u64) -> bool {
     par & 1 == 0
 }
 
+/// Whether EL0 may write `va` in the current address space.
+pub fn user_writable(va: u64) -> bool {
+    let par: u64;
+    // SAFETY: an address translation only writes PAR_EL1, which nothing else reads.
+    unsafe {
+        asm!(
+            "at s1e0w, {va}",
+            "isb",
+            "mrs {par}, par_el1",
+            va = in(reg) va,
+            par = out(reg) par,
+            options(nostack, preserves_flags),
+        )
+    };
+    par & 1 == 0
+}
+
 /// Makes instructions written to `start..start + len` visible to instruction fetch.
 ///
 /// # Safety

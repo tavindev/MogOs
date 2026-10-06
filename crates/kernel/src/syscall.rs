@@ -2,7 +2,8 @@
 
 use core::ops::Range;
 
-use crate::handle::{EXEC, Handles, MAX_HANDLES, Object, READ};
+use crate::handle::{EXEC, Handles, MAX_HANDLES, Object, READ, WRITE};
+use crate::pipe::End;
 
 /// `exit(code)`: ends the calling process; `wait` reports the low 8 bits of `code`.
 const EXIT: u64 = 0;
@@ -24,6 +25,14 @@ const OPEN: u64 = 5;
 /// it the `handles_len` handles at `handles_ptr` (transfer right; values 0, 1, ... in the child) and `budget` frames of
 /// the caller's budget; returns a handle to the process (wait, kill). On failure nothing moves.
 const SPAWN: u64 = 6;
+/// `pipe()`: returns a handle to a new pipe's read end (read, duplicate, transfer), and in `x1` one to its write end
+/// (write, duplicate, transfer). Its one-page buffer is charged to the caller's budget until the last handle to it
+/// closes. Reading it empty waits for data, or returns 0 once no write end is left; writing it full waits for room,
+/// or fails with `EPIPE` once no read end is left.
+const PIPE: u64 = 7;
+/// `wait(process)`: waits for the process (wait right) to exit; returns its exit code (`KILLED` if a fault killed it)
+/// and moves what is left of its budget back to the caller. `EBADF` once a newer process took its slot.
+const WAIT: u64 = 8;
 
 /// The exit code `wait` reports for a process a fault killed: outside `exit`'s 0..=255.
 pub const KILLED: u64 = 256;
@@ -51,8 +60,12 @@ pub const EFAULT: i64 = -14;
 /// Invalid argument: a `map` of zero bytes or more than `MAX_MAP`, a `spawn` of more than `MAX_HANDLES` handles, an
 /// unknown I/O op.
 const EINVAL: i64 = -22;
+/// The pipe table is full.
+pub const ENFILE: i64 = -23;
 /// The handle table is full.
 pub const EMFILE: i64 = -24;
+/// Writing a pipe with no read end left.
+pub const EPIPE: i64 = -32;
 /// No such syscall.
 const ENOSYS: i64 = -38;
 
@@ -69,6 +82,16 @@ pub enum Call {
     Exit(u64),
     /// Write to the console; `ptr..ptr + len` lies in `USER` unless empty, but may be unmapped.
     Write { ptr: u64, len: usize },
+    /// Read from (or, for a write end, write to) the pipe `end` reaches; `ptr..ptr + len` as for `Write`.
+    Pipe { end: End, ptr: u64, len: usize },
+    /// Create a pipe.
+    NewPipe,
+    /// Wait for the process in `slot` with `generation`.
+    Wait { slot: usize, generation: u64 },
+    /// `handle` is a new handle to `object`.
+    Dup { handle: u64, object: Object },
+    /// A handle to this object was closed.
+    Close(Object),
     /// Map this many pages into the caller's address space.
     Map { pages: usize },
     /// Open the boot archive's file whose name is at `ptr..ptr + len` (in `USER` unless empty, maybe unmapped) with `rights`.
@@ -80,8 +103,6 @@ pub enum Call {
         len: usize,
         budget: usize,
     },
-    /// Done; return this value.
-    Done(u64),
 }
 
 /// Runs syscall `nr` with arguments `args` (`x0`-`x5`) against the caller's `handles`, leaving the board the parts
@@ -93,7 +114,7 @@ pub fn dispatch(nr: u64, args: &[u64; 6], handles: &mut Handles) -> Result<Call,
             let (handle, op, ptr, len) = (args[0], args[1], args[2], args[3]);
             let need = match op {
                 IO_READ => READ,
-                IO_WRITE => crate::handle::WRITE,
+                IO_WRITE => WRITE,
                 _ => return Err(EINVAL),
             };
             let object = handles.get(handle, need)?;
@@ -101,11 +122,18 @@ pub fn dispatch(nr: u64, args: &[u64; 6], handles: &mut Handles) -> Result<Call,
             let len = len as usize;
             match object {
                 Object::Console if op == IO_WRITE => Ok(Call::Write { ptr, len }),
+                Object::Pipe(end) if end.write == (op == IO_WRITE) => {
+                    Ok(Call::Pipe { end, ptr, len })
+                }
                 _ => Err(EACCES),
             }
         }
-        DUP => Ok(Call::Done(handles.dup(args[0], args[1])?)),
-        CLOSE => handles.close(args[0]).map(|_| Call::Done(0)),
+        DUP => {
+            let object = handles.get(args[0], 0)?;
+            let handle = handles.dup(args[0], args[1])?;
+            Ok(Call::Dup { handle, object })
+        }
+        CLOSE => handles.close(args[0]).map(Call::Close),
         MAP => match args[0] {
             0 => Err(EINVAL),
             len if len > MAX_MAP => Err(EINVAL),
@@ -141,6 +169,11 @@ pub fn dispatch(nr: u64, args: &[u64; 6], handles: &mut Handles) -> Result<Call,
                 budget: budget as usize,
             })
         }
+        PIPE => Ok(Call::NewPipe),
+        WAIT => match handles.get(args[0], crate::handle::WAIT)? {
+            Object::Process { slot, generation } => Ok(Call::Wait { slot, generation }),
+            _ => Err(EACCES),
+        },
         _ => Err(ENOSYS),
     }
 }
