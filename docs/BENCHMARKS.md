@@ -7,7 +7,7 @@ Speed is a primary goal, so performance is tested like behavior: measured, recor
 | Kind | What | How | Use for |
 | --- | --- | --- | --- |
 | Host | Pure-logic crates (allocators, parsers, encodings) | `benches/*.rs` with `harness = false`, timed with `std::time::Instant`, run on macOS | Algorithmic cost of safe crates |
-| Kernel | Hot paths in the running kernel (exception entry, context switch, syscall, IPC, page fault, allocation) | Boot QEMU in bench mode, time with the ARM generic timer (`CNTVCT_EL0`), print results over the UART | Real kernel paths end to end |
+| Kernel | Hot paths in the running kernel (exception entry, context switch, syscall, pipe, page fault, allocation) | Boot QEMU in bench mode, time with the ARM generic timer (`CNTVCT_EL0`), print results over the UART | Real kernel paths end to end |
 
 - Kernel numbers under QEMU's default emulator (TCG) are only meaningful as relative comparisons between commits, not as absolute speed.
 - For realistic absolute numbers, run with Apple's hypervisor, which executes natively on the M-series CPU. The boot path works under `-accel hvf -cpu cortex-a72` (PSCI power-off, exceptions, MMU, fault report). `-cpu host` (and `max`) abort at startup on QEMU 9.2.1 with an M4 host (`Property 'host-arm-cpu.sme' not found`).
@@ -26,5 +26,5 @@ Speed is a primary goal, so performance is tested like behavior: measured, recor
 | Benchmark | Mode | Min | Median | Commit |
 | --- | --- | --- | --- | --- |
 | `mm` frames: alloc+free of 1000 frames, 128 MiB allocator (ns/op) | Host, M4 Pro | 4.6 | 5.2 | uncommitted |
-| Kernel boot, kmain to end of init (us) | QEMU TCG, dev build | 2820 | 3268 | uncommitted |
-| Kernel boot, kmain to end of init (us) | QEMU hvf (`-cpu cortex-a72`), dev build | 235 | 251 | uncommitted |
+| Kernel boot, kmain to end of init (us) | QEMU TCG, dev build | 2928 | 3140 | uncommitted |
+| Kernel boot, kmain to end of init (us) | QEMU hvf (`-cpu cortex-a72`), dev build | 171 | 190 | uncommitted |

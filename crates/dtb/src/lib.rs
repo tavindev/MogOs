@@ -26,9 +26,6 @@ pub struct Dtb<'a> {
 
 impl<'a> Dtb<'a> {
     pub fn new(blob: &'a [u8]) -> Option<Self> {
-        if total_size(blob)? > blob.len() {
-            return None;
-        }
         let structs = be32(blob, 8)? as usize;
         let strings = be32(blob, 12)? as usize;
         Some(Self {

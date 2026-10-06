@@ -9,16 +9,17 @@ Ordered by dependency: each phase builds on the previous one.
 | 3 | User space: isolated programs | [phase-3-user-space.md](phases/phase-3-user-space.md) | Not started |
 | 4 | I/O and storage | [phase-4-io-storage.md](phases/phase-4-io-storage.md) | Not started |
 
-Later: multicore (SMP), networking, graphics, power management, real hardware.
+Later: Linux binary-compatibility layer, multicore (SMP), networking, graphics, power management, real hardware.
 
 ## Ongoing in every phase
 
 - Host tests: pure-logic crates are `cargo test`-ed on macOS.
 - QEMU integration: `cargo run` boots, prints progress, and powers off.
 - Debugging: LLDB over QEMU's gdbstub; readable panic and fault dumps.
-- Benchmarks ([BENCHMARKS.md](BENCHMARKS.md)): each hot path gets one when it lands (phase 1: frame allocation, boot time; phase 2+: exception entry, context switch, syscall, IPC).
+- Benchmarks ([BENCHMARKS.md](BENCHMARKS.md)): each hot path gets one when it lands (phase 1: frame allocation, boot time; phase 2+: exception entry, context switch, syscall, pipe).
 
-## Open decisions (settle before phase 3)
+## Decisions
 
-- Monolithic vs microkernel vs hybrid (shapes IPC and syscalls).
-- Unix "everything is a file" vs capability handles.
+- Kernel architecture: monolithic, built from safe subsystem crates.
+- User-facing model: POSIX (file descriptors, `fork`/`exec`, signals, pipes) over a native syscall ABI, with a ported libc and a Rust `std` target.
+- Linux binary compatibility: optional translation layer after phase 4.

@@ -1,18 +1,20 @@
 use core::fmt;
 
-/// PL011 UART on QEMU `virt`. QEMU accepts writes to DR without initialization.
+use mm::PhysAddr;
+
+/// PL011 UART on QEMU `virt` (identity mapped). QEMU accepts writes to DR without initialization.
 pub struct Uart {
-    base: usize,
+    base: PhysAddr,
 }
 
 impl Uart {
-    pub const fn new(base: usize) -> Self {
+    pub const fn new(base: PhysAddr) -> Self {
         Self { base }
     }
 
     pub fn put(&mut self, byte: u8) {
         // SAFETY: `base` is the MMIO data register of a PL011 on this board.
-        unsafe { (self.base as *mut u32).write_volatile(byte as u32) }
+        unsafe { (self.base.0 as *mut u32).write_volatile(byte as u32) }
     }
 }
 

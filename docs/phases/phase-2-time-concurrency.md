@@ -14,4 +14,3 @@ Goal: the kernel runs several tasks and preempts them on a timer.
 ## Notes
 
 - The scheduler is a hot path: no heap allocation or dynamic dispatch on switch.
-- Decide monolithic vs microkernel before leaving this phase.

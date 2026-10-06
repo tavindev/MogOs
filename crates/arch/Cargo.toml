@@ -1,7 +1,11 @@
 [package]
-name = "aarch64"
+name = "arch"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mm = { path = "../mm" }
 
 # Architecture crate: allowed `unsafe` behind safe wrappers, no board addresses.
 [lints.rust]

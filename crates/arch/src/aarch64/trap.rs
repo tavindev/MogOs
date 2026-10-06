@@ -1,14 +1,11 @@
-#![no_std]
-
 use core::arch::{asm, global_asm};
-use core::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
 /// Registers saved on exception entry; the layout is fixed by the vector asm below.
 #[repr(C)]
-pub struct TrapFrame {
-    pub x: [u64; 31],
-    pub elr: u64,
-    pub spsr: u64,
+struct TrapFrame {
+    x: [u64; 31],
+    elr: u64,
+    spsr: u64,
     _pad: u64,
 }
 
@@ -101,8 +98,6 @@ const SOURCES: [&str; 4] = [
 const SYNC_CURRENT_SPX: u64 = 4;
 const EC_BRK64: u64 = 0x3c;
 
-static BREAKPOINT_HIT: AtomicBool = AtomicBool::new(false);
-
 /// Points `VBAR_EL1` at this crate's vector table.
 pub fn install_vectors() {
     // SAFETY: `aarch64_vectors` is a complete, 2 KiB aligned EL1 vector table.
@@ -117,12 +112,10 @@ pub fn install_vectors() {
     }
 }
 
-/// Executes `brk #0` and reports whether the handler caught and skipped it. Call after `install_vectors`.
-pub fn breakpoint_self_test() -> bool {
-    BREAKPOINT_HIT.store(false, Relaxed);
-    // SAFETY: the installed sync handler records the breakpoint and resumes after it.
-    unsafe { asm!("brk #0") };
-    BREAKPOINT_HIT.load(Relaxed)
+/// Executes `brk #0`, which the handler skips; returning proves it was caught. Call after `install_vectors`.
+pub fn breakpoint_self_test() {
+    // SAFETY: the installed sync handler skips `brk #0` and resumes after it.
+    unsafe { asm!("brk #0", clobber_abi("C")) };
 }
 
 #[unsafe(no_mangle)]
@@ -130,8 +123,7 @@ extern "C" fn aarch64_exception(frame: &mut TrapFrame, index: u64) {
     let esr: u64;
     // SAFETY: reading ESR_EL1 has no side effects.
     unsafe { asm!("mrs {}, esr_el1", out(reg) esr) };
-    if index == SYNC_CURRENT_SPX && (esr >> 26) & 0x3f == EC_BRK64 {
-        BREAKPOINT_HIT.store(true, Relaxed);
+    if index == SYNC_CURRENT_SPX && (esr >> 26) & 0x3f == EC_BRK64 && esr & 0xffff == 0 {
         frame.elr += 4;
         return;
     }
@@ -144,61 +136,4 @@ extern "C" fn aarch64_exception(frame: &mut TrapFrame, index: u64) {
         SOURCES[index as usize / 4],
         frame.elr
     );
-}
-
-#[repr(C, align(4096))]
-struct Table([u64; 512]);
-
-static mut L1: Table = Table([0; 512]);
-
-/// Loads `l1` as the level-1 table for TTBR0 (4 KiB granule, 39-bit VA, attributes per `mair`) and turns on the MMU and caches.
-///
-/// # Safety
-///
-/// Call once, before any atomic read-modify-write. The entries must map, at their current
-/// physical addresses, all code, data, stack and MMIO the program uses.
-pub unsafe fn enable_mmu(l1: &[u64], mair: u64) {
-    let table = &raw mut L1;
-    // SAFETY: single core with the MMU off; nothing else references L1.
-    unsafe { (&mut (*table).0)[..l1.len()].copy_from_slice(l1) };
-    let pa_range: u64;
-    // SAFETY: reading ID_AA64MMFR0_EL1 has no side effects.
-    unsafe { asm!("mrs {}, id_aa64mmfr0_el1", out(reg) pa_range) };
-    let tcr = 25 // T0SZ: 39-bit VA
-        | 0b01 << 8 | 0b01 << 10 | 0b11 << 12 // walks: write-back, inner shareable
-        | 1 << 23 // EPD1: no TTBR1 walks
-        | 0b10 << 30 // TG1 4 KiB, only to avoid the reserved encoding
-        | (pa_range & 0xf) << 32;
-    // SAFETY: the table is written and the caller guarantees it maps everything in use.
-    unsafe {
-        asm!(
-            "dsb ish",
-            "msr mair_el1, {mair}",
-            "msr tcr_el1, {tcr}",
-            "msr ttbr0_el1, {ttbr}",
-            "isb",
-            "tlbi vmalle1",
-            "dsb ish",
-            "isb",
-            "mrs {t}, sctlr_el1",
-            "orr {t}, {t}, {m_c_i}",
-            "msr sctlr_el1, {t}",
-            "isb",
-            mair = in(reg) mair,
-            tcr = in(reg) tcr,
-            ttbr = in(reg) &raw const L1,
-            m_c_i = in(reg) 1u64 << 0 | 1 << 2 | 1 << 12,
-            t = out(reg) _,
-        )
-    }
-}
-
-/// Microseconds since the virtual counter started.
-pub fn uptime_us() -> u64 {
-    let (ticks, freq): (u64, u64);
-    // SAFETY: reading the generic timer counter and frequency has no side effects; `isb` keeps the read in order.
-    unsafe {
-        asm!("isb", "mrs {}, cntvct_el0", "mrs {}, cntfrq_el0", out(reg) ticks, out(reg) freq)
-    };
-    (ticks as u128 * 1_000_000 / freq as u128) as u64
 }

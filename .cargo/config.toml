@@ -10,8 +10,8 @@ runner = "qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -nographic -kernel
 
 [alias]
 # Host tests, including the QEMU boot test in `crates/e2e`; arch/board crates only build for the bare-metal target.
-test-host = ["test", "--target", "aarch64-apple-darwin", "--workspace", "--exclude", "qemu-virt", "--exclude", "aarch64"]
+test-host = ["test", "--target", "aarch64-apple-darwin", "--workspace", "--exclude", "qemu-virt", "--exclude", "arch"]
 # Host benchmarks (`benches/*.rs`, harness = false) for the same crates.
-bench-host = ["bench", "--target", "aarch64-apple-darwin", "--workspace", "--exclude", "qemu-virt", "--exclude", "aarch64", "--bench", "*"]
+bench-host = ["bench", "--target", "aarch64-apple-darwin", "--workspace", "--exclude", "qemu-virt", "--exclude", "arch", "--bench", "*"]
 # Same as `cargo run`, but in a QEMU window that doesn't grab the mouse and stays open after power-off.
 window = ["run", "--config", "target.aarch64-unknown-none.runner='qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -device virtio-tablet-pci -display cocoa,show-cursor=on -serial vc -no-shutdown -kernel'"]

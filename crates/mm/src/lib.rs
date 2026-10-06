@@ -3,9 +3,9 @@
 use core::fmt;
 use core::ops::Range;
 
-pub const FRAME_SIZE: u64 = 4096;
+const FRAME_SIZE: u64 = 4096;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PhysAddr(pub u64);
 
 impl fmt::LowerHex for PhysAddr {
@@ -25,16 +25,13 @@ impl<const WORDS: usize> FrameAllocator<WORDS> {
     /// All whole frames in `ram` start free; frames past the capacity are ignored.
     pub fn new(ram: Range<PhysAddr>) -> Self {
         let base = ram.start.0.next_multiple_of(FRAME_SIZE);
-        let frames = (ram.end.0.saturating_sub(base) / FRAME_SIZE) as usize;
-        let mut allocator = Self {
-            base,
-            frames: frames.min(WORDS * 64),
-            used: [u64::MAX; WORDS],
-        };
-        for i in 0..allocator.frames {
-            allocator.used[i / 64] &= !(1 << (i % 64));
+        let frames = ((ram.end.0.saturating_sub(base) / FRAME_SIZE) as usize).min(WORDS * 64);
+        let mut used = [u64::MAX; WORDS];
+        used[..frames / 64].fill(0);
+        if !frames.is_multiple_of(64) {
+            used[frames / 64] = u64::MAX << (frames % 64);
         }
-        allocator
+        Self { base, frames, used }
     }
 
     /// Marks every frame overlapping `range` as in use.
@@ -90,27 +87,4 @@ impl<const WORDS: usize> FrameAllocator<WORDS> {
     pub fn free_count(&self) -> usize {
         self.used.iter().map(|w| w.count_zeros() as usize).sum()
     }
-}
-
-/// Memory type of a mapping; the value is its `MAIR_EL1` attribute index.
-#[derive(Clone, Copy)]
-pub enum MemoryType {
-    Device = 0,
-    Normal = 1,
-}
-
-/// `MAIR_EL1` matching `MemoryType`: Device-nGnRE, Normal write-back cacheable.
-pub const MAIR: u64 = 0x04 | 0xff << 8;
-
-/// Level-1 block descriptor (4 KiB granule) mapping the 1 GiB at `addr` for EL1 read/write.
-pub const fn l1_block(addr: PhysAddr, ty: MemoryType) -> u64 {
-    const VALID_BLOCK: u64 = 0b01;
-    const INNER_SHAREABLE: u64 = 0b11 << 8;
-    const ACCESS_FLAG: u64 = 1 << 10;
-    const PXN_UXN: u64 = 0b11 << 53;
-    let attrs = match ty {
-        MemoryType::Device => PXN_UXN,
-        MemoryType::Normal => INNER_SHAREABLE,
-    };
-    addr.0 & 0x0000_ffff_c000_0000 | attrs | ACCESS_FLAG | (ty as u64) << 2 | VALID_BLOCK
 }

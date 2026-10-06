@@ -106,5 +106,10 @@ fn unmapped_access_reports_data_abort() {
         .expect("missing ESR_EL1");
     let esr = u64::from_str_radix(esr, 16).unwrap();
     assert_eq!(esr >> 26, 0x25, "not a data abort from EL1: {fault}");
+    assert_eq!(
+        esr & 0x3f,
+        0b00_0101,
+        "not a level-1 translation fault: {fault}"
+    );
     assert!(status.success(), "QEMU exited with {status}");
 }

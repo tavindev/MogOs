@@ -1,6 +1,12 @@
 # MogOs
 
-A small operating system written in Rust. Goals, in priority order:** simple, fast, efficient**.
+A small operating system written in Rust. Goals, in priority order: **simple, fast, efficient**.
+
+## Core decisions
+
+- Monolithic kernel built from safe subsystem crates (`forbid(unsafe_code)`); `unsafe` only in `arch` and `board`.
+- POSIX-compatible at the source level: native MogOs syscall ABI, a ported libc (relibc or musl) and a Rust `std` target. Programs are recompiled for `aarch64-unknown-mogos`.
+- Optional Linux binary-compatibility layer later, translating Linux syscalls to native ones; it must never shape kernel internals.
 
 ## Docs (memory tree)
 
@@ -38,11 +44,11 @@ Every new `.md` file must be linked from its parent so it stays reachable from t
 ## Layout
 
 - `crates/kernel` — OS logic, `#![no_std]`, **no `unsafe`** (`forbid`). Defines ports (traits) like `Board`.
-- `crates/mm` — `PhysAddr`, bitmap 4 KiB frame allocator, level-1 block descriptor and `MAIR` encoding. Safe, host-tested; `benches/frames.rs`.
-- `crates/dtb` — minimal FDT parser (memory node, PL011 base, `/chosen/bootargs`). Safe, host-tested against `tests/virt.dtb`.
-- `crates/aarch64` — arch crate, `unsafe` allowed: exception vectors, trap frame, `VBAR_EL1`, MMU enable with the static level-1 table, generic-timer uptime. No board addresses.
-- `crates/qemu-virt` — board crate, `unsafe` allowed: boot asm (`_start`), `kmain`, panic handler, drivers (`uart.rs`, PL011 base from the DTB; the panic path uses `0x0900_0000`), identity map (GiB 0 device, GiB 1 RAM), `#[global_allocator]`, `linker.ld` (loads at `0x4020_0000`; DTB at `0x4000_0000`). Implements the kernel's ports and builds the `mog_os` binary.
-- `crates/e2e` — host-only boot tests (`tests/boot.rs`): builds the kernel, boots QEMU, asserts serial output (normal boot and `-append test=mmu-fault`).
+- `crates/mm` — arch-independent memory management (`PhysAddr`, frame allocator). Safe, host-tested.
+- `crates/dtb` — minimal FDT parser. Safe, host-tested.
+- `crates/arch` — the only arch-specific crate, `unsafe` allowed; AArch64 code in `src/aarch64/` (boot, traps, MMU).
+- `crates/board/qemu-virt` — board crate, `unsafe` allowed: drivers, memory map, `linker.ld`, `#[global_allocator]`; builds the `mog_os` binary.
+- `crates/e2e` — host-only QEMU boot tests (`tests/boot.rs`).
 - `.cargo/config.toml` — default target, build/link thread caps, QEMU runners.
 
 ## Architecture
@@ -70,5 +76,5 @@ Every new `.md` file must be linked from its parent so it stays reachable from t
 
 - `#![no_std]`. Edition 2024: use `#[unsafe(no_mangle)]`, `unsafe extern`.
 - Host-testable crates use `#![cfg_attr(not(test), no_std)]`.
-- `unsafe` only in `crates/qemu-virt` and `crates/aarch64` (or a future arch/board crate), each block with a one-line `// SAFETY:` reason.
-- After editing `linker.ld`, `crates/qemu-virt/build.rs` triggers a relink automatically.
+- `unsafe` only in `crates/arch` and board crates (`crates/board/*`), each block with a one-line `// SAFETY:` reason.
+- After editing `linker.ld`, `crates/board/qemu-virt/build.rs` triggers a relink automatically.

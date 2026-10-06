@@ -2,6 +2,7 @@
 name = "dtb"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 mm = { path = "../mm" }

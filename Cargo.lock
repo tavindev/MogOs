@@ -3,8 +3,11 @@
 version = 4
 
 [[package]]
-name = "aarch64"
+name = "arch"
 version = "0.1.0"
+dependencies = [
+ "mm",
+]
 
 [[package]]
 name = "dtb"
@@ -51,7 +54,7 @@ version = "0.1.0"
 name = "qemu-virt"
 version = "0.1.0"
 dependencies = [
- "aarch64",
+ "arch",
  "dtb",
  "kernel",
  "linked_list_allocator",
