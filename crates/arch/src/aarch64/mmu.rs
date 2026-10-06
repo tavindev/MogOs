@@ -160,6 +160,65 @@ pub unsafe fn map_page(
     Some(())
 }
 
+/// Clears the page at `va` in the tables under `l1` and returns its frame; flush the ASID's TLB entries after.
+///
+/// # Safety
+///
+/// `va` must be mapped by `map_page` under `l1`, an identity-mapped table that only this address space uses.
+pub unsafe fn unmap_page(l1: PhysAddr, va: u64) -> PhysAddr {
+    let mut table = l1.0;
+    for shift in [30, 21] {
+        // SAFETY: the caller guarantees `va` is mapped, so each level holds a table descriptor of this space.
+        table = unsafe {
+            (table as *const u64)
+                .wrapping_add((va >> shift) as usize & 511)
+                .read()
+        } & ADDR;
+    }
+    // SAFETY: as above.
+    let leaf = unsafe {
+        (table as *mut u64)
+            .wrapping_add((va >> 12) as usize & 511)
+            .replace(0)
+    };
+    // SAFETY: a barrier only orders the table write before the TLB flush.
+    unsafe { asm!("dsb ishst", options(nostack, preserves_flags)) };
+    PhysAddr(leaf & ADDR)
+}
+
+/// Calls `free` on every frame of the address space under `l1`: its user pages, its level-3 and level-2 tables, then
+/// `l1` itself.
+///
+/// # Safety
+///
+/// `l1` must be a level-1 table built by `map_page` (the kernel blocks aside) that no TTBR0 uses any more.
+pub unsafe fn free_space(l1: PhysAddr, mut free: impl FnMut(PhysAddr)) {
+    // SAFETY: the caller's guarantee.
+    unsafe { free_table(l1, 1, &mut free) }
+}
+
+/// # Safety
+///
+/// `table` must be a level-`level` table of an address space built by `map_page`.
+unsafe fn free_table<F: FnMut(PhysAddr)>(table: PhysAddr, level: u32, free: &mut F) {
+    for i in 0..512 {
+        // SAFETY: the caller guarantees `table` is an identity-mapped table frame.
+        let desc = unsafe { (table.0 as *const u64).wrapping_add(i).read() };
+        // Kernel blocks (`0b01`) are skipped; table and page descriptors are `0b11`.
+        if desc & VALID_TABLE_OR_PAGE != VALID_TABLE_OR_PAGE {
+            continue;
+        }
+        let next = PhysAddr(desc & ADDR);
+        if level == 3 {
+            free(next);
+        } else {
+            // SAFETY: a table descriptor above level 3 points at a table `map_page` added.
+            unsafe { free_table(next, level + 1, free) };
+        }
+    }
+    free(table);
+}
+
 /// Switches TTBR0 to the level-1 table `table`, its walks and TLB entries tagged with `asid`.
 ///
 /// # Safety
@@ -178,7 +237,7 @@ pub unsafe fn set_ttbr0(table: PhysAddr, asid: usize) {
     };
 }
 
-/// Drops every non-global TLB entry tagged with `asid`; call after TTBR0 stopped using it.
+/// Drops every non-global TLB entry tagged with `asid`.
 pub fn flush_asid(asid: usize) {
     // SAFETY: invalidating TLB entries only forces later walks.
     unsafe {

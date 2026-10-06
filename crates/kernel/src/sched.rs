@@ -1,4 +1,4 @@
-use mm::PhysAddr;
+use mm::{Budget, PhysAddr};
 
 use crate::handle::Handles;
 
@@ -6,11 +6,28 @@ use crate::handle::Handles;
 #[derive(Debug)]
 pub struct Full;
 
+/// A task's kernel stack and, for a process, its budget and where its next `map` goes. Handle tables are fixed arrays
+/// in the scheduler, so they are not charged.
+#[derive(Clone, Copy)]
+pub struct Memory {
+    /// First frame of the kernel stack.
+    pub stack: PhysAddr,
+    pub budget: Budget,
+    pub next: u64,
+}
+
+const NO_MEMORY: Memory = Memory {
+    stack: PhysAddr(0),
+    budget: Budget::new(0),
+    next: 0,
+};
+
 /// Round-robin run queue of up to `N` tasks, each known by its saved trap frame address and address space
-/// (its level-1 table; `PhysAddr(0)` is the boot table), and its handle table.
+/// (its level-1 table; `PhysAddr(0)` is the boot table), its memory and its handle table.
 pub struct Scheduler<const N: usize> {
     /// Frame address and address space per slot; frame 0 marks a free slot (never slot 0).
     tasks: [(usize, PhysAddr); N],
+    memory: [Memory; N],
     handles: [Handles; N],
     /// One past the highest slot ever used.
     end: usize,
@@ -22,22 +39,25 @@ impl<const N: usize> Scheduler<N> {
     pub const fn new() -> Self {
         Self {
             tasks: [(0, PhysAddr(0)); N],
+            memory: [NO_MEMORY; N],
             handles: [Handles::new(); N],
             end: 1,
             current: 0,
         }
     }
 
-    /// Queues a new task whose first frame is at `frame` in address space `space`, with `handles(slot)` as its
-    /// handles.
+    /// Queues a new task whose first frame is at `frame` in address space `space`, with `memory`, and `handles(slot)`
+    /// as its handles.
     pub fn add(
         &mut self,
         frame: usize,
         space: PhysAddr,
+        memory: Memory,
         handles: impl FnOnce(usize) -> Handles,
     ) -> Result<(), Full> {
         let slot = 1 + self.tasks[1..].iter().position(|t| t.0 == 0).ok_or(Full)?;
         self.tasks[slot] = (frame, space);
+        self.memory[slot] = memory;
         self.handles[slot] = handles(slot);
         self.end = self.end.max(slot + 1);
         Ok(())
@@ -49,17 +69,25 @@ impl<const N: usize> Scheduler<N> {
         self.advance()
     }
 
-    /// Drops the current task (never slot 0) and its handles, and returns the next task's frame.
-    pub fn exit(&mut self) -> usize {
+    /// Drops the current task (never slot 0) and its handles; returns the next task's frame and the dropped task's
+    /// memory, whose frames the caller frees.
+    pub fn exit(&mut self) -> (usize, Memory) {
         assert!(self.current != 0, "the boot context cannot exit");
+        let memory = self.memory[self.current];
         self.tasks[self.current] = (0, PhysAddr(0));
+        self.memory[self.current] = NO_MEMORY;
         self.handles[self.current] = Handles::new();
-        self.advance()
+        (self.advance(), memory)
     }
 
     /// The current task's slot and address space.
     pub fn current(&self) -> (usize, PhysAddr) {
         (self.current, self.tasks[self.current].1)
+    }
+
+    /// The current task's memory.
+    pub fn memory(&mut self) -> &mut Memory {
+        &mut self.memory[self.current]
     }
 
     /// The current task's handles.

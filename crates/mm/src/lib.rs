@@ -22,6 +22,15 @@ pub struct FrameAllocator<const WORDS: usize> {
 }
 
 impl<const WORDS: usize> FrameAllocator<WORDS> {
+    /// Manages no frames; a placeholder until one built by `new` replaces it.
+    pub const fn empty() -> Self {
+        Self {
+            base: 0,
+            frames: 0,
+            used: [u64::MAX; WORDS],
+        }
+    }
+
     /// All whole frames in `ram` start free; frames past the capacity are ignored.
     pub fn new(ram: Range<PhysAddr>) -> Self {
         let base = ram.start.0.next_multiple_of(FRAME_SIZE);
@@ -86,5 +95,52 @@ impl<const WORDS: usize> FrameAllocator<WORDS> {
 
     pub fn free_count(&self) -> usize {
         self.used.iter().map(|w| w.count_zeros() as usize).sum()
+    }
+}
+
+/// Frames a process may hold; every frame taken through it is charged at allocation time.
+#[derive(Clone, Copy, Debug)]
+pub struct Budget {
+    limit: usize,
+    used: usize,
+}
+
+impl Budget {
+    pub const fn new(limit: usize) -> Self {
+        Self { limit, used: 0 }
+    }
+
+    /// Takes a frame from `frames` and charges it; `None` (nothing charged) over budget or out of frames.
+    pub fn alloc<const W: usize>(&mut self, frames: &mut FrameAllocator<W>) -> Option<PhysAddr> {
+        if self.used == self.limit {
+            return None;
+        }
+        let frame = frames.alloc()?;
+        self.used += 1;
+        Some(frame)
+    }
+
+    /// Takes `count` contiguous frames and charges them; `None` (nothing charged) over budget or out of frames.
+    pub fn alloc_contiguous<const W: usize>(
+        &mut self,
+        frames: &mut FrameAllocator<W>,
+        count: usize,
+    ) -> Option<Range<PhysAddr>> {
+        if self.remaining() < count {
+            return None;
+        }
+        let range = frames.alloc_contiguous(count)?;
+        self.used += count;
+        Some(range)
+    }
+
+    /// Returns `frame` to `frames` and refunds it.
+    pub fn free<const W: usize>(&mut self, frames: &mut FrameAllocator<W>, frame: PhysAddr) {
+        frames.free(frame);
+        self.used -= 1;
+    }
+
+    pub fn remaining(&self) -> usize {
+        self.limit - self.used
     }
 }

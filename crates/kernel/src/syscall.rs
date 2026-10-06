@@ -12,15 +12,23 @@ const WRITE: u64 = 1;
 const DUP: u64 = 2;
 /// `close(handle)`: returns 0.
 const CLOSE: u64 = 3;
+/// `map(len)`: maps `len` bytes (rounded up to pages) of zeroed read-write memory at an address the kernel picks,
+/// charged to the caller's budget; returns the address. The kernel picking the address leaves nothing to overlap, and
+/// it is what musl's `mmap(NULL, ...)` needs (its malloc falls back from `brk` to `mmap`).
+const MAP: u64 = 4;
 
 // Errors are negated musl errno values.
 
 /// Bad, closed or stale handle.
 pub const EBADF: i64 = -9;
+/// Over the memory budget, or out of frames.
+pub const ENOMEM: i64 = -12;
 /// The handle lacks a right the call needs.
 pub const EACCES: i64 = -13;
 /// Bad address: outside user space, unmapped, or longer than `MAX_WRITE`.
 pub const EFAULT: i64 = -14;
+/// Invalid argument: a zero-length `map`.
+const EINVAL: i64 = -22;
 /// The handle table is full.
 pub const EMFILE: i64 = -24;
 /// No such syscall.
@@ -37,6 +45,10 @@ pub enum Call {
     Write {
         ptr: u64,
         len: usize,
+    },
+    /// Map this many pages into the caller's address space.
+    Map {
+        pages: usize,
     },
     /// Done; return this value.
     Done(u64),
@@ -63,6 +75,12 @@ pub fn dispatch(nr: u64, args: &[u64; 6], handles: &mut Handles) -> Result<Call,
         }
         DUP => Ok(Call::Done(handles.dup(args[0], args[1])?)),
         CLOSE => handles.close(args[0]).map(|()| Call::Done(0)),
+        MAP => match args[0] {
+            0 => Err(EINVAL),
+            len => Ok(Call::Map {
+                pages: len.div_ceil(4096) as usize,
+            }),
+        },
         _ => Err(ENOSYS),
     }
 }

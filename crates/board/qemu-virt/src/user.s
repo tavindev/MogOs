@@ -1,4 +1,4 @@
-// User programs, copied into process pages; position independent. x8 = syscall: 0 exit, 1 write, 2 dup, 3 close.
+// User programs, copied into process pages; position independent. x8 = syscall: 0 exit, 1 write, 2 dup, 3 close, 4 map.
 // Each starts with init's handles: 0 is the console, 1 the process itself.
 .section .rodata.user, "a"
 .balign 4
@@ -182,3 +182,52 @@ user_handles:
 3:  .ascii "H: closed handle: EBADF\n"
 4:  .ascii "H: stale handle: EBADF\n"
 user_handles_end:
+
+.balign 4
+.global user_budget, user_budget_end
+user_budget:
+    // map of the 23 frames left after the fixed 9 needs 24 with its level-3 table: ENOMEM, the 22 mapped pages undone.
+    movz x0, #0x7000
+    movk x0, #1, lsl #16
+    mov x8, #4
+    svc #0
+    cmn x0, #12
+    b.ne 9f
+    // x19 = pages from map(4096) until it fails; each must read zero and take a write.
+    mov x19, #0
+1:  mov x0, #4096
+    mov x8, #4
+    svc #0
+    tbnz x0, #63, 2f
+    ldr x9, [x0]
+    cbnz x9, 9f
+    str x0, [x0]
+    add x19, x19, #1
+    b 1b
+2:  cmn x0, #12
+    b.ne 9f
+    write #0, 7f, 16
+    // decimal digits of x19, written backwards below sp
+    mov x10, sp
+    mov x11, sp
+    mov x12, #10
+3:  udiv x13, x19, x12
+    msub x14, x13, x12, x19
+    add x14, x14, #'0'
+    strb w14, [x11, #-1]!
+    mov x19, x13
+    cbnz x19, 3b
+    mov x0, #0
+    mov x1, x11
+    sub x2, x10, x11
+    mov x8, #1
+    svc #0
+    write #0, 6f, 7
+    write #0, 5f, 17
+9:  mov x0, #0
+    mov x8, #0
+    svc #0
+7:  .ascii "M: ENOMEM after "
+6:  .ascii " pages\n"
+5:  .ascii "M: still running\n"
+user_budget_end:

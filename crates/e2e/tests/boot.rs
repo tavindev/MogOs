@@ -217,3 +217,25 @@ fn syscall_bench_reports_round_trip() {
         .unwrap();
     assert!(status.success(), "QEMU exited with {status}");
 }
+
+#[test]
+fn map_stops_at_budget_and_exit_returns_every_frame() {
+    let (status, lines) = boot(&["-append", "test=budget"]);
+    assert!(
+        !lines.iter().any(|l| l.starts_with("panic:")),
+        "kernel panicked"
+    );
+    let m: Vec<_> = lines.iter().filter(|l| l.starts_with("M: ")).collect();
+    // Budget 32 minus 9 fixed frames (3 tables, code, stack, 4 kernel stack) minus the map region's level-3 table;
+    // a rollback leak in the failed 23-page map before the loop would lower it.
+    assert_eq!(m, ["M: ENOMEM after 22 pages", "M: still running"]);
+    let (before, after) = lines
+        .iter()
+        .find_map(|l| {
+            l.strip_prefix("budget: free frames ")?
+                .split_once(" before, ")
+        })
+        .expect("missing budget line");
+    assert_eq!(after, format!("{before} after"), "frames leaked");
+    assert!(status.success(), "QEMU exited with {status}");
+}

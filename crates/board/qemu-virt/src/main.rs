@@ -18,10 +18,10 @@ use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use arch::{MemoryType, UserAccess, l1_block, user_page};
 use dtb::Dtb;
 use kernel::handle::Handles;
-use kernel::syscall::{Call, EFAULT};
-use kernel::{Full, Program, Scheduler};
+use kernel::syscall::{Call, EFAULT, ENOMEM};
+use kernel::{FRAME_WORDS, Full, Memory, Program, Scheduler};
 use linked_list_allocator::Heap;
-use mm::PhysAddr;
+use mm::{Budget, FrameAllocator, PhysAddr};
 use uart::Uart;
 
 /// Panic- and trap-path console; normal output uses the PL011 from the DTB.
@@ -42,6 +42,8 @@ const PAGE: usize = 4096;
 const USER_BASE: u64 = 1 << 32;
 /// Each process's one stack page ends here.
 const USER_STACK_TOP: u64 = USER_BASE + (2 << 20);
+/// Where a process's first `map` goes; later ones follow it.
+const MAP_BASE: u64 = USER_STACK_TOP;
 /// EL1 virtual timer PPI.
 const TIMER_IRQ: u32 = 27;
 const TICK_US: u64 = 10_000;
@@ -51,8 +53,8 @@ static GIC_CPU: AtomicU64 = AtomicU64::new(0);
 /// Boot context included; a task's slot is its ASID (8 bits).
 const MAX_TASKS: usize = 8;
 const _: () = assert!(MAX_TASKS <= 256);
-/// 16 KiB, 16-byte aligned.
-const TASK_STACK: Layout = Layout::new::<[u128; 1024]>();
+/// Kernel stack per task: 16 KiB.
+const TASK_STACK_FRAMES: usize = 4;
 
 #[global_allocator]
 static HEAP: KernelHeap = KernelHeap(UnsafeCell::new(Heap::empty()));
@@ -86,20 +88,28 @@ unsafe impl GlobalAlloc for KernelHeap {
     }
 }
 
-/// Task contexts; touched only with IRQs masked on the only core.
-static SCHED: Sched = Sched(UnsafeCell::new(Scheduler::new()));
+/// Task contexts and free frames; touched only with IRQs masked on the only core.
+static KERNEL: Global = Global(UnsafeCell::new(Kernel {
+    sched: Scheduler::new(),
+    frames: FrameAllocator::empty(),
+}));
 
-struct Sched(UnsafeCell<Scheduler<MAX_TASKS>>);
+struct Kernel {
+    sched: Scheduler<MAX_TASKS>,
+    frames: FrameAllocator<FRAME_WORDS>,
+}
 
-// SAFETY: one core, and the scheduler is only touched with IRQs masked, so accesses never overlap.
-unsafe impl Sync for Sched {}
+struct Global(UnsafeCell<Kernel>);
+
+// SAFETY: one core, and the kernel state is only touched with IRQs masked, so accesses never overlap.
+unsafe impl Sync for Global {}
 
 /// # Safety
 /// IRQs must be masked (trap context), so this is the only reference to the scheduler.
 #[unsafe(no_mangle)]
 unsafe extern "C" fn task_switch(frame: usize) -> usize {
     // SAFETY: the caller masked IRQs on the only core, so this is the sole reference.
-    let sched = unsafe { &mut *SCHED.0.get() };
+    let sched = unsafe { &mut (*KERNEL.0.get()).sched };
     let (_, from) = sched.current();
     let next = sched.switch(frame);
     if sched.current().1 != from {
@@ -109,19 +119,85 @@ unsafe extern "C" fn task_switch(frame: usize) -> usize {
     next
 }
 
-/// Drops the current process and returns the next task's frame; its pages and kernel stack are not reclaimed yet.
+/// Drops the current process, returns all its frames, and returns the next task's frame.
 ///
 /// # Safety
 /// IRQs must be masked (trap context), the current task must be a process, and `frame` its trap frame.
 unsafe fn task_exit(frame: usize) -> usize {
     // SAFETY: the caller masked IRQs on the only core, so this is the sole reference.
-    let sched = unsafe { &mut *SCHED.0.get() };
-    let (asid, _) = sched.current();
-    let next = sched.exit();
+    let Kernel { sched, frames } = unsafe { &mut *KERNEL.0.get() };
+    let (asid, l1) = sched.current();
+    let (next, memory) = sched.exit();
     // SAFETY: `frame` is the exiting process's trap frame and `next` came from the scheduler.
     unsafe { enter(sched, frame, next) };
     arch::flush_asid(asid);
+    // Frees the kernel stack this runs on: sound only while nothing allocates before the trap returns to `next`.
+    // SAFETY: TTBR0 left `l1` above, and its tables hold only this process's frames.
+    unsafe { arch::free_space(l1, |f| frames.free(f)) };
+    free_stack(frames, memory.stack);
     next
+}
+
+fn free_stack(frames: &mut FrameAllocator<FRAME_WORDS>, stack: PhysAddr) {
+    for i in 0..TASK_STACK_FRAMES {
+        frames.free(PhysAddr(stack.0 + (i * PAGE) as u64));
+    }
+}
+
+/// A zeroed frame charged to `budget`.
+fn zeroed(frames: &mut FrameAllocator<FRAME_WORDS>, budget: &mut Budget) -> Option<PhysAddr> {
+    let page = budget.alloc(frames)?;
+    // SAFETY: a fresh frame from the allocator: identity-mapped RAM that nothing else uses.
+    unsafe { ptr::write_bytes(page.0 as *mut u8, 0, PAGE) };
+    Some(page)
+}
+
+/// Maps a zeroed frame at `va` under `l1` with `access`, the frame and any new table charged to `budget`; `None`
+/// (the frame refunded) if either is out of budget or frames.
+fn map_zeroed(
+    frames: &mut FrameAllocator<FRAME_WORDS>,
+    budget: &mut Budget,
+    l1: PhysAddr,
+    va: u64,
+    access: UserAccess,
+) -> Option<PhysAddr> {
+    let page = zeroed(frames, budget)?;
+    let leaf = user_page(page, access);
+    // SAFETY: `l1` is a process's table built from zeroed frames like these, and `va` is a user address it leaves unmapped.
+    if unsafe { arch::map_page(l1, va, leaf, || zeroed(frames, budget)) }.is_none() {
+        budget.free(frames, page);
+        return None;
+    }
+    Some(page)
+}
+
+/// Maps `pages` zeroed read-write pages at the current process's next map address, charged to its budget; returns
+/// their address, or `None` with nothing mapped if the budget or the frames run out.
+fn map(
+    sched: &mut Scheduler<MAX_TASKS>,
+    frames: &mut FrameAllocator<FRAME_WORDS>,
+    pages: usize,
+) -> Option<u64> {
+    let (asid, l1) = sched.current();
+    let memory = sched.memory();
+    if pages > memory.budget.remaining() {
+        return None;
+    }
+    let start = memory.next;
+    let end = start + (pages * PAGE) as u64;
+    for va in (start..end).step_by(PAGE) {
+        if map_zeroed(frames, &mut memory.budget, l1, va, UserAccess::ReadWrite).is_none() {
+            for va in (start..va).step_by(PAGE) {
+                // SAFETY: this call mapped `va` under `l1` above.
+                let page = unsafe { arch::unmap_page(l1, va) };
+                memory.budget.free(frames, page);
+            }
+            arch::flush_asid(asid);
+            return None;
+        }
+    }
+    memory.next = end;
+    Some(start)
 }
 
 /// Moves SP_EL0, TPIDR_EL0 and TTBR0 from the task that saved `frame` to the scheduler's current task, whose frame is
@@ -141,26 +217,45 @@ unsafe fn enter(sched: &Scheduler<MAX_TASKS>, frame: usize, next: usize) {
     unsafe { arch::set_ttbr0(table, asid) }
 }
 
-/// Allocates a kernel stack, lets `first_frame(stack_top)` write the task's first frame on it, and queues
-/// the task in address space `space` with `handles(slot)`.
-fn queue_task(
-    space: PhysAddr,
-    first_frame: impl FnOnce(usize) -> usize,
-    handles: impl FnOnce(usize) -> Handles,
+/// Builds a process for `code` (entered at `entry`): address space, pages and kernel stack, all charged to `budget`,
+/// and queues it; on failure returns every frame it took.
+fn spawn_process(
+    sched: &mut Scheduler<MAX_TASKS>,
+    frames: &mut FrameAllocator<FRAME_WORDS>,
+    code: &[u8],
+    entry: u64,
+    mut budget: Budget,
 ) -> Result<(), Full> {
-    // SAFETY: the layout has a nonzero size.
-    let stack = unsafe { alloc::alloc::alloc(TASK_STACK) };
-    if stack.is_null() {
-        return Err(Full);
-    }
-    let frame = first_frame(stack as usize + TASK_STACK.size());
-    let irq = arch::irq::disable();
-    // SAFETY: IRQs are masked on the only core, so this is the sole reference.
-    let added = unsafe { &mut *SCHED.0.get() }.add(frame, space, handles);
-    arch::irq::restore(irq);
+    let l1 = zeroed(frames, &mut budget).ok_or(Full)?;
+    // SAFETY: `l1` is a fresh, zeroed frame.
+    unsafe { (l1.0 as *mut [u64; 2]).write(KERNEL_L1) };
+    let stack = (|| {
+        let text = map_zeroed(frames, &mut budget, l1, entry, UserAccess::ReadExecute)?;
+        // SAFETY: `code` fits in the fresh frame `text` (checked by the caller).
+        unsafe { ptr::copy_nonoverlapping(code.as_ptr(), text.0 as *mut u8, code.len()) };
+        // SAFETY: `text` is identity-mapped RAM.
+        unsafe { arch::sync_icache(text.0 as usize, PAGE) };
+        let stack_page = USER_STACK_TOP - PAGE as u64;
+        map_zeroed(frames, &mut budget, l1, stack_page, UserAccess::ReadWrite)?;
+        budget.alloc_contiguous(frames, TASK_STACK_FRAMES)
+    })();
+    let added = stack.ok_or(Full).and_then(|stack| {
+        // SAFETY: the kernel stack below `stack.end` is fresh and owned by the new process.
+        let frame = unsafe { arch::new_user_task(stack.end.0 as usize, entry, USER_STACK_TOP) };
+        let memory = Memory {
+            stack: stack.start,
+            budget,
+            next: MAP_BASE,
+        };
+        let added = sched.add(frame, l1, memory, Handles::init);
+        if added.is_err() {
+            free_stack(frames, stack.start);
+        }
+        added
+    });
     if added.is_err() {
-        // SAFETY: `stack` came from `alloc` with this layout and was never handed to the scheduler.
-        unsafe { alloc::alloc::dealloc(stack, TASK_STACK) };
+        // SAFETY: no TTBR0 ever used `l1`, and its tables hold only frames taken above.
+        unsafe { arch::free_space(l1, |f| frames.free(f)) };
     }
     added
 }
@@ -178,6 +273,8 @@ unsafe extern "C" {
     static user_bench_end: u8;
     static user_handles: u8;
     static user_handles_end: u8;
+    static user_budget: u8;
+    static user_budget_end: u8;
 }
 
 /// A user program's code and the address it is mapped and starts at.
@@ -202,6 +299,11 @@ fn user_program(program: Program) -> (&'static [u8], u64) {
         Program::Handles => (
             &raw const user_handles,
             &raw const user_handles_end,
+            USER_BASE,
+        ),
+        Program::Budget => (
+            &raw const user_budget,
+            &raw const user_budget_end,
             USER_BASE,
         ),
     };
@@ -308,69 +410,67 @@ impl kernel::Board for QemuVirt {
 
     fn spawn(&mut self, entry: fn(&mut Self, usize) -> !, arg: usize) -> Result<(), Full> {
         let board = self.clone();
-        queue_task(
-            PhysAddr(0),
-            |stack_top| {
-                let start = (stack_top - size_of::<Start>()) & !15;
+        let irq = arch::irq::disable();
+        // SAFETY: IRQs are masked on the only core, so this is the sole reference.
+        let Kernel { sched, frames } = unsafe { &mut *KERNEL.0.get() };
+        let added = frames
+            .alloc_contiguous(TASK_STACK_FRAMES)
+            .ok_or(Full)
+            .and_then(|stack| {
+                let start = (stack.end.0 as usize - size_of::<Start>()) & !15;
                 // SAFETY: `start` is 16-byte aligned and inside the fresh stack, which nothing else references.
                 unsafe { (start as *mut Start).write(Start { board, entry, arg }) };
                 // SAFETY: `start` is 16-byte aligned and the stack below it is fresh and owned by the new task.
-                unsafe { arch::new_task(start, task_start, start) }
-            },
-            |_| Handles::new(),
-        )
+                let frame = unsafe { arch::new_task(start, task_start, start) };
+                let memory = Memory {
+                    stack: stack.start,
+                    budget: Budget::new(0),
+                    next: 0,
+                };
+                let added = sched.add(frame, PhysAddr(0), memory, |_| Handles::new());
+                if added.is_err() {
+                    free_stack(frames, stack.start);
+                }
+                added
+            });
+        arch::irq::restore(irq);
+        added
     }
 
     fn yield_now(&mut self) {
         arch::yield_now()
     }
 
-    fn spawn_user(
-        &mut self,
-        program: Program,
-        mut frame: impl FnMut() -> Option<PhysAddr>,
-    ) -> Result<(), Full> {
+    fn init_frames(&mut self, frames: FrameAllocator<FRAME_WORDS>) {
+        let irq = arch::irq::disable();
+        // SAFETY: IRQs are masked on the only core, so this is the sole reference.
+        unsafe { (*KERNEL.0.get()).frames = frames };
+        arch::irq::restore(irq);
+    }
+
+    fn free_frames(&self) -> usize {
+        let irq = arch::irq::disable();
+        // SAFETY: IRQs are masked on the only core, so this is the sole reference.
+        let free = unsafe { &(*KERNEL.0.get()).frames }.free_count();
+        arch::irq::restore(irq);
+        free
+    }
+
+    fn spawn_user(&mut self, program: Program, budget: usize) -> Result<(), Full> {
         let (code, entry) = user_program(program);
         assert!(code.len() <= PAGE, "user program over one page");
-        let mut page = || {
-            let page = frame()?;
-            // SAFETY: a fresh frame from the allocator: identity-mapped RAM that nothing else uses.
-            unsafe { ptr::write_bytes(page.0 as *mut u8, 0, PAGE) };
-            Some(page)
-        };
-        let l1 = page().ok_or(Full)?;
-        // SAFETY: `l1` is a fresh, zeroed frame.
-        unsafe { (l1.0 as *mut [u64; 2]).write(KERNEL_L1) };
-        let text = page().ok_or(Full)?;
-        // SAFETY: `code` fits in the fresh frame `text`.
-        unsafe { ptr::copy_nonoverlapping(code.as_ptr(), text.0 as *mut u8, code.len()) };
-        // SAFETY: `text` is identity-mapped RAM.
-        unsafe { arch::sync_icache(text.0 as usize, PAGE) };
-        let stack = page().ok_or(Full)?;
-        for (va, leaf) in [
-            (entry, user_page(text, UserAccess::ReadExecute)),
-            (
-                USER_STACK_TOP - PAGE as u64,
-                user_page(stack, UserAccess::ReadWrite),
-            ),
-        ] {
-            // SAFETY: `l1` and every frame `page` returns are fresh, zeroed and only this address space's; `va` is a user address.
-            unsafe { arch::map_page(l1, va, leaf, &mut page) }.ok_or(Full)?;
-        }
-        queue_task(
-            l1,
-            |stack_top| {
-                // SAFETY: the kernel stack below `stack_top` is fresh and owned by the new process.
-                unsafe { arch::new_user_task(stack_top, entry, USER_STACK_TOP) }
-            },
-            Handles::init,
-        )
+        let irq = arch::irq::disable();
+        // SAFETY: IRQs are masked on the only core, so this is the sole reference.
+        let Kernel { sched, frames } = unsafe { &mut *KERNEL.0.get() };
+        let added = spawn_process(sched, frames, code, entry, Budget::new(budget));
+        arch::irq::restore(irq);
+        added
     }
 
     fn tasks(&self) -> usize {
         let irq = arch::irq::disable();
         // SAFETY: IRQs are masked on the only core, so this is the sole reference.
-        let count = unsafe { &*SCHED.0.get() }.count();
+        let count = unsafe { &(*KERNEL.0.get()).sched }.count();
         arch::irq::restore(irq);
         count
     }
@@ -437,13 +537,14 @@ unsafe extern "C" fn board_irq(frame: usize) -> usize {
 #[unsafe(no_mangle)]
 unsafe extern "C" fn board_syscall(frame: &mut arch::TrapFrame) -> usize {
     // SAFETY: the caller masked IRQs on the only core, so this is the sole reference.
-    let handles = unsafe { &mut *SCHED.0.get() }.handles();
+    let Kernel { sched, frames } = unsafe { &mut *KERNEL.0.get() };
     let x = &mut frame.x;
-    x[0] = match kernel::syscall::dispatch(x[8], x.first_chunk().unwrap(), handles) {
+    x[0] = match kernel::syscall::dispatch(x[8], x.first_chunk().unwrap(), sched.handles()) {
         // SAFETY: the caller masked IRQs, and `frame` is the current process's.
         Ok(Call::Exit) => return unsafe { task_exit(frame as *mut arch::TrapFrame as usize) },
         Ok(Call::Write { ptr, len }) if write_user(ptr, len) => len as u64,
         Ok(Call::Write { .. }) => EFAULT as u64,
+        Ok(Call::Map { pages }) => map(sched, frames, pages).unwrap_or(ENOMEM as u64),
         Ok(Call::Done(value)) => value,
         Err(error) => error as u64,
     };
@@ -455,7 +556,7 @@ unsafe extern "C" fn board_syscall(frame: &mut arch::TrapFrame) -> usize {
 #[unsafe(no_mangle)]
 unsafe extern "C" fn board_user_fault(frame: usize, ec: u64, far: u64) -> usize {
     // SAFETY: the caller masked IRQs on the only core, so this is the sole reference.
-    let (slot, _) = unsafe { &*SCHED.0.get() }.current();
+    let (slot, _) = unsafe { &(*KERNEL.0.get()).sched }.current();
     let _ = writeln!(Uart::new(UART0), "fault: {slot} ec={ec:#x} far={far:#x}");
     // SAFETY: as above; `frame` is the current process's.
     unsafe { task_exit(frame) }

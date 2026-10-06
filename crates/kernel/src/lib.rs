@@ -6,7 +6,7 @@ pub mod handle;
 mod sched;
 pub mod syscall;
 
-pub use sched::{Full, Scheduler};
+pub use sched::{Full, Memory, Scheduler};
 
 use alloc::vec::Vec;
 use core::fmt::Write;
@@ -40,13 +40,12 @@ pub trait Board {
     fn spawn(&mut self, entry: fn(&mut Self, usize) -> !, arg: usize) -> Result<(), Full>;
     /// Runs the other tasks in turn; returns when this one is scheduled again.
     fn yield_now(&mut self);
-    /// Queues `program` as a process at EL0 in its own address space, its tables and pages taken from `frame`, with
-    /// init's handles (`Handles::init`) until spawn passes handles (step 14).
-    fn spawn_user(
-        &mut self,
-        program: Program,
-        frame: impl FnMut() -> Option<PhysAddr>,
-    ) -> Result<(), Full>;
+    /// Takes over the frame allocator: process memory and kernel stacks come from it from now on; call once.
+    fn init_frames(&mut self, frames: FrameAllocator<FRAME_WORDS>);
+    fn free_frames(&self) -> usize;
+    /// Queues `program` as a process at EL0 in its own address space, with a budget of `budget` frames that pays for
+    /// its tables, pages and kernel stack, and init's handles (`Handles::init`) until spawn passes handles (step 14).
+    fn spawn_user(&mut self, program: Program, budget: usize) -> Result<(), Full>;
     /// Tasks in the run queue, the boot context included.
     fn tasks(&self) -> usize;
 }
@@ -64,15 +63,20 @@ pub enum Program {
     /// Writes to the console, then through a duplicate without write, a closed handle and a stale one (its entry
     /// reused), printing a line for each expected result.
     Handles,
+    /// Maps a page at a time, checking each is zeroed and writable, until `map` fails with `ENOMEM`; prints the
+    /// page count, then a line showing it still runs.
+    Budget,
 }
 
 /// Round trips timed by `test=bench`.
 const BENCH_YIELDS: u64 = 100_000;
 
 /// Bitmap capacity in 64-frame words: 512 words cover 128 MiB.
-const FRAME_WORDS: usize = 512;
+pub const FRAME_WORDS: usize = 512;
 /// 1 MiB kernel heap.
 const HEAP_FRAMES: usize = 256;
+/// Each boot-spawned process's budget in frames, until spawn moves budget from parent to child (step 14).
+const BOOT_BUDGET: usize = 32;
 
 /// `reserved` lists physical ranges in use (kernel image, DTB).
 pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> ! {
@@ -107,6 +111,7 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
         500_500
     );
     let _ = writeln!(board.console(), "heap: ok");
+    board.init_frames(frames);
 
     let boot_us = board.uptime_us();
     let _ = writeln!(board.console(), "boot: {boot_us} us");
@@ -116,9 +121,18 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
             "test=yield" => yield_demo(board),
             "test=bench" => yield_bench(board),
             "test=preempt" => preempt_demo(board),
-            "test=user" => user_demo(board, &mut frames),
-            "test=bench-syscall" => run_alone(board, &mut frames, Program::SyscallBench),
-            "test=handles" => run_alone(board, &mut frames, Program::Handles),
+            "test=user" => user_demo(board),
+            "test=bench-syscall" => run_alone(board, Program::SyscallBench),
+            "test=handles" => run_alone(board, Program::Handles),
+            "test=budget" => {
+                let before = board.free_frames();
+                run_alone(board, Program::Budget);
+                let after = board.free_frames();
+                let _ = writeln!(
+                    board.console(),
+                    "budget: free frames {before} before, {after} after"
+                );
+            }
             _ => {}
         }
     }
@@ -171,19 +185,19 @@ fn print_and_power_off<B: Board>(board: &mut B, _: usize) -> ! {
 
 /// The timer preempts process A between its lines; B faults on A's address and is killed; C then takes B's
 /// slot (and ASID) and is killed for reading kernel memory; returns once all are gone.
-fn user_demo<B: Board, const W: usize>(board: &mut B, frames: &mut FrameAllocator<W>) {
+fn user_demo<B: Board>(board: &mut B) {
     board
-        .spawn_user(Program::Counter, || frames.alloc())
+        .spawn_user(Program::Counter, BOOT_BUDGET)
         .expect("spawn A");
     board
-        .spawn_user(Program::Intruder, || frames.alloc())
+        .spawn_user(Program::Intruder, BOOT_BUDGET)
         .expect("spawn B");
     board.start_timer();
     while board.tasks() > 2 {
         board.idle();
     }
     board
-        .spawn_user(Program::KernelReader, || frames.alloc())
+        .spawn_user(Program::KernelReader, BOOT_BUDGET)
         .expect("spawn C");
     while board.tasks() > 1 {
         board.idle();
@@ -191,12 +205,8 @@ fn user_demo<B: Board, const W: usize>(board: &mut B, frames: &mut FrameAllocato
 }
 
 /// Runs `program` until it exits; the timer stays off so nothing preempts it.
-fn run_alone<B: Board, const W: usize>(
-    board: &mut B,
-    frames: &mut FrameAllocator<W>,
-    program: Program,
-) {
-    board.spawn_user(program, || frames.alloc()).expect("spawn");
+fn run_alone<B: Board>(board: &mut B, program: Program) {
+    board.spawn_user(program, BOOT_BUDGET).expect("spawn");
     while board.tasks() > 1 {
         board.yield_now();
     }
