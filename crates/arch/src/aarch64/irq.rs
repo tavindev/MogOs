@@ -1,6 +1,7 @@
 use core::arch::asm;
 
 /// DAIF as it was before `disable`.
+#[must_use = "dropping it leaves IRQs masked"]
 pub struct State(u64);
 
 /// Masks IRQs and returns the previous mask state.

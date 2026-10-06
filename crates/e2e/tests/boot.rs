@@ -61,6 +61,10 @@ fn boot(extra: &[&str]) -> (ExitStatus, Vec<String>) {
 #[test]
 fn boots_and_powers_off() {
     let (status, lines) = boot(&[]);
+    assert!(
+        !lines.iter().any(|l| l.contains("panic:")),
+        "kernel panicked"
+    );
     for expected in [
         "MogOs: hello from EL1",
         "exceptions: ok",
@@ -86,10 +90,6 @@ fn boots_and_powers_off() {
         .expect("missing boot line")
         .parse::<u64>()
         .unwrap();
-    assert!(
-        !lines.iter().any(|l| l.starts_with("panic:")),
-        "kernel panicked"
-    );
     assert!(status.success(), "QEMU exited with {status}");
 }
 

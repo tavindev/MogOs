@@ -10,7 +10,6 @@ use core::ops::Range;
 use core::panic::PanicInfo;
 use core::ptr::{self, NonNull};
 use core::slice;
-use core::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
 use arch::{MemoryType, l1_block};
 use dtb::Dtb;
@@ -29,7 +28,6 @@ const UNMAPPED: PhysAddr = PhysAddr(0x8000_0000);
 
 #[global_allocator]
 static HEAP: KernelHeap = KernelHeap(UnsafeCell::new(Heap::empty()));
-static HEAP_READY: AtomicBool = AtomicBool::new(false);
 
 struct KernelHeap(UnsafeCell<Heap>);
 
@@ -98,12 +96,14 @@ impl kernel::Board for QemuVirt {
     }
 
     fn init_heap(&mut self, region: Range<PhysAddr>) {
-        assert!(!HEAP_READY.swap(true, Relaxed), "heap already initialized");
         let size = (region.end.0 - region.start.0) as usize;
-        // SAFETY: boot runs with IRQs still masked on the only core, so this is the sole reference.
+        let irq = arch::irq::disable();
+        // SAFETY: IRQs are masked on the only core, so this is the sole reference.
         let heap = unsafe { &mut *HEAP.0.get() };
-        // SAFETY: init runs once (guard above); `region` being unused, mapped RAM is the `Board::init_heap` contract the kernel upholds.
+        assert!(heap.bottom().is_null(), "heap already initialized");
+        // SAFETY: the heap is empty (checked above); `region` being unused, mapped RAM is the `Board::init_heap` contract the kernel upholds.
         unsafe { heap.init(region.start.0 as *mut u8, size) }
+        arch::irq::restore(irq);
     }
 
     fn uptime_us(&self) -> u64 {
