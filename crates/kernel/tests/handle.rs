@@ -8,6 +8,8 @@ fn closed_handle_and_its_reused_entry_reject_the_old_value() {
     handles.close(old).unwrap();
     assert_eq!(handles.get(old, WRITE), Err(EBADF));
     assert_eq!(handles.close(old), Err(EBADF));
+    assert_eq!(handles.close(MAX_HANDLES as u64), Err(EBADF));
+    assert_eq!(handles.close(1 << 32), Err(EBADF), "wrong generation");
 
     let new = handles.dup(0, WRITE).unwrap();
     assert_eq!(new as u32, old as u32, "the closed entry is reused");

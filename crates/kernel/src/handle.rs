@@ -1,10 +1,13 @@
 //! Per-process handle tables. A handle value is `generation << 32 | index`; closing bumps the entry's generation,
-//! so a closed handle's value never reaches whatever reuses its entry.
+//! so a closed handle's value never reaches whatever reuses its entry. An entry is retired once its generation
+//! reaches 2^31, so handle values stay positive (never read as an error) and generations never wrap.
 
 use crate::syscall::{EACCES, EBADF, EMFILE};
 
 /// Handles per process.
 pub const MAX_HANDLES: usize = 16;
+
+const RETIRED: u32 = 1 << 31;
 
 /// A set of rights, one bit each.
 pub type Rights = u64;
@@ -56,7 +59,11 @@ impl Handles {
         if held & DUPLICATE == 0 || rights & !held != 0 {
             return Err(EACCES);
         }
-        let index = self.0.iter().position(|e| e.1.is_none()).ok_or(EMFILE)?;
+        let index = self
+            .0
+            .iter()
+            .position(|e| e.1.is_none() && e.0 < RETIRED)
+            .ok_or(EMFILE)?;
         self.0[index].1 = Some((object, rights));
         Ok((self.0[index].0 as u64) << 32 | index as u64)
     }
@@ -64,7 +71,7 @@ impl Handles {
     pub fn close(&mut self, handle: u64) -> Result<(), i64> {
         self.entry(handle)?;
         let entry = &mut self.0[handle as u32 as usize];
-        *entry = (entry.0.wrapping_add(1), None);
+        *entry = (entry.0 + 1, None);
         Ok(())
     }
 
