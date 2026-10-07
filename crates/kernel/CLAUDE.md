@@ -11,6 +11,9 @@ touches memory through raw addresses: the board reads user buffers, copies pages
 ## Responsibilities
 
 - `Board` trait and `Program` enum (`src/lib.rs`); `run` drives boot and the `test=*` bootargs scenarios.
+- `Disk` trait and `BLOCK` (4096) (`src/lib.rs`): synchronous `read`/`write` of consecutive blocks, `flush`,
+  `blocks`; errors `EIO` (device failure or past the end) and `EFAULT` (buffer not kernel memory). `Board::disk` is
+  called once in `run`, before the `boot:` line, so the probe counts toward boot time.
 - `Scheduler<N>` (`src/sched.rs`): slots, states (`Ready`, `Blocked`, `Exited`, `Zombie`), priorities, `reap`, `kill`.
 - `Handles` (`src/handle.rs`): per-process handle tables, rights, `dup`, `split` for `spawn`.
 - `Pipes<N>` (`src/pipe.rs`), `Mutexes<N>` (`src/mutex.rs`): fixed tables of kernel objects.

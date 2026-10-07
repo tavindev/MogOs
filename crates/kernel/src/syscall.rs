@@ -61,6 +61,8 @@ pub const IO_WRITE: u64 = 1;
 pub const EPERM: i64 = -1;
 /// No such file in the directory.
 pub const ENOENT: i64 = -2;
+/// The disk failed a request.
+pub const EIO: i64 = -5;
 /// Not a valid executable.
 pub const ENOEXEC: i64 = -8;
 

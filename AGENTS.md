@@ -48,7 +48,7 @@ Every new `.md` file must be linked from its parent so it stays reachable from t
 
 ## Layout
 
-- `crates/kernel` ([CLAUDE.md](crates/kernel/CLAUDE.md)) — OS logic, `#![no_std]`, **no `unsafe`** (`forbid`). Defines ports (traits) like `Board`, the scheduler, handles, pipes, mutexes, the console line discipline, syscall decoding and the boot archive's cpio and ELF parsers.
+- `crates/kernel` ([CLAUDE.md](crates/kernel/CLAUDE.md)) — OS logic, `#![no_std]`, **no `unsafe`** (`forbid`). Defines ports (traits) like `Board` and `Disk`, the scheduler, handles, pipes, mutexes, the console line discipline, syscall decoding and the boot archive's cpio and ELF parsers.
 - `crates/mm` ([CLAUDE.md](crates/mm/CLAUDE.md)) — arch-independent memory management (`PhysAddr`, frame allocator). Safe, host-tested.
 - `crates/dtb` ([CLAUDE.md](crates/dtb/CLAUDE.md)) — minimal FDT parser. Safe, host-tested.
 - `crates/arch` ([CLAUDE.md](crates/arch/CLAUDE.md)) — the only arch-specific crate, `unsafe` allowed; AArch64 code in `src/aarch64/` (boot, traps, MMU and page tables, GICv2, timer).

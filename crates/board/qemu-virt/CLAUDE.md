@@ -3,7 +3,7 @@
 ## What this crate is
 
 The adapter that implements `kernel::Board` for QEMU `virt` and owns everything stateful and unsafe outside
-`crates/arch`: `kmain`, the PL011 driver (`src/uart.rs`), the global kernel state, the `#[global_allocator]`, the
+`crates/arch`: `kmain`, the PL011 driver (`src/uart.rs`), the virtio-blk driver (`src/virtio_blk.rs`), the global kernel state, the `#[global_allocator]`, the
 trap hooks, process construction and ELF loading, the asm test programs (`src/user.s`), `linker.ld`, and `build.rs`,
 which builds `crates/user` and bundles it as the boot archive.
 
@@ -17,6 +17,11 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
 - Trap hooks `task_switch`, `board_irq`, `board_syscall`, `board_user_fault`: execute the `kernel::syscall::Call`
   that `dispatch` returns (user buffers, pages, frames, wake/block).
 - Processes: `spawn_process`, `spawn`, `task_exit`, `kill`, `map`, `release`, `enter` (TTBR0/ASID switch).
+- `VirtioBlk` (`src/virtio_blk.rs`) implements `kernel::Disk`: modern (version 2) virtio-mmio only, one 4-entry
+  queue in one frame, one request in flight, completion polled (no IRQ), DMA straight to the caller's blocks (only
+  inside the identity-mapped RAM GiB, else `EFAULT`), requests past the capacity `EIO`. `Board::disk` hands it out
+  once (`DISK_TAKEN`), scanning QEMU `virt`'s fixed virtio-mmio transports from the highest down and stopping at the first empty one
+  (QEMU `virt` fills them from the top with no gaps; a board fact like `UART_IRQ`).
 - `build.rs`: nested `cargo build` of `crates/user` into `target/user`, newc `boot.cpio` into `OUT_DIR` (plus a
   non-ELF `bad` entry), `-T linker.ld`. Why it is built this way: `docs/DEVELOPMENT.md` settings table.
 
@@ -27,7 +32,9 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
   `// SAFETY:` and every `unsafe fn` a `# Safety` section.
 - Depends on `kernel`, never the reverse. UART, GIC and RAM come from the DTB; board constants fix the rest:
   `UART0` (user `write`, panic and fault output), `DTB` (RAM base), `KERNEL_L1` (GiB 0 device, GiB 1 RAM),
-  `UNMAPPED`, `TIMER_IRQ` (27), the PSCI call.
+  `UNMAPPED`, `TIMER_IRQ` (27), `VIRTIO`, `VIRTIO_STRIDE`, `VIRTIO_COUNT` (32 virtio-mmio transports from `0x0a00_0000`, `0x200` apart), the PSCI call. QEMU runs with
+  `-global virtio-mmio.force-legacy=false` (the driver rejects legacy) and `-global virtio-mmio.ioeventfd=off`
+  (`docs/DEVELOPMENT.md` settings table).
 - Bare-metal only: excluded from `cargo test-host`.
 
 ## Vocabulary
