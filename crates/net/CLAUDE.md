@@ -13,8 +13,8 @@ time_wait))` adds connection slots (`TcpSocket::new(rx, tx)`, the rings from the
 (`[HalfOpen::EMPTY; N]`), a TIME_WAIT table (`[TimeWait::EMPTY; N]`) and the 128-bit seed every key is derived
 from. Then `listen`, `accept`, `connect(now, local, to)` (local 0 is ephemeral), `send`, `recv` (`Ok(0)` is the end
 of the stream, `WouldBlock` is nothing yet), `shutdown` (half-close), `tcp_close` (release; a RST if data was left
-unread), `abort` and `tcp_info` (state, error, cwnd, ssthresh, send window, RTO, the deadline the next `poll` acts
-on, bytes queued, whether released, retransmission timeouts taken). Segments go out from `poll`.
+unread), `abort` and `tcp_info` (peer address and port, state, error, cwnd, ssthresh, send window, RTO, the deadline
+the next `poll` acts on, bytes queued, whether released, retransmission timeouts taken). Segments go out from `poll`.
 
 The `Nic` trait: `mac`, `mtu`, `transmit(len, |buf| ..)` (the stack writes the frame into the driver's buffer) and
 `receive(|frame| ..)`.
@@ -102,7 +102,11 @@ kernel, step 50), DHCP, DNS or IPv6 (phase 9), or IPv4 fragment reassembly.
   No key is used twice: `Tcp::new` derives one per use from the caller's seed (SipHash of the seed and a label):
   ISNs, ports, cookies, the TIME_WAIT takeover bits and the half-open mix, so the weak mix's observable collisions
   reveal nothing about the cookie or ISN keys. A cookie's clock and MSS index go into the hashed message, never the
-  key. The kernel's seed comes from the DT seed (step 49).
+  key. Each purpose's key is its own type, `Key<P>`, derived from a `Seed` with `P`'s label, and each purpose's hash
+  is a method of its key type, so a key cannot be used for another purpose. The kernel's seed comes from the DT
+  seed (step 49).
+- Sequence-space values are `Seq(u32)`: ordered and subtracted modulo 2^32 (`lt`, `le`, `gt`, `offset_from`,
+  `Seq - Seq` is a distance), and only a byte count can be added to one; byte counts and windows stay integers.
 - Segments about a connection go to the MAC from its last ARP resolution (each send resolves the next hop; until
   the first, a passive open's SYN source), never to a received frame's source; a pure ACK carries `snd_max`, so a
   go-back-N `snd_nxt` never starts an ACK war. Demux tries the last matched slot first.

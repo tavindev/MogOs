@@ -123,6 +123,8 @@ Decision: write `crates/net` fresh. smoltcp is a host-only dev-dependency of `cr
   (`refresh`): an obligation appearing with no deadline before starts its timer then, so a FIN owed after a
   `shutdown` no longer took a timeout when a peer segment arrived in the same `poll`. `tcp_info` reports
   `timeouts`. Merged with main (steps 49-51) first; the kernel's network task builds unchanged.
+- **47 (newtypes).** Per the new rule (invalid states unrepresentable): `Seq(u32)` for sequence-space values and
+  `Key<P>` per keyed purpose from a `Seed`, at no run-time cost; `tcp_info` reports the peer address for accept.
 - **49.** `crates/board/qemu-virt/src/virtio_net.rs`: modern virtio-mmio only, `VIRTIO_NET_F_MAC` and
   `VIRTIO_F_VERSION_1` (12-byte header, no offloads), one RX and one TX queue of 64 descriptors, each owning a 2 KiB
   buffer of a 256 KiB pool taken from the frame allocator once when the network starts, never grown. Every RX buffer
