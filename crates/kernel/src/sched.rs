@@ -139,7 +139,7 @@ impl<const M: usize> Entries<M> {
 }
 
 /// The process table: per index, an address space (its level-1 table; `PhysAddr(0)` is the boot table), handles,
-/// memory and live thread count. Index 0 is the kernel: the boot context and kernel tasks, in the boot table.
+/// memory and live threads. Index 0 is the kernel: the boot context and kernel tasks, in the boot table.
 pub struct Processes<const P: usize> {
     space: [PhysAddr; P],
     handles: [Handles; P],
@@ -278,6 +278,10 @@ impl<const N: usize, const P: usize> Scheduler<N, P> {
         self.slots.end(slot, code);
         self.wake(Event::Join(slot));
         let index = self.process[slot];
+        debug_assert!(
+            self.processes.threads[index] & 1 << slot != 0,
+            "slot {slot} ended twice"
+        );
         self.processes.threads[index] &= !(1 << slot);
         if self.processes.threads[index] == 0 {
             self.processes.entries.end(index, code);

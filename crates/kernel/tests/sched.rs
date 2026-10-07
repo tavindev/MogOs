@@ -313,26 +313,33 @@ fn ending_a_waiter_reports_its_event_so_the_owner_drops_its_boost_and_is_outrank
 }
 
 #[test]
-fn a_zombie_stays_until_its_last_handle_closes_and_a_stale_close_counts_for_nothing() {
-    let mut sched = Scheduler::<4, 3>::new();
-    spawn(&mut sched, 0x100);
-    let (_, child) = spawn_with(&mut sched, 0x200, 5, 0);
-    let process = Object::Process {
-        index: child.0,
-        generation: child.1,
+fn a_zombie_thread_stays_until_its_last_handle_closes_and_a_stale_close_counts_for_nothing() {
+    let mut sched = Scheduler::<3, 2>::new();
+    let (_, process) = spawn(&mut sched, 0x100);
+    let held = thread(&mut sched, process.0, 0x200, 0);
+    let object = Object::Thread {
+        slot: held.0,
+        generation: held.1,
     };
-    give(&mut sched, process);
-    give(&mut sched, process);
+    give(&mut sched, object);
+    give(&mut sched, object);
     sched.block(Event::Idle);
     assert_eq!(sched.switch(0x10), 0x100);
     assert_eq!(sched.switch(0x110), 0x200);
-    assert_eq!(exit(&mut sched, 3), 0x110);
-    assert_eq!(sched.close(child.0, child.1), 0, "one handle left");
-    assert_eq!(sched.free_process(), None);
-    assert_eq!(sched.close(child.0, child.1), 5, "the last one frees it");
-    let (index, generation) = sched.free_process().unwrap();
-    assert_eq!(index, child.0);
-    spawn(&mut sched, 0x300);
-    assert_eq!(sched.close(index, generation - 1), 0, "an older generation");
-    assert_eq!(sched.process_live(index, generation), Ok(true));
+    assert_eq!(exit(&mut sched, 4), 0x110);
+    sched.close_thread(held.0, held.1);
+    assert_eq!(sched.free_slot(), None, "one handle left: a zombie");
+    sched.close_thread(held.0, held.1);
+    let (slot, generation) = sched.free_slot().unwrap();
+    assert_eq!(slot, held.0, "the last one frees it");
+
+    let reused = thread(&mut sched, process.0, 0x300, 0);
+    sched.close_thread(held.0, held.1);
+    assert_eq!(sched.switch(0x111), 0x300);
+    assert_eq!(exit(&mut sched, 0), 0x111);
+    assert_eq!(
+        sched.free_slot(),
+        Some((reused.0, generation + 1)),
+        "an older generation's close neither counted nor kept it"
+    );
 }

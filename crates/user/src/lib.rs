@@ -12,6 +12,7 @@ pub const WRITE: u64 = 1 << 1;
 pub const DUPLICATE: u64 = 1 << 3;
 pub const TRANSFER: u64 = 1 << 4;
 pub const EXEC: u64 = 1 << 5;
+pub const WAIT: u64 = 1 << 6;
 
 /// `open` flags: create a missing file; empty the file.
 pub const CREATE: u64 = 1 << 0;

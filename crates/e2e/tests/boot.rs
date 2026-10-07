@@ -1172,6 +1172,7 @@ fn threads_share_a_counter_keep_their_tls_and_end_with_their_process() {
             "T: count 400000",
             "T: killed a process with a spinning and a blocked thread",
             "T: a killed thread joins with KILLED",
+            "T: a thread stays a zombie until its last handle closes",
             "T: the main thread exits first",
             "T: the last thread ends the process",
         ]

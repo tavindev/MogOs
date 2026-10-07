@@ -43,6 +43,12 @@ extern "C" fn spin(_: u64) -> ! {
     }
 }
 
+/// Writes a byte to the pipe end `write_end`, then exits with 7.
+extern "C" fn signal(write_end: u64) -> ! {
+    write(write_end, &[1]);
+    thread_exit(7)
+}
+
 extern "C" fn last(_: u64) -> ! {
     let mut me = 0;
     while me == 0 {
@@ -98,6 +104,22 @@ extern "C" fn _start() -> ! {
     check(
         t >= 0 && kill(t as u64) == 0 && wait(t as u64) == KILLED && close(t as u64) == 0,
         b"T: a killed thread joins with KILLED\n",
+    );
+    // More rounds than free slots, so a slot kept after its last handle closes would fail a later `thread`; the first
+    // is joined through its second handle, after its first closed. Two stacks, so no ending thread shares one.
+    let (signals, signal_end) = pipe();
+    for i in 0..9 {
+        let t = thread(signal, base + (3 + i % 2) * 4096, 0, signal_end);
+        let d = dup(t as u64, WAIT);
+        let ended = signals >= 0 && t >= 0 && d >= 0 && read(signals as u64, &mut byte) == 1;
+        let closed = close(t as u64) == 0 && (i > 0 || wait(d as u64) == 7) && close(d as u64) == 0;
+        if !(ended && closed) {
+            exit(1);
+        }
+    }
+    write(
+        CONSOLE,
+        b"T: a thread stays a zombie until its last handle closes\n",
     );
     let t = thread(last, base + 2 * 4096, 0, 0);
     check(t >= 0, b"T: the main thread exits first\n");
