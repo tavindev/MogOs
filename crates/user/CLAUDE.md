@@ -11,8 +11,8 @@ board crate).
 ## Boundaries (hard)
 
 - Outside the workspace (own `Cargo.lock`): lint and format with the `--manifest-path` commands in
-  `docs/DEVELOPMENT.md`. `cargo test-host` does not build it; its lib's host test (the command table) runs with the
-  `cargo test --manifest-path` command there.
+  `docs/DEVELOPMENT.md`. `cargo test-host` builds it only for its lib's host test (the command
+  table), through `crates/e2e/tests/user.rs`, which runs the `cargo test --manifest-path` command there.
 - `#![no_std]` (the lib `cfg_attr(not(test))`), `#![no_main]`, no dependencies. `unsafe` only in `src/lib.rs` for
   `svc`, `map`'s slice and `start`'s argument slice, and in bins for `#[unsafe(no_mangle)]`, the one call to the
   `unsafe fn start`, and `fuzz`'s calls to `unsafe fn raw` (any syscall, all seven arguments; the caller keeps what the

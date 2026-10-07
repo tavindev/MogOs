@@ -42,7 +42,7 @@ Every new `.md` file must be linked from its parent so it stays reachable from t
 - Shell on a persistent disk: `[ -f disk.img ] || cargo mkfs; cargo shell` (msh builtins `cd`, `pwd`, `exit`, `help`; programs `ls`, `mkdir`, `touch`, `write`, `cat`, `rm`, `mv`, `echo`, `sync`)
 - Run in a QEMU window: `cargo window` (mouse stays free; Ctrl+Option+G releases a grab)
 - Quit a hung QEMU: `Ctrl-A` then `X`
-- Test: `cargo test-host` (host tests plus the QEMU boot tests in `crates/e2e`; must pass)
+- Test: `cargo test-host` (host tests, `crates/user`'s included, plus the QEMU boot tests in `crates/e2e`; must pass)
 - Benchmarks: `cargo bench-host` (host); kernel boot time is the `boot: <N> us` line
 - Debug: `cargo run -- -s -S`, then attach `lldb` / `gdb` to `localhost:1234`
 - Lint/format: `cargo clippy`, `cargo fmt` (must be clean; `crates/user` is outside the workspace, see `docs/DEVELOPMENT.md`). Settings, rules for agents: `docs/DEVELOPMENT.md`
