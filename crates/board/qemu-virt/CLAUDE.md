@@ -14,9 +14,8 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
 
 - `kmain`: reads the DTB at RAM base, builds `QemuVirt`, calls `kernel::run` with the image and DTB reserved.
 - `KERNEL` (`Scheduler`, `FrameAllocator`, `Pipes`, `Mutexes`, console `Line`, the MogFS `Fs<FsDisk>` and whether it
-  is mounted) and `HEAP` statics. `Fs::new` is const, so the 48 KiB file system is built in the static; its disk is
-  `FsDisk`, which forwards to `FS_DISK` (the `VirtioBlk` `Board::mount` stores, `Io` before), because mogfs cannot
-  replace an `Fs`'s disk. File syscalls run their disk I/O inside the trap with IRQs masked: a `sync` holds the core
+  is mounted) and `HEAP` statics. `Fs::new` is const, so the 48 KiB file system is built in the static with an empty
+  `FsDisk(None)` (`Io` until `Board::mount` puts the `VirtioBlk` in through `Fs::disk`). File syscalls run their disk I/O inside the trap with IRQs masked: a `sync` holds the core
   for its writes and two flushes. Boot-spawned processes get the root directory as handle 3 once mounted (`spawn_init`).
 - Trap hooks `task_switch`, `board_irq`, `board_syscall`, `board_user_fault`: execute the `kernel::syscall::Call`
   that `dispatch` returns (user buffers, pages, frames, wake/block).
@@ -60,7 +59,9 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
 - A blocking call rewinds its `svc` (`block` calls `TrapFrame::restart`) and reruns when woken.
 - User memory is read only through `user_bytes` / `user_bytes_mut`, which probe every page with
   `arch::user_readable` / `user_writable`; slices live only until the trap returns.
-- User layout: code at `USER_BASE` (4 GiB), ELF segments within `IMAGE`, one stack page below `USER_STACK_TOP`,
+- User layout: code at `USER_BASE` (4 GiB), ELF segments within `IMAGE` (below the top two pages and an unmapped guard page, so a stack overflow faults), one stack page
+  below `USER_STACK_TOP`; a `spawn` with arguments copies them to the end of that page and adds a stack page below it
+  (both charged to the child), and the child starts with x0-x2 = count, address, length,
   `map` from `MAP_BASE` upward. Kernel blocks (`KERNEL_L1`) are EL1-only in every address space.
 - `MAX_MUTEXES = MAX_TASKS * MAX_HANDLES`: every live mutex holds a handle, so the handle tables are the quota.
 - `linker.ld` provides `__stack_top`, `__bss_start`, `__bss_end`, `__kernel_start`, `__kernel_end`; its load address

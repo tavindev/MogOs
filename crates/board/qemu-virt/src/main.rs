@@ -52,8 +52,8 @@ const USER_BASE: u64 = 1 << 32;
 const USER_STACK_TOP: u64 = USER_BASE + (2 << 20);
 /// Where a process's first `map` goes; later ones follow it.
 const MAP_BASE: u64 = USER_STACK_TOP;
-/// Where an executable's segments may go: below the stack page, so they share one level-3 table with it.
-const IMAGE: Range<u64> = USER_BASE..USER_STACK_TOP - PAGE as u64;
+/// Where an executable's segments may go: below the two stack pages and an unmapped guard page, in one level-3 table.
+const IMAGE: Range<u64> = USER_BASE..USER_STACK_TOP - 3 * PAGE as u64;
 /// The boot archive (cpio, newc), built by `build.rs` from `crates/user`.
 static ARCHIVE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/boot.cpio"));
 /// EL1 virtual timer PPI.
@@ -119,7 +119,7 @@ static KERNEL: Global = Global(UnsafeCell::new(Kernel {
     pipes: Pipes::new(),
     mutexes: Mutexes::new(),
     line: Line::new(),
-    fs: Fs::new(FsDisk),
+    fs: Fs::new(FsDisk(None)),
     mounted: false,
 }));
 
@@ -139,42 +139,25 @@ struct Global(UnsafeCell<Kernel>);
 // SAFETY: one core, and the kernel state is only touched with IRQs masked, so accesses never overlap.
 unsafe impl Sync for Global {}
 
-/// The file system's block device, set by `Board::mount`; touched only with IRQs masked, through `FsDisk`.
-static FS_DISK: DiskSlot = DiskSlot(UnsafeCell::new(None));
-
-struct DiskSlot(UnsafeCell<Option<VirtioBlk>>);
-
-// SAFETY: one core, and the slot is only touched with IRQs masked, so accesses never overlap.
-unsafe impl Sync for DiskSlot {}
-
-/// `KERNEL.fs`'s disk: `FS_DISK`, so the const `Fs::new` builds the static before the device exists (mogfs has no
-/// way to replace an `Fs`'s disk); `Io` while there is none.
-struct FsDisk;
-
-impl FsDisk {
-    /// Valid only until the calling `Disk` method returns.
-    fn get<'a>() -> Option<&'a mut VirtioBlk> {
-        // SAFETY: only `KERNEL.fs` holds an `FsDisk`, and it and `FS_DISK` are touched only with IRQs masked on the only
-        // core, so this is the sole reference.
-        unsafe { (*FS_DISK.0.get()).as_mut() }
-    }
-}
+/// `KERNEL.fs`'s disk: `None` until `Board::mount` puts the device in, so the const `Fs::new` builds the static before
+/// the device exists; `Io` while there is none.
+struct FsDisk(Option<VirtioBlk>);
 
 impl Disk for FsDisk {
     fn read(&mut self, block: u64, bufs: &mut [[u8; BLOCK_SIZE]]) -> Result<(), Error> {
-        Self::get().ok_or(Error::Io)?.read(block, bufs)
+        self.0.as_mut().ok_or(Error::Io)?.read(block, bufs)
     }
 
     fn write(&mut self, block: u64, bufs: &[[u8; BLOCK_SIZE]]) -> Result<(), Error> {
-        Self::get().ok_or(Error::Io)?.write(block, bufs)
+        self.0.as_mut().ok_or(Error::Io)?.write(block, bufs)
     }
 
     fn flush(&mut self) -> Result<(), Error> {
-        Self::get().ok_or(Error::Io)?.flush()
+        self.0.as_mut().ok_or(Error::Io)?.flush()
     }
 
     fn blocks(&self) -> u64 {
-        Self::get().map_or(0, |disk| disk.blocks())
+        self.0.as_ref().map_or(0, VirtioBlk::blocks)
     }
 }
 
@@ -376,7 +359,26 @@ fn map_zeroed(
     va: u64,
     access: UserAccess,
 ) -> Option<PhysAddr> {
-    let page = zeroed(frames, budget)?;
+    map_filled(frames, budget, (l1, va, access), (0, &[]))
+}
+
+/// As `map_zeroed`, with `bytes` at offset `at` of the frame (`at + bytes.len()` at most a page); only the rest is
+/// zeroed.
+fn map_filled(
+    frames: &mut FrameAllocator<FRAME_WORDS>,
+    budget: &mut Budget,
+    (l1, va, access): (PhysAddr, u64, UserAccess),
+    (at, bytes): (usize, &[u8]),
+) -> Option<PhysAddr> {
+    let page = budget.alloc(frames)?;
+    let base = page.0 as *mut u8;
+    let end = at + bytes.len();
+    // SAFETY: a fresh frame from the allocator: identity-mapped RAM that nothing else uses, and `end <= PAGE`.
+    unsafe { ptr::write_bytes(base, 0, at) };
+    // SAFETY: as above; `bytes` is kernel or user memory, never this frame.
+    unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), base.wrapping_add(at), bytes.len()) };
+    // SAFETY: as above.
+    unsafe { ptr::write_bytes(base.wrapping_add(end), 0, PAGE - end) };
     let leaf = user_page(page, access);
     // SAFETY: `l1` is a process's table built from zeroed frames like these, and `va` is a user address it leaves unmapped;
     // map's `next` only grows, by at most the budget, and budgets stay within RAM, so `va` stays far below 512 GiB.
@@ -435,13 +437,15 @@ unsafe fn enter(sched: &Scheduler<MAX_TASKS>, frame: usize, next: usize) {
 
 /// Builds a process from `file`'s `segments` (entered at `entry`): address space, pages and kernel stack, all charged
 /// to `budget`, and queues it in the free `slot` with `handles` at `priority`; on failure (`ENOMEM`) returns every
-/// frame it took.
+/// frame it took. With `args` (`argc` of them, at most a page), the top stack page holds them and the stack gets a
+/// page below it.
 fn spawn_process(
     sched: &mut Scheduler<MAX_TASKS>,
     frames: &mut FrameAllocator<FRAME_WORDS>,
     (file, segments, entry): (&[u8], impl Iterator<Item = Segment>, u64),
     mut budget: Budget,
     (slot, handles, priority): ((usize, u64), Handles, u8),
+    (args, argc): (&[u8], usize),
 ) -> Result<(), i64> {
     let l1 = zeroed(frames, &mut budget).ok_or(ENOMEM)?;
     // SAFETY: `l1` is a fresh, zeroed frame.
@@ -456,17 +460,27 @@ fn spawn_process(
             };
             for offset in (0..segment.size as usize).step_by(PAGE) {
                 let va = segment.vaddr + offset as u64;
-                let page = map_zeroed(frames, &mut budget, l1, va, access)?;
                 let bytes = data.get(offset..).unwrap_or_default();
                 let bytes = &bytes[..bytes.len().min(PAGE)];
-                // SAFETY: `bytes` fits in the fresh frame `page`.
-                unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), page.0 as *mut u8, bytes.len()) };
-                // SAFETY: `page` is identity-mapped RAM.
-                unsafe { arch::sync_icache(page.0 as usize, PAGE) };
+                let page = map_filled(frames, &mut budget, (l1, va, access), (0, bytes))?;
+                if !segment.writable {
+                    // SAFETY: `page` is identity-mapped RAM.
+                    unsafe { arch::clean_dcache(page.0 as usize, PAGE) };
+                }
             }
         }
         let stack_page = USER_STACK_TOP - PAGE as u64;
-        map_zeroed(frames, &mut budget, l1, stack_page, UserAccess::ReadWrite)?;
+        let top = (l1, stack_page, UserAccess::ReadWrite);
+        map_filled(frames, &mut budget, top, (PAGE - args.len(), args))?;
+        if !args.is_empty() {
+            map_zeroed(
+                frames,
+                &mut budget,
+                l1,
+                stack_page - PAGE as u64,
+                UserAccess::ReadWrite,
+            )?;
+        }
         budget.alloc_contiguous(frames, TASK_STACK_FRAMES)
     })();
     let Some(stack) = stack else {
@@ -474,8 +488,11 @@ fn spawn_process(
         unsafe { arch::free_space(l1, |f| frames.free(f)) };
         return Err(ENOMEM);
     };
+    arch::invalidate_icache();
+    let at = USER_STACK_TOP - args.len() as u64;
+    let x = [argc as u64, at, args.len() as u64];
     // SAFETY: the kernel stack below `stack.end` is fresh and owned by the new process.
-    let frame = unsafe { arch::new_user_task(stack.end.0 as usize, entry, USER_STACK_TOP) };
+    let frame = unsafe { arch::new_user_task(stack.end.0 as usize, entry, at & !15, x) };
     let memory = Memory {
         stack: stack.start,
         budget,
@@ -515,7 +532,14 @@ fn spawn_init(
             handles.insert(Object::Dir(ROOT), READ | WRITE | DUPLICATE | TRANSFER)?;
         }
         let init = (slot, handles, priority);
-        spawn_process(sched, frames, executable, Budget::new(budget), init)
+        spawn_process(
+            sched,
+            frames,
+            executable,
+            Budget::new(budget),
+            init,
+            (&[], 0),
+        )
     });
     arch::irq::restore(irq);
     added
@@ -523,16 +547,18 @@ fn spawn_init(
 
 /// Spawns the boot archive's executable at `file` with the `len` handles at user address `ptr` and `budget` frames
 /// moved from the current process, which gets a handle to the child, at `priority` capped at the current process's
-/// own; on failure nothing moves.
+/// own, with the arguments at user address `args`; on failure nothing moves.
 fn spawn(
     sched: &mut Scheduler<MAX_TASKS>,
     frames: &mut FrameAllocator<FRAME_WORDS>,
     file: Range<usize>,
     (ptr, len): (u64, usize),
-    budget: usize,
-    priority: u64,
+    (budget, priority): (usize, u8),
+    args: (u64, usize),
 ) -> Result<u64, i64> {
     let executable = executable(file)?;
+    let args = user_bytes(args.0, args.1).ok_or(EFAULT)?;
+    let argc = kernel::syscall::argc(args)?;
     let bytes = user_bytes(ptr, len * 8).ok_or(EFAULT)?;
     let mut list = [0; MAX_HANDLES];
     for (handle, bytes) in list.iter_mut().zip(bytes.as_chunks::<8>().0) {
@@ -544,9 +570,16 @@ fn spawn(
     }
     let (slot, generation) = sched.free_slot().ok_or(EAGAIN)?;
     let process = parent.insert(Object::Process { slot, generation }, WAIT | KILL)?;
-    let priority = priority.min(sched.priority().into()) as u8;
+    let priority = priority.min(sched.priority());
     let child = ((slot, generation), child, priority);
-    spawn_process(sched, frames, executable, Budget::new(budget), child)?;
+    spawn_process(
+        sched,
+        frames,
+        executable,
+        Budget::new(budget),
+        child,
+        (args, argc),
+    )?;
     sched.memory().budget.shrink(budget);
     *sched.handles() = parent;
     Ok(process)
@@ -818,9 +851,8 @@ impl kernel::Board for QemuVirt {
     fn mount(&mut self, disk: VirtioBlk) -> Result<(), Error> {
         let irq = arch::irq::disable();
         // SAFETY: IRQs are masked on the only core, so this is the sole reference.
-        unsafe { *FS_DISK.0.get() = Some(disk) };
-        // SAFETY: as above.
         let kernel = unsafe { &mut *KERNEL.0.get() };
+        *kernel.fs.disk() = FsDisk(Some(disk));
         let mounted = kernel.fs.mount();
         kernel.mounted = mounted.is_ok();
         arch::irq::restore(irq);
@@ -1029,6 +1061,18 @@ unsafe extern "C" fn board_syscall(frame: &mut arch::TrapFrame) -> usize {
                 _ => file::list_archive(ARCHIVE, start, out),
             })
             .map_or_else(|error| error as u64, |n| n as u64),
+        Ok(Call::Unlink { dir, ptr, len }) => user_bytes(ptr, len)
+            .ok_or(EFAULT)
+            .and_then(|path| {
+                let held = |i| sched.holds(|o| o == Object::Dir(i) || o == Object::Node(i));
+                file::unlink(fs, dir, path, held)
+            })
+            .map_or_else(|error| error as u64, |()| 0),
+        Ok(Call::Rename { from, to }) => user_bytes(from.1, from.2)
+            .zip(user_bytes(to.1, to.2))
+            .ok_or(EFAULT)
+            .and_then(|(f, t)| file::rename(fs, (from.0, f), (to.0, t)))
+            .map_or_else(|error| error as u64, |()| 0),
         Ok(Call::Sync) => fs
             .commit()
             .map_or_else(|error| file::errno(error) as u64, |()| 0),
@@ -1038,8 +1082,17 @@ unsafe extern "C" fn board_syscall(frame: &mut arch::TrapFrame) -> usize {
             len,
             budget,
             priority,
-        }) => spawn(sched, frames, file, (ptr, len), budget, priority)
-            .unwrap_or_else(|error| error as u64),
+            args,
+            args_len,
+        }) => spawn(
+            sched,
+            frames,
+            file,
+            (ptr, len.into()),
+            (budget, priority),
+            (args, args_len.into()),
+        )
+        .unwrap_or_else(|error| error as u64),
         Ok(Call::NewMutex) => match mutexes.create() {
             Some(mutex) => sched
                 .handles()

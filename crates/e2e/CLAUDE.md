@@ -21,11 +21,11 @@ lines and the exit status.
   in the same change (`docs/DEVELOPMENT.md`, rules for agents).
 - Each boot has a 30 s deadline, then QEMU is killed and the test fails.
 - Disk scenarios make a zeroed raw image in the temp dir per test (`disk_image`), or a formatted MogFS one
-  (`mogfs_image`), and remove it; the flush check boots through a `blkdebug` blockdev that fails every host flush with EIO.
+  (`mogfs_image`), and remove it; the flush checks (`test=disk`, and msh's `sync` in `sync_reports_a_failed_flush`) boot through a `blkdebug` blockdev that fails every host flush with EIO (`flush_fails`).
 - Console input (`boot_with_input`) writes chunk `i` once the output holds the ready marker `i + 1` times, so `shell`
   types one command per `msh> ` prompt and no echo interleaves with msh's output.
 - `assert_no_leak` checks that a scenario's `<test>: free frames <n> before, <n> after` counts match; every scenario
-  of `budget`, `spawn`, `pipe`, `wait`, `pi`, `echo`, `shell` and `bench-fs` uses it; a new scenario that frees frames should too.
+  of `budget`, `spawn`, `pipe`, `wait`, `pi`, `echo`, `shell`, `bench-fs` and `bench-spawn` uses it; a new scenario that frees frames should too.
 - A new kernel behavior gets its failing scenario here first (`docs/WORKFLOW.md`, step 2).
 - Performance is the moat: a slowdown is never accepted because it has an explanation; it is removed, or shown to
   be unavoidable with before/after numbers (`docs/BENCHMARKS.md`).

@@ -1,4 +1,4 @@
-//! msh's `echo`: prints its arguments, separated by spaces.
+//! msh's `rm <name>`: removes the file or empty directory `name` from the directory handle 1 (write right).
 #![no_std]
 #![no_main]
 
@@ -11,6 +11,5 @@ extern "C" fn _start(argc: usize, _: usize, len: usize) -> ! {
 }
 
 fn main(args: &[&[u8]]) -> u64 {
-    write_words(CONSOLE, &args[1.min(args.len())..], 0);
-    0
+    status(unlink(1, arg(args, 1)))
 }

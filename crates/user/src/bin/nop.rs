@@ -1,4 +1,4 @@
-//! msh's `echo`: prints its arguments, separated by spaces.
+//! Spawned by `spawnbench`: takes its arguments and exits 0.
 #![no_std]
 #![no_main]
 
@@ -10,7 +10,6 @@ extern "C" fn _start(argc: usize, _: usize, len: usize) -> ! {
     unsafe { start(argc, len, main) }
 }
 
-fn main(args: &[&[u8]]) -> u64 {
-    write_words(CONSOLE, &args[1.min(args.len())..], 0);
+fn main(_: &[&[u8]]) -> u64 {
     0
 }

@@ -1,48 +1,82 @@
-//! `test=shell`'s init: a native shell. Reads a command line from the console, runs it against the root directory,
-//! and prints `msh: <command>: <error>` when it fails.
+//! `test=shell`'s init: a native shell. Reads a command line from the console; runs the builtins `cd`, `pwd`, `exit`
+//! and `help` itself and the commands in `user::COMMANDS` as programs from the boot archive, never from disk. It
+//! resolves each path argument against its root handle and current directory and passes the program only a handle to
+//! what it needs, narrowed by `dup` (`crates/user/CLAUDE.md`). Prints `msh: <command>: <error>` when a command fails.
 #![no_std]
 #![no_main]
 
 use user::*;
 
+/// init's boot-archive directory handle.
+const ARCHIVE: u64 = 2;
 /// init's root directory handle, present when a disk is mounted.
 const ROOT: u64 = 3;
+/// A command's budget: a shell program's 10 frames (3 tables, text, 2 stack, 4 kernel stack) and room for two more
+/// pages of program; msh's own 11 (3 pages of program) leave 14 of its 25.
+const CHILD_BUDGET: usize = 12;
+/// Longest path msh keeps or builds, and its argument buffer (a command line is at most 256 bytes).
+const PATH: usize = 256;
 
-const ERRORS: [(i64, &[u8]); 11] = [
+const ERRORS: [(i64, &[u8]); 18] = [
     (ENOENT, b"ENOENT"),
     (EIO, b"EIO"),
+    (E2BIG, b"E2BIG"),
+    (ENOEXEC, b"ENOEXEC"),
     (EBADF, b"EBADF"),
+    (ENOMEM, b"ENOMEM"),
     (EACCES, b"EACCES"),
+    (EFAULT, b"EFAULT"),
+    (EBUSY, b"EBUSY"),
     (EEXIST, b"EEXIST"),
     (ENOTDIR, b"ENOTDIR"),
     (EISDIR, b"EISDIR"),
     (EINVAL, b"EINVAL"),
+    (EMFILE, b"EMFILE"),
     (EFBIG, b"EFBIG"),
     (ENOSPC, b"ENOSPC"),
     (EROFS, b"EROFS"),
+    (ENOTEMPTY, b"ENOTEMPTY"),
 ];
+
+/// The current directory: a path below the root, empty for the root itself.
+struct Cwd {
+    path: [u8; PATH],
+    len: usize,
+}
 
 #[unsafe(no_mangle)]
 extern "C" fn _start() -> ! {
+    let mut cwd = Cwd {
+        path: [0; PATH],
+        len: 0,
+    };
     let mut buf = [0; 256];
     loop {
         write(CONSOLE, b"msh> ");
         let len = read(CONSOLE, &mut buf).max(0) as usize;
-        let line = buf[..len].strip_suffix(b"\n").unwrap_or(&buf[..len]);
-        let (command, args) = split(line);
-        let (path, text) = split(args);
+        let mut words: [&[u8]; MAX_ARGS] = [&[]; MAX_ARGS];
+        let mut count = 0;
+        for word in buf[..len].split(|&b| b == b' ' || b == b'\n') {
+            if !word.is_empty() && count < MAX_ARGS {
+                words[count] = word;
+                count += 1;
+            }
+        }
+        let words = &words[..count];
+        let Some(&command) = words.first() else {
+            continue;
+        };
         let result = match command {
-            b"" => continue,
-            b"ls" => ls(path),
-            b"mkdir" => mkdir(ROOT, path),
-            b"touch" => with_file(path, CREATE, |_| 0),
-            b"write" => with_file(path, CREATE | TRUNC, |file| {
-                write_at(file, text, 0).min(write_at(file, b"\n", text.len() as u64))
-            }),
-            b"cat" => with_file(path, 0, cat),
-            b"sync" => sync(ROOT),
+            b"cd" => cd(&mut cwd, arg(words, 1)),
+            b"pwd" => {
+                write(CONSOLE, b"/");
+                write(CONSOLE, &cwd.path[..cwd.len]);
+                write(CONSOLE, b"\n");
+                0
+            }
             b"exit" => exit(0),
-            _ => ENOENT,
+            b"help" => help(),
+            _ => run(&cwd, words),
         };
         if result < 0 {
             write(CONSOLE, b"msh: ");
@@ -59,55 +93,173 @@ extern "C" fn _start() -> ! {
     }
 }
 
-/// The text before the first space and the text after it.
-fn split(line: &[u8]) -> (&[u8], &[u8]) {
-    match line.iter().position(|&b| b == b' ') {
-        Some(i) => (&line[..i], &line[i + 1..]),
-        None => (line, &[]),
+/// `path` relative to `cwd`, as a path below the root, in `out`.
+fn resolve<'a>(cwd: &Cwd, path: &[u8], out: &'a mut [u8; PATH]) -> Result<&'a [u8], i64> {
+    let parts: [&[u8]; 3] = match (cwd.len, path.len()) {
+        (0, _) => [path, b"", b""],
+        (_, 0) => [&cwd.path[..cwd.len], b"", b""],
+        _ => [&cwd.path[..cwd.len], b"/", path],
+    };
+    let mut len = 0;
+    for part in parts {
+        out.get_mut(len..len + part.len())
+            .ok_or(EINVAL)?
+            .copy_from_slice(part);
+        len += part.len();
+    }
+    Ok(&out[..len])
+}
+
+/// A new handle with only `rights` (and transfer) to the directory or file at `path` below the root (the root if empty).
+fn handle(path: &[u8], rights: u64) -> i64 {
+    if path.is_empty() {
+        return dup(ROOT, rights | TRANSFER);
+    }
+    let wide = open(ROOT, path, 0);
+    if wide < 0 {
+        return wide;
+    }
+    let narrow = dup(wide as u64, rights | TRANSFER);
+    close(wide as u64);
+    narrow
+}
+
+/// `path`'s parent directory and last component.
+fn split(path: &[u8]) -> (&[u8], &[u8]) {
+    match path.iter().rposition(|&b| b == b'/') {
+        Some(i) => (&path[..i], &path[i + 1..]),
+        None => (b"", path),
     }
 }
 
-/// Opens `path` with `flags`, runs `f` on it and closes it; the first error.
-fn with_file(path: &[u8], flags: u64, f: impl FnOnce(u64) -> i64) -> i64 {
-    let file = open(ROOT, path, flags);
-    if file < 0 {
-        return file;
+fn cd(cwd: &mut Cwd, path: &[u8]) -> i64 {
+    if path == b".." {
+        cwd.len = split(&cwd.path[..cwd.len]).0.len();
+        return 0;
     }
-    let result = f(file as u64);
-    close(file as u64);
-    result
-}
-
-fn ls(path: &[u8]) -> i64 {
-    match path {
-        b"" => list(ROOT),
-        path => with_file(path, 0, list),
-    }
-}
-
-fn list(dir: u64) -> i64 {
-    let mut buf = [0; 512];
-    let mut start = 0;
-    loop {
-        let n = readdir(dir, &mut buf, start);
-        if n <= 0 {
-            return n;
+    let mut out = [0; PATH];
+    let path = match path {
+        b"" => &[][..],
+        path => match resolve(cwd, path, &mut out) {
+            Ok(path) => path,
+            Err(error) => return error,
+        },
+    };
+    if !path.is_empty() {
+        let dir = handle(path, READ);
+        if dir < 0 {
+            return dir;
         }
-        let entries = &buf[..n as usize];
-        write(CONSOLE, entries);
-        start += entries.iter().filter(|&&b| b == b'\n').count() as u64;
+        // Only a directory lists; from past its end, it reads nothing.
+        let listed = readdir(dir as u64, &mut [], u64::MAX);
+        close(dir as u64);
+        if listed < 0 {
+            return listed;
+        }
     }
+    cwd.path[..path.len()].copy_from_slice(path);
+    cwd.len = path.len();
+    0
 }
 
-fn cat(file: u64) -> i64 {
-    let mut buf = [0; 512];
-    let mut offset = 0;
-    loop {
-        let n = read_at(file, &mut buf, offset);
-        if n <= 0 {
-            return n;
-        }
-        write(CONSOLE, &buf[..n as usize]);
-        offset += n as u64;
+fn help() -> i64 {
+    write(CONSOLE, b"builtins: cd pwd exit help\ncommands:");
+    for (name, _) in COMMANDS {
+        write(CONSOLE, b" ");
+        write(CONSOLE, name);
     }
+    write(CONSOLE, b"\n");
+    0
+}
+
+/// Runs the command `words[0]` from msh's table, a program in the boot archive, with the console as handle 0 and then
+/// the handles its `Grant` names, and waits for it; its exit code is an errno.
+fn run(cwd: &Cwd, words: &[&[u8]]) -> i64 {
+    let Some(grant) = grant(words[0]) else {
+        write(CONSOLE, b"msh: ");
+        write(CONSOLE, words[0]);
+        write(CONSOLE, b": command not found\n");
+        return 0;
+    };
+    let exe = open(ARCHIVE, words[0], 0);
+    if exe < 0 {
+        return exe;
+    }
+    let (mut handles, mut granted, mut args) = ([0; 3], 0, [0; PATH]);
+    let result = give(cwd, words, grant, (&mut handles, &mut granted), &mut args).and_then(|len| {
+        let process = spawn_at(
+            exe as u64,
+            &handles[..granted],
+            CHILD_BUDGET,
+            u64::MAX,
+            &args[..len],
+        );
+        if process < 0 {
+            return Err(process);
+        }
+        granted = 0;
+        let code = wait(process as u64);
+        close(process as u64);
+        Ok(-code)
+    });
+    handles[..granted].iter().for_each(|&h| _ = close(h));
+    close(exe as u64);
+    result.unwrap_or_else(|error| error)
+}
+
+/// Puts the console (write only) and what `grant` names in `handles` (counting them in `granted`), and the arguments
+/// in `args`: every word, the paths a `Grant::Parents` changes replaced by their last component; returns their length.
+fn give(
+    cwd: &Cwd,
+    words: &[&[u8]],
+    grant: Grant,
+    (handles, granted): (&mut [u64; 3], &mut usize),
+    args: &mut [u8; PATH],
+) -> Result<usize, i64> {
+    let console = dup(CONSOLE, WRITE | TRANSFER);
+    if console < 0 {
+        return Err(console);
+    }
+    (handles[0], *granted) = (console as u64, 1);
+    let mut argv: [&[u8]; MAX_ARGS] = [&[]; MAX_ARGS];
+    argv[..words.len()].copy_from_slice(words);
+    let mut outs = [[0; PATH]; 2];
+    let [first, second] = &mut outs;
+    let mut grants: [(&[u8], u64); 2] = [(b"", 0); 2];
+    let count = match grant {
+        Grant::Console => 0,
+        Grant::Root(rights) => {
+            grants[0] = (b"", rights);
+            1
+        }
+        Grant::Target(rights) => {
+            grants[0] = (resolve(cwd, arg(words, 1), first)?, rights);
+            1
+        }
+        Grant::Parents(rights, n) => {
+            for (i, out) in [first, second].into_iter().enumerate().take(n) {
+                let (dir, name) = split(resolve(cwd, words.get(i + 1).ok_or(EINVAL)?, out)?);
+                (grants[i], argv[i + 1]) = ((dir, rights), name);
+            }
+            n
+        }
+    };
+    for &(path, rights) in &grants[..count] {
+        let handle = handle(path, rights);
+        if handle < 0 {
+            return Err(handle);
+        }
+        handles[*granted] = handle as u64;
+        *granted += 1;
+    }
+    let mut len = 0;
+    for word in &argv[..words.len()] {
+        let end = len + word.len() + 1;
+        if end > args.len() {
+            return Err(E2BIG);
+        }
+        args[len..end - 1].copy_from_slice(word);
+        len = end;
+    }
+    Ok(len)
 }

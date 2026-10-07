@@ -1,4 +1,4 @@
-//! msh's `echo`: prints its arguments, separated by spaces.
+//! msh's `touch <name>`: makes the file `name` in the directory handle 1 (read and write rights) if it is missing.
 #![no_std]
 #![no_main]
 
@@ -11,6 +11,9 @@ extern "C" fn _start(argc: usize, _: usize, len: usize) -> ! {
 }
 
 fn main(args: &[&[u8]]) -> u64 {
-    write_words(CONSOLE, &args[1.min(args.len())..], 0);
-    0
+    let file = open(1, arg(args, 1), CREATE);
+    if file >= 0 {
+        close(file as u64);
+    }
+    status(file)
 }

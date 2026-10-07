@@ -1,4 +1,4 @@
-//! `test=bench-fs`'s init: times `open(CREATE | TRUNC)` + a 100-byte write + `sync` round trips, then `open` +
+//! `test=bench-fs`'s init: checks that `unlink` refuses a file a handle reaches (`EBUSY`), then times `open(CREATE | TRUNC)` + a 100-byte write + `sync` round trips, then `open` +
 //! `close` round trips, on a file in the root directory; prints each in ns.
 #![no_std]
 #![no_main]
@@ -13,6 +13,20 @@ const OPENS: u64 = 100_000;
 #[unsafe(no_mangle)]
 extern "C" fn _start() -> ! {
     let data = [0x5a; 100];
+    let held = open(ROOT, b"held", CREATE);
+    let mut buf = [0; 4];
+    if held < 0
+        || write(held as u64, b"kept") != 4
+        || unlink(ROOT, b"held") != EBUSY
+        || read(held as u64, &mut buf) != 4
+        || buf != *b"kept"
+    {
+        exit(1);
+    }
+    close(held as u64);
+    if unlink(ROOT, b"held") != 0 {
+        exit(1);
+    }
     let start = now_ns();
     for _ in 0..SYNCS {
         let file = open(ROOT, b"f", CREATE | TRUNC);

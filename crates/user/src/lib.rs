@@ -1,12 +1,13 @@
-//! Native syscalls (`x8` = number, `x0`-`x4` = arguments, `x0` = result, negative = error) and the panic handler.
-#![no_std]
+//! Native syscalls (`x8` = number, `x0`-`x6` = arguments, `x0` = result, negative = error), msh's command table and
+//! the panic handler.
+#![cfg_attr(not(test), no_std)]
 
 use core::arch::asm;
-use core::panic::PanicInfo;
 
 /// Handle 0: the console, for every program spawned with it first.
 pub const CONSOLE: u64 = 0;
 
+pub const READ: u64 = 1 << 0;
 pub const WRITE: u64 = 1 << 1;
 pub const TRANSFER: u64 = 1 << 4;
 
@@ -14,21 +15,31 @@ pub const TRANSFER: u64 = 1 << 4;
 pub const CREATE: u64 = 1 << 0;
 pub const TRUNC: u64 = 1 << 1;
 
+/// Where the stack ends: the board's `USER_STACK_TOP`.
+const STACK_TOP: usize = (1 << 32) + (2 << 20);
+/// Most arguments `spawn` passes.
+pub const MAX_ARGS: usize = 32;
+
 pub const EPERM: i64 = -1;
 pub const ENOENT: i64 = -2;
 pub const EIO: i64 = -5;
+pub const E2BIG: i64 = -7;
 pub const ENOEXEC: i64 = -8;
 pub const EBADF: i64 = -9;
 pub const ENOMEM: i64 = -12;
 pub const EACCES: i64 = -13;
+pub const EFAULT: i64 = -14;
+pub const EBUSY: i64 = -16;
 pub const EEXIST: i64 = -17;
 pub const ENOTDIR: i64 = -20;
 pub const EISDIR: i64 = -21;
 pub const EINVAL: i64 = -22;
+pub const EMFILE: i64 = -24;
 pub const EFBIG: i64 = -27;
 pub const ENOSPC: i64 = -28;
 pub const EROFS: i64 = -30;
 pub const EDEADLK: i64 = -35;
+pub const ENOTEMPTY: i64 = -39;
 
 /// The exit code `wait` reports for a killed process.
 pub const KILLED: i64 = 256;
@@ -119,21 +130,67 @@ pub fn open(dir: u64, path: &[u8], flags: u64) -> i64 {
     syscall(5, [dir, path.as_ptr() as u64, path.len() as u64, flags])
 }
 
-/// `spawn_at` this process's own priority.
+/// `spawn_at` this process's own priority, with no arguments.
 pub fn spawn(exe: u64, handles: &[u64], budget: usize) -> i64 {
-    spawn_at(exe, handles, budget, u64::MAX)
+    spawn_at(exe, handles, budget, u64::MAX, &[])
 }
 
 /// Moves `handles` to the child (at values 0, 1, ...) and `budget` frames of this process's budget; the child runs at
-/// `priority` (0 lowest), capped at this process's own.
-pub fn spawn_at(exe: u64, handles: &[u64], budget: usize, priority: u64) -> i64 {
+/// `priority` (0 lowest), capped at this process's own, with `args`: strings each ending in a NUL, at most `MAX_ARGS`
+/// and 4096 bytes (`E2BIG`).
+pub fn spawn_at(exe: u64, handles: &[u64], budget: usize, priority: u64, args: &[u8]) -> i64 {
     let result;
-    // SAFETY: as in `syscall`; `spawn` reads only the handle list.
+    // SAFETY: as in `syscall`; `spawn` reads only the handle list and the arguments.
     unsafe {
         asm!("svc #0", inlateout("x0") exe => result, in("x1") handles.as_ptr(),
-            in("x2") handles.len(), in("x3") budget, in("x4") priority, in("x8") 6, options(nostack))
+            in("x2") handles.len(), in("x3") budget, in("x4") priority, in("x5") args.as_ptr(),
+            in("x6") args.len(), in("x8") 6, options(nostack))
     };
     result
+}
+
+/// Runs `main` with the arguments `spawn` passed and exits with its result: `_start` receives x0 = their count, x1 =
+/// their address, x2 = their length (0, none, for a process spawned at boot), and passes the count and length here.
+///
+/// # Safety
+///
+/// `argc` and `len` must be the x0 and x2 the kernel started this process with: the `len` bytes below `STACK_TOP` are
+/// then its arguments, and nothing else references them.
+pub unsafe fn start(argc: usize, len: usize, main: fn(&[&[u8]]) -> u64) -> ! {
+    let len = len.min(4096);
+    // SAFETY: the kernel copied the arguments to the end of the top stack page, which stays mapped (caller contract).
+    let bytes = unsafe { core::slice::from_raw_parts((STACK_TOP - len) as *const u8, len) };
+    let mut args: [&[u8]; MAX_ARGS] = [&[]; MAX_ARGS];
+    for (arg, bytes) in args.iter_mut().zip(bytes.split(|&b| b == 0)) {
+        *arg = bytes;
+    }
+    exit(main(&args[..argc.min(MAX_ARGS)]))
+}
+
+/// The exit code for a syscall result: its errno (`-result`) if it failed, else 0; msh prints it by name.
+pub fn status(result: i64) -> u64 {
+    result.min(0).unsigned_abs()
+}
+
+/// Argument `i`, empty if missing (a name the kernel then rejects).
+pub fn arg<'a>(args: &[&'a [u8]], i: usize) -> &'a [u8] {
+    args.get(i).copied().unwrap_or_default()
+}
+
+/// Writes `words` separated by spaces, then a newline, at `offset`; returns the first error or the bytes written.
+pub fn write_words(handle: u64, words: &[&[u8]], mut offset: u64) -> i64 {
+    for (i, &word) in words.iter().enumerate() {
+        let sep: &[u8] = if i == 0 { b"" } else { b" " };
+        for part in [sep, word] {
+            let n = write_at(handle, part, offset);
+            if n < 0 {
+                return n;
+            }
+            offset += n as u64;
+        }
+    }
+    let n = write_at(handle, b"\n", offset);
+    if n < 0 { n } else { offset as i64 + n }
 }
 
 /// Returns the read end (or an error) and the write end.
@@ -183,6 +240,22 @@ pub fn sync(dir: u64) -> i64 {
     syscall(15, [dir, 0, 0, 0])
 }
 
+/// Removes the file or empty directory at `path` under `dir`.
+pub fn unlink(dir: u64, path: &[u8]) -> i64 {
+    syscall(16, [dir, path.as_ptr() as u64, path.len() as u64, 0])
+}
+
+/// Moves the entry at `from` under `from_dir` to `to` under `to_dir`; `EEXIST` if `to` exists.
+pub fn rename(from_dir: u64, from: &[u8], to_dir: u64, to: &[u8]) -> i64 {
+    let result;
+    // SAFETY: as in `syscall`; `rename` reads only the two paths.
+    unsafe {
+        asm!("svc #0", inlateout("x0") from_dir => result, in("x1") from.as_ptr(), in("x2") from.len(),
+            in("x3") to_dir, in("x4") to.as_ptr(), in("x5") to.len(), in("x8") 17, options(nostack))
+    };
+    result
+}
+
 /// Nanoseconds on the virtual counter.
 pub fn now_ns() -> u64 {
     let (count, freq): (u64, u64);
@@ -194,7 +267,68 @@ pub fn now_ns() -> u64 {
     (count as u128 * 1_000_000_000 / freq as u128) as u64
 }
 
+/// A panic exits 255, outside the errno range a shell program's exit code uses.
+#[cfg(not(test))]
 #[panic_handler]
-fn panic(_: &PanicInfo) -> ! {
-    exit(1)
+fn panic(_: &core::panic::PanicInfo) -> ! {
+    exit(255)
+}
+
+/// What msh hands a command besides the console (write only), each handle narrowed to these rights (and transfer).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Grant {
+    /// Nothing more.
+    Console,
+    /// The root directory.
+    Root(u64),
+    /// What the first argument names (the current directory if none).
+    Target(u64),
+    /// The parent directory of each of the first `n` arguments, which go to the program as their last components.
+    Parents(u64, usize),
+}
+
+/// The programs msh runs, each with only what its job needs (least privilege, `crates/user/CLAUDE.md`).
+pub const COMMANDS: [(&[u8], Grant); 9] = [
+    (b"cat", Grant::Target(READ)),
+    (b"ls", Grant::Target(READ)),
+    (b"echo", Grant::Console),
+    (b"sync", Grant::Root(0)),
+    (b"mkdir", Grant::Parents(WRITE, 1)),
+    (b"rm", Grant::Parents(WRITE, 1)),
+    (b"touch", Grant::Parents(READ | WRITE, 1)),
+    (b"write", Grant::Parents(READ | WRITE, 1)),
+    (b"mv", Grant::Parents(WRITE, 2)),
+];
+
+/// What msh grants the command `name`; `None` if msh does not run it.
+pub fn grant(name: &[u8]) -> Option<Grant> {
+    COMMANDS.iter().find(|c| c.0 == name).map(|c| c.1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_command_gets_only_what_its_job_needs() {
+        let reader = Grant::Target(READ);
+        let expected = [
+            ("cat", Some(reader)),
+            ("ls", Some(reader)),
+            ("echo", Some(Grant::Console)),
+            ("sync", Some(Grant::Root(0))),
+            ("mkdir", Some(Grant::Parents(WRITE, 1))),
+            ("rm", Some(Grant::Parents(WRITE, 1))),
+            ("touch", Some(Grant::Parents(READ | WRITE, 1))),
+            ("write", Some(Grant::Parents(READ | WRITE, 1))),
+            ("mv", Some(Grant::Parents(WRITE, 2))),
+            ("msh", None),
+            ("mid", None),
+            ("child", None),
+        ];
+        for (name, grant_) in expected {
+            assert_eq!(grant(name.as_bytes()), grant_, "{name}");
+        }
+        assert_eq!(COMMANDS.len(), 9);
+    }
 }

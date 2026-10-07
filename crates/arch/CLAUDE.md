@@ -15,7 +15,7 @@ It is **NOT** board-specific: no MMIO addresses, no memory map, no drivers, no s
   EL1 `brk #0` (self-test); anything else panics with ESR/FAR/ELR.
 - `new_task`, `new_user_task`, `switch_el0_regs`, `TrapFrame::restart`.
 - Descriptor encoding (`l1_block`, `user_page`), `enable_mmu`, `map_page`, `unmap_page`, `free_space`, `set_ttbr0`,
-  `flush_asid`, `user_readable` / `user_writable` (`at` probes), `sync_icache`.
+  `flush_asid`, `user_readable` / `user_writable` (`at` probes), `clean_dcache` / `invalidate_icache` (clean each code page, invalidate once).
 - `irq::disable` / `restore` / `wait`, `gic::enable` / `ack` / `eoi`, `timer::arm`, `timer::allow_user_counter`.
 
 ## Boundaries (hard)

@@ -1,4 +1,4 @@
-//! Native syscalls: `x8` = number, `x0`-`x5` = arguments, `x0` = result (negative = error), `svc #0`.
+//! Native syscalls: `x8` = number, `x0`-`x6` = arguments, `x0` = result (negative = error), `svc #0`.
 
 use core::ops::Range;
 
@@ -30,10 +30,13 @@ const MAP: u64 = 4;
 /// `/`-separated component must be a name, so `..`, `.`, an empty component (`/x`, `a//b`) is `EINVAL`; more than
 /// `file::MAX_DEPTH` (16) components is `ENAMETOOLONG`.
 const OPEN: u64 = 5;
-/// `spawn(exe, handles_ptr, handles_len, budget, priority)`: starts the executable `exe` (exec right) as a new process
-/// at `priority`, capped at the caller's own (so no process escalates), moving it the `handles_len` handles at
-/// `handles_ptr` (transfer right; values 0, 1, ... in the child) and `budget` frames of the caller's budget; returns a
-/// handle to the process (wait, kill). On failure nothing moves.
+/// `spawn(exe, handles_ptr, handles_len, budget, priority, args_ptr, args_len)`: starts the executable `exe` (exec
+/// right) as a new process at `priority`, capped at the caller's own (so no process escalates), moving it the
+/// `handles_len` handles at `handles_ptr` (transfer right; values 0, 1, ... in the child) and `budget` frames of the
+/// caller's budget; returns a handle to the process (wait, kill). On failure nothing moves. `args` holds the child's
+/// arguments, each ending in a NUL (`EINVAL` otherwise), at most `MAX_ARGS` and `MAX_BUFFER` bytes (`E2BIG`); the
+/// kernel copies them to the top of the child's stack, on a page charged to the child's budget below which the stack
+/// gets its usual page, and the child starts with x0 = their count, x1 = their address, x2 = their length.
 const SPAWN: u64 = 6;
 /// `pipe()`: returns a handle to a new pipe's read end (read, duplicate, transfer), and in `x1` one to its write end
 /// (write, duplicate, transfer). Its one-page buffer is charged to the caller's budget until the last handle to it
@@ -58,12 +61,24 @@ const KILL: u64 = 12;
 /// returns 0. `EROFS` on the boot archive.
 const MKDIR: u64 = 13;
 /// `readdir(dir, ptr, len, start)`: fills `ptr` with whole `name\n` entries (`name/\n` for a directory) of `dir` (read
-/// right) from entry `start` on, in creation order; returns the bytes written, 0 past the last entry. The caller
-/// advances `start` by the newlines it got. `EINVAL` if the next entry does not fit in `len`.
+/// right) from entry `start` on; returns the bytes written, 0 past the last entry. The caller advances `start` by the
+/// newlines it got; an unlink between calls moves an entry, so a resumed listing can skip or repeat one. `EINVAL` if
+/// the first entry does not fit in `len`.
 const READDIR: u64 = 14;
-/// `sync(dir)`: makes every change to the file system `dir` (write right) is on durable, atomically; it holds the core
-/// for its writes and two flushes. `EIO` means unknown: the changes may or may not be durable.
+/// `sync(handle)`: makes every change to the file system the directory or file `handle` (no right needed: it changes
+/// nothing a handle reaches) is on durable, atomically; it holds the core for its writes and two flushes. `EIO` means unknown: the changes may or may not be durable.
 const SYNC: u64 = 15;
+/// `unlink(dir, path_ptr, path_len)`: removes the file or empty directory (`ENOTEMPTY` otherwise) at `path` under `dir`
+/// (write right), resolved as by `open`; returns 0. `EBUSY` while any process holds a handle to it, so a freed inode
+/// is never reached through an old handle. `EROFS` on the boot archive.
+const UNLINK: u64 = 16;
+/// `rename(from_dir, from_ptr, from_len, to_dir, to_ptr, to_len)`: moves the entry at the path `from` under `from_dir`
+/// to the path `to` under `to_dir` (both write right), resolved as by `open`; returns 0. `EEXIST` if `to` exists,
+/// `EINVAL` if a directory would move below itself, `EROFS` on the boot archive.
+const RENAME: u64 = 17;
+
+/// Most arguments a `spawn` passes.
+pub const MAX_ARGS: usize = 32;
 
 /// The exit code `wait` reports for a process a fault killed: outside `exit`'s 0..=255.
 pub const KILLED: u64 = 256;
@@ -83,6 +98,8 @@ pub const EPERM: i64 = -1;
 pub const ENOENT: i64 = -2;
 /// The disk failed a request, or the file system is corrupt.
 pub const EIO: i64 = -5;
+/// Over `spawn`'s argument limits.
+pub const E2BIG: i64 = -7;
 /// Not a valid executable.
 pub const ENOEXEC: i64 = -8;
 
@@ -96,6 +113,8 @@ pub const ENOMEM: i64 = -12;
 pub const EACCES: i64 = -13;
 /// Bad address: outside user space, unmapped, or (except for `io_submit_wait`) longer than `MAX_BUFFER`.
 pub const EFAULT: i64 = -14;
+/// Unlinking a file or directory that a handle reaches.
+pub const EBUSY: i64 = -16;
 /// The name exists.
 pub const EEXIST: i64 = -17;
 /// A path component, or a handle a call needs to be a directory, is a file.
@@ -123,6 +142,8 @@ pub const EDEADLK: i64 = -35;
 pub const ENAMETOOLONG: i64 = -36;
 /// No such syscall.
 const ENOSYS: i64 = -38;
+/// Unlinking a directory that has entries.
+pub const ENOTEMPTY: i64 = -39;
 
 /// User virtual addresses: 4 GiB up to the 39-bit VA limit.
 const USER: Range<u64> = 1 << 32..1 << 39;
@@ -205,13 +226,27 @@ pub enum Call {
     },
     /// Commit the file system.
     Sync,
-    /// Spawn the boot archive's file `file`, moving the `len` handles at `ptr` (in `USER` unless empty, maybe unmapped) and `budget`.
+    /// Unlink the path at `ptr..ptr + len` (as for `Open`) under `dir`.
+    Unlink {
+        dir: Inode,
+        ptr: u64,
+        len: usize,
+    },
+    /// Rename the path `from` to the path `to`, each a directory and a buffer as for `Unlink`.
+    Rename {
+        from: (Inode, u64, usize),
+        to: (Inode, u64, usize),
+    },
+    /// Spawn the boot archive's file `file`, moving the `len` handles at `ptr` (in `USER` unless empty, maybe unmapped)
+    /// and `budget`, with the arguments at `args..args + args_len` (as for `ptr`). The small fields keep `Call` at 56 bytes.
     Spawn {
         file: Range<usize>,
         ptr: u64,
-        len: usize,
+        len: u8,
         budget: usize,
-        priority: u64,
+        priority: u8,
+        args: u64,
+        args_len: u16,
     },
     /// Create a mutex.
     NewMutex,
@@ -224,9 +259,11 @@ pub enum Call {
     },
 }
 
-/// Runs syscall `nr` with arguments `args` (`x0`-`x5`) against the caller's `handles`, leaving the board the parts
+const _: () = assert!(size_of::<Call>() == 56, "every syscall returns a Call");
+
+/// Runs syscall `nr` with arguments `args` (`x0`-`x6`) against the caller's `handles`, leaving the board the parts
 /// that touch hardware or tasks; `Err` holds the result to return.
-pub fn dispatch(nr: u64, args: &[u64; 6], handles: &mut Handles) -> Result<Call, i64> {
+pub fn dispatch(nr: u64, args: &[u64; 7], handles: &mut Handles) -> Result<Call, i64> {
     match nr {
         EXIT => Ok(Call::Exit(args[0] & 0xff)),
         IO => {
@@ -301,12 +338,19 @@ pub fn dispatch(nr: u64, args: &[u64; 6], handles: &mut Handles) -> Result<Call,
                 return Err(EINVAL);
             }
             user_buffer(ptr, len * 8)?;
+            let (argv, argv_len) = (args[5], args[6]);
+            if argv_len > MAX_BUFFER {
+                return Err(E2BIG);
+            }
+            user_buffer(argv, argv_len)?;
             Ok(Call::Spawn {
                 file: start..end,
                 ptr,
-                len: len as usize,
+                len: len as u8,
                 budget: budget as usize,
-                priority: args[4],
+                priority: args[4].min(u8::MAX.into()) as u8,
+                args: argv,
+                args_len: argv_len as u16,
             })
         }
         PIPE => Ok(Call::NewPipe),
@@ -324,21 +368,17 @@ pub fn dispatch(nr: u64, args: &[u64; 6], handles: &mut Handles) -> Result<Call,
             Object::Process { slot, generation } => Ok(Call::Kill { slot, generation }),
             _ => Err(EACCES),
         },
-        MKDIR => {
-            let (ptr, len) = (args[1], args[2]);
-            let dir = match handles.entry(args[0])? {
-                (Object::Archive, _) => return Err(EROFS),
-                (Object::Dir(_), rights) if rights & WRITE == 0 => return Err(EACCES),
-                (Object::Dir(dir), _) => dir,
-                _ => return Err(ENOTDIR),
-            };
-            user_buffer(ptr, len)?;
-            Ok(Call::Mkdir {
-                dir,
-                ptr,
-                len: len as usize,
+        MKDIR | UNLINK => {
+            let (dir, ptr, len) = path(handles, args[0], args[1], args[2])?;
+            Ok(match nr {
+                MKDIR => Call::Mkdir { dir, ptr, len },
+                _ => Call::Unlink { dir, ptr, len },
             })
         }
+        RENAME => Ok(Call::Rename {
+            from: path(handles, args[0], args[1], args[2])?,
+            to: path(handles, args[3], args[4], args[5])?,
+        }),
         READDIR => {
             let (ptr, len) = (args[1], args[2]);
             let dir = handles.get(args[0], READ)?;
@@ -353,11 +393,34 @@ pub fn dispatch(nr: u64, args: &[u64; 6], handles: &mut Handles) -> Result<Call,
                 start: args[3],
             })
         }
-        SYNC => match handles.get(args[0], WRITE)? {
-            Object::Dir(_) => Ok(Call::Sync),
+        SYNC => match handles.get(args[0], 0)? {
+            Object::Dir(_) | Object::Node(_) => Ok(Call::Sync),
             _ => Err(ENOTDIR),
         },
         _ => Err(ENOSYS),
+    }
+}
+
+/// The directory `handle` (write right) and the path buffer `ptr..ptr + len` a call that changes it names.
+fn path(handles: &Handles, handle: u64, ptr: u64, len: u64) -> Result<(Inode, u64, usize), i64> {
+    let dir = match handles.entry(handle)? {
+        (Object::Archive, _) => return Err(EROFS),
+        (Object::Dir(_), rights) if rights & WRITE == 0 => return Err(EACCES),
+        (Object::Dir(dir), _) => dir,
+        _ => return Err(ENOTDIR),
+    };
+    user_buffer(ptr, len)?;
+    Ok((dir, ptr, len as usize))
+}
+
+/// The number of arguments in `args`, each ending in a NUL; `E2BIG` over `MAX_ARGS`, `EINVAL` if the last one has
+/// no NUL.
+pub fn argc(args: &[u8]) -> Result<usize, i64> {
+    let count = args.iter().filter(|&&b| b == 0).count();
+    match args.last() {
+        _ if count > MAX_ARGS => Err(E2BIG),
+        Some(&last) if last != 0 => Err(EINVAL),
+        _ => Ok(count),
     }
 }
 

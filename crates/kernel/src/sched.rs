@@ -183,14 +183,16 @@ impl<const N: usize> Scheduler<N> {
             slot,
             generation: self.generation[slot],
         };
-        let held = self.handles[..self.end]
-            .iter()
-            .any(|h| h.objects().any(|o| o == process));
-        self.state[slot] = match held {
+        self.state[slot] = match self.holds(|o| o == process) {
             true => State::Zombie(code),
             false => State::Exited(code),
         };
         self.wake(Event::Exit(slot));
+    }
+
+    /// Whether any task's handle table holds a handle to an object `f` matches.
+    pub fn holds(&self, f: impl Fn(Object) -> bool) -> bool {
+        self.handles[..self.end].iter().any(|h| h.objects().any(&f))
     }
 
     /// For the process in `slot` with `generation`: `None` while it runs; once it exited, its code and its budget's

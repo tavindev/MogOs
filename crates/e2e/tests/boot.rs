@@ -301,12 +301,17 @@ fn spawn_moves_handles_and_budget_to_the_child() {
             "S: spawn over budget: ENOMEM",
             "S: spawn without handles over budget: ENOMEM",
             "S: spawn one frame short: ENOMEM",
+            "S: spawn 4097 bytes of args: E2BIG",
+            "S: spawn 33 args: E2BIG",
+            "S: spawn args without a NUL: EINVAL",
+            "S: spawn with args one frame short: ENOMEM",
             "S: console not moved",
             "S: spawned child with the console",
             "S: moved console: EBADF",
             "C: hello through handle 0",
             "C: statics work",
             "C: handle 1 not given: EBADF",
+            "C: 32 args of 4096 bytes: child, a b",
         ]
     );
     // The one-frame-short spawn fails after mapping everything but the kernel stack, so this checks its rollback.
@@ -489,6 +494,14 @@ fn boot_with_disk(image: &Path, test: &str) -> (ExitStatus, Vec<String>) {
     ])
 }
 
+/// A `-blockdev` value for `image` as drive `d0` behind blkdebug, which fails every host flush with EIO.
+fn flush_fails(image: &Path) -> String {
+    format!(
+        r#"{{"driver":"raw","node-name":"d0","file":{{"driver":"blkdebug","inject-error":[{{"event":"flush_to_disk","errno":5}}],"image":{{"driver":"file","filename":"{}"}}}}}}"#,
+        image.display()
+    )
+}
+
 #[test]
 fn a_flushed_block_survives_a_reboot() {
     let image = disk_image("disk", 16);
@@ -512,10 +525,7 @@ fn a_flushed_block_survives_a_reboot() {
 
     // A fresh image behind blkdebug, which fails every host flush with EIO: the kernel must see it, so it flushed.
     let image = disk_image("disk-flush", 16);
-    let blockdev = format!(
-        r#"{{"driver":"raw","node-name":"d0","file":{{"driver":"blkdebug","inject-error":[{{"event":"flush_to_disk","errno":5}}],"image":{{"driver":"file","filename":"{}"}}}}}}"#,
-        image.display()
-    );
+    let blockdev = flush_fails(&image);
     let (status, lines) = boot(&[
         "-blockdev",
         &blockdev,
@@ -599,19 +609,24 @@ fn mogfs_image(test: &str, blocks: u64) -> PathBuf {
 /// command with the lines msh printed for it.
 fn shell(image: &Path, commands: &[&str]) -> (ExitStatus, Vec<(String, Vec<String>)>) {
     let drive = format!("file={},if=none,format=raw,id=d0", image.display());
+    shell_on(&["-drive", &drive], commands)
+}
+
+/// As `shell`, with the drive `d0` given by `drive` (QEMU arguments).
+fn shell_on(drive: &[&str], commands: &[&str]) -> (ExitStatus, Vec<(String, Vec<String>)>) {
     let typed: Vec<Vec<u8>> = commands.iter().map(|c| format!("{c}\r").into()).collect();
     let chunks: Vec<&[u8]> = typed.iter().map(Vec::as_slice).collect();
-    let (status, lines) = boot_with_input(
+    let args = [
+        drive,
         &[
-            "-drive",
-            &drive,
             "-device",
             "virtio-blk-device,drive=d0",
             "-append",
             "test=shell",
         ],
-        Some(("msh> ", &chunks)),
-    );
+    ]
+    .concat();
+    let (status, lines) = boot_with_input(&args, Some(("msh> ", &chunks)));
     assert!(
         !lines.iter().any(|l| l.starts_with("panic:")),
         "kernel panicked"
@@ -645,10 +660,25 @@ fn shell_files_survive_a_reboot_only_once_synced() {
         &image,
         &[
             "mkdir docs",
-            "write docs/a.txt hello",
+            "cd docs",
+            "pwd",
+            "write a.txt hello",
+            "cd ..",
+            "mv docs/a.txt docs/b.txt",
+            "mkdir tmp",
+            "rm tmp",
+            "write c.txt cross",
+            "mkdir sub",
+            "mv c.txt docs/c.txt",
+            "mv sub docs/sub",
+            "echo hi  there",
             "sync",
-            "write docs/b.txt late",
+            "write docs/late.txt x",
             "ls docs",
+            "frob",
+            "mid",
+            "msh",
+            "help",
             "exit",
         ],
     );
@@ -657,37 +687,113 @@ fn shell_files_survive_a_reboot_only_once_synced() {
         boot1,
         session(&[
             ("mkdir docs", &[]),
-            ("write docs/a.txt hello", &[]),
+            ("cd docs", &[]),
+            ("pwd", &["/docs"]),
+            ("write a.txt hello", &[]),
+            ("cd ..", &[]),
+            ("mv docs/a.txt docs/b.txt", &[]),
+            ("mkdir tmp", &[]),
+            ("rm tmp", &[]),
+            ("write c.txt cross", &[]),
+            ("mkdir sub", &[]),
+            ("mv c.txt docs/c.txt", &[]),
+            ("mv sub docs/sub", &[]),
+            ("echo hi  there", &["hi there"]),
             ("sync", &[]),
-            ("write docs/b.txt late", &[]),
-            ("ls docs", &["a.txt", "b.txt"]),
+            ("write docs/late.txt x", &[]),
+            ("ls docs", &["b.txt", "c.txt", "sub/", "late.txt"]),
+            ("frob", &["msh: frob: command not found"]),
+            // Archive programs outside msh's command table do not run.
+            ("mid", &["msh: mid: command not found"]),
+            ("msh", &["msh: msh: command not found"]),
+            (
+                "help",
+                &[
+                    "builtins: cd pwd exit help",
+                    "commands: cat ls echo sync mkdir rm touch write mv",
+                ],
+            ),
             ("exit", &[]),
         ])
     );
 
-    // b.txt was written but never synced, so the reboot drops it.
+    // late.txt was written but never synced, so the reboot drops it; this boot commits after mounting.
     let (status, boot2) = shell(
         &image,
         &[
             "ls",
             "ls docs",
-            "cat docs/a.txt",
+            "cat docs/b.txt",
+            "cat docs/c.txt",
             "cat ../x",
             "cat /x",
+            "rm docs",
+            "rm docs/b.txt",
+            "rm docs/c.txt",
+            "rm docs/sub",
+            "sync",
+            "ls docs",
             "exit",
         ],
     );
-    std::fs::remove_file(&image).unwrap();
     assert!(status.success(), "QEMU exited with {status}");
     assert_eq!(
         boot2,
         session(&[
             ("ls", &["docs/"]),
-            ("ls docs", &["a.txt"]),
-            ("cat docs/a.txt", &["hello"]),
+            ("ls docs", &["b.txt", "c.txt", "sub/"]),
+            ("cat docs/b.txt", &["hello"]),
+            ("cat docs/c.txt", &["cross"]),
             ("cat ../x", &["msh: cat: EINVAL"]),
             ("cat /x", &["msh: cat: EINVAL"]),
+            ("rm docs", &["msh: rm: ENOTEMPTY"]),
+            ("rm docs/b.txt", &[]),
+            ("rm docs/c.txt", &[]),
+            ("rm docs/sub", &[]),
+            ("sync", &[]),
+            ("ls docs", &[]),
             ("exit", &[]),
+        ])
+    );
+
+    let (status, boot3) = shell(
+        &image,
+        &[
+            "cd docs", "ls", "cd nope", "touch f", "cd f", "pwd", "cd", "pwd", "ls", "exit",
+        ],
+    );
+    std::fs::remove_file(&image).unwrap();
+    assert!(status.success(), "QEMU exited with {status}");
+    assert_eq!(
+        boot3,
+        session(&[
+            ("cd docs", &[]),
+            ("ls", &[]),
+            ("cd nope", &["msh: cd: ENOENT"]),
+            ("touch f", &[]),
+            ("cd f", &["msh: cd: ENOTDIR"]),
+            ("pwd", &["/docs"]),
+            ("cd", &[]),
+            ("pwd", &["/"]),
+            ("ls", &["docs/"]),
+            ("exit", &[]),
+        ])
+    );
+}
+
+#[test]
+fn sync_reports_a_failed_flush() {
+    let image = mogfs_image("shell-flush", 1024);
+    let blockdev = flush_fails(&image);
+    let (status, got) = shell_on(&["-blockdev", &blockdev], &["mkdir x", "sync", "exit"]);
+    std::fs::remove_file(&image).unwrap();
+    assert!(status.success(), "QEMU exited with {status}");
+    assert_eq!(
+        got,
+        session(&[
+            ("mkdir x", &[]),
+            ("sync", &["msh: sync: EIO"]),
+            ("exit", &[])
         ])
     );
 }
@@ -713,5 +819,27 @@ fn fs_bench_reports_round_trips() {
             .unwrap();
     }
     assert_no_leak(&lines, "bench-fs");
+    assert!(status.success(), "QEMU exited with {status}");
+}
+
+#[test]
+fn spawn_bench_reports_round_trip() {
+    let (status, lines) = boot(&["-append", "test=bench-spawn"]);
+    assert!(
+        !lines.iter().any(|l| l.starts_with("panic:")),
+        "kernel panicked"
+    );
+    for op in ["spawn", "spawn+args"] {
+        lines
+            .iter()
+            .find_map(|l| {
+                l.strip_prefix(&format!("{op}: "))?
+                    .strip_suffix(" ns/round-trip")
+            })
+            .unwrap_or_else(|| panic!("missing {op} line"))
+            .parse::<u64>()
+            .unwrap();
+    }
+    assert_no_leak(&lines, "bench-spawn");
     assert!(status.success(), "QEMU exited with {status}");
 }

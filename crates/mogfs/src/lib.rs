@@ -10,7 +10,8 @@
 //!   data block numbers (0 = zeros). Inode `n` is record `n % 63` of table block `n / 63`; inode 0 is the root
 //!   directory. Inode numbers stay fixed while their blocks move.
 //! - File data: byte `i` lives at payload offset `i % 4088` of data block `i / 4088`.
-//! - Directory data: 56-byte entries (inode u32, name length u8, name), 73 per block, in creation order.
+//! - Directory data: 56-byte entries (inode u32, name length u8, name), 73 per block, packed: removing one moves the
+//!   last entry into its slot.
 //! - Copy-on-write: no block reachable from either slot is written. A change writes its data blocks at once, each to
 //!   a new block or over one allocated since the last commit; changed table blocks wait for `commit`, which writes
 //!   them, flushes, writes the other slot with the next generation, and flushes.
@@ -44,6 +45,10 @@ const FREE: u8 = 0;
 const FILE: u8 = 1;
 const DIR: u8 = 2;
 const WORDS: usize = MAX_BLOCKS as usize / 64;
+// The data buffer first: lookups measured about 3% faster than with it second.
+const DATA: usize = 0;
+const META: usize = 1;
+const INODE_WORDS: usize = (MAX_INODES as usize).div_ceil(64);
 
 type Bitmap = [u64; WORDS];
 
@@ -58,6 +63,7 @@ pub enum Error {
     InvalidName,
     TooBig,
     NoSpace,
+    NotEmpty,
 }
 
 /// A block device of 4 KiB blocks; a request covers `bufs.len()` consecutive blocks from `block`.
@@ -113,12 +119,12 @@ pub struct Fs<D> {
     free: u32,
     /// Every word of `used` before it is full.
     hint: usize,
-    /// Every inode before it is in use; inodes are only freed by `mount`.
+    /// Every inode before it is in use.
     inode_hint: usize,
-    buf: [u8; BLOCK_SIZE],
-    /// The data block `buf` holds unchanged.
+    /// `META` (table and superblock blocks) and `DATA`; one array so mount reads both superblocks in one request.
+    bufs: [[u8; BLOCK_SIZE]; 2],
+    /// The data block `bufs[DATA]` holds unchanged.
     cached: Option<u32>,
-    meta: [u8; BLOCK_SIZE],
     broken: bool,
 }
 
@@ -139,11 +145,15 @@ impl<D: Disk> Fs<D> {
             free: 0,
             hint: 0,
             inode_hint: 0,
-            buf: [0; BLOCK_SIZE],
+            bufs: [[0; BLOCK_SIZE]; 2],
             cached: None,
-            meta: [0; BLOCK_SIZE],
             broken: false,
         }
+    }
+
+    /// The disk; replace it only before `mount`.
+    pub fn disk(&mut self) -> &mut D {
+        &mut self.disk
     }
 
     /// Writes an empty file system (only a root directory) and commits it.
@@ -153,7 +163,7 @@ impl<D: Disk> Fs<D> {
             return Err(Error::NoSpace);
         }
         // Stale superblocks could outrank the new ones.
-        self.meta.fill(0);
+        self.bufs[META].fill(0);
         self.put(0, true)?;
         self.put(1, true)?;
         self.flush()?;
@@ -170,11 +180,8 @@ impl<D: Disk> Fs<D> {
     pub fn mount(&mut self) -> Result<(), Error> {
         self.reset();
         self.broken = true;
-        let (a, b) = (self.superblock(0), self.superblock(1));
-        if a == Err(Error::Io) || b == Err(Error::Io) {
-            return Err(Error::Io);
-        }
-        let mut slots = [a.ok(), b.ok()];
+        self.disk.read(0, &mut self.bufs)?;
+        let mut slots = [self.superblock(0), self.superblock(1)];
         if slots[0].map(|s| s.0) < slots[1].map(|s| s.0) {
             slots.swap(0, 1);
         }
@@ -225,20 +232,17 @@ impl<D: Disk> Fs<D> {
     }
 
     pub fn lookup(&mut self, dir: Inode, name: &[u8]) -> Result<Inode, Error> {
-        if !valid_name(name) {
-            return Err(Error::InvalidName);
-        }
-        self.scan(dir, false, |n, _| n == name)?
-            .ok_or(Error::NotFound)
+        Ok(self.find(dir, name)?.1)
     }
 
-    /// Calls `f` with each entry's name and inode, in creation order.
-    pub fn readdir(&mut self, dir: Inode, mut f: impl FnMut(&[u8], Inode)) -> Result<(), Error> {
-        self.scan(dir, true, |n, i| {
-            f(n, i);
-            false
-        })
-        .map(|_| ())
+    /// Calls `f` with each entry's name, inode and kind from entry `start` on, until `f` returns true.
+    pub fn readdir(
+        &mut self,
+        dir: Inode,
+        start: usize,
+        f: impl FnMut(&[u8], Inode, Kind) -> bool,
+    ) -> Result<(), Error> {
+        self.scan(dir, start, true, f).map(|_| ())
     }
 
     pub fn kind(&self, inode: Inode) -> Result<Kind, Error> {
@@ -253,6 +257,7 @@ impl<D: Disk> Fs<D> {
         self.add(dir, name, DIR)
     }
 
+    /// The inode `name` names, or a new empty file if it names none.
     pub fn create(&mut self, dir: Inode, name: &[u8]) -> Result<Inode, Error> {
         self.add(dir, name, FILE)
     }
@@ -273,7 +278,7 @@ impl<D: Disk> Fs<D> {
                 0 => out.fill(0),
                 p => {
                     self.load(p, false)?;
-                    out.copy_from_slice(&self.buf[at..at + n]);
+                    out.copy_from_slice(&self.bufs[DATA][at..at + n]);
                 }
             }
             pos += n as u64;
@@ -300,13 +305,112 @@ impl<D: Disk> Fs<D> {
 
     /// Empties `file`.
     pub fn truncate(&mut self, file: Inode) -> Result<(), Error> {
-        self.file(file)?;
+        if self.broken {
+            return Err(Error::Io);
+        }
+        if self.file(file)?.size == 0 {
+            return Ok(());
+        }
         self.reserve(0, &[file])?;
         let r = Record {
             kind: FILE,
             ..Record::EMPTY
         };
         self.set(file, r)
+    }
+
+    /// Removes a file or an empty directory and frees its inode and blocks. `NoSpace` changes nothing.
+    pub fn unlink(&mut self, dir: Inode, name: &[u8]) -> Result<(), Error> {
+        if self.broken {
+            return Err(Error::Io);
+        }
+        let (e, inode) = self.find(dir, name)?;
+        if inode == ROOT {
+            return Err(Error::Corrupt);
+        }
+        let r = self.records[inode.0 as usize];
+        if r.kind == DIR && r.size != 0 {
+            return Err(Error::NotEmpty);
+        }
+        let mut d = self.dir(dir)?;
+        let (last, need) = self.last(&d, e)?;
+        self.reserve(need, &[dir, inode])?;
+        self.remove(&mut d, e, last)?;
+        self.set(dir, d)?;
+        self.set(inode, Record::EMPTY)?;
+        self.inode_hint = min(self.inode_hint, inode.0 as usize);
+        Ok(())
+    }
+
+    /// Moves an entry, possibly to another directory; `Exists` if `to_name` is taken, `InvalidName` if a directory would
+    /// move into itself or below itself; renaming an entry to itself does nothing. `NoSpace` changes nothing.
+    pub fn rename(
+        &mut self,
+        from_dir: Inode,
+        from_name: &[u8],
+        to_dir: Inode,
+        to_name: &[u8],
+    ) -> Result<(), Error> {
+        if self.broken {
+            return Err(Error::Io);
+        }
+        if !valid_name(to_name) || !valid_name(from_name) {
+            return Err(Error::InvalidName);
+        }
+        if from_dir == to_dir && from_name == to_name {
+            return self.find(from_dir, from_name).map(|_| ());
+        }
+        let (mut e, mut k, mut found) = (None, 0, ROOT);
+        if from_dir != to_dir {
+            let (fe, fi) = self.find(from_dir, from_name)?;
+            (e, found) = (Some(fe), fi);
+        }
+        let taken = self
+            .scan(to_dir, 0, false, |n, i, _| {
+                if e.is_none() && n == from_name {
+                    (e, found) = (Some(k), i);
+                }
+                k += 1;
+                n == to_name
+            })?
+            .is_some();
+        let (e, inode) = match e {
+            Some(e) => (e, found),
+            None => self.find(from_dir, from_name)?,
+        };
+        if taken {
+            return Err(Error::Exists);
+        }
+        let entry = dirent(inode, to_name);
+        let mut from = self.dir(from_dir)?;
+        if from_dir == to_dir {
+            self.reserve(
+                !self.fresh(from.ptrs[e / PER_DIR_BLOCK]) as usize,
+                &[from_dir],
+            )?;
+            self.write_data(&mut from, (e * DIRENT) as u64, &entry)?;
+            return self.set(from_dir, from);
+        }
+        if inode == to_dir
+            || (to_dir != ROOT
+                && self.records[inode.0 as usize].kind == DIR
+                && self.below(inode, to_dir)?)
+        {
+            return Err(Error::InvalidName);
+        }
+        let mut to = self.dir(to_dir)?;
+        let need = self.room(&to)?;
+        let (last, more) = self.last(&from, e)?;
+        self.reserve(need + more, &[from_dir, to_dir])?;
+        self.remove(&mut from, e, last)?;
+        self.set(from_dir, from)?;
+        // The entry is in neither directory until `to` is written.
+        let end = to.size as u64;
+        let r = self
+            .write_data(&mut to, end, &entry)
+            .and_then(|()| self.set(to_dir, to));
+        self.broken |= r.is_err();
+        r
     }
 
     /// Makes every change so far durable, atomically; does nothing if nothing changed.
@@ -324,7 +428,7 @@ impl<D: Disk> Fs<D> {
             self.store(self.table[t], true)?;
         }
         self.flush()?;
-        let sb = &mut self.meta;
+        let sb = &mut self.bufs[META];
         sb.fill(0);
         sb[..8].copy_from_slice(&MAGIC.to_le_bytes());
         sb[8..16].copy_from_slice(&generation.to_le_bytes());
@@ -378,19 +482,20 @@ impl<D: Disk> Fs<D> {
         self.hint = 0;
     }
 
-    /// Generation, block count and inode table of a valid superblock slot.
-    fn superblock(&mut self, slot: u32) -> Result<(u64, u32, [u32; TABLE_BLOCKS]), Error> {
-        self.load(slot, true)?;
-        let (generation, blocks) = (le64(&self.meta, 8), le32(&self.meta, 16));
-        let table = core::array::from_fn(|i| le32(&self.meta, 20 + 4 * i));
-        if le64(&self.meta, 0) != MAGIC
+    /// Generation, block count and inode table of superblock slot `slot`, read into `bufs[slot]`, if valid.
+    fn superblock(&self, slot: usize) -> Option<(u64, u32, [u32; TABLE_BLOCKS])> {
+        let sb = &self.bufs[slot];
+        let (generation, blocks) = (le64(sb, 8), le32(sb, 16));
+        let table = core::array::from_fn(|i| le32(sb, 20 + 4 * i));
+        if le64(sb, PAYLOAD) != checksum(slot as u32, sb)
+            || le64(sb, 0) != MAGIC
             || generation % 2 != slot as u64
             || !(MIN_BLOCKS..=self.blocks).contains(&blocks)
             || !valid(&table, blocks)
         {
-            return Err(Error::Corrupt);
+            return None;
         }
-        Ok((generation, blocks, table))
+        Some((generation, blocks, table))
     }
 
     /// Marks the blocks `table` reaches in `newest` (and loads its records) or, for the older slot, in `committed`.
@@ -501,7 +606,7 @@ impl<D: Disk> Fs<D> {
             }
             self.cached = None;
         }
-        let buf = if meta { &mut self.meta } else { &mut self.buf };
+        let buf = &mut self.bufs[if meta { META } else { DATA }];
         self.disk.read(b as u64, from_mut(buf))?;
         if le64(buf, PAYLOAD) != checksum(b, buf) {
             return Err(Error::Corrupt);
@@ -512,12 +617,12 @@ impl<D: Disk> Fs<D> {
         Ok(())
     }
 
-    /// Seals `meta` (table and superblock blocks) or `buf` (data blocks, which then stay cached) and writes it to `b`.
+    /// Seals `bufs[META]` or `bufs[DATA]` (data blocks, which then stay cached) and writes it to `b`.
     fn store(&mut self, b: u32, meta: bool) -> Result<(), Error> {
         if !meta || self.cached == Some(b) {
             self.cached = None;
         }
-        let buf = if meta { &mut self.meta } else { &mut self.buf };
+        let buf = &mut self.bufs[if meta { META } else { DATA }];
         let sum = checksum(b, buf);
         buf[PAYLOAD..].copy_from_slice(&sum.to_le_bytes());
         self.put(b, meta)?;
@@ -531,7 +636,7 @@ impl<D: Disk> Fs<D> {
         if self.broken {
             return Err(Error::Io);
         }
-        let buf = if meta { &self.meta } else { &self.buf };
+        let buf = &self.bufs[if meta { META } else { DATA }];
         let r = self.disk.write(b as u64, from_ref(buf));
         // A fresh block rewritten in place may be torn.
         self.broken |= r.is_err();
@@ -546,7 +651,7 @@ impl<D: Disk> Fs<D> {
 
     /// Record `i` of the table block in `meta`.
     fn decode(&self, i: usize) -> Result<Record, Error> {
-        let b = &self.meta[i * RECORD..][..RECORD];
+        let b = &self.bufs[META][i * RECORD..][..RECORD];
         let r = Record {
             kind: b[0],
             size: le32(b, 4),
@@ -568,12 +673,12 @@ impl<D: Disk> Fs<D> {
 
     /// Table block `t` into `meta`.
     fn encode(&mut self, t: usize) {
-        self.meta.fill(0);
+        self.bufs[META].fill(0);
         for (i, r) in self.records[t * PER_TABLE..][..PER_TABLE]
             .iter()
             .enumerate()
         {
-            let b = &mut self.meta[i * RECORD..][..RECORD];
+            let b = &mut self.bufs[META][i * RECORD..][..RECORD];
             b[0] = r.kind;
             b[4..8].copy_from_slice(&r.size.to_le_bytes());
             for (p, ptr) in r.ptrs.iter().enumerate() {
@@ -621,9 +726,9 @@ impl<D: Disk> Fs<D> {
             }
             self.cached = None;
             if old == 0 {
-                self.buf.fill(0);
+                self.bufs[DATA].fill(0);
             }
-            self.buf[at..at + n].copy_from_slice(&data[(pos - offset) as usize..][..n]);
+            self.bufs[DATA][at..at + n].copy_from_slice(&data[(pos - offset) as usize..][..n]);
             let b = if self.fresh(old) { old } else { self.alloc()? };
             self.store(b, false)?;
             r.ptrs[i] = b;
@@ -633,59 +738,137 @@ impl<D: Disk> Fs<D> {
         Ok(())
     }
 
-    /// The first entry of `dir` for which `f` returns true; `names` checks each name, which a valid name to match never needs.
+    /// Index and inode of the first entry of `dir` from `start` for which `f` returns true. `list` checks each name and
+    /// kind and passes the kind (else `Kind::File`), which a valid name to match never needs.
     fn scan(
         &mut self,
         dir: Inode,
-        names: bool,
-        mut f: impl FnMut(&[u8], Inode) -> bool,
-    ) -> Result<Option<Inode>, Error> {
+        start: usize,
+        list: bool,
+        mut f: impl FnMut(&[u8], Inode, Kind) -> bool,
+    ) -> Result<Option<(usize, Inode)>, Error> {
         let r = self.dir(dir)?;
-        for e in 0..r.size as usize / DIRENT {
+        for e in start..r.size as usize / DIRENT {
             let at = e % PER_DIR_BLOCK * DIRENT;
-            if at == 0 {
+            if at == 0 || e == start {
                 match r.ptrs[e / PER_DIR_BLOCK] {
                     0 => return Err(Error::Corrupt),
                     p => self.load(p, false)?,
                 }
             }
-            let d = &self.buf[at..at + DIRENT];
+            let d = &self.bufs[DATA][at..at + DIRENT];
             let (inode, len) = (le32(d, 0), d[4] as usize);
-            if inode >= MAX_INODES || len > NAME_MAX || (names && !valid_name(&d[5..5 + len])) {
+            if inode >= MAX_INODES || len > NAME_MAX {
                 return Err(Error::Corrupt);
             }
-            if f(&d[5..5 + len], Inode(inode)) {
-                return Ok(Some(Inode(inode)));
+            let kind = match list.then(|| self.records[inode as usize].kind) {
+                None | Some(FILE) => Kind::File,
+                Some(DIR) => Kind::Dir,
+                _ => return Err(Error::Corrupt),
+            };
+            if list && !valid_name(&d[5..5 + len]) {
+                return Err(Error::Corrupt);
+            }
+            if f(&d[5..5 + len], Inode(inode), kind) {
+                return Ok(Some((e, Inode(inode))));
             }
         }
         Ok(None)
     }
 
-    fn add(&mut self, dir: Inode, name: &[u8], kind: u8) -> Result<Inode, Error> {
+    fn find(&mut self, dir: Inode, name: &[u8]) -> Result<(usize, Inode), Error> {
         if !valid_name(name) {
             return Err(Error::InvalidName);
         }
-        if self.scan(dir, false, |n, _| n == name)?.is_some() {
-            return Err(Error::Exists);
-        }
-        let mut d = self.dir(dir)?;
+        self.scan(dir, 0, false, |n, _, _| n == name)?
+            .ok_or(Error::NotFound)
+    }
+
+    /// Blocks an entry appended to `d` needs.
+    fn room(&self, d: &Record) -> Result<usize, Error> {
         if d.size as u64 + DIRENT as u64 > MAX_FILE_SIZE {
             return Err(Error::TooBig);
         }
+        // Entries never straddle blocks, so the new one needs at most its own block.
+        Ok(!self.fresh(d.ptrs[d.size as usize / PAYLOAD]) as usize)
+    }
+
+    /// The last entry of `d` unless slot `e` is last, and the blocks moving it into slot `e` needs.
+    fn last(&mut self, d: &Record, e: usize) -> Result<(Option<[u8; DIRENT]>, usize), Error> {
+        let last = d.size as usize / DIRENT - 1;
+        if e == last {
+            return Ok((None, 0));
+        }
+        // Keeps slot `e`'s buffered block when the last entry lives in another block.
+        let keep = self.cached == Some(d.ptrs[e / PER_DIR_BLOCK])
+            && e / PER_DIR_BLOCK != last / PER_DIR_BLOCK;
+        match d.ptrs[last / PER_DIR_BLOCK] {
+            0 => return Err(Error::Corrupt),
+            p => self.load(p, keep)?,
+        }
+        let at = last % PER_DIR_BLOCK * DIRENT;
+        let buf = if keep { META } else { DATA };
+        let entry = self.bufs[buf][at..at + DIRENT].try_into().unwrap();
+        Ok((Some(entry), !self.fresh(d.ptrs[e / PER_DIR_BLOCK]) as usize))
+    }
+
+    /// Removes entry `e` from `d` (a copy), moving `last` into its slot. Call `reserve` first.
+    fn remove(
+        &mut self,
+        d: &mut Record,
+        e: usize,
+        last: Option<[u8; DIRENT]>,
+    ) -> Result<(), Error> {
+        if let Some(entry) = last {
+            self.write_data(d, (e * DIRENT) as u64, &entry)?;
+        }
+        d.size -= DIRENT as u32;
+        d.ptrs[(d.size as usize).div_ceil(PAYLOAD)..].fill(0);
+        Ok(())
+    }
+
+    /// Whether `target` is `dir` or below it; scans each directory below `dir` once, so a crafted cycle ends.
+    fn below(&mut self, dir: Inode, target: Inode) -> Result<bool, Error> {
+        let (mut seen, mut done) = ([0u64; INODE_WORDS], [0u64; INODE_WORDS]);
+        let mut next = Some(dir.0 as usize);
+        while let Some(d) = next {
+            if d == target.0 as usize {
+                return Ok(true);
+            }
+            done[d / 64] |= 1 << (d % 64);
+            if self
+                .scan(Inode(d as u32), 0, false, |_, i, _| {
+                    seen[i.0 as usize / 64] |= 1 << (i.0 % 64);
+                    i == target
+                })?
+                .is_some()
+            {
+                return Ok(true);
+            }
+            next = (0..MAX_INODES as usize).find(|&i| {
+                (seen[i / 64] & !done[i / 64]) >> (i % 64) & 1 != 0 && self.records[i].kind == DIR
+            });
+        }
+        Ok(false)
+    }
+
+    fn add(&mut self, dir: Inode, name: &[u8], kind: u8) -> Result<Inode, Error> {
+        match self.find(dir, name) {
+            Err(Error::NotFound) => {}
+            Ok((_, inode)) if kind == FILE => return Ok(inode),
+            Ok(_) => return Err(Error::Exists),
+            Err(e) => return Err(e),
+        }
+        let mut d = self.dir(dir)?;
+        let need = self.room(&d)?;
         self.inode_hint += self.records[self.inode_hint..]
             .iter()
             .position(|r| r.kind == FREE)
             .ok_or(Error::NoSpace)?;
         let inode = Inode(self.inode_hint as u32);
-        // Entries never straddle blocks, so the new one needs at most its own block.
-        let need = !self.fresh(d.ptrs[d.size as usize / PAYLOAD]) as usize;
         self.reserve(need, &[dir, inode])?;
-        let mut entry = [0; DIRENT];
-        entry[..4].copy_from_slice(&inode.0.to_le_bytes());
-        entry[4] = name.len() as u8;
-        entry[5..5 + name.len()].copy_from_slice(name);
         let end = d.size as u64;
-        self.write_data(&mut d, end, &entry)?;
+        self.write_data(&mut d, end, &dirent(inode, name))?;
         self.set(dir, d)?;
         let r = Record {
             kind,
@@ -694,6 +877,14 @@ impl<D: Disk> Fs<D> {
         self.set(inode, r)?;
         Ok(inode)
     }
+}
+
+fn dirent(inode: Inode, name: &[u8]) -> [u8; DIRENT] {
+    let mut entry = [0; DIRENT];
+    entry[..4].copy_from_slice(&inode.0.to_le_bytes());
+    entry[4] = name.len() as u8;
+    entry[5..5 + name.len()].copy_from_slice(name);
+    entry
 }
 
 fn valid_name(name: &[u8]) -> bool {
