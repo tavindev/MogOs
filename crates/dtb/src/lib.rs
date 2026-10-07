@@ -57,19 +57,32 @@ impl<'a> Dtb<'a> {
         Some((PhysAddr(reg.reg(0)?.0), PhysAddr(reg.reg(1)?.0)))
     }
 
+    /// Interrupt ID and whether it is edge-triggered, from the first top-level `arm,pl011` node's GIC SPI specifier
+    /// (type 0, number, flags).
+    pub fn uart_irq(&self) -> Option<(u32, bool)> {
+        let value = self.prop_of(b"arm,pl011", b"interrupts")?.value;
+        let [kind, number, flags] = [0, 4, 8].map(|offset| be32(value, offset));
+        (kind? == 0).then_some((number? + 32, flags? & 3 != 0))
+    }
+
     /// `reg` property of the first top-level node compatible with `compatible`.
     fn reg_of(&self, compatible: &[u8]) -> Option<Prop<'a>> {
-        let (mut node, mut reg, mut found) = (0, None, false);
+        self.prop_of(compatible, b"reg")
+    }
+
+    /// Property `name` of the first top-level node compatible with `compatible`.
+    fn prop_of(&self, compatible: &[u8], name: &[u8]) -> Option<Prop<'a>> {
+        let (mut node, mut prop, mut found) = (0, None, false);
         self.find(|p| {
             if p.node_offset != node {
-                (node, reg, found) = (p.node_offset, None, false);
+                (node, prop, found) = (p.node_offset, None, false);
             }
             match p.name {
-                b"reg" if p.depth == 2 => reg = Some(*p),
                 b"compatible" => found = p.value.split(|&b| b == 0).any(|c| c == compatible),
+                n if n == name && p.depth == 2 => prop = Some(*p),
                 _ => {}
             }
-            reg.filter(|_| found)
+            prop.filter(|_| found)
         })
     }
 

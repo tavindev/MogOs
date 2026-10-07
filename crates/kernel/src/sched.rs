@@ -34,6 +34,8 @@ pub enum Event {
     Exit(usize),
     /// The mutex at this table index being unlocked.
     Lock(usize),
+    /// A console line being entered.
+    Console,
     /// Nothing: the boot context, which runs only once no other task is ready.
     Idle,
 }

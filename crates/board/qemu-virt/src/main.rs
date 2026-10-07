@@ -13,10 +13,11 @@ use core::ops::Range;
 use core::panic::PanicInfo;
 use core::ptr::{self, NonNull};
 use core::slice;
-use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 
 use arch::{MemoryType, UserAccess, l1_block, user_page};
 use dtb::Dtb;
+use kernel::console::Line;
 use kernel::elf::{Elf, Segment};
 use kernel::handle::{DUPLICATE, Handles, KILL, MAX_HANDLES, Object, READ, TRANSFER, WAIT, WRITE};
 use kernel::mutex::Mutexes;
@@ -57,6 +58,8 @@ const TICK_US: u64 = 10_000;
 
 /// GIC CPU interface base, set before the first IRQ can be delivered.
 static GIC_CPU: AtomicU64 = AtomicU64::new(0);
+/// The UART's interrupt ID, from the DTB.
+static UART_IRQ: AtomicU32 = AtomicU32::new(0);
 /// Boot context included; a task's slot is its ASID (8 bits).
 const MAX_TASKS: usize = 8;
 const _: () = assert!(MAX_TASKS <= 256);
@@ -97,12 +100,13 @@ unsafe impl GlobalAlloc for KernelHeap {
     }
 }
 
-/// Task contexts, free frames, pipes and mutexes; touched only with IRQs masked on the only core.
+/// Task contexts, free frames, pipes, mutexes and console input; touched only with IRQs masked on the only core.
 static KERNEL: Global = Global(UnsafeCell::new(Kernel {
     sched: Scheduler::new(),
     frames: FrameAllocator::empty(),
     pipes: Pipes::new(),
     mutexes: Mutexes::new(),
+    line: Line::new(),
 }));
 
 struct Kernel {
@@ -110,6 +114,7 @@ struct Kernel {
     frames: FrameAllocator<FRAME_WORDS>,
     pipes: Pipes<MAX_PIPES>,
     mutexes: Mutexes<MAX_MUTEXES>,
+    line: Line,
 }
 
 struct Global(UnsafeCell<Kernel>);
@@ -152,6 +157,7 @@ unsafe fn task_exit(frame: usize, code: u64) -> usize {
         frames,
         pipes,
         mutexes,
+        ..
     } = unsafe { &mut *KERNEL.0.get() };
     // Before `exit` picks the next task, so a reader or locker this wakes can be it.
     for index in mutexes.release(sched.current().0) {
@@ -258,6 +264,7 @@ fn kill(
         frames,
         pipes,
         mutexes,
+        ..
     }: &mut Kernel,
     slot: usize,
     generation: u64,
@@ -734,6 +741,14 @@ extern "C" fn kmain() -> ! {
     let dtb = Dtb::new(blob).expect("bad DTB");
     let uart = dtb.uart().expect("no PL011 in DTB");
     let gic = dtb.gic().expect("no GICv2 in DTB");
+    let (uart_irq, edge) = dtb.uart_irq().expect("no PL011 interrupt in DTB");
+    GIC_CPU.store(gic.1.0, Relaxed);
+    UART_IRQ.store(uart_irq, Relaxed);
+    // SAFETY: the DTB's GICv2 registers and the PL011's SPI, in the device-mapped GiB 0.
+    unsafe { arch::gic::route_spi(gic.0, uart_irq, edge) };
+    // SAFETY: as above.
+    unsafe { arch::gic::enable(gic.0, gic.1, uart_irq) };
+    Uart::new(uart).enable_rx_irq();
 
     kernel::run(
         &mut QemuVirt {
@@ -751,11 +766,20 @@ extern "C" fn kmain() -> ! {
 #[unsafe(no_mangle)]
 unsafe extern "C" fn board_irq(frame: usize) -> usize {
     let cpu = PhysAddr(GIC_CPU.load(Relaxed));
-    // SAFETY: IRQs are delivered only after `start_timer` stored the DTB's GIC CPU interface.
+    // SAFETY: IRQs are delivered only after `kmain` stored the DTB's GIC CPU interface.
     let iar = unsafe { arch::gic::ack(cpu) };
     let tick = iar == TIMER_IRQ;
     if tick {
         arch::timer::arm(TICK_US);
+    } else if iar == UART_IRQ.load(Relaxed) {
+        // SAFETY: the caller masked IRQs on the only core, so this is the sole reference.
+        let Kernel { sched, line, .. } = unsafe { &mut *KERNEL.0.get() };
+        let mut uart = Uart::new(UART0);
+        while let Some(byte) = uart.get() {
+            if line.push(byte, |echo| uart.write(echo)) {
+                sched.wake(Event::Console);
+            }
+        }
     }
     // SAFETY: as above.
     unsafe { arch::gic::eoi(cpu, iar) };
@@ -777,6 +801,7 @@ unsafe extern "C" fn board_syscall(frame: &mut arch::TrapFrame) -> usize {
         frames,
         pipes,
         mutexes,
+        line,
     } = kernel;
     let args = frame.x.first_chunk().unwrap();
     frame.x[0] = match kernel::syscall::dispatch(frame.x[8], args, sched.handles()) {
@@ -790,6 +815,12 @@ unsafe extern "C" fn board_syscall(frame: &mut arch::TrapFrame) -> usize {
                 len as u64
             }
             None => EFAULT as u64,
+        },
+        Ok(Call::Read { ptr, len }) => match user_bytes_mut(ptr, len).map(|out| line.read(out)) {
+            None => EFAULT as u64,
+            Some(Some(n)) => n as u64,
+            // SAFETY: the caller masked IRQs, and `frame` is the current process's.
+            Some(None) => return unsafe { block(sched, frame, Event::Console) },
         },
         Ok(Call::Pipe { end, ptr, len }) => match pipe_io(pipes, end, ptr, len) {
             Some(moved) => {

@@ -2,6 +2,8 @@ use mm::PhysAddr;
 
 const GICD_CTLR: u64 = 0x000;
 const GICD_ISENABLER: u64 = 0x100;
+const GICD_ITARGETSR: u64 = 0x800;
+const GICD_ICFGR: u64 = 0xc00;
 const GICC_CTLR: u64 = 0x000;
 const GICC_PMR: u64 = 0x004;
 const GICC_IAR: u64 = 0x00c;
@@ -24,6 +26,23 @@ pub unsafe fn enable(dist: PhysAddr, cpu: PhysAddr, irq: u32) {
         // SAFETY: the caller guarantees these are this GIC's registers.
         unsafe { (addr as *mut u32).write_volatile(value) };
     }
+}
+
+/// Routes SPI `irq` of the GICv2 distributor at `dist` to CPU 0, edge-triggered if `edge`, else level-sensitive.
+///
+/// # Safety
+///
+/// `dist` must be a GICv2 distributor, mapped as Device memory, and `irq` an SPI (32 or above) it implements.
+pub unsafe fn route_spi(dist: PhysAddr, irq: u32, edge: bool) {
+    let target = (dist.0 + GICD_ITARGETSR + irq as u64) as *mut u8;
+    let icfgr = (dist.0 + GICD_ICFGR + 4 * (irq / 16) as u64) as *mut u32;
+    let bit = 2 << (2 * (irq % 16));
+    // SAFETY: the caller guarantees `dist` is a GICv2 distributor implementing `irq`; ITARGETSR is byte-accessible.
+    unsafe { target.write_volatile(1) };
+    // SAFETY: as above.
+    let config = unsafe { icfgr.read_volatile() } & !bit;
+    // SAFETY: as above.
+    unsafe { icfgr.write_volatile(if edge { config | bit } else { config }) };
 }
 
 /// Acknowledges the highest-priority pending interrupt and returns its `GICC_IAR` (1023 if spurious).

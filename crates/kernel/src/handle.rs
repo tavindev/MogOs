@@ -50,11 +50,11 @@ impl Handles {
         Self([(0, None); MAX_HANDLES])
     }
 
-    /// init's handles: 0 is the console (write, duplicate, transfer), 1 is the process itself (kill), in `slot` with
-    /// `generation`, 2 is the boot archive (read, exec).
+    /// init's handles: 0 is the console (read, write, duplicate, transfer), 1 is the process itself (kill), in `slot`
+    /// with `generation`, 2 is the boot archive (read, exec).
     pub fn init(slot: usize, generation: u64) -> Self {
         let mut handles = Self::new();
-        handles.0[0].1 = Some((Object::Console, WRITE | DUPLICATE | TRANSFER));
+        handles.0[0].1 = Some((Object::Console, READ | WRITE | DUPLICATE | TRANSFER));
         handles.0[1].1 = Some((Object::Process { slot, generation }, KILL));
         handles.0[2].1 = Some((Object::Archive, READ | EXEC));
         handles
