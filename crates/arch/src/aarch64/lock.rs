@@ -10,6 +10,7 @@ use super::irq;
 
 /// This core's index: TPIDR_EL1's bits 48-63 (bits 0-47 hold its per-CPU area's offset; all 0 on core 0 until
 /// `enter_percpu`).
+#[inline]
 pub fn cpu() -> usize {
     let cpu: usize;
     // SAFETY: reading TPIDR_EL1 has no side effects.

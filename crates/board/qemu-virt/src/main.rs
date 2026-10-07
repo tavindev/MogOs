@@ -670,8 +670,17 @@ fn send(cpu: usize, sgi: u32) {
 }
 
 /// Signals an idle core for each task made ready since the last call, while one is left to signal.
+#[inline(always)]
 fn kick(sched: &mut Sched, cpu: usize) {
-    for _ in 0..sched.take_woken() {
+    let woken = sched.take_woken();
+    if woken > 0 {
+        signal(sched, cpu, woken);
+    }
+}
+
+/// Signals up to `woken` idle cores other than `cpu`.
+fn signal(sched: &mut Sched, cpu: usize, woken: usize) {
+    for _ in 0..woken {
         let Some(core) = sched.claim_idle(cpu) else {
             return;
         };

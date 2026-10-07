@@ -121,11 +121,15 @@ fn end_process(kernel: &mut Kernel, cpu: usize, index: usize, code: u64) -> Opti
     while let Some(slot) = sched.thread_of(index, cpu) {
         end_thread(sched, frames, mutexes, (cpu, slot), code);
     }
-    let elsewhere = sched.threads_elsewhere(index, cpu);
-    for slot in (0..64).filter(|s| elsewhere & 1 << s != 0) {
-        end_remote(sched, slot, code);
+    let mut elsewhere = sched.threads_elsewhere(index, cpu);
+    if elsewhere != 0 {
+        while elsewhere != 0 {
+            end_remote(sched, elsewhere.trailing_zeros() as usize, code);
+            elsewhere &= elsewhere - 1;
+        }
+        return None;
     }
-    (elsewhere == 0).then(|| sched.space(index))
+    Some(sched.space(index))
 }
 
 /// Ends the thread in `slot`, which another core runs, with `code` on that core: marks it and signals the core.

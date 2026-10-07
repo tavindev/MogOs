@@ -95,8 +95,10 @@ touches memory through raw addresses: the board reads user buffers, copies pages
   "the current task" takes the core. `advance(cpu)` runs the highest effective priority no other core runs (a bit per
   running slot), round robin within a level; slot 0 (the boot context) only on core 0; with none, core 0 the boot
   context once no core runs a task, any other case the core's idle context (process 0, its frame saved by `switch`).
-  `wake` and `add` count the tasks made ready (`take_woken`) and `claim_idle` hands out an idle core to signal, once
-  per idle period. A thread another core runs is never ended in place: the board `mark`s it and its core ends it.
+  `wake` and `add` count the tasks made ready; `take_woken`, at the end of a hook, turns that into the cores to signal:
+  at most the tasks still ready and run nowhere (a waker that blocked took one itself), nothing while no core idles
+  unsignalled (so one core pays only the count), plus core 0 when every core went idle under a waiting boot context;
+  `claim_idle` hands out an idle core to signal, once per idle period. A thread another core runs is never ended in place: the board `mark`s it and its core ends it.
   Priority inheritance is one level only (`unboost` doc). The board calls `unboost(slot, ..)` when an owner loses a
   waiter (an unlock that woke one, or the end of a thread blocked on `Lock`); after such an unlock it switches at once if
   `outranked()` (any ready task beats the caller).

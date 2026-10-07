@@ -101,8 +101,9 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
 - Locks need the MMU on (exclusives), so `kmain` calls `enable_mmu` first, before any output, trap or secondary core.
 - Every core runs tasks from the one run queue under `KERNEL`; each hook reads `arch::cpu()` once and passes it to the
   scheduler. A core with no task runs its idle context (process 0, so `switch` loads the boot table); an idle core's
-  only trap is an IRQ, after which it always reschedules. Each task made ready (`add`, `wake`) signals one idle core
-  with `RESCHEDULE_SGI` (`kick`, at the end of each hook; once per idle period), never the calling core. A thread
+  only trap is an IRQ, after which it always reschedules. A task made ready (`add`, `wake`) that is still ready and
+  run nowhere at the end of the hook signals one idle core with `RESCHEDULE_SGI` (`kick`, `Scheduler::take_woken`;
+  once per idle period), never the calling core; a waker that blocked and took the task itself signals none. A thread
   end on another core signals core 0 when it idles or runs the boot context (`boot_waits`), whose `wait` loop counts
   tasks. The tick only preempts a running task: it is rearmed only while the core runs a slot after `start_timer`
   (`TICKS`), and stopped otherwise; an idle core starts it again when it picks a task. A thread another core runs is

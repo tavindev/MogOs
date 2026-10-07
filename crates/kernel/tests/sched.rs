@@ -355,6 +355,37 @@ fn a_zombie_thread_stays_until_its_last_handle_closes_and_a_stale_close_counts_f
 }
 
 #[test]
+fn a_woken_task_signals_an_idle_core_only_while_it_still_waits_for_one() {
+    let mut sched = Scheduler::<4, 4>::new();
+    sched.start_cores(2, 0xd0);
+    spawn(&mut sched, 0x100);
+    let ((b, _), _) = spawn(&mut sched, 0x200);
+    sched.take_woken();
+    sched.block(0, Event::Idle);
+    assert_eq!(sched.switch(0, 0x10), 0x100);
+    sched.block(0, Event::Pipe(1));
+    assert_eq!(sched.switch(0, 0x110), 0x200);
+    sched.block(0, Event::Pipe(2));
+    sched.wake(Event::Pipe(1));
+    assert_eq!(sched.take_woken(), 1, "a waits while core 1 idles");
+    assert_eq!(
+        sched.switch(0, 0x210),
+        0x110,
+        "b blocked: this core takes a"
+    );
+    sched.wake(Event::Pipe(2));
+    sched.block(0, Event::Pipe(1));
+    assert_eq!(sched.switch(0, 0x111), 0x210);
+    assert_eq!(sched.current(0).0, b);
+    assert_eq!(sched.take_woken(), 0, "b runs here: nothing waits");
+
+    let mut one = Scheduler::<4, 4>::new();
+    one.start_cores(1, 0xd0);
+    spawn(&mut one, 0x100);
+    assert_eq!(one.take_woken(), 0, "no core to signal");
+}
+
+#[test]
 fn a_core_runs_only_tasks_no_other_core_runs_and_core_0_resumes_boot_once_every_core_idles() {
     let mut sched = Scheduler::<4, 4>::new();
     sched.start_cores(2, 0xd0);
