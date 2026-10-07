@@ -8,15 +8,42 @@ use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 
 use super::irq;
 
-/// Cores `PerCpu` has a slot for.
-pub const MAX_CPUS: usize = 4;
-
-/// This core's index, from TPIDR_EL1 (set at boot).
+/// This core's index: TPIDR_EL1's bits 48-63 (bits 0-47 hold its per-CPU area's offset; all 0 on core 0 until
+/// `enter_percpu`).
 pub fn cpu() -> usize {
     let cpu: usize;
     // SAFETY: reading TPIDR_EL1 has no side effects.
-    unsafe { asm!("mrs {}, tpidr_el1", out(reg) cpu, options(nomem, nostack, preserves_flags)) };
+    unsafe {
+        asm!("mrs {0}, tpidr_el1", "lsr {0}, {0}, #48", out(reg) cpu, options(nomem, nostack, preserves_flags))
+    };
     cpu
+}
+
+unsafe extern "C" {
+    static __percpu_start: u8;
+    static __percpu_end: u8;
+}
+
+/// Bytes of the `.percpu` template, so of each core's per-CPU area (a multiple of 16).
+pub fn percpu_size() -> usize {
+    &raw const __percpu_end as usize - &raw const __percpu_start as usize
+}
+
+/// Makes `area` this core's per-CPU area as core `index`: copies the `.percpu` template into it and sets TPIDR_EL1.
+///
+/// # Safety
+///
+/// `area` must be 16-byte aligned, below 256 TiB, `percpu_size()` bytes of mapped memory only this core uses from now
+/// on; call it once per core, before any `PerCpu` use, with IRQs masked.
+pub unsafe fn enter_percpu(index: usize, area: usize) {
+    let template = &raw const __percpu_start;
+    // SAFETY: the caller guarantees `area` is this core's own, and the template is the linker's `.percpu`.
+    unsafe { core::ptr::copy_nonoverlapping(template, area as *mut u8, percpu_size()) };
+    let offset = area.wrapping_sub(template as usize) & 0xffff_ffff_ffff;
+    // SAFETY: TPIDR_EL1 is read only by `cpu` and `PerCpu`, which now reach the copy just made.
+    unsafe {
+        asm!("msr tpidr_el1, {}", in(reg) index << 48 | offset, options(nostack, preserves_flags))
+    };
 }
 
 /// A ticket spinlock: waiters take a ticket and are served in order, each spinning on `ldarh` of the owner ticket.
@@ -116,31 +143,38 @@ impl<T> Drop for Guard<'_, T> {
     }
 }
 
-/// One `T` per core, reached with IRQs masked so the task stays on its core.
-pub struct PerCpu<T>([RefCell<T>; MAX_CPUS]);
+/// One `T` per core, reached with IRQs masked so the task stays on its core. The static is a template in `.percpu`,
+/// never touched: each core reaches its own copy at the static's address plus its TPIDR_EL1 offset.
+pub struct PerCpu<T>(RefCell<T>);
 
-// SAFETY: core `i` touches only slot `i`, with IRQs masked, so no slot is shared between cores or reentered by an IRQ.
+// SAFETY: each core touches only its own copy, with IRQs masked, so no copy is shared between cores or reentered by an
+// IRQ.
 unsafe impl<T: Send> Sync for PerCpu<T> {}
 
 impl<T> PerCpu<T> {
-    /// Every core's slot starts as `value`.
-    pub const fn new(value: T) -> Self
-    where
-        T: Copy,
-    {
-        Self([
-            RefCell::new(value),
-            RefCell::new(value),
-            RefCell::new(value),
-            RefCell::new(value),
-        ])
+    /// Every core's copy starts as `value`.
+    ///
+    /// # Safety
+    ///
+    /// The static must be in the `.percpu` section (`#[unsafe(link_section = ".percpu")]`): `with` reaches it by its
+    /// offset from the template.
+    pub const unsafe fn new(value: T) -> Self {
+        Self(RefCell::new(value))
     }
 
-    /// Runs `f` on this core's `T` with IRQs masked; panics if `f` reaches it again. `f` must not switch tasks: once
-    /// tasks migrate (step 25b) the borrow could end on another core.
+    /// Runs `f` on this core's `T` with IRQs masked; panics if `f` reaches it again. `f` must not switch tasks, or the
+    /// borrow could end on another core.
     pub fn with<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
         let irq = irq::disable();
-        let mut slot = self.0[cpu()].borrow_mut();
+        let offset: isize;
+        // SAFETY: reading TPIDR_EL1 has no side effects; `sbfx` sign-extends its offset bits.
+        unsafe {
+            asm!("mrs {0}, tpidr_el1", "sbfx {0}, {0}, #0, #48", out(reg) offset, options(nomem, nostack, preserves_flags))
+        };
+        // SAFETY: `new`'s contract puts `self` in the template, and `enter_percpu` made this core's copy at `offset` from
+        // it, which only this core reaches, with IRQs masked.
+        let copy = unsafe { &*(self as *const Self).wrapping_byte_offset(offset) };
+        let mut slot = copy.0.borrow_mut();
         let result = f(&mut slot);
         drop(slot);
         irq::restore(irq);

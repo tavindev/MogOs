@@ -17,8 +17,8 @@ use crate::net;
 use crate::process::{free_stack, map, spawn, thread};
 use crate::usermem::{UserIn, UserOut, copy_in};
 use crate::{
-    ARCHIVE, CONSOLE, KERNEL, Kernel, MAX_MUTEXES, MAX_PIPES, PING_SGI, PONGS, Sched, TICK_US,
-    TICKED, TICKS, TIMER_IRQ, UART_IRQ, kick, send, send_sgi,
+    ARCHIVE, CONSOLE, KERNEL, Kernel, MAX_MUTEXES, MAX_PIPES, PING_SGI, PONGS, Sched, TICK_COUNTED,
+    TICK_US, TICKED, TICKS, TIMER_IRQ, UART_IRQ, kick, send, send_sgi,
 };
 
 /// # Safety
@@ -295,7 +295,9 @@ unsafe extern "C" fn board_irq(frame: usize) -> usize {
     let irq = arch::gic::ack();
     let tick = irq == TIMER_IRQ;
     if tick {
-        TICKED.fetch_or(1 << cpu, Relaxed);
+        if !TICK_COUNTED.with(|counted| core::mem::replace(counted, true)) {
+            TICKED.fetch_add(1, Relaxed);
+        }
         net::tick(&mut kernel.sched);
     } else if irq == PING_SGI {
         match cpu {

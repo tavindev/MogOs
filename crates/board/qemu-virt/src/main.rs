@@ -80,24 +80,34 @@ const RESCHEDULE_SGI: u32 = 0;
 const PING_SGI: u32 = 1;
 static PONGS: AtomicU64 = AtomicU64::new(0);
 const PSCI_CPU_ON: u64 = 0xc400_0003;
-/// Each secondary core's stack, and core 0's idle context's, reserved in `linker.ld` above `__stack_top`.
-const SECONDARY_STACK: u64 = 0x4000;
+/// Each core's per-CPU block: a stack of `CPU_STACK` bytes, then its copy of the `.percpu` template, whose start is
+/// the stack's top (core 0 keeps its boot stack; block 0's runs its idle context).
+const CPU_STACK: u64 = 0x4000;
+/// The blocks, one `alloc_contiguous` sized at boot: the first's address, and each one's size.
+static BLOCKS: AtomicU64 = AtomicU64::new(0);
+static BLOCK: AtomicU64 = AtomicU64::new(0);
+/// The cores' table, written by `kmain` right after the image (and reserved with it): `CPUS` MPIDRs by dense index (0
+/// the boot core, the rest in DTB order), then `REDIST_REGIONS` pairs of the DTB's redistributor regions' base and
+/// frame count.
+static CPU_TABLE: AtomicU64 = AtomicU64::new(0);
+static REDIST_REGIONS: AtomicUsize = AtomicUsize::new(0);
 
-/// The GICv3 distributor and the DTB's first redistributor region, set before the first IRQ can be delivered and before
-/// any secondary starts. Core `n`'s redistributor is the region's `n`th frame (at most `MAX_CPUS` start).
+/// The GICv3 distributor, set before the first IRQ can be delivered and before any secondary starts.
 static GIC_DIST: AtomicU64 = AtomicU64::new(0);
-static GIC_REDIST: AtomicU64 = AtomicU64::new(0);
 /// A GICv3 redistributor's two 64 KiB frames (control, then SGIs and PPIs).
 const REDIST_STRIDE: u64 = 0x2_0000;
-/// Bit `n` is set once core `n` has taken a timer tick.
+/// Cores that have taken a timer tick, each counted once (`TICK_COUNTED`).
 static TICKED: AtomicUsize = AtomicUsize::new(0);
+#[unsafe(link_section = ".percpu")]
+// SAFETY: in `.percpu`.
+static TICK_COUNTED: PerCpu<bool> = unsafe { PerCpu::new(false) };
 /// `Board::start_timer` was called: a core that runs a task ticks.
 static TICKS: AtomicBool = AtomicBool::new(false);
 /// Cores whose GIC is set up, counted once each (core 0 at `start_cpus`).
 static ONLINE: AtomicUsize = AtomicUsize::new(0);
-/// `test=smp`: secondaries announce themselves and run their timer; otherwise they sleep until 25b gives them work.
+/// `test=smp`: secondaries arm their timer once, so each takes a tick.
 static SMP_TEST: AtomicBool = AtomicBool::new(false);
-/// The DTB's cores, at most `MAX_CPUS`; `start_cpus` starts them all or panics.
+/// The DTB's cores; `start_cpus` starts them all or panics.
 static CPUS: AtomicUsize = AtomicUsize::new(1);
 /// Set once `Board::disk` handed out the block device.
 static DISK_TAKEN: AtomicBool = AtomicBool::new(false);
@@ -105,17 +115,19 @@ static DISK_TAKEN: AtomicBool = AtomicBool::new(false);
 const VIRTIO: PhysAddr = PhysAddr(0x0a00_0000);
 const VIRTIO_STRIDE: u64 = 0x200;
 const VIRTIO_COUNT: u64 = 32;
-/// Threads, the boot context included.
-const MAX_TASKS: usize = 8;
+/// Threads, the boot context included. Interim, as `MAX_PROCESSES` and `MAX_PIPES` (64 each, room for `bench-smp`'s
+/// 12 workers): step 31 removes all three.
+const MAX_TASKS: usize = 64;
 /// The kernel included; a process's index is its ASID (8 bits).
-const MAX_PROCESSES: usize = 8;
+const MAX_PROCESSES: usize = 64;
 const _: () = assert!(MAX_PROCESSES <= 256);
 type Sched = Scheduler<MAX_TASKS, MAX_PROCESSES>;
 /// Kernel stack per task: 16 KiB.
 const TASK_STACK_FRAMES: usize = 4;
-const MAX_PIPES: usize = 16;
-/// Each live mutex has a handle, so the handle tables are the per-process quota.
-const MAX_MUTEXES: usize = MAX_PROCESSES * MAX_HANDLES;
+const MAX_PIPES: usize = 64;
+/// Mutexes: 8 processes' worth of handle tables, kept at its size before the interim 64 processes (each thread end
+/// scans it), until step 27 deletes them.
+const MAX_MUTEXES: usize = 8 * MAX_HANDLES;
 
 #[global_allocator]
 static HEAP: KernelHeap = KernelHeap(Lock::new(Heap::empty()));
@@ -283,10 +295,23 @@ impl kernel::Board for QemuVirt {
         arch::yield_now()
     }
 
+    fn init_cpus(&mut self, frames: &mut FrameAllocator<FRAME_WORDS>) {
+        let block = CPU_STACK + (arch::percpu_size() as u64).next_multiple_of(64);
+        let bytes = CPUS.load(Relaxed) as u64 * block;
+        let blocks = frames.alloc_contiguous(bytes.div_ceil(PAGE as u64) as usize);
+        BLOCKS.store(
+            blocks.expect("no room for the per-CPU blocks").start.0,
+            Relaxed,
+        );
+        BLOCK.store(block, Relaxed);
+        // SAFETY: block 0's area, in fresh frames only this core uses, 64-byte aligned, in RAM; IRQs are still masked and
+        // nothing used `PerCpu` yet.
+        unsafe { arch::enter_percpu(0, area(0) as usize) };
+    }
+
     fn init_frames(&mut self, frames: FrameAllocator<FRAME_WORDS>) {
-        let top = &raw const __stack_top as usize + arch::MAX_CPUS * SECONDARY_STACK as usize;
-        // SAFETY: core 0's idle stack, reserved in `linker.ld` above the secondaries' and used by nothing else.
-        let idle = unsafe { arch::new_task(top, idle, 0) };
+        // SAFETY: block 0's stack, which core 0 (on its boot stack) leaves to its idle context.
+        let idle = unsafe { arch::new_task(area(0) as usize, idle, 0) };
         let mut kernel = KERNEL.lock();
         kernel.frames = frames;
         kernel.sched.start_cores(CPUS.load(Relaxed), idle);
@@ -381,7 +406,9 @@ impl kernel::Board for QemuVirt {
     fn round_trips(&mut self, n: u64, kind: RoundTrip) {
         static TICKET: Lock<()> = Lock::new(());
         static TAS: AtomicBool = AtomicBool::new(false);
-        static COUNT: PerCpu<u64> = PerCpu::new(0);
+        #[unsafe(link_section = ".percpu")]
+        // SAFETY: in `.percpu`.
+        static COUNT: PerCpu<u64> = unsafe { PerCpu::new(0) };
         for _ in 0..n {
             match kind {
                 RoundTrip::Ticket => drop(TICKET.lock_masked()),
@@ -421,7 +448,7 @@ impl kernel::Board for QemuVirt {
     fn start_cpus(&mut self, smp_test: bool) {
         SMP_TEST.store(smp_test, Relaxed);
         ONLINE.store(1, Relaxed);
-        // Core 1 starts the rest, so boot pays one call.
+        // Core 1 starts the rest, as a tree, so boot pays one call.
         if CPUS.load(Relaxed) > 1 {
             start_cpu(1);
         }
@@ -436,7 +463,11 @@ impl kernel::Board for QemuVirt {
     }
 
     fn ticked_cpus(&self) -> usize {
-        TICKED.load(Relaxed).count_ones() as usize
+        TICKED.load(Relaxed)
+    }
+
+    fn online_cpus(&self) -> usize {
+        ONLINE.load(Acquire)
     }
 }
 
@@ -460,16 +491,37 @@ extern "C" fn kmain() -> ! {
     // SAFETY: the magic matched, so QEMU loaded `size` bytes of DTB here and nothing writes them.
     let blob = unsafe { slice::from_raw_parts(DTB.0 as *const u8, size) };
 
-    let image =
-        PhysAddr(&raw const __kernel_start as u64)..PhysAddr(&raw const __kernel_end as u64);
-    let dtb_range = DTB..PhysAddr(DTB.0 + size as u64);
-
     let dtb = Dtb::new(blob).expect("bad DTB");
+    // The cores' table (`CPU_TABLE`), in one DTB walk for the cores: the boot core first.
+    let table = &raw const __kernel_end as *mut u64;
+    let boot = arch::mpidr();
+    // SAFETY: RAM right after the image, reserved with it below and used by nothing else; a word per core and two per
+    // redistributor region.
+    unsafe { table.write(boot) };
+    let mut len = 1;
+    let cpus = dtb.cpus(|mpidr| {
+        if mpidr != boot {
+            // SAFETY: as above.
+            unsafe { table.wrapping_add(len).write(mpidr) };
+            len += 1;
+        }
+    });
+    assert_eq!(len, cpus, "the boot core's MPIDR is not the DTB's once");
     let gic = dtb.gic().expect("no GICv3 in DTB");
     let dist = gic.distributor().expect("no GICv3 distributor");
-    let (redist, _) = gic.redistributors().next().expect("no GICv3 redistributor");
+    for (base, size) in gic.redistributors() {
+        // SAFETY: as above.
+        unsafe { (table.wrapping_add(len) as *mut [u64; 2]).write([base.0, size / REDIST_STRIDE]) };
+        len += 2;
+    }
+    CPU_TABLE.store(table as u64, Relaxed);
+    CPUS.store(cpus, Relaxed);
+    REDIST_REGIONS.store((len - cpus) / 2, Relaxed);
     GIC_DIST.store(dist.0, Relaxed);
-    GIC_REDIST.store(redist.0, Relaxed);
+    for gib in gic_gibs() {
+        // SAFETY: core 0, before any secondary or process: a GiB of the DTB's GIC registers, not yet mapped.
+        unsafe { arch::map_device_gib(PhysAddr(gib * GIB)) };
+    }
     let gic_gib = gic.redistributors().map(|r| r.0.0 / GIB);
     let user_end = gic_gib
         .chain([dist.0 / GIB])
@@ -480,13 +532,14 @@ extern "C" fn kmain() -> ! {
     unsafe { arch::gic::enable(dist) };
     enable_gic_cpu();
     // SAFETY: as above; UART_IRQ is an SPI, routed to this core.
-    unsafe { arch::gic::route(dist, UART_IRQ, arch::mpidr()) };
+    unsafe { arch::gic::route(dist, UART_IRQ, boot) };
     // SAFETY: as above.
     unsafe { arch::gic::unmask(dist, UART_IRQ) };
     Uart::new(UART0).enable_rx_irq();
-    let cpus = dtb.cpus().min(arch::MAX_CPUS);
-    CPUS.store(cpus, Relaxed);
 
+    let image_end = &raw const __kernel_end as u64 + len as u64 * 8;
+    let image = PhysAddr(&raw const __kernel_start as u64)..PhysAddr(image_end);
+    let dtb_range = DTB..PhysAddr(DTB.0 + size as u64);
     kernel::run(
         &mut QemuVirt {
             console: Console,
@@ -497,19 +550,60 @@ extern "C" fn kmain() -> ! {
     )
 }
 
-/// Starts core `cpu` (MPIDR `cpu` on QEMU `virt`) at `arch::secondary_entry` on its stack, without waiting for it.
+/// The cores' table's redistributor regions: base and frame count each.
+fn redist_regions() -> impl Iterator<Item = [u64; 2]> {
+    let table = CPU_TABLE.load(Relaxed) as *const u64;
+    let regions = table.wrapping_add(CPUS.load(Relaxed)) as *const [u64; 2];
+    // SAFETY: `kmain` wrote `REDIST_REGIONS` pairs after the `CPUS` MPIDRs before any reader.
+    (0..REDIST_REGIONS.load(Relaxed)).map(move |i| unsafe { regions.wrapping_add(i).read() })
+}
+
+/// The GiBs of the DTB's redistributor regions past `KERNEL_L1` (QEMU `virt` puts a second region at 256 GiB past
+/// 123 cores): EL1-only Device blocks in the boot table and every address space.
+fn gic_gibs() -> impl Iterator<Item = u64> {
+    redist_regions().flat_map(|[base, frames]| {
+        (base / GIB..(base + frames * REDIST_STRIDE).div_ceil(GIB))
+            .filter(|&g| g >= KERNEL_L1.len() as u64)
+    })
+}
+
+/// Core `cpu`'s per-CPU area, the top of its block's stack.
+fn area(cpu: usize) -> u64 {
+    BLOCKS.load(Relaxed) + cpu as u64 * BLOCK.load(Relaxed) + CPU_STACK
+}
+
+/// Core `cpu`'s MPIDR affinity, from the table `kmain` wrote before any secondary started.
+fn mpidr(cpu: usize) -> u64 {
+    let table = CPU_TABLE.load(Relaxed) as *const u64;
+    // SAFETY: the table holds `CPUS` MPIDRs, and `cpu` is below `CPUS`.
+    unsafe { table.wrapping_add(cpu).read() }
+}
+
+/// Core `cpu`'s GICv3 redistributor: frame `cpu` counting through the DTB's regions in order (QEMU `virt` gives
+/// redistributors in core order), so no core walks every other core's.
+fn redistributor(cpu: usize) -> PhysAddr {
+    let mut frame = cpu as u64;
+    for [base, frames] in redist_regions() {
+        if frame < frames {
+            return PhysAddr(base + frame * REDIST_STRIDE);
+        }
+        frame -= frames;
+    }
+    panic!("no redistributor for core {cpu}")
+}
+
+/// Starts core `cpu` (`mpidr(cpu)`) at `arch::secondary_entry` with its per-CPU area and index, without waiting for it.
 fn start_cpu(cpu: usize) {
-    let stack_top = &raw const __stack_top as u64 + cpu as u64 * SECONDARY_STACK;
     let status: i64;
-    // SAFETY: CPU_ON starts an off core on an unused stack; `dsb ish` first completes the stores it reads.
+    // SAFETY: CPU_ON starts an off core on its own, unused block; `dsb ish` first completes the stores it reads.
     unsafe {
         core::arch::asm!(
             "dsb ish",
             "hvc #0",
             inlateout("x0") PSCI_CPU_ON => status,
-            in("x1") cpu,
+            in("x1") mpidr(cpu),
             in("x2") arch::secondary_entry(),
-            in("x3") stack_top,
+            in("x3") area(cpu) | (cpu as u64) << 48,
             clobber_abi("C"),
         )
     };
@@ -520,15 +614,14 @@ fn start_cpu(cpu: usize) {
 /// its GIC CPU interface, timer PPI and reschedule SGI, and becomes its idle context.
 #[unsafe(no_mangle)]
 extern "C" fn kmain_secondary() -> ! {
+    // Core k starts 2k and 2k + 1, so every core is up after about log2 N levels.
+    let cpu = arch::cpu();
+    (2 * cpu..(2 * cpu + 2).min(CPUS.load(Relaxed))).for_each(start_cpu);
     arch::install_vectors();
     arch::timer::allow_user_counter();
-    if arch::cpu() == 1 {
-        (2..CPUS.load(Relaxed)).for_each(start_cpu);
-    }
     enable_gic_cpu();
     ONLINE.fetch_add(1, Release);
     if SMP_TEST.load(Relaxed) {
-        let _ = writeln!(Console, "cpu {}: online", arch::cpu());
         arch::timer::arm(TICK_US);
     }
     idle(0)
@@ -538,9 +631,8 @@ extern "C" fn kmain_secondary() -> ! {
 /// redistributor's affinity is not this core's MPIDR.
 fn enable_gic_cpu() {
     let cpu = arch::cpu();
-    let redist = PhysAddr(GIC_REDIST.load(Relaxed) + cpu as u64 * REDIST_STRIDE);
-    // SAFETY: core `cpu`'s frame of the DTB's first redistributor region (stored by `kmain` before any secondary starts),
-    // in the device-mapped GiB 0.
+    let redist = redistributor(cpu);
+    // SAFETY: a frame of the DTB's redistributor regions, device-mapped by `kmain` before any secondary started.
     let affinity = unsafe { arch::gic::affinity(redist) } as u64;
     let mpidr = arch::mpidr();
     assert_eq!(
@@ -568,9 +660,9 @@ fn send_sgi(cpu: usize) {
     send(cpu, RESCHEDULE_SGI);
 }
 
-/// Sends `cpu` (MPIDR `cpu` on QEMU `virt` below 16 cores) SGI `sgi`.
+/// Sends core `cpu` SGI `sgi`.
 fn send(cpu: usize, sgi: u32) {
-    arch::gic::send_sgi(cpu as u64, sgi);
+    arch::gic::send_sgi(mpidr(cpu), sgi);
 }
 
 /// Signals an idle core for each task made ready since the last call, while one is left to signal.

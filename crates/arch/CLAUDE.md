@@ -15,15 +15,18 @@ It is **NOT** board-specific: no MMIO addresses, no memory map, no drivers, no s
   EL1 `brk #0` (self-test); anything else panics with ESR/FAR/ELR.
 - `new_task`, `new_user_task`, `switch_el0_regs`, `TrapFrame::restart`.
 - Descriptor encoding (`l1_block`, `user_page`), `enable_mmu` (core 0 fills the boot table, then runs `aarch64_mmu_on`),
-  `secondary_entry` (PSCI `CPU_ON`'s entry: `aarch64_mmu_on` on the same table, the stack top from the context id),
+  `secondary_entry` (PSCI `CPU_ON`'s entry: `aarch64_mmu_on` on the same table, then its per-CPU area, also its stack
+  top, and its index from the context id), `map_device_gib`,
   `map_page` (`None` on a level-1 or level-2 block on the way, never writing a table into kernel memory), `unmap_page`, `free_space`, `set_ttbr0`, `flush_asid` (`tlbi aside1is`), `user_readable` /
   `user_writable` (`at` probes), `clean_dcache` / `invalidate_icache` (`ic ialluis`; clean each code page, invalidate once).
 - `irq::disable` / `restore` / `wait` / `window`, `gic::enable` / `affinity` / `enable_cpu` / `route` / `unmask` / `unmask_local` / `send_sgi` / `ack` / `eoi`, `mpidr`,
   `timer::arm` / `stop`, `timer::allow_user_counter`.
 - `Lock<T>`, a ticket spinlock: `lock()` masks IRQs, then acquires, and its `Guard` releases, then restores DAIF;
   `lock_masked()` skips DAIF, for code entered masked; `Guard::leak` keeps it held until the `unsafe` `Lock::unlock`
-  (how trap hooks return holding the board's kernel lock). `cpu()` (TPIDR_EL1: 0 from `_start`, MPIDR Aff0 from `aarch64_secondary`), `MAX_CPUS` (4),
-  `PerCpu<T>` (one `RefCell<T>` per core, reached through `with` with IRQs masked; reentry panics).
+  (how trap hooks return holding the board's kernel lock). TPIDR_EL1 holds the core's dense index in bits 48-63 and its per-CPU area's
+  signed offset from the `.percpu` template in bits 0-47 (0 on core 0 until `enter_percpu`): `cpu()` is `mrs` + `lsr`,
+  `PerCpu<T>::with` (a `RefCell<T>` template static in `.percpu`, its `new` `unsafe`) is `mrs` + `sbfx` + add, IRQs
+  masked, reentry panics. `enter_percpu` (core 0; copies the template, sets TPIDR_EL1), `percpu_size`, `mpidr`.
 
 ## Boundaries (hard)
 
@@ -57,7 +60,9 @@ It is **NOT** board-specific: no MMIO addresses, no memory map, no drivers, no s
 - `enable_mmu` runs once, on core 0, with the MMU off and before any atomic RMW (exclusives need Normal memory), so
   before any `Lock`. `aarch64_mmu_on` and the secondary entry up to its SCTLR write touch no memory (no load, store or
   atomic: constants by `movz`/`movk`, the table by `adrp`), and its `tlbi vmalle1` is local.
-- A core's index is its MPIDR Aff0 (one cluster); the board starts only cores below `MAX_CPUS`, which `PerCpu` indexes.
+- A core's index is dense, from the DTB (the board's table), not its MPIDR; there is no compile-time core count. A
+  secondary's entry copies the template into its area and sets TPIDR_EL1 from `CPU_ON`'s context id, with no MPIDR
+  lookup; the template is never written.
 - TLB and I-cache maintenance use the inner-shareable forms the hardware broadcasts to every core, so a shootdown
   needs no IPI.
 - `Lock` is the only lock: a waiter spins on `ldarh` of the owner ticket, with no `wfe` until measured (hvf may trap

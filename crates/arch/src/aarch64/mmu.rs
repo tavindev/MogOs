@@ -136,6 +136,20 @@ pub unsafe fn enable_mmu(l1: &[u64]) {
     unsafe { asm!("bl aarch64_mmu_on", out("x9") _, out("x10") _, out("x30") _) }
 }
 
+/// Maps the GiB at `addr` as EL1-only Device memory in the boot table.
+///
+/// # Safety
+///
+/// The GiB must be MMIO the kernel may touch and its boot-table entry invalid; call after `enable_mmu`, on core 0,
+/// before any other core starts.
+pub unsafe fn map_device_gib(addr: PhysAddr) {
+    let table = &raw mut L1;
+    // SAFETY: core 0 alone; the entry was invalid, so no walk or TLB entry depends on it (no break-before-make).
+    unsafe { (*table).0[(addr.0 >> 30) as usize] = l1_block(addr, MemoryType::Device) };
+    // SAFETY: barriers only complete the table write before later walks.
+    unsafe { asm!("dsb ishst", "isb", options(nostack, preserves_flags)) };
+}
+
 /// The boot level-1 table that `enable_mmu` loaded, with ASID 0.
 pub fn boot_table() -> PhysAddr {
     PhysAddr(&raw const L1 as u64)

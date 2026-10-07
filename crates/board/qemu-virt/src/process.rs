@@ -6,7 +6,7 @@ use core::ptr;
 use core::slice;
 use core::sync::atomic::Ordering::Relaxed;
 
-use arch::{UserAccess, user_page};
+use arch::{MemoryType, UserAccess, l1_block, user_page};
 use kernel::elf::{Elf, Segment};
 use kernel::handle::{
     CONNECT, DUPLICATE, Handles, KILL, LISTEN, MAX_HANDLES, Object, READ, Rights, TRANSFER, WAIT,
@@ -20,7 +20,7 @@ use mogfs::ROOT;
 use crate::usermem::copy_in;
 use crate::{
     ARCHIVE, IMAGE, KERNEL, KERNEL_L1, Kernel, MAP_BASE, PAGE, Sched, TASK_STACK_FRAMES, USER_BASE,
-    USER_END, USER_STACK_TOP,
+    USER_END, USER_STACK_TOP, gic_gibs,
 };
 
 /// Returns a thread's kernel stack at `stack` to `frames`, refunding `budget`.
@@ -128,6 +128,14 @@ fn spawn_process(
     let l1 = zeroed(frames, &mut budget).ok_or(ENOMEM)?;
     // SAFETY: `l1` is a fresh, zeroed frame.
     unsafe { (l1.0 as *mut [u64; 2]).write(KERNEL_L1) };
+    for gib in gic_gibs() {
+        // SAFETY: as above; `gib` is below 512.
+        unsafe {
+            (l1.0 as *mut u64)
+                .wrapping_add(gib as usize)
+                .write(l1_block(PhysAddr(gib << 30), MemoryType::Device))
+        };
+    }
     let stack = (|| {
         for segment in segments {
             let data = &file[segment.data];

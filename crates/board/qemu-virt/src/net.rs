@@ -99,8 +99,8 @@ fn setup(board: &mut QemuVirt) {
     if nic.is_some() {
         let irq = IRQ.load(Relaxed);
         let dist = PhysAddr(GIC_DIST.load(Relaxed));
-        // SAFETY: the DTB's GICv3 distributor, in the device-mapped GiB 0; `irq` is an SPI, core 0's MPIDR is 0.
-        unsafe { arch::gic::route(dist, irq, 0) };
+        // SAFETY: the DTB's GICv3 distributor, in the device-mapped GiB 0; `irq` is an SPI, routed to core 0.
+        unsafe { arch::gic::route(dist, irq, crate::mpidr(0)) };
         // SAFETY: as above.
         unsafe { arch::gic::unmask(dist, irq) };
     }

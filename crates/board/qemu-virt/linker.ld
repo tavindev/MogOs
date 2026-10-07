@@ -14,6 +14,14 @@ SECTIONS
     .rodata : ALIGN(8) { *(.rodata .rodata.*) }
     .data   : ALIGN(8) { *(.data .data.*) }
 
+    /* The per-CPU template: each core's area is a copy, made at boot; the template itself is never written. */
+    .percpu : ALIGN(64) {
+        __percpu_start = .;
+        KEEP(*(.percpu .percpu.*))
+        . = ALIGN(16);
+        __percpu_end = .;
+    }
+
     .bss (NOLOAD) : ALIGN(16) {
         __bss_start = .;
         *(.bss .bss.*)
@@ -25,8 +33,6 @@ SECTIONS
     . = ALIGN(16);
     . += 0x10000;
     __stack_top = .;
-    /* 16 KiB stacks for cores 1 to MAX_CPUS - 1 (3), core n's ending at __stack_top + n * 0x4000, then core 0's idle stack. */
-    . += 4 * 0x4000;
     __kernel_end = .;
 
     /DISCARD/ : { *(.comment) *(.note*) *(.eh_frame*) }

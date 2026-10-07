@@ -55,6 +55,9 @@ pub trait Board {
     fn yield_now(&mut self);
     /// Runs the other tasks until none is ready (each exited or blocked). Boot context only.
     fn run_others(&mut self);
+    /// Sets up every core's per-CPU area from `frames` and makes this core's its own; call once, right after the frame
+    /// allocator is built, before any trap, IRQ or other core.
+    fn init_cpus(&mut self, frames: &mut FrameAllocator<FRAME_WORDS>);
     /// Takes over the frame allocator: process memory and kernel stacks come from it from now on; call once.
     fn init_frames(&mut self, frames: FrameAllocator<FRAME_WORDS>);
     fn free_frames(&self) -> usize;
@@ -109,6 +112,8 @@ pub trait Board {
     fn cpu(&self) -> usize;
     /// Cores that have taken a timer tick.
     fn ticked_cpus(&self) -> usize;
+    /// Cores whose interrupt controller is set up, this one included, once `start_cpus` ran.
+    fn online_cpus(&self) -> usize;
 }
 
 /// What `Board::round_trips` times.
@@ -152,10 +157,12 @@ const BENCH_YIELDS: u64 = 100_000;
 const BENCH_LOCKS: u64 = 10_000_000;
 /// SGI round trips `test=bench-ipi` times.
 const IPI_ROUND_TRIPS: u64 = 1000;
-/// The additions each of `test=bench-lock`'s adders makes, one adder per core (at least two).
-const CONTENDED_LOCKS: u64 = 1_000_000;
+/// The additions each of `test=bench-lock`'s adders makes, one adder per core (at least two), the boot context one.
+const CONTENDED_LOCKS: u64 = 100_000;
 /// `test=bench-lock`'s adders that are done.
 static ADDERS_DONE: AtomicUsize = AtomicUsize::new(0);
+/// `test=smp`'s kernel tasks that each take a core at once (the full N-task form is step 31's `test=limits`).
+const MAX_SPINNERS: usize = 32;
 /// `test=smp`'s spinners that have started, and those that have printed their core.
 static SPINNERS: AtomicUsize = AtomicUsize::new(0);
 static SPUN: AtomicUsize = AtomicUsize::new(0);
@@ -218,6 +225,7 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
         frames.reserve(range.clone());
     }
     let _ = writeln!(board.console(), "frames: {} free", frames.free_count());
+    board.init_cpus(&mut frames);
 
     let heap = frames
         .alloc_contiguous(HEAP_FRAMES)
@@ -261,6 +269,7 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
         board.start_net(config, seed.expect("no rng-seed in DTB"));
     }
 
+    let cpus_started = board.uptime_us();
     board.start_cpus(bootargs.split_whitespace().any(|a| a == "test=smp"));
     let boot_us = board.uptime_us();
     let _ = writeln!(board.console(), "boot: {boot_us} us");
@@ -319,13 +328,13 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
             ),
             "test=bench-pipe" => pipe_bench(board),
             "test=bench-lock" => lock_bench(board),
-            "test=bench-ipi" => {
+            "test=bench-ipi" if board.cpus() > 1 => {
                 let start = board.uptime_us();
                 board.ipi_round_trips(IPI_ROUND_TRIPS);
                 let ns = (board.uptime_us() - start) * 1000 / IPI_ROUND_TRIPS;
                 let _ = writeln!(board.console(), "ipi: {ns} ns/round-trip");
             }
-            "test=smp" => smp_test(board),
+            "test=smp" => smp_test(board, cpus_started),
             "test=fuzz" => fuzz(board, bootargs),
             "test=httpd" => httpd(board, bootargs),
             "test=bench-shell" => shell_bench(board),
@@ -379,17 +388,22 @@ fn arg_value<T: core::str::FromStr>(bootargs: &str, prefix: &str) -> Option<T> {
         .find_map(|a| a.strip_prefix(prefix)?.parse().ok())
 }
 
-/// Core 0 joins the secondaries' `cpu <n>: online` lines; `threads` kills a process whose threads spin on another core
-/// and block; with the timer off, one kernel task per core waits until all have started, so each prints a distinct
-/// core; then every core must have taken a timer tick.
-fn smp_test<B: Board>(board: &mut B) {
-    let _ = writeln!(board.console(), "cpu 0: online");
+/// Waits until every core is online, which took this long from `started_us` (`start_cpus`); `threads` kills a process
+/// whose threads spin on another core and block; with the timer off, one kernel task per core (at most `MAX_SPINNERS`)
+/// waits until all have started, so each prints a distinct core; then every core must have taken a timer tick.
+fn smp_test<B: Board>(board: &mut B, started_us: u64) {
     let cpus = board.cpus();
-    run_archived(board, "smp", "threads", (THREADS_BUDGET, INIT_ARCHIVE));
-    for _ in 0..cpus {
-        board.spawn(spin_together, cpus).expect("spawn");
+    while board.online_cpus() < cpus {
+        core::hint::spin_loop();
     }
-    while SPUN.load(Relaxed) < cpus {
+    let us = board.uptime_us() - started_us;
+    let _ = writeln!(board.console(), "smp: {cpus} cpus online in {us} us");
+    run_archived(board, "smp", "threads", (THREADS_BUDGET, INIT_ARCHIVE));
+    let spinners = cpus.min(MAX_SPINNERS);
+    for _ in 0..spinners {
+        board.spawn(spin_together, spinners).expect("spawn");
+    }
+    while SPUN.load(Relaxed) < spinners {
         board.yield_now();
     }
     board.start_timer();
@@ -597,7 +611,7 @@ fn pipe_bench<B: Board>(board: &mut B) {
 }
 
 /// Times uncontended acquire + release of the ticket and the test-and-set lock, reading the core index and a per-CPU
-/// access; then one task per core (at least two,
+/// access; then the boot context and a task per other core (at least one,
 /// so the timer interleaves them on one) each adds `CONTENDED_LOCKS` to a counter under the board's lock, timed from
 /// their spawn until all are done, and the total must be exact.
 fn lock_bench<B: Board>(board: &mut B) {
@@ -615,11 +629,12 @@ fn lock_bench<B: Board>(board: &mut B) {
     }
     let adders = board.cpus().max(2);
     let start = board.uptime_us();
-    for _ in 0..adders {
+    for _ in 1..adders {
         board.spawn(add_and_yield, 0).expect("spawn");
     }
     board.start_timer();
-    while ADDERS_DONE.load(Relaxed) < adders {
+    board.add_locked(CONTENDED_LOCKS);
+    while ADDERS_DONE.load(Relaxed) < adders - 1 {
         board.idle();
     }
     let ns = (board.uptime_us() - start) * 1000 / CONTENDED_LOCKS;

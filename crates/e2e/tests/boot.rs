@@ -11,9 +11,22 @@ fn boot(extra: &[&str]) -> (ExitStatus, Vec<String>) {
     boot_with_input(extra, None)
 }
 
+/// As `boot`, with a deadline of `secs` instead of 30 s.
+fn boot_for(secs: u64, extra: &[&str]) -> (ExitStatus, Vec<String>) {
+    boot_with(secs, extra, None)
+}
+
 /// As `boot`; with `input` = (`ready`, `chunks`), writes chunk `i` to QEMU's stdin once the output contains `ready`
 /// `i + 1` times.
 fn boot_with_input(extra: &[&str], input: Option<(&str, &[&[u8]])>) -> (ExitStatus, Vec<String>) {
+    boot_with(30, extra, input)
+}
+
+fn boot_with(
+    secs: u64,
+    extra: &[&str],
+    input: Option<(&str, &[&[u8]])>,
+) -> (ExitStatus, Vec<String>) {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     // Once per run: even a fresh `cargo build` replaces `mog_os`, so a build beside a booting test can leave QEMU no ELF.
     static BUILD: Once = Once::new();
@@ -58,7 +71,7 @@ fn boot_with_input(extra: &[&str], input: Option<(&str, &[&[u8]])>) -> (ExitStat
 
     let (out, out_reader) = drain(qemu.stdout.take().unwrap());
     let (err, err_reader) = drain(qemu.stderr.take().unwrap());
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(secs);
     let mut sent = 0;
     let status = loop {
         if let Some(status) = qemu.try_wait().unwrap() {
@@ -519,7 +532,21 @@ fn pipe_bench_reports_round_trip() {
 
 #[test]
 fn lock_bench_reports_round_trips_and_an_exact_count() {
-    let (status, lines) = boot(&["-append", "test=bench-lock"]);
+    lock_bench(4, 30);
+}
+
+#[test]
+#[ignore = "the ticket lock convoys with 64 TCG vCPUs on 12 host cores: until step 32's queued lock"]
+fn every_one_of_sixty_four_cores_adds_under_the_lock_and_the_count_is_exact() {
+    lock_bench(64, 1200);
+}
+
+/// `test=bench-lock` on `cpus` cores within `secs`.
+fn lock_bench(cpus: usize, secs: u64) {
+    let (status, lines) = boot_for(
+        secs,
+        &["-smp", &cpus.to_string(), "-append", "test=bench-lock"],
+    );
     assert!(
         !lines.iter().any(|l| l.starts_with("panic:")),
         "kernel panicked"
@@ -541,12 +568,10 @@ fn lock_bench_reports_round_trips_and_an_exact_count() {
         .expect("missing adder line")
         .parse::<u64>()
         .unwrap();
-    // Four adders, one per core, each adding 10^6.
-    assert!(first > 1_000_000, "the adders never interleaved");
-    assert!(
-        lines.iter().any(|l| l == "lock: count 4000000"),
-        "the four adders' count is not exact"
-    );
+    // One adder per core, the boot context one of them, each adding 10^5.
+    assert!(first > 100_000, "the adders never interleaved");
+    let count = format!("lock: count {}", cpus * 100_000);
+    assert!(lines.contains(&count), "missing line: {count}");
     assert!(status.success(), "QEMU exited with {status}");
 }
 
@@ -573,15 +598,41 @@ fn console_reads_edited_lines_typed_ahead() {
 
 #[test]
 fn every_core_comes_online_runs_a_task_and_takes_a_timer_tick() {
-    let (status, lines) = boot(&["-smp", "4", "-append", "test=smp"]);
+    every_core_runs(4, 30);
+}
+
+/// TCG; about 10 s alone on a loaded host, so the deadline is several times that.
+#[test]
+fn sixty_four_cores_come_online_run_tasks_and_take_a_timer_tick() {
+    every_core_runs(64, 90);
+}
+
+#[test]
+#[ignore = "TCG at 128 cores: run with --ignored --test-threads=1"]
+fn a_hundred_and_twenty_eight_cores_come_online_run_tasks_and_take_a_timer_tick() {
+    every_core_runs(128, 300);
+}
+
+#[test]
+#[ignore = "TCG at 512 cores: run with --ignored --test-threads=1"]
+fn five_hundred_and_twelve_cores_come_online_run_tasks_and_take_a_timer_tick() {
+    every_core_runs(512, 1200);
+}
+
+/// `test=smp` on `cpus` cores within `secs`.
+fn every_core_runs(cpus: usize, secs: u64) {
+    let (status, lines) = boot_for(secs, &["-smp", &cpus.to_string(), "-append", "test=smp"]);
     assert!(
         !lines.iter().any(|l| l.starts_with("panic:")),
         "kernel panicked"
     );
-    for cpu in 0..4 {
-        let online = format!("cpu {cpu}: online");
-        assert!(lines.contains(&online), "missing line: {online}");
-    }
+    let online = format!("smp: {cpus} cpus online in ");
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with(&online) && l.ends_with(" us")),
+        "missing line: {online}<us> us"
+    );
     // `threads`' victim spins on one core while its other thread blocks; the kill ends both from another core.
     assert!(
         lines
@@ -590,17 +641,18 @@ fn every_core_comes_online_runs_a_task_and_takes_a_timer_tick() {
         "the victim was not killed"
     );
     assert_no_leak(&lines, "smp");
-    // Each spinner waits until all four have started, so they ran at once, on four cores.
-    let mut cpus: Vec<_> = lines
+    // Each spinner (one per core, at most 32) waits until all have started, so they ran at once, on distinct cores.
+    let mut spun: Vec<usize> = lines
         .iter()
-        .filter_map(|l| l.strip_prefix("smp: spinner on cpu "))
+        .filter_map(|l| l.strip_prefix("smp: spinner on cpu ")?.parse().ok())
         .collect();
-    cpus.sort();
-    assert_eq!(cpus, ["0", "1", "2", "3"]);
-    assert!(
-        lines.iter().any(|l| l == "smp: 4 cpus ticked"),
-        "missing line: smp: 4 cpus ticked"
-    );
+    let count = spun.len();
+    spun.sort();
+    spun.dedup();
+    assert_eq!((count, spun.len()), (cpus.min(32), cpus.min(32)));
+    assert!(spun.iter().all(|&c| c < cpus));
+    let ticked = format!("smp: {cpus} cpus ticked");
+    assert!(lines.contains(&ticked), "missing line: {ticked}");
     assert!(status.success(), "QEMU exited with {status}");
 }
 
