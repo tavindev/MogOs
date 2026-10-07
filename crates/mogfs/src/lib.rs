@@ -451,6 +451,9 @@ impl<D: Disk> Fs<D> {
             self.used[w] &= !bit;
             self.free += 1;
             self.hint = min(self.hint, w);
+            if self.cached == Some(b) {
+                self.cached = None;
+            }
         } else {
             self.replaced[w] |= bit;
         }
