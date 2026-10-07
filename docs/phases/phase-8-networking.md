@@ -18,8 +18,8 @@ Steps 46-48 are pure: a new crate, `crates/net` (safe, `no_std`, no `alloc`, no 
 
 ### Step details
 
-- **46.** Benchmark (host, `cargo bench-host`): receive path per frame (parse, demux, deliver) for UDP, in ns; UDP datagrams per second over the loss-free in-memory link. Invariants: no clock (every entry point takes `now` in ns; `poll(now)` returns the next deadline), so a seed reproduces a run; the caller gives every table its fixed memory; the ARP cache evicts its least recently used entry and learns only from replies to our requests or requests aimed at us; a full socket table is an error, never a silent eviction; every field is range-checked once when decoded, a crafted frame is dropped and counted, never a panic, overflow or out-of-range index; IPv4 fragments are dropped and counted (no reassembly memory to exhaust). Avoids: a network stack as a permanent C CVE source (M12): the parser of untrusted bytes cannot corrupt the kernel.
-- **47.** Benchmark (host): TCP goodput over the simulated link at 0% loss (CPU-bound MiB/s), and at 1% loss with 10 ms and 50 ms RTT (with fixed buffers the 50 ms number mostly reflects buffer size over RTT); receive path per segment (ns). Invariants: 46's; initial sequence numbers and ephemeral ports from a keyed hash seeded by the caller (the DT seed in the kernel, RFC 6528); half-open connections live in their own fixed table that evicts its oldest entry; TIME_WAIT entries are compact and the oldest is reused when the table is full, or a new SYN with a higher sequence number is accepted into one; challenge ACKs are rate-limited per socket; congestion control is NewReno as plain code (a trait comes with a second controller). Avoids: the global challenge-ACK limit that leaked connection state off-path (CVE-2016-5696), and TCP behavior shaped by decades of compatibility quirks: one RFC-cited path per mechanism.
+- **46.** Benchmark (host, `cargo bench-host`): receive path per frame (parse, demux, deliver) for UDP, in ns; UDP datagrams per second over the loss-free in-memory link. Invariants: no clock (every entry point takes `now` in ns; `poll(now)` returns the next deadline), so a seed reproduces a run; the caller gives every table its fixed memory; the ARP cache evicts its least recently used entry and learns only from replies to our own requests (a request aimed at us is answered, never learned); a full socket table is an error, never a silent eviction; every field is range-checked once when decoded, a crafted frame is dropped and counted, never a panic, overflow or out-of-range index; IPv4 fragments are dropped and counted (no reassembly memory to exhaust). Avoids: a network stack as a permanent C CVE source (M12): the parser of untrusted bytes cannot corrupt the kernel.
+- **47.** Benchmark (host): TCP goodput over the simulated link at 0% loss (CPU-bound MiB/s), and at 1% loss with 10 ms and 50 ms RTT (with fixed buffers the 50 ms number mostly reflects buffer size over RTT); receive path per segment (ns). Invariants: 46's; initial sequence numbers and ephemeral ports from a keyed hash seeded by the caller (the DT seed in the kernel, RFC 6528); half-open connections live in their own fixed table, and when it is full SYNs are answered with SYN cookies (the user approved cookies over oldest-first eviction after review, 2026-10-07); TIME_WAIT entries are compact and the oldest is reused when the table is full, or a new SYN with a higher sequence number is accepted into one; challenge ACKs are rate-limited per socket; congestion control is NewReno as plain code (a trait comes with a second controller). Avoids: the global challenge-ACK limit that leaked connection state off-path (CVE-2016-5696), and TCP behavior shaped by decades of compatibility quirks: one RFC-cited path per mechanism.
 - **48.** RFC 6675 over RACK-TLP because it extends the duplicate-ACK counting NewReno already has with one scoreboard and needs no new timer. Benchmark (host): goodput at 1% and 5% loss against step 47. Invariants: 47's; the scoreboard is fixed memory per connection, and SACK blocks only ever mark data the sender sent. Avoids: SACK-processing resource exhaustion (the 2019 SACK Panic CVEs) by bounding the scoreboard.
 - **49.** Needs phase 5 step 24 (the IRQ handler, net task and syscalls share the stack's state). Benchmark (hvf): UDP round trip to the host (median us), frames per second each way, boot time with and without a NIC (the probe). Invariants: DMA only into the fixed pool in the identity map; the pool is sized at boot and charged once, never grown; a full RX ring drops (counted), never allocates. Avoids: sk_buff-style allocation per packet on the hot path.
 - **50.** Needs phase 7 step 42 (non-blocking submit and complete, `io_cancel`), phase 5 step 24, and step 28 for a completion that wakes a task on another core. Benchmark (hvf): loopback TCP MiB/s, a 64-byte send + receive round trip against the pipe's 375 ns, connect + close. Invariants: no ambient authority (no handle, no network); rights only narrow on `dup`; ops are checked against rights at submit (D8); a socket's buffers are charged at creation and freed with the last handle. Avoids: `setsockopt`/`ioctl` multiplexers (M2), global `tcp_mem` pools that fail the wrong process, capability bits (M6), and a separate readiness API (M4: waiting is a completion).
@@ -59,3 +59,136 @@ Decision: write `crates/net` fresh. smoltcp is a host-only dev-dependency of `cr
   reordering, duplication and corruption; 100k seeded mutations of recorded frames; ARP spoof, flood, LRU and retry;
   named socket errors; fragments. Checksum: copy then sum in 32-bit words measured faster than a fused copy-and-sum
   loop on the host, so the copy is a plain `memcpy`. Benchmarks in `docs/BENCHMARKS.md`.
+- **46 (security fix).** ARP requests never learn: a request aimed at us is answered from its own sender fields, and
+  only a reply to our own request writes the cache, so a host on the link cannot overwrite the gateway's entry by
+  asking about us. Cost: one ARP round trip the first time we talk back to a host that asked.
+- **47.** `crates/net/src/tcp.rs`: `Stack::with_tcp(Tcp::new(key, connections, half_open, time_wait))`, every table
+  and ring from the caller. RFC 9293 with MSS and window scaling, RFC 6298 RTO (floor 200 ms, Linux's; the RFC's 1 s
+  is a SHOULD), NewReno with RFC 3465 byte counting and go-back-N after a timeout, a persist timer, out-of-order data
+  kept in the receive ring (4 ranges). Half-open table with oldest eviction rather than SYN cookies: simpler (no
+  options to encode) and a real SYN keeps its entry for a round trip unless a table's worth of SYNs arrives within
+  it. ISNs and ephemeral ports from SipHash-2-4 under the caller's key. A pure ACK carries `snd_max` (BSD's rule):
+  with `snd_nxt` both ends of a go-back-N recovery rejected each other's ACKs forever, which the 64 MiB runs found.
+  Segments about a connection go to the MAC it resolved, so a challenge ACK never answers a spoofed frame's source.
+  Tests (`tests/tcp.rs`): 1 MiB each way for 200 seeds and 64 MiB for 3 at 0%, 1% and 5% loss with reordering,
+  duplication and corruption, the client's ISN half a transfer below 2^32 (so its send and the server's receive
+  sequence spaces wrap); the attack list on a scripted peer; every timeout;
+  half-close, abort, refusal, simultaneous open; a reader stalled for 10 RTOs; 21 sequential connections through one
+  slot; the mutation test over TCP segments. The 64 MiB soak over 200 seeds is `--ignored` (about 43 s). The
+  gate's TCP tests take under a second. Interop (`tests/interop.rs`): our TCP and smoltcp 0.12's, each side opening,
+  256 KiB each way, 20 seeds at each loss rate; smoltcp 0.12 cancels its retransmission timer on entering CLOSING
+  with data in flight, so the test never closes both sides at once. The simulated link's queues became a binary
+  heap (the same delivery order), since the scan per frame made 1 MiB windows quadratic. Benchmarks in
+  `docs/BENCHMARKS.md`; the UDP rows did not move (interleaved with step 46, best minimums 29.6 against 29.8 ns and
+  69.9 against 69.1 ns, machine at load 15-18). Not done: a smoltcp-to-smoltcp goodput figure for the decision's
+  reopen clause.
+- **47 (review).** Timers: one deadline per connection derived from its state (retransmission, persist, FIN-WAIT-2)
+  and cached at the end of each event, replacing a field armed and cancelled in many places; that fixed a window
+  update in FIN-WAIT-2 pinning a released slot, a timeout into a window below one MSS sending nothing, and
+  zero-window probes never giving up on a silent peer (now after 10). Tests check after every step that a connection
+  with work outstanding has a deadline and that a silent peer always ends in CLOSED. SYN cookies replace oldest-first
+  eviction (user decision): a 29-bit SipHash over the connection and the peer's ISN, an MSS index and one clock bit,
+  accepted only within two 16 s periods of the stack sending one. A SYN taking over TIME_WAIT starts 65537 plus 24
+  keyed bits above the old sequence space. Out-of-window ACKs are limited to one per 500 ms per connection; receiver
+  silly-window avoidance; a SYN-ACK offers a connection slot's window; simultaneous open scales only if the peer
+  offered; an ACK below `snd_una` never updates the window; demux tries the last matched slot first (63 idle
+  connections ahead: 92 ns per segment against 80 alone). A security scan found three holes, each now with an attack
+  test: cookies accepted with no flood running (brute-forceable), a SYN-ACK checked as a cookie ACK, and a TIME_WAIT
+  ISS of exactly old `snd_nxt` + 65537. RFC 7323 timestamps with PAWS were built and measured interleaved: the
+  receive path did not move, but loss-free goodput fell 3-5% (64 KiB window medians 6025-6223 against 6403-6470
+  MiB/s) and connect + close rose 7% (minimums 443-466 against 418-423 ns), so they were dropped and the ISS rule is
+  the wrapped-sequence protection. smoltcp 0.12 also drops its retransmission timer on ESTABLISHED + FIN ->
+  CLOSE-WAIT; the interop test works around both of its cases. FIN-WAIT-2 times out only once the caller releases
+  the connection (Linux's rule, the coordinator's decision): an open half-closed connection waits for a slow peer.
+  The half-open table is found in O(1) (a keyed mix picks a run of 8 slots; a full run means a cookie), for tables
+  sized from RAM: filling 4096 entries costs 45 ns per SYN, down from 2.0 us for the linear scan, and 64 entries 48 ns
+  against 68. Still linear: the per-`poll` walks over the half-open table and the slots, and the TIME_WAIT lookup.
+  A security scan flagged key reuse (one key for ISNs, ports, cookies, TIME_WAIT and the weak half-open mix, and the
+  cookie clock XORed into the key): each use now has a key derived from the seed, and the cookie's clock and index
+  are hashed as message words. Cost: 1.5 ns per cookie SYN (a third message word); connect + close unchanged.
+- **47 (second review).** An owed FIN or SYN that never left (next hop unresolved) now runs the retransmission timer,
+  and `poll` reports the ARP retry of a request TCP just started; the link tests lose ARP frames so the liveness rule
+  covers it. Released connections are bounded like Linux's orphans (FIN-WAIT-2 60 s from our FIN's ACK whatever the
+  peer sends, at most 8 zero-window probes); `tcp_info` reports `released`. `poll` walks the half-open table only when
+  a SYN-ACK retransmission is due (idle poll 7 ns at any size, from 1.2 us at 4096). A SYN takes TIME_WAIT over only
+  with a listener and room for the gap ISS, never via a cookie. A cookie ACK that misses a half-open entry for the
+  same connection is still checked as a cookie. The cookie gate is per listener. Interleaved against 9c4ca51: TCP
+  rows within noise, connect + close 398-407 against 427-430 ns; UDP 1472-byte receive reads 2 ns slower
+  (66.3-67.8 against 64.3-65.2) with no change on its path, and both builds match with loops aligned to 64 bytes
+  (65.5-67.7 against 65.2-66.1), so it is code placement; `-C llvm-args=-align-loops=64` in the build config is the
+  fix outside this crate; it is queued as its own experiment (every benchmark measured), and the row records it.
+- **49.** `crates/board/qemu-virt/src/virtio_net.rs`: modern virtio-mmio only, `VIRTIO_NET_F_MAC` and
+  `VIRTIO_F_VERSION_1` (12-byte header, no offloads), one RX and one TX queue of 64 descriptors, each owning a 2 KiB
+  buffer of a 256 KiB pool taken from the frame allocator once when the network starts, never grown. Every RX buffer
+  stays posted and is re-posted once the stack has read its frame (one notify per poll that re-posted any); a full RX
+  ring makes QEMU drop (it waits for a notify), never the driver allocate. TX descriptors are a free bitmask,
+  reclaimed from the used ring when a buffer is needed (TX raises no interrupt). Device-written used-ring ids and
+  lengths are range-checked before a buffer is touched. `src/net.rs` holds the NIC and the stack under `NET` (lock
+  order `KERNEL`, then `NET`) and runs the stack in a kernel net task (`Board::spawn`, priority 0), woken
+  (`Event::Net`) by the NIC's interrupt (SPI `16 + i` for transport `i`, routed to core 0), by the timer tick once
+  the stack's deadline passed (10 ms granularity against a 200 ms RTO floor and 1 s ARP retry) and by
+  `Board::with_net`. `kernel::network` parses `net=<ip>/<prefix>[,gw=<ip>]` and builds the stack's tables on the
+  heap (fallible); `Board::start_net` probes only when that bootarg is given, so a boot without it (NIC or not) is
+  unchanged: the block-device probe still stops at the first block device and the NIC probe looks past it (the e2e
+  attaches the disk first, so it is above the NIC). QEMU 9.2's user network answers ICMP echo to 10.0.2.2 and maps
+  UDP to 10.0.2.2 onto the host's loopback. e2e: `virtio_net_pings_the_gateway_and_echoes_udp_through_the_host`
+  (the host test runs the echo) and `a_net_bootarg_without_a_nic_boots_as_before`. Deviation: the net task runs at
+  priority 0, so a spinning top-priority process starves it until the fair class (phase 5 step 29). Benchmarks
+  (`test=bench-net`, `scripts/bench.sh` with `QEMU_ARGS`) in `docs/BENCHMARKS.md`.
+- **50.** Without phase 7 step 42 (no general non-blocking submit yet) and step 28: the completion ops are socket
+  ops only. `kernel::network` (design notes at its top): a NetStack handle (`CONNECT`, `LISTEN`) makes sockets, which
+  are kernel table entries reached by index and generation and counted by handles (a stale value never reaches a
+  later socket; the stack's bare `TcpId` is never used after its socket closes). Syscalls 20-25 (18 and 19 are threads): `socket`, `bind`,
+  `listen`, `io_submit` (receive, send, accept, connect), `io_wait` (result in x0, tag in x1; wait-any) and
+  `shutdown`, the one typed option. Buffers can be touched only in the submitter's address space, so an op is tried at
+  submit (an accept only in `io_wait`, which makes its handle at once) and again by each `io_wait` until it finishes;
+  the net task only polls and wakes `Event::NetIo`. One receive-side op and one send per socket, so a process's
+  in-flight ops are bounded by its sockets and so by its budget: that is the step's bounded queue charged to the
+  budget, without a separate queue. The rings (16 KiB each way, 16 TCP slots per stack) are a pool taken from the
+  frame allocator once when the network starts; a socket charges `SOCKET_FRAMES` (8) to its creator's budget as
+  accounting (`Budget::charge`, `ENOBUFS`) and refunds it with the last handle if the creator still runs. The
+  loopback `Nic` is a wire between two stacks, `LO` (127.0.0.1, listeners) and `PEER` (127.0.0.2, connections to
+  127/8), since a stack never routes to its own address; a listener listens on `LO` and, with a NIC, `ETH`. The TCP key
+  is the DTB's `/chosen/rng-seed` (`Dtb::rng_seed`). musl maps `AF_INET` stream sockets (`c/CLAUDE.md`), handle 5
+  is the NetStack. e2e `sockets_echo_over_loopback_wait_for_any_and_need_the_net_handle_and_budget`: the C `tcpecho`
+  pair on musl, one process serving 8 connections at once through `io_wait` and another driving 8 clients the same
+  way, a child without the handle (`EBADF`), one with a listen-only duplicate (`EACCES`), one whose budget holds 3
+  sockets (`ENOBUFS`), no frame leaked; host `crates/kernel/tests/network.rs`. The socket calls are one `Call::Net`
+  handled out of line (`net::syscall`), which kept `board_syscall` unchanged for other calls: with them inline, an
+  A/B showed `wait` +4% and `kill` +33% (the latter from `free_table`'s loop moving across a cache line; it moved
+  back). Deviations: `bind` takes only a port (a socket listens on every interface), `accept` reports no peer
+  address, and the fuzzer reaches the socket calls only without a NetStack. Security review fixes (each with a test
+  that failed first): `bind` and `listen` need the socket's write right (`tests/dispatch.rs`); an accepted handle has
+  only the accepting handle's rights (`tests/network.rs`, and `nettest: read-only accept send: EACCES` e2e); musl never
+  passes the NetStack to a spawned child (`tcpecho: child socket: EBADF` e2e); a listener's connections waiting for
+  accept are at most `BACKLOG` (8), each charged to its owner until accepted, the rest reset (`tests/network.rs`).
+- **51.** `httpd` is an echo server (the owner's change to "serves one page"): for each request on port 80 it answers
+  `200 OK`, `text/plain`, with the request it received (request line, headers, body) as the body, streaming a body of
+  any `Content-Length` back as it arrives, then closes; one connection at a time. As init (`test=httpd`) it runs
+  `fetch` with a connect-only NetStack, then itself as the server with a listen-only one and the console (no
+  directory: an echo serves no file). `fetch <ip>:<port>[/<path>] [<times>]` GETs over HTTP/1.0 and prints the body.
+  `cargo httpd` boots into it with `hostfwd=tcp:127.0.0.1:8080-10.0.2.15:80`; `test=httpd` alone implies QEMU's
+  user-network address, since a string alias cannot quote a two-word `-append`. e2e
+  `httpd_echoes_more_sequential_requests_than_its_tables_hold_and_fetch_gets_a_host_page`: 24 sequential POSTs from
+  a plain TCP client through `hostfwd` (more than the 16 TCP slots and 8 TIME_WAIT entries; the server closes
+  first, so each leaves a TIME_WAIT entry), each echo checked byte for byte, and `fetch` printing the test's host
+  page. Benchmarks in `docs/BENCHMARKS.md`.
+- **Review (steps 49-51).** Fixed: the NIC's receive stops at a ring's worth of frames per poll and the net task
+  polls again, so a flood never holds `KERNEL` without end; `bind` takes an address, 127.0.0.1 listening on loopback
+  only (musl passes `sin_addr`; any other address is `EADDRNOTAVAIL`), so a C server bound to loopback is not exposed
+  on the NIC. Open, for the step-47 owner and phase 10: a closed connection whose peer advertises a zero window stays
+  in FIN-WAIT-1 forever (`crates/net` persists without limit), so peers can fill the 16 TCP slots; a socket that
+  outlives its creator is charged to nobody (the parent's refund does not subtract it as it does pipes); the backlog
+  is charged to the listener's creator (fails once it exits; peers can spend up to 64 of its frames; charging it at
+  `listen` would fix both); the net task runs at priority 0 (`Board::spawn`), so any busy process delays the stack,
+  until the board can spawn kernel tasks at a priority (the e2e host page then must read the whole request).
+- **Follow-ups (owner's list, after the merge into main).** A socket's charge follows ownership: every process holding
+  a handle to it pays its cost (a bitmask of process indices in the socket entry); `spawn` charges the child before
+  it starts (`ENOBUFS`) and refunds the parent if it kept no handle; a process's last handle (close or exit) refunds
+  it, so no socket is charged to nobody. `listen(socket, backlog)` takes a backlog of 1 to 8 and charges every holder
+  for it up front, so peers queue only prepaid connections and an exited creator no longer breaks a listener. Booting
+  with a NIC: the NIC probe and setup (about 45 us of MMIO exits under hvf), the ring memory and the stacks (15 us)
+  and the timer moved into the net task, and the DTB's `rng-seed` is now read in the bootargs walk (`Dtb::chosen`;
+  a second walk of the whole blob cost about 45000 instructions): boot with a NIC runs 164000 instructions against
+  157000 without one (TCG `-icount`; main: 264000 against 156000); of that, the DTB walk is removed, the NIC and network setup is moved past the `boot:` stamp (a scenario waits for it). A `net=` without a NIC starts nothing (`Board::has_nic` reads device IDs only). Still open: `accept` cannot report the peer's
+  address until `crates/net` exposes a connection's remote address (`TcpInfo` has none).

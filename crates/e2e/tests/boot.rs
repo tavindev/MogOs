@@ -1002,7 +1002,9 @@ fn musl_bench_reports_round_trips() {
 fn oscb_runs_the_cross_os_benchmarks() {
     let image = mogfs_image("oscb", 1024);
     let script = "sh -c 'oscb syscalls / oscnop; oscb pipe / oscnop; oscb spawn / oscnop; oscb files / oscnop'";
-    let (status, got) = shell(&image, &[script, "exit"]);
+    let drive = format!("file={},if=none,format=raw,id=d0", image.display());
+    // A benchmark scenario: one core.
+    let (status, got) = shell_on(&["-smp", "1", "-drive", &drive], &[script, "exit"]);
     std::fs::remove_file(&image).unwrap();
     assert!(status.success(), "QEMU exited with {status}");
     let names: Vec<&str> = got[0]
@@ -1252,5 +1254,206 @@ fn thread_bench_reports_round_trips() {
             .unwrap();
     }
     assert_no_leak(&lines, "bench-threads");
+    assert!(status.success(), "QEMU exited with {status}");
+}
+
+/// QEMU's user networking (guest 10.0.2.15, host 10.0.2.2) with a virtio-net device, then `extra`.
+fn boot_with_nic(extra: &[&str]) -> (ExitStatus, Vec<String>) {
+    let nic = [
+        "-netdev",
+        "user,id=n0",
+        "-device",
+        "virtio-net-device,netdev=n0",
+    ];
+    boot(&[extra, &nic[..]].concat())
+}
+
+/// A UDP echo on the host's loopback, which QEMU's user networking shows the guest as 10.0.2.2; returns its port.
+fn udp_echo() -> u16 {
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port = socket.local_addr().unwrap().port();
+    thread::spawn(move || {
+        let mut buf = [0; 2048];
+        while let Ok((n, from)) = socket.recv_from(&mut buf) {
+            let _ = socket.send_to(&buf[..n], from);
+        }
+    });
+    port
+}
+
+#[test]
+fn virtio_net_pings_the_gateway_and_echoes_udp_through_the_host() {
+    let port = udp_echo();
+    let args = format!("test=net net=10.0.2.15/24,gw=10.0.2.2 udp={port}");
+    // The disk comes first, so it takes the highest transport and the probe must look past it for the NIC.
+    let image = disk_image("net", 16);
+    let drive = format!("file={},if=none,format=raw,id=d0", image.display());
+    let disk = ["-drive", &drive, "-device", "virtio-blk-device,drive=d0"];
+    let (status, lines) = boot_with_nic(&[&disk[..], &["-append", &args]].concat());
+    std::fs::remove_file(&image).unwrap();
+    assert!(
+        !lines.iter().any(|l| l.starts_with("panic:")),
+        "kernel panicked"
+    );
+    for expected in [
+        "disk: 16 blocks".to_string(),
+        "ping: reply from 10.0.2.2".to_string(),
+        format!("udp: echo mog from 10.0.2.2:{port}"),
+    ] {
+        assert!(lines.contains(&expected), "missing line: {expected}");
+    }
+    let counters = lines
+        .iter()
+        .find_map(|l| l.strip_prefix("net: rx "))
+        .expect("missing counters line");
+    let (rx, tx) = counters.split_once(" tx ").unwrap();
+    let tx = tx.split(' ').next().unwrap();
+    assert!(rx.parse::<u64>().unwrap() >= 2 && tx.parse::<u64>().unwrap() >= 2);
+    assert!(status.success(), "QEMU exited with {status}");
+}
+
+#[test]
+fn a_net_bootarg_without_a_nic_boots_as_before() {
+    let (status, lines) = boot(&["-append", "net=10.0.2.15/24,gw=10.0.2.2"]);
+    assert!(lines.iter().any(|l| l == "net: no nic"), "missing line");
+    assert!(status.success(), "QEMU exited with {status}");
+}
+
+/// A server on the host's loopback that answers every connection with an HTTP/1.0 page of `body`; returns its port.
+fn host_page(body: &'static str) -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let _ = stream.read(&mut [0; 1024]);
+            let head = format!("HTTP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+            let _ = stream.write_all((head + body).as_bytes());
+        }
+    });
+    port
+}
+
+/// Sends `request` to the host's `port` and reads the response to its end; `None` if the connection fails or closes
+/// at once (nothing listening behind QEMU's forward yet).
+fn exchange(port: u16, request: &str) -> Option<String> {
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).ok()?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .ok()?;
+    stream.write_all(request.as_bytes()).ok()?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response).ok()?;
+    (!response.is_empty()).then_some(response)
+}
+
+#[test]
+fn httpd_echoes_more_sequential_requests_than_its_tables_hold_and_fetch_gets_a_host_page() {
+    // More than the 16 TCP slots and 8 TIME_WAIT entries, so entries are reused.
+    const REQUESTS: usize = 24;
+    // Bad heads, each refused with its status, after which the server still answers: no body, so nothing is left
+    // unread and the close is clean.
+    const BAD: [(&str, &str); 5] = [
+        ("Content-Length: 99999999999999999999", "413"),
+        ("Content-Length: 18446744073709551615", "413"),
+        ("Content-Length: -5", "400"),
+        ("Content-Length: 5x", "400"),
+        ("Content-Length: 0\r\nContent-Length: 0", "400"),
+    ];
+    let page = host_page("hello from the host\n");
+    let forward = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let client = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(25);
+        let mut echoed = 0;
+        while echoed < REQUESTS && Instant::now() < deadline {
+            let body = format!("hello {echoed}");
+            let request = format!(
+                "POST /anything HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            match exchange(forward, &request) {
+                Some(response) => {
+                    let expected = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{request}",
+                        request.len()
+                    );
+                    assert_eq!(response, expected);
+                    echoed += 1;
+                    if echoed == 1 {
+                        for (header, status) in BAD {
+                            let request = format!("POST / HTTP/1.1\r\n{header}\r\n\r\n");
+                            let response = exchange(forward, &request).unwrap_or_default();
+                            let line = response.lines().next().unwrap_or_default();
+                            assert!(
+                                line.starts_with(&format!("HTTP/1.1 {status} ")),
+                                "{header}: {line}"
+                            );
+                        }
+                    }
+                }
+                None => sleep(Duration::from_millis(100)),
+            }
+        }
+        echoed
+    });
+    let netdev = format!("user,id=n0,hostfwd=tcp:127.0.0.1:{forward}-10.0.2.15:80");
+    let args = format!(
+        "test=httpd net=10.0.2.15/24,gw=10.0.2.2 httpd={} fetch=10.0.2.2:{page}",
+        REQUESTS + BAD.len()
+    );
+    let (status, lines) = boot(&[
+        "-netdev",
+        &netdev,
+        "-device",
+        "virtio-net-device,netdev=n0",
+        "-append",
+        &args,
+    ]);
+    assert_eq!(client.join().unwrap(), REQUESTS, "requests echoed");
+    assert!(
+        lines.iter().any(|l| l == "hello from the host"),
+        "fetch did not print the host's page"
+    );
+    assert_no_leak(&lines, "httpd");
+    assert!(status.success(), "QEMU exited with {status}");
+}
+
+#[test]
+fn sockets_echo_over_loopback_wait_for_any_and_need_the_net_handle_and_budget() {
+    let (status, lines) = boot(&["-append", "test=sockets"]);
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.starts_with("panic:") || l.starts_with("fault:")),
+        "kernel panicked or a process faulted"
+    );
+    for expected in [
+        // Two C processes on musl's BSD sockets.
+        "tcpecho: served 5 bytes",
+        "tcpecho: hello",
+        // A C child inherits no network from its parent.
+        "tcpecho: child socket: EBADF",
+        // One process serves 8 connections at once through `io_wait`; another drives 8 clients the same way.
+        "nettest: served 8",
+        "nettest: 8 echoes",
+        // A child spawned without the NetStack handle, then one with a listen-only duplicate.
+        "nettest: no handle: EBADF",
+        "nettest: listen-only connect: EACCES",
+        // A connection accepted through a read-only listener handle cannot be written.
+        "nettest: read-only accept send: EACCES",
+        // Socket buffers are charged to the budget.
+        "nettest: ENOBUFS after 3 sockets",
+        // A socket's charge follows it to the process that holds it.
+        "nettest: a moved socket is charged to its new holder",
+    ] {
+        assert!(
+            lines.iter().any(|l| l == expected),
+            "missing line: {expected}"
+        );
+    }
+    assert_no_leak(&lines, "sockets");
     assert!(status.success(), "QEMU exited with {status}");
 }

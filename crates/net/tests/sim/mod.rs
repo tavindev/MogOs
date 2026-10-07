@@ -1,6 +1,9 @@
 //! A simulated Ethernet link between two NICs in virtual time, with seeded faults so a failing seed replays exactly.
 #![allow(dead_code)]
 
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
+
 use net::{Mac, Nic};
 
 /// Fault rates in parts per thousand, and the one-way delay in ns.
@@ -11,6 +14,8 @@ pub struct Faults {
     pub reorder: u64,
     pub corrupt: u64,
     pub delay: u64,
+    /// Extra loss for ARP frames, so neighbours fail to resolve.
+    pub arp_loss: u64,
 }
 
 pub struct Rng(u64);
@@ -36,13 +41,17 @@ impl Rng {
     }
 }
 
+/// A frame in flight: delivery time, send order, frame; the heap pops the smallest.
+type InFlight = Reverse<(u64, u64, Vec<u8>)>;
+
 pub struct Link {
     pub rng: Rng,
     pub faults: Faults,
     pub now: u64,
     macs: [Mac; 2],
-    /// Frames in flight to each side, as (delivery time, frame).
-    queues: [Vec<(u64, Vec<u8>)>; 2],
+    /// Frames in flight to each side, earliest delivery first, then in the order sent.
+    queues: [BinaryHeap<InFlight>; 2],
+    sent: u64,
     spare: Vec<Vec<u8>>,
     /// Every frame sent, before faults, when set.
     pub record: Option<Vec<Vec<u8>>>,
@@ -55,10 +64,20 @@ impl Link {
             faults,
             now: 0,
             macs,
-            queues: [Vec::new(), Vec::new()],
+            queues: [BinaryHeap::new(), BinaryHeap::new()],
+            sent: 0,
             spare: Vec::new(),
             record: None,
         }
+    }
+
+    /// When the next frame in flight arrives.
+    pub fn next(&self) -> Option<u64> {
+        self.queues
+            .iter()
+            .filter_map(|q| q.peek())
+            .map(|q| q.0.0)
+            .min()
     }
 
     /// The NIC on `side` (0 or 1).
@@ -129,7 +148,8 @@ impl Nic for End<'_> {
             record.push(frame.clone());
         }
         let f = link.faults;
-        if link.rng.chance(f.loss) {
+        let arp = frame.get(12..14) == Some(&[8, 6]);
+        if link.rng.chance(f.loss) || (arp && link.rng.chance(f.arp_loss)) {
             link.spare.push(frame);
             return true;
         }
@@ -143,24 +163,49 @@ impl Nic for End<'_> {
         }
         let queue = &mut link.queues[1 - self.side];
         if link.rng.chance(f.duplicate) {
-            queue.push((at + link.rng.below(f.delay + 1), frame.clone()));
+            link.sent += 1;
+            queue.push(Reverse((
+                at + link.rng.below(f.delay + 1),
+                link.sent,
+                frame.clone(),
+            )));
         }
-        queue.push((at, frame));
+        link.sent += 1;
+        queue.push(Reverse((at, link.sent, frame)));
         true
     }
 
     fn receive(&mut self, f: impl FnOnce(&[u8])) -> bool {
         let link = &mut *self.link;
         let queue = &mut link.queues[self.side];
-        let Some(i) = (0..queue.len())
-            .filter(|&i| queue[i].0 <= link.now)
-            .min_by_key(|&i| queue[i].0)
-        else {
+        if queue.peek().is_none_or(|q| q.0.0 > link.now) {
             return false;
-        };
-        let (_, frame) = queue.remove(i);
+        }
+        let Reverse((_, _, frame)) = queue.pop().unwrap();
         f(&frame);
         link.spare.push(frame);
         true
     }
+}
+
+/// Applies one mutation; returns false if the Internet checksum may miss it (it cannot tell 0x0000 from 0xffff).
+pub fn mutate(rng: &mut Rng, frame: &mut Vec<u8>) -> bool {
+    let len = frame.len() as u64;
+    match rng.below(6) {
+        1 => frame[rng.below(len.min(64)) as usize] = rng.next() as u8,
+        2 => frame[rng.below(len) as usize] = [0, 0xff][rng.below(2) as usize],
+        3 => frame.truncate(rng.below(len) as usize),
+        4 => frame.extend((0..rng.below(64)).map(|_| rng.next() as u8)),
+        5 if len >= 2 => {
+            let i = rng.below(len.min(48) / 2) as usize * 2;
+            let v = [0u16, 1, 0x7fff, 0x8000, 0xffff][rng.below(5) as usize];
+            frame[i..i + 2].copy_from_slice(&v.to_be_bytes());
+            return false;
+        }
+        _ => {
+            let bit = rng.below(len * 8) as usize;
+            frame[bit / 8] ^= 1 << (bit % 8);
+        }
+    }
+    true
 }

@@ -37,6 +37,10 @@ pub enum Event {
     Lock(usize),
     /// A console line being entered.
     Console,
+    /// Work for the net task: a frame, a passed deadline or a socket submit.
+    Net,
+    /// A net task pass, after which a socket op may finish.
+    NetIo,
     /// Nothing: the boot context, which runs only once no other task is ready.
     Idle,
 }
@@ -590,6 +594,11 @@ impl<const N: usize, const P: usize> Scheduler<N, P> {
             Some(slot) => slot,
             None if cpu == 0 && self.running == 0 => 0,
             None => {
+                // The boot context waits for every core to idle: signal core 0 (first in `claim_idle`'s order).
+                let boot = self.cores[0];
+                if cpu != 0 && self.running == 0 && boot.current == IDLE && !boot.kicked {
+                    self.woken += 1;
+                }
                 self.cores[cpu] = Core {
                     current: IDLE,
                     process: 0,

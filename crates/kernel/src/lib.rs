@@ -8,6 +8,7 @@ pub mod elf;
 pub mod file;
 pub mod handle;
 pub mod mutex;
+pub mod network;
 pub mod pipe;
 mod sched;
 pub mod syscall;
@@ -30,6 +31,7 @@ use mm::{FrameAllocator, PhysAddr};
 pub trait Board {
     type Console: Write;
     type Disk: Disk;
+    type Nic: net::Nic;
 
     fn console(&mut self) -> &mut Self::Console;
     fn exception_level(&self) -> u8;
@@ -70,13 +72,27 @@ pub trait Board {
         archive: Rights,
         args: &[u8],
     ) -> Result<(), i64>;
-    /// Tasks in the run queue, the boot context included.
+    /// Tasks in the run queue, the boot context included and the net task not.
     fn tasks(&self) -> usize;
     /// The board's block device, set up with memory from the frame allocator; call once, after `init_frames`.
     fn disk(&mut self) -> Option<Self::Disk>;
     /// Mounts the MogFS on `disk` as the board's file system; once it is mounted, every process spawned from boot
     /// context also gets its root directory (read, write, duplicate, transfer) as handle 3. Never formats.
     fn mount(&mut self, disk: Self::Disk) -> Result<(), mogfs::Error>;
+    /// Whether the board has a NIC; reads only device IDs, sets up nothing.
+    fn has_nic(&self) -> bool;
+    /// Spawns the net task, which, off the boot path, sets up the NIC (only with `config`, its address; `has_nic`
+    /// found it), the `network::Network` (`key` seeds TCP) and the timer, then polls the network
+    /// whenever the NIC's interrupt, the tick past the next deadline, a socket call or `with_net` wakes it. Every
+    /// process spawned from boot context from then on also gets a NetStack handle (connect, listen, duplicate,
+    /// transfer) after its other handles. Call once, after `init_frames`.
+    fn start_net(&mut self, config: Option<net::Config>, key: [u64; 2]);
+    /// Waits for the net task's setup (boot context only), runs `f` with the network, the NIC and the time in ns, then
+    /// wakes the net task.
+    fn with_net<R>(
+        &mut self,
+        f: impl FnOnce(&mut network::Network, Option<&mut Self::Nic>, u64) -> R,
+    ) -> R;
     /// Makes `n` uncontended acquire + release round trips on a ticket lock like the board's kernel lock (`ticket`),
     /// or on a test-and-set lock.
     fn lock_round_trips(&mut self, n: u64, ticket: bool);
@@ -148,6 +164,10 @@ const THREADS_BUDGET: usize = 52;
 /// `fuzz`'s own frames, its scratch memory and `map`s, its pipes and its `nop` children: a child whose handle closes
 /// before it exits gives its frames back to the system, not to `fuzz`, so a million calls spend a few thousand.
 const FUZZ_BUDGET: usize = 8192;
+/// `httpd`'s own frames and its two children's, one at a time.
+const HTTPD_BUDGET: usize = 64;
+/// `nettest`'s own frames and its children's: two C programs on musl at once, then its own copies with their sockets.
+const NET_BUDGET: usize = 512;
 /// `sysbench`'s own frames, its 11 batches of 64 `map`ped pages that it never returns, its pipes and 4 `nop` children.
 const SYSBENCH_BUDGET: usize = 1024;
 /// Times msh runs `SHELL_BENCH` under `test=bench-shell`.
@@ -164,7 +184,8 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
     let _ = writeln!(board.console(), "exceptions: ok");
 
     let _ = writeln!(board.console(), "mmu: on");
-    let bootargs = dtb.bootargs().unwrap_or_default();
+    let (bootargs, seed) = dtb.chosen();
+    let bootargs = bootargs.unwrap_or_default();
     if bootargs.split_whitespace().any(|a| a == "test=mmu-fault") {
         board.read_unmapped();
     }
@@ -197,6 +218,29 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
         .any(|a| a == "test=disk" || a == "test=bench-disk");
     let mounted = disk.take_if(|_| !raw).map(|disk| board.mount(disk));
 
+    // One pass, as boot pays for each. `test=httpd` alone takes QEMU's user network, so `cargo httpd` needs one
+    // bootarg (a string alias splits on spaces).
+    let (mut config, mut loopback) = (None, false);
+    for arg in bootargs.split_whitespace() {
+        match arg {
+            "test=sockets" | "test=bench-sockets" => loopback = true,
+            "test=httpd" => config = config.or(network::config("10.0.2.15/24,gw=10.0.2.2")),
+            _ => {
+                if let Some(value) = arg.strip_prefix("net=") {
+                    config = network::config(value);
+                }
+            }
+        }
+    }
+    // The NIC is looked for only with a network address; without one nothing starts, as before, except loopback for
+    // the socket tests.
+    let no_nic = config.is_some() && !board.has_nic();
+    let config = config.filter(|_| !no_nic);
+    let net = config.is_some() || loopback;
+    if net {
+        board.start_net(config, seed.expect("no rng-seed in DTB"));
+    }
+
     board.start_cpus(bootargs.split_whitespace().any(|a| a == "test=smp"));
     let boot_us = board.uptime_us();
     let _ = writeln!(board.console(), "boot: {boot_us} us");
@@ -207,6 +251,13 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
     .ok();
     if let Some(Err(error)) = mounted {
         let _ = writeln!(board.console(), "fs: {error:?}");
+    }
+    if no_nic {
+        let _ = writeln!(board.console(), "net: no nic");
+    }
+    if net {
+        // Scenarios count free frames, so the net task's setup ends before the first (after `boot:`, so not in it).
+        board.with_net(|_, _, _| ());
     }
 
     for arg in bootargs.split_whitespace() {
@@ -249,7 +300,17 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
             "test=bench-lock" => lock_bench(board),
             "test=smp" => smp_test(board),
             "test=fuzz" => fuzz(board, bootargs),
+            "test=httpd" => httpd(board, bootargs),
             "test=bench-shell" => shell_bench(board),
+            "test=sockets" => {
+                run_archived(board, "sockets", "nettest", (NET_BUDGET, SHELL_ARCHIVE))
+            }
+            "test=bench-sockets" => run_checked(board, "bench-sockets", |board| {
+                let args = b"nettest\0bench\0";
+                board
+                    .spawn_archived("nettest", NET_BUDGET, INIT_ARCHIVE, args)
+                    .expect("spawn")
+            }),
             "test=bench-syscalls" => run_archived(
                 board,
                 "bench-syscalls",
@@ -265,6 +326,16 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
                     "budget: free frames {before} before, {after} after"
                 );
             }
+            "test=net" | "test=bench-net" => {
+                let gateway = config
+                    .and_then(|c| c.gateway)
+                    .expect("net=<ip>/<prefix>,gw=<ip>");
+                let port = arg_value(bootargs, "udp=").expect("udp=<port>");
+                match arg {
+                    "test=net" => network::net_test(board, gateway, port),
+                    _ => network::net_bench(board, gateway, port),
+                }
+            }
             "test=disk" => disk_test(board, disk.as_mut().expect("no disk")),
             "test=bench-disk" => disk_bench(board, disk.as_mut().expect("no disk")),
             _ => {}
@@ -272,6 +343,13 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
     }
 
     board.power_off()
+}
+
+/// The value of the bootarg `<prefix><value>`.
+fn arg_value<T: core::str::FromStr>(bootargs: &str, prefix: &str) -> Option<T> {
+    bootargs
+        .split_whitespace()
+        .find_map(|a| a.strip_prefix(prefix)?.parse().ok())
 }
 
 /// Core 0 joins the secondaries' `cpu <n>: online` lines; `threads` kills a process whose threads spin on another core
@@ -413,6 +491,26 @@ fn fuzz<B: Board>(board: &mut B, bootargs: &str) {
     run_checked(board, "fuzz", |board| {
         board
             .spawn_archived("fuzz", FUZZ_BUDGET, INIT_ARCHIVE, &args)
+            .expect("spawn")
+    });
+}
+
+/// Runs the boot archive's `httpd` with the bootargs `httpd=<requests>` (0, the default: forever) and
+/// `fetch=<ip>:<port>[/<path>][,<times>]` as its arguments.
+fn httpd<B: Board>(board: &mut B, bootargs: &str) {
+    let value = |key| {
+        bootargs
+            .split_whitespace()
+            .find_map(|a: &str| a.strip_prefix(key))
+    };
+    let mut args = b"httpd\0".to_vec();
+    args.extend(value("httpd=").unwrap_or("0").bytes().chain([0]));
+    if let Some(fetch) = value("fetch=") {
+        args.extend(fetch.split(',').flat_map(|v| v.bytes().chain([0])));
+    }
+    run_checked(board, "httpd", |board| {
+        board
+            .spawn_archived("httpd", HTTPD_BUDGET, INIT_ARCHIVE, &args)
             .expect("spawn")
     });
 }

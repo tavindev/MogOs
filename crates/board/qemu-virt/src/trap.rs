@@ -13,12 +13,12 @@ use kernel::pipe::{self, End, Pipes};
 use kernel::syscall::{Call, EBADF, EFAULT, ENFILE, ENOENT, ENOMEM, KILLED, MAX_BUFFER};
 use mm::{FrameAllocator, PhysAddr};
 
+use crate::net;
 use crate::process::{free_stack, map, spawn, thread};
-use crate::uart::Uart;
 use crate::usermem::{UserIn, UserOut, copy_in};
 use crate::{
-    ARCHIVE, GIC_CPU, KERNEL, Kernel, MAX_MUTEXES, MAX_PIPES, Sched, TICK_US, TICKED, TICKS,
-    TIMER_IRQ, UART_IRQ, UART0, kick, send_sgi,
+    ARCHIVE, CONSOLE, GIC_CPU, KERNEL, Kernel, MAX_MUTEXES, MAX_PIPES, Sched, TICK_US, TICKED,
+    TICKS, TIMER_IRQ, UART_IRQ, kick, send_sgi,
 };
 
 /// # Safety
@@ -26,8 +26,11 @@ use crate::{
 #[unsafe(no_mangle)]
 unsafe extern "C" fn task_switch(frame: usize) -> usize {
     let sched = &mut Guard::leak(KERNEL.lock_masked()).sched;
+    let cpu = arch::cpu();
     // SAFETY: the caller masked IRQs, and `frame` came from the trap path.
-    unsafe { switch(sched, arch::cpu(), frame) }
+    let next = unsafe { switch(sched, cpu, frame) };
+    kick(sched, cpu);
+    next
 }
 
 /// Releases `KERNEL`, once per trap, after the trap exit moved to the frame the hook returned.
@@ -113,7 +116,7 @@ fn end_process(kernel: &mut Kernel, cpu: usize, index: usize, code: u64) -> Opti
         ..
     } = kernel;
     for object in sched.take_handles(index).objects() {
-        release(sched, cpu, frames, pipes, mutexes, object);
+        release(sched, cpu, frames, pipes, mutexes, (object, index));
     }
     while let Some(slot) = sched.thread_of(index, cpu) {
         end_thread(sched, frames, mutexes, (cpu, slot), code);
@@ -211,11 +214,12 @@ fn release(
     frames: &mut FrameAllocator<FRAME_WORDS>,
     pipes: &mut Pipes<MAX_PIPES>,
     mutexes: &mut Mutexes<MAX_MUTEXES>,
-    object: Object,
+    (object, holder): (Object, usize),
 ) {
     let end = match object {
         Object::Pipe(end) => end,
         Object::Mutex(mutex) => return mutexes.close(mutex),
+        Object::Socket(sock) => return net::close(sched, cpu, sock, holder),
         Object::Process { index, generation } => {
             let limit = sched.close(index, generation);
             let held = pipes.charged_to((index, generation));
@@ -292,8 +296,11 @@ unsafe extern "C" fn board_irq(frame: usize) -> usize {
     let tick = irq == TIMER_IRQ;
     if tick {
         TICKED.fetch_or(1 << cpu, Relaxed);
+        net::tick(&mut kernel.sched);
+    } else if irq == net::IRQ.load(Relaxed) {
+        net::interrupt(&mut kernel.sched);
     } else if irq == UART_IRQ {
-        let mut uart = Uart::new(UART0);
+        let mut uart = CONSOLE.lock_masked();
         while let Some(byte) = uart.get() {
             if kernel.line.push(byte, |echo| uart.write(echo)) {
                 kernel.sched.wake(Event::Console);
@@ -399,7 +406,9 @@ unsafe fn syscall(kernel: &mut Kernel, cpu: usize, frame: &mut arch::TrapFrame) 
             .unwrap_or_else(|error| error as u64),
         Ok(Call::Write { ptr, len }) => match copy_in(ptr, len, buf) {
             Some(bytes) => {
-                Uart::new(UART0).write(bytes);
+                if !bytes.is_empty() {
+                    CONSOLE.lock_masked().write(bytes);
+                }
                 len as u64
             }
             None => EFAULT as u64,
@@ -457,12 +466,14 @@ unsafe fn syscall(kernel: &mut Kernel, cpu: usize, frame: &mut arch::TrapFrame) 
             match object {
                 Object::Pipe(end) => pipes.open(end),
                 Object::Mutex(mutex) => mutexes.open(mutex),
+                Object::Socket(sock) => net::open(sock),
                 object => sched.held(object),
             }
             handle
         }
         Ok(Call::Close(object)) => {
-            release(sched, cpu, frames, pipes, mutexes, object);
+            let current = sched.process(cpu);
+            release(sched, cpu, frames, pipes, mutexes, (object, current));
             0
         }
         Ok(Call::Map { pages }) => map(sched, cpu, frames, pages).unwrap_or(ENOMEM as u64),
@@ -623,6 +634,11 @@ unsafe fn syscall(kernel: &mut Kernel, cpu: usize, frame: &mut arch::TrapFrame) 
             Ok(false) => 0,
             Err(error) => error as u64,
         },
+        Ok(Call::Net(call)) => match net::syscall(sched, cpu, call, &mut frame.x[1]) {
+            Some(result) => result as u64,
+            // SAFETY: the caller masked IRQs, and `frame` is the current process's.
+            None => return unsafe { block(kernel, cpu, frame, Event::NetIo) },
+        },
         Err(error) => error as u64,
     };
     frame as *mut arch::TrapFrame as usize
@@ -635,7 +651,10 @@ unsafe extern "C" fn board_user_fault(frame: usize, ec: u64, far: u64) -> usize 
     let kernel = Guard::leak(KERNEL.lock_masked());
     let cpu = arch::cpu();
     let index = kernel.sched.process(cpu);
-    let _ = writeln!(Uart::new(UART0), "fault: {index} ec={ec:#x} far={far:#x}");
+    let _ = writeln!(
+        CONSOLE.lock_masked(),
+        "fault: {index} ec={ec:#x} far={far:#x}"
+    );
     // SAFETY: the caller masked IRQs; `frame` is the current process's.
     let next = unsafe { exit_process(kernel, cpu, frame, KILLED) };
     kick(&mut kernel.sched, cpu);

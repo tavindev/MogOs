@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+# Host-only, for the interop tests (approved in the phase 8 doc); never a normal dependency.
+[dev-dependencies]
+smoltcp = { version = "=0.12.0", default-features = false, features = ["std", "medium-ethernet", "proto-ipv4", "socket-tcp"] }
+
 [lints]
 workspace = true
 

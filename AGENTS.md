@@ -40,6 +40,7 @@ Every new `.md` file must be linked from its parent so it stays reachable from t
 - Build: `cargo build`
 - Run in QEMU: `cargo run` (prints to the terminal via PL011 UART, exits via PSCI `SYSTEM_OFF`)
 - Shell on a persistent disk: `[ -f disk.img ] || cargo mkfs; cargo shell` (msh builtins `cd`, `pwd`, `exit`, `help`; programs `ls`, `mkdir`, `touch`, `write`, `cat`, `rm`, `mv`, `echo`, `sync`, and `sh`: busybox on musl)
+- HTTP echo server on QEMU's user network: `cargo httpd`, then `curl -v http://localhost:8080/anything -d hello` from the Mac shows its own request back
 - Run in a QEMU window: `cargo window` (mouse stays free; Ctrl+Option+G releases a grab)
 - Quit a hung QEMU: `Ctrl-A` then `X`
 - Test: `cargo test-host` (host tests, `crates/user`'s included, plus the QEMU boot tests in `crates/e2e`; must pass)
@@ -50,12 +51,13 @@ Every new `.md` file must be linked from its parent so it stays reachable from t
 
 ## Layout
 
-- `crates/kernel` ([CLAUDE.md](crates/kernel/CLAUDE.md)) — OS logic, `#![no_std]`, **no `unsafe`** (`forbid`). Defines ports (traits) like `Board` (and re-exports `mogfs`'s `Disk`), the scheduler and process table, handles, pipes, mutexes, the console line discipline, syscall decoding and the boot archive's cpio and ELF parsers.
+- `crates/kernel` ([CLAUDE.md](crates/kernel/CLAUDE.md)) — OS logic, `#![no_std]`, **no `unsafe`** (`forbid`). Defines ports (traits) like `Board` (and re-exports `mogfs`'s `Disk`), the scheduler and process table, handles, pipes, mutexes, the console line discipline, syscall decoding, the network (sockets over `crates/net`'s stacks) and the boot archive's cpio and ELF parsers.
 - `crates/mm` ([CLAUDE.md](crates/mm/CLAUDE.md)) — arch-independent memory management (`PhysAddr`, frame allocator). Safe, host-tested.
 - `crates/dtb` ([CLAUDE.md](crates/dtb/CLAUDE.md)) — minimal FDT parser. Safe, host-tested.
 - `crates/mogfs` ([CLAUDE.md](crates/mogfs/CLAUDE.md)) — MogFS: checksummed copy-on-write file system over a `Disk` trait (format at the top of `src/lib.rs`). Safe, `no_std`, host-tested; `examples/mkfs.rs` writes an empty image.
-- `crates/net` ([CLAUDE.md](crates/net/CLAUDE.md)) — network stack over a `Nic` trait: Ethernet, ARP, IPv4, ICMP echo, UDP, in caller-supplied memory with time as an input. Safe, `no_std`, host-tested over a seeded simulated link (`tests/sim/mod.rs`).
+- `crates/net` ([CLAUDE.md](crates/net/CLAUDE.md)) — network stack over a `Nic` trait: Ethernet, ARP, IPv4, ICMP echo, UDP, TCP with NewReno, in caller-supplied memory with time as an input. Safe, `no_std`, host-tested over a seeded simulated link (`tests/sim/mod.rs`).
 - `crates/arch` ([CLAUDE.md](crates/arch/CLAUDE.md)) — the only arch-specific crate, `unsafe` allowed; AArch64 code in `src/aarch64/` (boot, traps, MMU and page tables, GICv2, timer, the lock and per-CPU primitives).
+- `crates/mogfs2` ([CLAUDE.md](crates/mogfs2/CLAUDE.md)) — MogFS v2 (phase 7): a checksummed copy-on-write B+tree over v1's `Disk` (format at the top of `src/lib.rs`) in fixed memory its caller gives. Safe, `no_std`, no `alloc`, host-tested; replaces `crates/mogfs` and takes its name in step 39b.
 - `crates/board/qemu-virt` ([CLAUDE.md](crates/board/qemu-virt/CLAUDE.md)) — board crate, `unsafe` allowed: drivers, memory map, `linker.ld`, `#[global_allocator]`, trap hooks (switch, syscall, fault), process setup and ELF loading, asm user programs (`user.s`); builds the `mog_os` binary. Its `build.rs` builds `crates/user` and bundles the programs as the boot archive (cpio).
 - `crates/user` ([CLAUDE.md](crates/user/CLAUDE.md)) — user programs (`src/bin/*.rs`, static ELFs at 4 GiB via `link.ld`) and their syscall stubs (`src/lib.rs`); user space, outside the workspace, `unsafe` only for `svc`.
 - `crates/e2e` ([CLAUDE.md](crates/e2e/CLAUDE.md)) — host-only QEMU boot tests (`tests/boot.rs`).
@@ -83,10 +85,12 @@ Every new `.md` file must be linked from its parent so it stays reachable from t
 - Speed is a feature, so it is measured, not assumed. Details and baselines: `docs/BENCHMARKS.md`.
 - Every hot path gets a benchmark when it lands. Every change to a hot path reports before/after numbers.
 - Speed with complete safety is the moat. A tracked benchmark slowing down (hvf or host medians, never TCG) is a failure: an explanation does not excuse it. Remove it, or show with numbers that no safe faster form exists.
+- Invariants checked at compile time are part of the moat: they cost nothing at run time and their bug class cannot return.
 
 ## Code rules
 
 - `#![no_std]`. Edition 2024: use `#[unsafe(no_mangle)]`, `unsafe extern`.
 - Host-testable crates use `#![cfg_attr(not(test), no_std)]`.
+- Make invalid states unrepresentable: typestate, newtypes and ownership when the state is known at compile time; exhaustive enums when it comes from input (packets, user handles, tables of mixed states). It must cost nothing at run time; a type-level encoding that adds code size or generic bloat on a hot path is measured.
 - `unsafe` only in `crates/arch` and board crates (`crates/board/*`), each block with a one-line `// SAFETY:` reason; user space (`crates/user`) only for its syscall stubs.
 - After editing `linker.ld`, `crates/board/qemu-virt/build.rs` triggers a relink automatically.

@@ -4,11 +4,13 @@
 extern crate alloc;
 
 mod fs;
+mod net;
 mod process;
 mod trap;
 mod uart;
 mod usermem;
 mod virtio_blk;
+mod virtio_net;
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::fmt::{self, Write};
@@ -27,6 +29,7 @@ use kernel::console::Line;
 use kernel::elf::Segment;
 use kernel::handle::{INIT_ARCHIVE, MAX_HANDLES, Rights};
 use kernel::mutex::Mutexes;
+use kernel::network::Network;
 use kernel::pipe::Pipes;
 use kernel::syscall::{ENOENT, MAX_BUFFER};
 use kernel::{Event, FRAME_WORDS, Full, PRIORITIES, Program, Scheduler};
@@ -36,6 +39,7 @@ use mogfs::{Error, Fs};
 use process::{executable, spawn_init, user_program};
 use uart::Uart;
 use virtio_blk::VirtioBlk;
+use virtio_net::VirtioNet;
 
 /// The PL011 every console write and read uses (QEMU `virt` fixes it there).
 const UART0: PhysAddr = PhysAddr(0x0900_0000);
@@ -153,8 +157,8 @@ struct Kernel {
     buf: [u8; 2 * MAX_BUFFER as usize],
 }
 
-/// `Board::console` output on `UART0`, a leaf lock. Panic, fault, echo and user `write` output go straight to `UART0`,
-/// so a panic under this lock still prints.
+/// Every console write and read on `UART0`, a leaf lock, except panic output, which goes straight to `UART0` so a panic
+/// under this lock still prints.
 static CONSOLE: Lock<Uart> = Lock::new(Uart::new(UART0));
 
 /// `Board::console`: each formatted write holds `CONSOLE` for its whole line.
@@ -187,14 +191,13 @@ extern "C" fn task_start(start: usize) -> ! {
 #[derive(Clone)]
 struct QemuVirt {
     console: Console,
-    /// GICv2 distributor and CPU interface.
-    gic: (PhysAddr, PhysAddr),
     entry_us: u64,
 }
 
 impl kernel::Board for QemuVirt {
     type Console = Console;
     type Disk = VirtioBlk;
+    type Nic = VirtioNet;
 
     fn console(&mut self) -> &mut Console {
         &mut self.console
@@ -232,8 +235,6 @@ impl kernel::Board for QemuVirt {
 
     fn start_timer(&mut self) {
         TICKS.store(true, Relaxed);
-        // SAFETY: the DTB's GICv2 distributor, in the device-mapped GiB 0.
-        unsafe { arch::gic::unmask(self.gic.0, TIMER_IRQ) };
         arch::timer::arm(TICK_US);
     }
 
@@ -313,7 +314,7 @@ impl kernel::Board for QemuVirt {
     }
 
     fn tasks(&self) -> usize {
-        KERNEL.lock().sched.count()
+        KERNEL.lock().sched.count() - net::STARTED.load(Relaxed) as usize
     }
 
     fn disk(&mut self) -> Option<VirtioBlk> {
@@ -341,6 +342,18 @@ impl kernel::Board for QemuVirt {
         let mounted = kernel.fs.mount();
         kernel.mounted = mounted.is_ok();
         mounted
+    }
+
+    fn has_nic(&self) -> bool {
+        net::present()
+    }
+
+    fn start_net(&mut self, config: Option<::net::Config>, key: [u64; 2]) {
+        net::start(self, config, key)
+    }
+
+    fn with_net<R>(&mut self, f: impl FnOnce(&mut Network, Option<&mut VirtioNet>, u64) -> R) -> R {
+        net::with(f)
     }
 
     fn lock_round_trips(&mut self, n: u64, ticket: bool) {
@@ -419,8 +432,10 @@ extern "C" fn kmain() -> ! {
     GIC_CPU.store(gic.1.0, Relaxed);
     // SAFETY: the DTB's GICv2 registers, in the device-mapped GiB 0.
     unsafe { arch::gic::enable(gic.0, gic.1) };
-    // SAFETY: as above.
-    unsafe { arch::gic::unmask(gic.0, UART_IRQ) };
+    for irq in [UART_IRQ, TIMER_IRQ] {
+        // SAFETY: as above.
+        unsafe { arch::gic::unmask(gic.0, irq) };
+    }
     Uart::new(UART0).enable_rx_irq();
     let cpus = dtb.cpus().min(arch::MAX_CPUS);
     CPUS.store(cpus, Relaxed);
@@ -435,7 +450,6 @@ extern "C" fn kmain() -> ! {
     kernel::run(
         &mut QemuVirt {
             console: Console,
-            gic,
             entry_us,
         },
         dtb,

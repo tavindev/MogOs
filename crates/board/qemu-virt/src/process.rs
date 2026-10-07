@@ -8,7 +8,8 @@ use core::slice;
 use arch::{UserAccess, user_page};
 use kernel::elf::{Elf, Segment};
 use kernel::handle::{
-    DUPLICATE, Handles, KILL, MAX_HANDLES, Object, READ, Rights, TRANSFER, WAIT, WRITE,
+    CONNECT, DUPLICATE, Handles, KILL, LISTEN, MAX_HANDLES, Object, READ, Rights, TRANSFER, WAIT,
+    WRITE,
 };
 use kernel::syscall::{EAGAIN, EFAULT, ENOEXEC, ENOMEM, MAX_BUFFER};
 use kernel::{FRAME_WORDS, Memory, Program};
@@ -212,6 +213,10 @@ pub(crate) fn spawn_init(
         if *mounted {
             handles.insert(Object::Dir(ROOT), READ | WRITE | DUPLICATE | TRANSFER)?;
         }
+        if crate::net::STARTED.load(core::sync::atomic::Ordering::Relaxed) {
+            let rights = CONNECT | LISTEN | DUPLICATE | TRANSFER;
+            handles.insert(Object::NetStack, rights)?;
+        }
         let init = (process, slot, handles, priority);
         spawn_process(
             sched,
@@ -256,17 +261,14 @@ pub(crate) fn spawn(
     let (index, generation) = process;
     let handle = parent.insert(Object::Process { index, generation }, WAIT | KILL)?;
     let priority = priority.min(sched.priority(cpu));
+    let mut child_budget = Budget::new(budget);
+    crate::net::spawn_charge(&child, &mut child_budget)?;
+    let moved = child;
     let child = (process, slot, child, priority);
-    spawn_process(
-        sched,
-        frames,
-        executable,
-        Budget::new(budget),
-        child,
-        (args, argc),
-    )?;
+    spawn_process(sched, frames, executable, child_budget, child, (args, argc))?;
     sched.memory(current).budget.shrink(budget);
     *sched.handles(cpu) = parent;
+    crate::net::spawned(sched, cpu, index, &moved);
     Ok(handle)
 }
 
