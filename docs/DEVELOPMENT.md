@@ -56,7 +56,8 @@ cargo run -- -append test=handles    # EL0 process writes via its console handle
 cargo run -- -append test=budget     # EL0 process maps pages until ENOMEM (M: lines), exits; free frames before/after its lifetime match
 cargo run -- -append test=spawn      # spawner (from the boot archive) checks failing spawns move nothing, spawns child with only the console (S: and C: lines); free frames before/after match
 cargo run -- -append test=pipe       # reader blocks on an empty pipe until its child writer writes, reads EOF, waits for exit code 7, respawns into the reused slot; a stale process handle is EBADF; 8 KiB I/O moves 4 KiB (R: and W: lines); free frames before/after match
-cargo run -- -append test=wait       # waiter's child A exits before child B is spawned; wait still returns both codes and budgets (P: and C: lines); free frames before/after match
+cargo run -- -append test=wait       # waiter's child A exits before child B is spawned; wait still returns both codes and budgets; closing a third, exited child's handle returns its budget too (P: and C: lines); free frames before/after match
+cargo run -- -append test=pi         # timer on: L (priority 1) holds a mutex H (3) blocks on while Mid (2) is ready to spin forever; H acquires only through priority inheritance, then init kills Mid (L:, H:, P: lines; no M: line); free frames before/after match
 cargo run -- -append test=bench-pipe # ping and pong echo one byte over two pipes 100000 times; prints the round trip in ns
 cargo run -- -s -S     # boot halted, gdbstub on localhost:1234; attach lldb/gdb
 cargo build --release  # LTO release image
