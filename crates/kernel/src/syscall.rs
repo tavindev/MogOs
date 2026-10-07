@@ -413,12 +413,12 @@ fn path(handles: &Handles, handle: u64, ptr: u64, len: u64) -> Result<(Inode, u6
     Ok((dir, ptr, len as usize))
 }
 
-/// The number of arguments in `args`, each ending in a NUL; `E2BIG` over `MAX_ARGS`, `EINVAL` if the last one has
-/// no NUL.
+/// The number of arguments in `args`, each ending in a NUL; `E2BIG` over `MAX_ARGS` or `MAX_BUFFER` bytes, `EINVAL`
+/// if the last one has no NUL.
 pub fn argc(args: &[u8]) -> Result<usize, i64> {
     let count = args.iter().filter(|&&b| b == 0).count();
     match args.last() {
-        _ if count > MAX_ARGS => Err(E2BIG),
+        _ if count > MAX_ARGS || args.len() > MAX_BUFFER as usize => Err(E2BIG),
         Some(&last) if last != 0 => Err(EINVAL),
         _ => Ok(count),
     }

@@ -224,7 +224,8 @@ fn main(args: &[&[u8]]) -> u64 {
     0
 }
 
-/// Whether `result` is a count or a known errno, within what call `nr` can return.
+/// Whether `result` is a count or a known errno: `ENOSYS` alone for an unknown call, at most the length asked for
+/// from `io_submit_wait` and `readdir`.
 fn valid(nr: u64, args: &[u64; 7], result: i64) -> bool {
     if result < 0 {
         return ERRNOS.contains(&result) && (nr <= LAST_SYSCALL || result == ENOSYS);
@@ -427,14 +428,9 @@ impl Fuzzer {
             15 => a[0] = self.handle_of(|k| k == Kind::Fs),
             4 => {
                 let any = self.rng.below(MAX_MAP);
-                // Mapped memory is never returned: past `MAPS`, only lengths `map` rejects, so the budget lasts.
-                a[0] = match self.mapped - STACK_TOP < MAPS {
-                    true => {
-                        self.rng
-                            .pick(&[0, 1, PAGE, PAGE + 1, MAX_MAP, MAX_MAP + 1, u64::MAX, any])
-                    }
-                    false => self.rng.pick(&[0, MAX_MAP + 1, u64::MAX]),
-                };
+                a[0] = self
+                    .rng
+                    .pick(&[0, 1, PAGE, PAGE + 1, MAX_MAP, MAX_MAP + 1, u64::MAX, any]);
             }
             5 | 13 | 16 => {
                 a[0] = self.handle_of(|k| matches!(k, Kind::Fs | Kind::Archive));
@@ -522,6 +518,8 @@ impl Fuzzer {
                 }
                 true
             }
+            // Mapped memory is never returned: past `MAPS`, only lengths `map` rejects, so the budget lasts.
+            4 => self.mapped - STACK_TOP < MAPS || a[0] == 0 || a[0] > MAX_MAP,
             12 => a[0] != SELF,
             14 => a[2] > MAX_BUFFER || off_image(a[1], a[2]),
             _ => true,

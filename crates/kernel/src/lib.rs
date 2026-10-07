@@ -320,16 +320,11 @@ fn run_archived<B: Board>(
     program: &str,
     (budget, archive): (usize, Rights),
 ) {
-    let before = board.free_frames();
-    board
-        .spawn_archived(program, budget, archive, &[])
-        .expect("spawn");
-    wait(board);
-    let after = board.free_frames();
-    let _ = writeln!(
-        board.console(),
-        "{test}: free frames {before} before, {after} after"
-    );
+    run_checked(board, test, |board| {
+        board
+            .spawn_archived(program, budget, archive, &[])
+            .expect("spawn")
+    });
 }
 
 /// Runs `start`, then the other tasks until every one has exited; prints the free frames before and after as

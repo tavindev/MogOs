@@ -64,6 +64,10 @@ END {
     }
     printf "%-16s %12s %12s %8s %12s %12s %8s\n", "bench", "base median", "new median", "delta", "base min", "new min", "delta"
     for (k = 1; k <= names_len; k++) {
+        if (!count["base" SUBSEP names[k]] || !count["new" SUBSEP names[k]]) {
+            printf "%-16s  only in the %s kernel\n", names[k], count["new" SUBSEP names[k]] ? "new" : "base"
+            continue
+        }
         stats("base" SUBSEP names[k]); bm = median; bn = min
         stats("new" SUBSEP names[k]); nm = median; nn = min
         printf "%-16s %12.1f %12.1f %+7.1f%% %12.1f %12.1f %+7.1f%%%s\n", names[k], bm, nm, (nm - bm) * 100 / bm, \

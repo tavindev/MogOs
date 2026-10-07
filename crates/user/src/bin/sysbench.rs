@@ -10,7 +10,7 @@ use user::*;
 const ARCHIVE: u64 = 2;
 const ROOT: u64 = 3;
 const BATCHES: usize = 11;
-/// Calls per counter read: amortizes the read, and fits the 16-entry handle table with init's 4.
+/// Calls per counter read: amortizes the read, and fills the 16-entry handle table beside the 8 `main` holds.
 const GROUP: usize = 8;
 /// `nop`'s 9 frames and its argument page.
 const NOP_BUDGET: usize = 10;
