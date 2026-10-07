@@ -39,15 +39,15 @@ kernel, step 50), DHCP, DNS or IPv6 (phase 9), or IPv4 fragment reassembly.
   frame that fails is dropped and counted in exactly one `Counters` field (`malformed`, `checksum`, `fragments`,
   `ignored`, `no_socket`, `socket_full`), never a panic, overflow or out-of-range index.
 - IPv4 fragments (MF set or an offset) are dropped and counted: no reassembly memory to exhaust.
-- ARP learns only from a reply to an entry we asked about (first reply wins) and from a request aimed at our IP;
-  the ARP sender MAC must equal the Ethernet source and the sender IP must be an on-link unicast address other than
+- ARP learns only from a reply to an entry we asked about (first reply wins); a request aimed at our IP is answered
+  from its own sender fields but never learned, so talking back to a host that asked costs one ARP round trip. The
+  ARP sender MAC must equal the Ethernet source and the sender IP must be an on-link unicast address other than
   ours. Everything else is `ignored`, so ARP traffic not aimed at us never evicts a neighbour. A full cache evicts
   its least recently used entry. ARP has no checksum: the MAC check rejects a flipped bit in either MAC, but a flip
-  in the sender IP of a request aimed at us is learned (the NIC's FCS catches it on a real link). Pending requests
+  in the sender IP of a reply we asked for is learned (the NIC's FCS catches it on a real link). Pending requests
   live in the same bounded table and are freed after 3 unanswered tries.
 - An echo reply goes to the request's Ethernet source; received IP traffic never writes the ARP cache.
-- Residual risk: plain ARP cannot stop an on-path attacker who answers our request first, or who sends a request
-  aimed at us claiming a neighbour's IP.
+- Residual risk: only an on-path attacker who answers our own request first can poison the cache.
 - A full socket table is `TableFull`, a bound port `InUse`; nothing is evicted silently. A full socket buffer drops
   the datagram (`socket_full`).
 - Replies built while the received frame is borrowed (ARP reply, echo reply) go through one buffer, sent after the

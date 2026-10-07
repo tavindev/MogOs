@@ -3,8 +3,8 @@
 //! - No clock: every entry point takes `now` in ns, and `poll` returns the next deadline, so a seed replays a run.
 //! - Every received frame is untrusted: each field is range-checked once when decoded, and a frame that fails is
 //!   dropped and counted in `Counters`, never a panic. IPv4 fragments are dropped and counted (no reassembly).
-//! - ARP learns only from replies to our requests and from requests aimed at us whose sender MAC matches the
-//!   Ethernet source; a full cache evicts its least recently used entry.
+//! - ARP learns only from replies to our own requests whose sender MAC matches the Ethernet source; a request
+//!   aimed at us is answered but never learned. A full cache evicts its least recently used entry.
 //! - Sockets are UDP ports and ICMP echo identifiers (a Linux ping socket: the caller sends and receives whole echo
 //!   messages, the stack sets the identifier and checksum). Each socket queues received datagrams in its own buffer
 //!   as records: length u16, source address u32, source port u16 (0 for ICMP), data.
@@ -391,11 +391,6 @@ impl<'a> Stack<'a> {
         }
         match a[7] {
             1 => {
-                let i = self
-                    .find(spa)
-                    .or_else(|| self.slot())
-                    .ok_or(Reason::Ignored)?;
-                self.learn(i, spa, sha, now);
                 write_arp(&mut self.reply, 2, ours, self.config.ip, sha, spa);
                 self.reply_len = ETH + ARP;
                 Ok(())

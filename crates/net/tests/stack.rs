@@ -312,6 +312,12 @@ fn send(
     }
 }
 
+/// Teaches `stack` the neighbour at `ip` the only way it learns: it asks, and the neighbour replies.
+fn learn(stack: &mut Stack, tap: &mut Tap, now: u64, sock: net::SocketId, ip: Ipv4Addr, mac: Mac) {
+    assert_eq!(send(stack, tap, now, sock, ip), None);
+    feed_all(stack, tap, now, [arp(2, mac, ip, MAC_A, IP_A)]);
+}
+
 fn feed_all(stack: &mut Stack, tap: &mut Tap, now: u64, frames: impl IntoIterator<Item = Vec<u8>>) {
     tap.rx.extend(frames);
     stack.poll(tap, now);
@@ -373,8 +379,37 @@ fn arp_ignores_spoofed_and_unsolicited_traffic() {
     );
     assert_eq!(
         send(&mut a, &mut tap, 0, s, ip(4)),
-        Some(mac(4)),
-        "and learned"
+        None,
+        "but never learned"
+    );
+}
+
+#[test]
+fn arp_request_claiming_the_gateways_ip_is_answered_but_never_changes_its_mac() {
+    let mut nb = [Neighbor::EMPTY; 2];
+    let mut bufs = [[0u8; 256]; 1];
+    let mut socks = bufs.each_mut().map(|b| Socket::new(b));
+    let gw = Config {
+        gateway: Some(ip(254)),
+        ..config(IP_A)
+    };
+    let mut a = Stack::new(gw, &mut nb, &mut socks);
+    let s = a.bind(Proto::Udp, 9).unwrap();
+    let mut tap = Tap::new(MAC_A);
+    learn(&mut a, &mut tap, 0, s, ip(254), mac(254));
+    let n = tap.tx.len();
+    feed_all(&mut a, &mut tap, 0, [arp(1, EVIL, ip(254), [0; 6], IP_A)]);
+    assert_eq!(
+        tap.tx[n..],
+        [arp(2, MAC_A, IP_A, EVIL, ip(254))],
+        "the request is answered"
+    );
+    let far = SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, 8), 53);
+    assert_eq!(a.send_to(&mut tap, 0, s, far, b"x"), Ok(()));
+    assert_eq!(
+        &tap.tx.last().unwrap()[..6],
+        &mac(254),
+        "the gateway's MAC is unchanged"
     );
 }
 
@@ -386,12 +421,9 @@ fn arp_flood_not_aimed_at_us_never_evicts_a_live_neighbour() {
     let mut a = Stack::new(config(IP_A), &mut nb, &mut socks);
     let s = a.bind(Proto::Udp, 9).unwrap();
     let mut tap = Tap::new(MAC_A);
-    feed_all(
-        &mut a,
-        &mut tap,
-        0,
-        (2..6).map(|n| arp(1, mac(n), ip(n), [0; 6], IP_A)),
-    );
+    for n in 2..6 {
+        learn(&mut a, &mut tap, 0, s, ip(n), mac(n));
+    }
 
     let mut rng = Rng::new(7);
     let flood = (0..10_000).map(|i| {
@@ -424,17 +456,10 @@ fn arp_evicts_the_least_recently_used_neighbour() {
     let mut a = Stack::new(config(IP_A), &mut nb, &mut socks);
     let s = a.bind(Proto::Udp, 9).unwrap();
     let mut tap = Tap::new(MAC_A);
-    feed_all(
-        &mut a,
-        &mut tap,
-        0,
-        [
-            arp(1, mac(2), ip(2), [0; 6], IP_A),
-            arp(1, mac(3), ip(3), [0; 6], IP_A),
-        ],
-    );
+    learn(&mut a, &mut tap, 0, s, ip(2), mac(2));
+    learn(&mut a, &mut tap, 0, s, ip(3), mac(3));
     assert_eq!(send(&mut a, &mut tap, 1, s, ip(2)), Some(mac(2)));
-    feed_all(&mut a, &mut tap, 2, [arp(1, mac(4), ip(4), [0; 6], IP_A)]);
+    learn(&mut a, &mut tap, 2, s, ip(4), mac(4));
     assert_eq!(send(&mut a, &mut tap, 3, s, ip(2)), Some(mac(2)));
     assert_eq!(send(&mut a, &mut tap, 3, s, ip(4)), Some(mac(4)));
     assert_eq!(send(&mut a, &mut tap, 3, s, ip(3)), None);
@@ -581,7 +606,7 @@ fn ipv4_fragments_are_dropped_and_counted() {
     let s = a.bind(Proto::Udp, 9).unwrap();
     let server = b.bind(Proto::Udp, 9).unwrap();
     let (mut tap_a, mut tap_b) = (Tap::new(MAC_A), Tap::new(MAC_B));
-    feed_all(&mut a, &mut tap_a, 0, [arp(1, MAC_B, IP_B, [0; 6], IP_A)]);
+    learn(&mut a, &mut tap_a, 0, s, IP_B, MAC_B);
     assert_eq!(send(&mut a, &mut tap_a, 0, s, IP_B), Some(MAC_B));
     let whole = tap_a.tx.pop().unwrap();
     let fragments = [(0x20, 0), (0, 1), (0x21, 0x80)].map(|(hi, lo)| {
@@ -648,15 +673,8 @@ fn arp_asks_a_stale_neighbour_again_and_drops_it_if_silent() {
     let mut a = Stack::new(config(IP_A), &mut nb, &mut socks);
     let s = a.bind(Proto::Udp, 9).unwrap();
     let mut tap = Tap::new(MAC_A);
-    feed_all(
-        &mut a,
-        &mut tap,
-        0,
-        [
-            arp(1, mac(2), ip(2), [0; 6], IP_A),
-            arp(1, mac(3), ip(3), [0; 6], IP_A),
-        ],
-    );
+    learn(&mut a, &mut tap, 0, s, ip(2), mac(2));
+    learn(&mut a, &mut tap, 0, s, ip(3), mac(3));
     for n in [2, 3] {
         let sent = tap.tx.len();
         let r = a.send_to(&mut tap, 60 * SEC, s, SocketAddrV4::new(ip(n), 9), b"x");
