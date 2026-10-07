@@ -4,11 +4,14 @@ use core::sync::atomic::Ordering::Relaxed;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 
 use arch::Lock;
+use core::fmt::Write;
 use kernel::handle::{DUPLICATE, Object, READ, TRANSFER, WRITE};
-use kernel::network::{Network, Sock, UserMemory};
+
+use kernel::network::{self, Network, Sock, UserMemory};
 use kernel::syscall::{EINVAL, NetCall};
 use kernel::{Board, Event};
 use mm::PhysAddr;
+use net::Config;
 
 use crate::usermem::{UserIn, UserOut};
 use crate::virtio_net::{POOL_FRAMES, VirtioNet};
@@ -17,23 +20,25 @@ use crate::{CPUS, GIC_DIST, KERNEL, QemuVirt, Sched, VIRTIO, VIRTIO_COUNT, VIRTI
 /// QEMU `virt` wires virtio-mmio transport `i` to SPI `16 + i`.
 const VIRTIO_IRQ: u32 = 48;
 
-/// Set by `start`. Lock order: `KERNEL`, then `NET`.
+/// Set by the net task once it set the network up. Lock order: `KERNEL`, then `NET`.
 static NET: Lock<Option<(Option<VirtioNet>, &'static mut Network)>> = Lock::new(None);
+/// What `start` hands the net task to set up: the NIC's address, if any, and the TCP key.
+static SETUP: Lock<Option<(Option<Config>, [u64; 2])>> = Lock::new(None);
 /// The NIC's interrupt ID, `u32::MAX` without one.
 pub static IRQ: AtomicU32 = AtomicU32::new(u32::MAX);
 /// The net task has work: a frame arrived, a socket call ran, or frames wait on the loopback wire.
 static PENDING: AtomicBool = AtomicBool::new(false);
 /// The next deadline in ns, `u64::MAX` for none.
 static DEADLINE: AtomicU64 = AtomicU64::new(u64::MAX);
-/// `start` ran: boot-spawned processes get a NetStack handle.
+/// `start` ran: boot-spawned processes get a NetStack handle, and the net task is not counted as a task.
 pub static STARTED: AtomicBool = AtomicBool::new(false);
 
 fn now() -> u64 {
     arch::uptime_us() * 1000
 }
 
-/// `Board::nic`: sets up the first net device among the transports.
-pub fn nic() -> Option<VirtioNet> {
+/// Sets up the first net device among the transports.
+fn nic() -> Option<VirtioNet> {
     let alloc = || KERNEL.lock().frames.alloc();
     let pool = || Some(KERNEL.lock().frames.alloc_contiguous(POOL_FRAMES)?.start);
     // QEMU `virt` fills the transports from the highest address down with no gaps, as `Board::disk` relies on.
@@ -51,18 +56,35 @@ pub fn nic() -> Option<VirtioNet> {
     Some(nic)
 }
 
-/// `Board::memory`.
-pub fn memory(frames: usize) -> Option<&'static mut [u8]> {
-    let range = KERNEL.lock().frames.alloc_contiguous(frames)?;
-    // SAFETY: fresh identity-mapped frames that nothing else references, never freed.
-    Some(unsafe { core::slice::from_raw_parts_mut(range.start.0 as *mut u8, frames * 4096) })
+/// `Board::start_net`: only spawns the net task, which does the setup.
+pub fn start(board: &mut QemuVirt, config: Option<Config>, key: [u64; 2]) {
+    *SETUP.lock() = Some((config, key));
+    STARTED.store(true, Relaxed);
+    board.spawn(task, 0).expect("net task");
 }
 
-/// `Board::start_net`: routes the NIC's interrupt to core 0.
-pub fn start(board: &mut QemuVirt, network: &'static mut Network, nic: Option<VirtioNet>) {
+/// Sets up the NIC (with an address), routing its interrupt to core 0, and the network, and starts the timer.
+fn setup(board: &mut QemuVirt) {
+    let (config, key) = SETUP.lock().take().expect("net setup");
+    let nic = config.and_then(|_| nic());
+    if config.is_some() && nic.is_none() {
+        let _ = writeln!(board.console(), "net: no nic");
+    }
+    let eth = config.filter(|_| nic.is_some());
+    let frames = network::frames(eth.is_some());
+    let range = KERNEL
+        .lock()
+        .frames
+        .alloc_contiguous(frames)
+        .expect("net memory");
+    // SAFETY: fresh identity-mapped frames that nothing else references, never freed.
+    let memory =
+        unsafe { core::slice::from_raw_parts_mut(range.start.0 as *mut u8, frames * 4096) };
+    let network = Network::new(eth, key, memory)
+        .and_then(network::leak_one)
+        .expect("net heap");
     let irq = nic.is_some().then(|| IRQ.load(Relaxed));
     *NET.lock() = Some((nic, network));
-    STARTED.store(true, Relaxed);
     if let Some(irq) = irq {
         let dist = PhysAddr(GIC_DIST.load(Relaxed));
         if CPUS.load(Relaxed) > 1 {
@@ -72,15 +94,18 @@ pub fn start(board: &mut QemuVirt, network: &'static mut Network, nic: Option<Vi
         // SAFETY: as above.
         unsafe { arch::gic::unmask(dist, irq) };
     }
-    board.spawn(task, 0).expect("net task");
     board.start_timer();
 }
 
-/// `Board::with_net`.
+/// `Board::with_net`: first lets the net task finish its setup (boot context only).
 pub fn with<R>(f: impl FnOnce(&mut Network, Option<&mut VirtioNet>, u64) -> R) -> R {
+    while NET.lock().is_none() {
+        KERNEL.lock().sched.block(Event::Idle);
+        arch::yield_now();
+    }
     let mut kernel = KERNEL.lock();
     let mut net = NET.lock();
-    let (nic, network) = net.as_mut().expect("with_net before start_net");
+    let (nic, network) = net.as_mut().expect("set up above");
     let result = f(network, nic.as_mut(), now());
     wake(&mut kernel.sched);
     result
@@ -245,8 +270,10 @@ fn wake(sched: &mut Sched) {
     sched.wake(Event::Net);
 }
 
-/// Polls the network whenever there is work and wakes every `io_wait`, then sleeps until the next wake.
-fn task(_: &mut QemuVirt, _: usize) -> ! {
+/// Sets the network up, then polls it whenever there is work and wakes every `io_wait`, and sleeps until the next
+/// wake.
+fn task(board: &mut QemuVirt, _: usize) -> ! {
+    setup(board);
     loop {
         let mut kernel = KERNEL.lock();
         if !PENDING.swap(false, Relaxed) {

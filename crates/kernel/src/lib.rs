@@ -78,17 +78,14 @@ pub trait Board {
     /// Mounts the MogFS on `disk` as the board's file system; once it is mounted, every process spawned from boot
     /// context also gets its root directory (read, write, duplicate, transfer) as handle 3. Never formats.
     fn mount(&mut self, disk: Self::Disk) -> Result<(), mogfs::Error>;
-    /// The board's NIC, set up with frames from the frame allocator; call once, after `init_frames`.
-    fn nic(&mut self) -> Option<Self::Nic>;
-    /// `frames` contiguous frames from the frame allocator for the kernel's lifetime, as bytes; call after
-    /// `init_frames`.
-    fn memory(&mut self, frames: usize) -> Option<&'static mut [u8]>;
-    /// Runs `network` (its `ETH` stack on `nic`) in a kernel net task woken by the NIC's interrupt, by the timer tick
-    /// once the next deadline passed, by socket calls and by `with_net`; starts the timer. Every process spawned from
-    /// boot context from then on also gets a NetStack handle (connect, listen, duplicate, transfer) after its other
-    /// handles. Call once.
-    fn start_net(&mut self, network: &'static mut network::Network, nic: Option<Self::Nic>);
-    /// Runs `f` with the network, the NIC and the time in ns, then wakes the net task. After `start_net`.
+    /// Spawns the net task, which, off the boot path, sets up the NIC (only with `config`, as its address; it prints
+    /// `net: no nic` without one), the `network::Network` (`key` seeds TCP) and the timer, then polls the network
+    /// whenever the NIC's interrupt, the tick past the next deadline, a socket call or `with_net` wakes it. Every
+    /// process spawned from boot context from then on also gets a NetStack handle (connect, listen, duplicate,
+    /// transfer) after its other handles. Call once, after `init_frames`.
+    fn start_net(&mut self, config: Option<net::Config>, key: [u64; 2]);
+    /// Waits for the net task's setup (boot context only), runs `f` with the network, the NIC and the time in ns, then
+    /// wakes the net task.
     fn with_net<R>(
         &mut self,
         f: impl FnOnce(&mut network::Network, Option<&mut Self::Nic>, u64) -> R,
@@ -225,16 +222,9 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
         }
     }
     // The NIC is probed only for a network address; loopback alone starts only for the socket tests.
-    let nic = config.and_then(|_| board.nic());
-    let no_nic = config.is_some() && nic.is_none();
-    if nic.is_some() || loopback {
-        let eth = config.filter(|_| nic.is_some());
-        let memory = board
-            .memory(network::frames(eth.is_some()))
-            .expect("net memory");
-        let key = dtb.rng_seed().expect("no rng-seed in DTB");
-        let network = network::Network::new(eth, key, memory).expect("net heap");
-        board.start_net(network::leak_one(network).expect("net heap"), nic);
+    let net = config.is_some() || loopback;
+    if net {
+        board.start_net(config, dtb.rng_seed().expect("no rng-seed in DTB"));
     }
 
     board.start_cpus(bootargs.split_whitespace().any(|a| a == "test=smp"));
@@ -248,8 +238,9 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
     if let Some(Err(error)) = mounted {
         let _ = writeln!(board.console(), "fs: {error:?}");
     }
-    if no_nic {
-        let _ = writeln!(board.console(), "net: no nic");
+    if net {
+        // Scenarios count free frames, so the net task's setup ends before the first.
+        board.with_net(|_, _, _| ());
     }
 
     for arg in bootargs.split_whitespace() {
