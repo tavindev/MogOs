@@ -57,12 +57,13 @@ impl Handles {
     }
 
     /// init's handles: 0 is the console (read, write, duplicate, transfer), 1 is the process itself (kill), in `slot`
-    /// with `generation`, 2 is the boot archive (read, exec).
+    /// with `generation`, 2 is the boot archive (read, exec, duplicate, transfer: a shell hands it to the programs it
+    /// runs, which spawn from it).
     pub fn init(slot: usize, generation: u64) -> Self {
         let mut handles = Self::new();
         handles.0[0].1 = Some((Object::Console, READ | WRITE | DUPLICATE | TRANSFER));
         handles.0[1].1 = Some((Object::Process { slot, generation }, KILL));
-        handles.0[2].1 = Some((Object::Archive, READ | EXEC));
+        handles.0[2].1 = Some((Object::Archive, READ | EXEC | DUPLICATE | TRANSFER));
         handles
     }
 

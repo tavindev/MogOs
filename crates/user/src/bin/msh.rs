@@ -14,6 +14,9 @@ const ROOT: u64 = 3;
 /// A command's budget: a shell program's 10 frames (3 tables, text, 2 stack, 4 kernel stack) and room for two more
 /// pages of program; msh's own 11 (3 pages of program) leave 14 of its 25.
 const CHILD_BUDGET: usize = 12;
+/// A `Grant::Posix` program's budget: busybox sh with its 128 KiB stack and heap, and the children it spawns (libc
+/// gives each up to 1024 frames, halving on `ENOMEM`).
+const POSIX_BUDGET: usize = 2048;
 /// Longest path msh keeps or builds, and its argument buffer (a command line is at most 256 bytes).
 const PATH: usize = 256;
 
@@ -56,11 +59,26 @@ extern "C" fn _start() -> ! {
         let len = read(CONSOLE, &mut buf).max(0) as usize;
         let mut words: [&[u8]; MAX_ARGS] = [&[]; MAX_ARGS];
         let mut count = 0;
-        for word in buf[..len].split(|&b| b == b' ' || b == b'\n') {
-            if !word.is_empty() && count < MAX_ARGS {
-                words[count] = word;
-                count += 1;
-            }
+        let mut rest = &buf[..len];
+        while count < MAX_ARGS {
+            let start = rest.iter().position(|&b| b != b' ' && b != b'\n');
+            let Some(start) = start else { break };
+            rest = &rest[start..];
+            // A word in single quotes keeps its spaces.
+            let (word, end) = match rest[0] {
+                b'\'' => match rest[1..].iter().position(|&b| b == b'\'') {
+                    Some(i) => (&rest[1..=i], i + 2),
+                    None => (&rest[1..], rest.len()),
+                },
+                _ => {
+                    let i = rest.iter().position(|&b| b == b' ' || b == b'\n');
+                    let i = i.unwrap_or(rest.len());
+                    (&rest[..i], i)
+                }
+            };
+            words[count] = word;
+            count += 1;
+            rest = &rest[end..];
         }
         let words = &words[..count];
         let Some(&command) = words.first() else {
@@ -185,12 +203,16 @@ fn run(cwd: &Cwd, words: &[&[u8]]) -> i64 {
     if exe < 0 {
         return exe;
     }
-    let (mut handles, mut granted, mut args) = ([0; 3], 0, [0; PATH]);
+    let budget = match grant {
+        Grant::Posix => POSIX_BUDGET,
+        _ => CHILD_BUDGET,
+    };
+    let (mut handles, mut granted, mut args) = ([0; 5], 0, [0; PATH]);
     let result = give(cwd, words, grant, (&mut handles, &mut granted), &mut args).and_then(|len| {
         let process = spawn_at(
             exe as u64,
             &handles[..granted],
-            CHILD_BUDGET,
+            budget,
             u64::MAX,
             &args[..len],
         );
@@ -213,9 +235,12 @@ fn give(
     cwd: &Cwd,
     words: &[&[u8]],
     grant: Grant,
-    (handles, granted): (&mut [u64; 3], &mut usize),
+    (handles, granted): (&mut [u64; 5], &mut usize),
     args: &mut [u8; PATH],
 ) -> Result<usize, i64> {
+    if grant == Grant::Posix {
+        return posix(cwd, words, (handles, granted), args);
+    }
     let console = dup(CONSOLE, WRITE | TRANSFER);
     if console < 0 {
         return Err(console);
@@ -227,7 +252,7 @@ fn give(
     let [first, second] = &mut outs;
     let mut grants: [(&[u8], u64); 2] = [(b"", 0); 2];
     let count = match grant {
-        Grant::Console => 0,
+        Grant::Console | Grant::Posix => 0,
         Grant::Root(rights) => {
             grants[0] = (b"", rights);
             1
@@ -254,12 +279,51 @@ fn give(
     }
     let mut len = 0;
     for word in &argv[..words.len()] {
-        let end = len + word.len() + 1;
-        if end > args.len() {
-            return Err(E2BIG);
-        }
-        args[len..end - 1].copy_from_slice(word);
-        len = end;
+        push(args, &mut len, &[word])?;
     }
     Ok(len)
+}
+
+/// `Grant::Posix`: the console three times (stdin, stdout, stderr), the root and the archive, and the arguments
+/// after `<argc> /<cwd>`, which tells musl's start code the current directory.
+fn posix(
+    cwd: &Cwd,
+    words: &[&[u8]],
+    (handles, granted): (&mut [u64; 5], &mut usize),
+    args: &mut [u8; PATH],
+) -> Result<usize, i64> {
+    let stdio = [(CONSOLE, READ | WRITE); 3];
+    for (handle, rights) in stdio
+        .into_iter()
+        .chain([(ROOT, READ | WRITE), (ARCHIVE, READ | EXEC)])
+    {
+        let dup = dup(handle, rights | DUPLICATE | TRANSFER);
+        if dup < 0 {
+            return Err(dup);
+        }
+        handles[*granted] = dup as u64;
+        *granted += 1;
+    }
+    let argc = words.len() as u8;
+    let digits = [b'0' + argc / 10, b'0' + argc % 10];
+    let digits = if argc < 10 { &digits[1..] } else { &digits[..] };
+    let mut len = 0;
+    push(args, &mut len, &[digits, b" /", &cwd.path[..cwd.len]])?;
+    for word in words {
+        push(args, &mut len, &[word])?;
+    }
+    Ok(len)
+}
+
+/// Appends `parts` and a NUL at `len` in `args`; `E2BIG` if they do not fit.
+fn push(args: &mut [u8; PATH], len: &mut usize, parts: &[&[u8]]) -> Result<(), i64> {
+    for part in parts {
+        args.get_mut(*len..*len + part.len())
+            .ok_or(E2BIG)?
+            .copy_from_slice(part);
+        *len += part.len();
+    }
+    *args.get_mut(*len).ok_or(E2BIG)? = 0;
+    *len += 1;
+    Ok(())
 }

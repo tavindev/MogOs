@@ -104,6 +104,8 @@ pub const FRAME_WORDS: usize = 512;
 const HEAP_FRAMES: usize = 256;
 /// Each boot-spawned process's budget in frames; a process moves part of its own to each child it spawns.
 const BOOT_BUDGET: usize = 25;
+/// msh's 25 and the 2048 it gives `sh` (busybox) and the C programs `sh` spawns.
+const SHELL_BUDGET: usize = BOOT_BUDGET + 2048;
 /// `waiter`'s 9 frames and its two children's 9 and 10 at once.
 const WAITER_BUDGET: usize = 28;
 /// `pi`'s 9 frames, its two pipes' pages and its three children's 9 each.
@@ -175,7 +177,7 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
             "test=pipe" => run_archived(board, "pipe", "reader", BOOT_BUDGET),
             "test=wait" => run_archived(board, "wait", "waiter", WAITER_BUDGET),
             "test=echo" => run_archived(board, "echo", "readlines", BOOT_BUDGET),
-            "test=shell" => run_archived(board, "shell", "msh", BOOT_BUDGET),
+            "test=shell" => run_archived(board, "shell", "msh", SHELL_BUDGET),
             "test=bench-fs" => run_archived(board, "bench-fs", "fsbench", BOOT_BUDGET),
             "test=bench-spawn" => run_archived(board, "bench-spawn", "spawnbench", BOOT_BUDGET),
             "test=pi" => {
