@@ -126,6 +126,9 @@ pub enum Program {
     /// Maps a page at a time, checking each is zeroed and writable, until `map` fails with `ENOMEM`; prints the
     /// page count, then a line showing it still runs.
     Budget,
+    /// Started with its map cursor two pages below the board's end of user memory: a one-page `map` succeeds, a
+    /// three-page one fails with `ENOMEM` with budget left, and a last one-page `map` succeeds; a line for each.
+    MapEnd,
 }
 
 /// Round trips timed by `test=bench`.
@@ -268,6 +271,7 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
             "test=user" => user_demo(board),
             "test=bench-syscall" => run_alone(board, Program::SyscallBench),
             "test=handles" => run_alone(board, Program::Handles),
+            "test=map-end" => run_alone(board, Program::MapEnd),
             "test=spawn" => run_archived(board, "spawn", "spawner", (BOOT_BUDGET, INIT_ARCHIVE)),
             "test=pipe" => run_archived(board, "pipe", "reader", (BOOT_BUDGET, INIT_ARCHIVE)),
             "test=wait" => run_archived(board, "wait", "waiter", (WAITER_BUDGET, INIT_ARCHIVE)),

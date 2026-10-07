@@ -278,6 +278,24 @@ fn syscall_bench_reports_round_trip() {
 }
 
 #[test]
+fn map_stops_at_the_end_of_user_memory_with_budget_left() {
+    let (status, lines) = boot(&["-append", "test=map-end"]);
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.starts_with("panic:") || l.starts_with("fault:")),
+        "kernel panicked or the fixture faulted"
+    );
+    let n: Vec<_> = lines.iter().filter(|l| l.starts_with("N: ")).collect();
+    // From two pages below the end: one page, then three would pass it, then the last page.
+    assert_eq!(
+        n,
+        ["N: one page", "N: past the end: ENOMEM", "N: the last page"]
+    );
+    assert!(status.success(), "QEMU exited with {status}");
+}
+
+#[test]
 fn map_stops_at_budget_and_exit_returns_every_frame() {
     let (status, lines) = boot(&["-append", "test=budget"]);
     assert!(

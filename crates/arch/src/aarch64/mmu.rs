@@ -142,7 +142,8 @@ pub fn boot_table() -> PhysAddr {
 }
 
 /// Maps the 4 KiB page at `va` to `leaf` (a `user_page` descriptor) in the tables under `l1`, taking each
-/// missing level-2 or level-3 table from `alloc`; `None` if `alloc` ran out.
+/// missing level-2 or level-3 table from `alloc`; `None` if `alloc` ran out or a level-1 or level-2 entry on the way is
+/// a block (a kernel mapping), not a table.
 ///
 /// # Safety
 ///
@@ -159,10 +160,14 @@ pub unsafe fn map_page(
         let entry = (table as *mut u64).wrapping_add((va >> shift) as usize & 511);
         // SAFETY: the caller guarantees `table` is an identity-mapped table frame of this address space.
         let mut desc = unsafe { entry.read() };
-        if desc & VALID_TABLE_OR_PAGE == 0 {
-            desc = table_entry(alloc()?);
-            // SAFETY: as above.
-            unsafe { entry.write(desc) };
+        match desc & VALID_TABLE_OR_PAGE {
+            0 => {
+                desc = table_entry(alloc()?);
+                // SAFETY: as above.
+                unsafe { entry.write(desc) };
+            }
+            VALID_TABLE_OR_PAGE => {}
+            _ => return None,
         }
         table = desc & ADDR;
     }

@@ -16,7 +16,7 @@ It is **NOT** board-specific: no MMIO addresses, no memory map, no drivers, no s
 - `new_task`, `new_user_task`, `switch_el0_regs`, `TrapFrame::restart`.
 - Descriptor encoding (`l1_block`, `user_page`), `enable_mmu` (core 0 fills the boot table, then runs `aarch64_mmu_on`),
   `secondary_entry` (PSCI `CPU_ON`'s entry: `aarch64_mmu_on` on the same table, the stack top from the context id),
-  `map_page`, `unmap_page`, `free_space`, `set_ttbr0`, `flush_asid` (`tlbi aside1is`), `user_readable` /
+  `map_page` (`None` on a level-1 or level-2 block on the way, never writing a table into kernel memory), `unmap_page`, `free_space`, `set_ttbr0`, `flush_asid` (`tlbi aside1is`), `user_readable` /
   `user_writable` (`at` probes), `clean_dcache` / `invalidate_icache` (`ic ialluis`; clean each code page, invalidate once).
 - `irq::disable` / `restore` / `wait`, `gic::enable` / `enable_cpu` / `route` / `unmask` / `send_sgi` / `ack` / `eoi`,
   `timer::arm` / `stop`, `timer::allow_user_counter`.

@@ -130,7 +130,8 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
 - User layout: code at `USER_BASE` (4 GiB), ELF segments within `IMAGE` (below the top two pages and an unmapped guard page, so a stack overflow faults), one stack page
   below `USER_STACK_TOP`; a `spawn` with arguments copies them to the end of that page and adds a stack page below it
   (both charged to the child), and the child starts with x0-x2 = count, address, length,
-  `map` from `MAP_BASE` upward. Kernel blocks (`KERNEL_L1`) are EL1-only in every address space.
+  `map` from `MAP_BASE` upward, never reaching `USER_END` (the lower of the first GiB from 4 GiB up that a DTB GIC
+  region occupies and 511 GiB; `ENOMEM` past it). Kernel blocks (`KERNEL_L1`) are EL1-only in every address space.
 - `MAX_MUTEXES = MAX_PROCESSES * MAX_HANDLES`: every live mutex holds a handle, so the handle tables are the quota.
 - `linker.ld` provides `__stack_top`, `__bss_start`, `__bss_end`, `__kernel_start`, `__kernel_end`, and above
   `__stack_top` the secondaries' stacks (core `n`'s ends at `__stack_top + n * 0x4000`), inside the reserved image; its load address

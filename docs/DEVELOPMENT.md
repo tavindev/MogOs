@@ -90,6 +90,7 @@ cargo run -- -append test=preempt    # timer preempts spinning task a; task b pr
 cargo run -- -append test=user       # EL0 process A writes A: 0..9 to its console handle; B reads A's address, then C (B's process index) kernel RAM: both killed (fault: 2 ec=0x24 far=...)
 cargo run -- -append test=bench-syscall  # EL0 loop of no-op syscalls, prints the round trip in ns
 cargo run -- -append test=handles    # EL0 process writes via its console handle, then a no-write duplicate, a closed and a stale handle fail (H: lines)
+cargo run -- -append test=map-end    # asm fixture whose map cursor starts two pages below USER_END: one page maps, three are ENOMEM, the last page maps (N: lines)
 cargo run -- -append test=budget     # EL0 process maps pages until ENOMEM (M: lines), exits; free frames before/after its lifetime match
 cargo run -- -append test=spawn      # spawner (from the boot archive) checks failing spawns (budget, argument limits) move nothing, spawns child with only the console and 32 arguments in 4096 bytes (S: and C: lines); free frames before/after match
 cargo run -- -append test=pipe       # reader blocks on an empty pipe until its child writer writes, reads EOF, waits for exit code 7, respawns into the reused slot; a stale process handle is EBADF; 8 KiB I/O moves 4 KiB (R: and W: lines); free frames before/after match

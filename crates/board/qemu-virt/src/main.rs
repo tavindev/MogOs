@@ -61,6 +61,9 @@ const USER_BASE: u64 = 1 << 32;
 const USER_STACK_TOP: u64 = USER_BASE + (2 << 20);
 /// Where a process's first `map` goes; later ones follow it.
 const MAP_BASE: u64 = USER_STACK_TOP;
+/// No `map` reaches it: the lower of the first GiB from `USER_BASE` up that the DTB's GIC regions occupy, which every
+/// address space maps for EL1, and 511 GiB, so the last GiB of the 39-bit VA stays unmapped. Set by `kmain`.
+static USER_END: AtomicU64 = AtomicU64::new(0);
 /// Where an executable's segments may go: below the two stack pages and an unmapped guard page, in one level-3 table.
 const IMAGE: Range<u64> = USER_BASE..USER_STACK_TOP - 3 * PAGE as u64;
 /// The boot archive (cpio, newc), built by `build.rs` from `crates/user`.
@@ -286,6 +289,11 @@ impl kernel::Board for QemuVirt {
     }
 
     fn spawn_user(&mut self, program: Program, budget: usize) -> Result<(), i64> {
+        // `test=map-end` starts the map cursor two pages below `USER_END`.
+        let next = match program {
+            Program::MapEnd => USER_END.load(Relaxed) - 2 * PAGE as u64,
+            _ => MAP_BASE,
+        };
         let (code, entry) = user_program(program);
         let segment = Segment {
             vaddr: entry,
@@ -295,7 +303,7 @@ impl kernel::Board for QemuVirt {
         };
         spawn_init(
             (code, [segment].into_iter(), entry),
-            budget,
+            (budget, next),
             0,
             INIT_ARCHIVE,
             &[],
@@ -310,7 +318,13 @@ impl kernel::Board for QemuVirt {
         args: &[u8],
     ) -> Result<(), i64> {
         let file = kernel::cpio::find(ARCHIVE, name.as_bytes()).ok_or(ENOENT)?;
-        spawn_init(executable(file)?, budget, PRIORITIES - 1, archive, args)
+        spawn_init(
+            executable(file)?,
+            (budget, MAP_BASE),
+            PRIORITIES - 1,
+            archive,
+            args,
+        )
     }
 
     fn tasks(&self) -> usize {
@@ -430,6 +444,11 @@ extern "C" fn kmain() -> ! {
     let gic = dtb.gic().expect("no GICv2 in DTB");
     GIC_DIST.store(gic.0.0, Relaxed);
     GIC_CPU.store(gic.1.0, Relaxed);
+    let gic_gib = [gic.0, gic.1].map(|r| r.0 / GIB).into_iter();
+    let user_end = gic_gib
+        .filter(|&g| g >= USER_BASE / GIB)
+        .fold(511, u64::min);
+    USER_END.store(user_end * GIB, Relaxed);
     // SAFETY: the DTB's GICv2 registers, in the device-mapped GiB 0.
     unsafe { arch::gic::enable(gic.0, gic.1) };
     for irq in [UART_IRQ, TIMER_IRQ] {

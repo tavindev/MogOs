@@ -249,3 +249,33 @@ user_budget:
 6:  .ascii " pages\n"
 5:  .ascii "M: still running\n"
 user_budget_end:
+
+.balign 4
+.global user_map_end, user_map_end_end
+user_map_end:
+    // The map cursor starts two pages below the end of user memory: one page fits, three do not (with budget left).
+    mov x0, #4096
+    mov x8, #4
+    svc #0
+    tbnz x0, #63, 9f
+    str x0, [x0]
+    write #0, 7f, 12
+    mov x0, #0x3000
+    mov x8, #4
+    svc #0
+    cmn x0, #12
+    b.ne 9f
+    write #0, 6f, 24
+    mov x0, #4096
+    mov x8, #4
+    svc #0
+    tbnz x0, #63, 9f
+    str x0, [x0]
+    write #0, 5f, 17
+9:  mov x0, #0
+    mov x8, #0
+    svc #0
+7:  .ascii "N: one page\n"
+6:  .ascii "N: past the end: ENOMEM\n"
+5:  .ascii "N: the last page\n"
+user_map_end_end:
