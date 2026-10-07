@@ -80,6 +80,7 @@ cargo fmt --manifest-path crates/user/Cargo.toml
 cargo test --manifest-path crates/user/Cargo.toml --target aarch64-apple-darwin --target-dir target/user --lib  # msh's command table
 cargo build            # dev build
 cargo test-host        # host tests (crates/user's too) + QEMU boot e2e tests (crates/e2e); must pass
+for i in $(seq 50); do cargo test -q --target aarch64-apple-darwin -p e2e --test boot -- handles_enforce_rights_and_generations --exact || break; done  # flake hunt: one test N times; drop `-- <name> --exact` to loop the whole suite (its parallel boots add load)
 cargo bench-host       # host benchmarks (min/median); see docs/BENCHMARKS.md
 cargo run              # boot in QEMU; prints hello, exceptions, mmu, ram, frames, heap, boot, disk lines and powers off
 cargo run -- -append test=mmu-fault  # reads an unmapped address after MMU on; prints the data abort

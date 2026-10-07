@@ -1,9 +1,9 @@
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::{Arc, Mutex};
-use std::thread::{self, sleep};
+use std::sync::{Arc, Mutex, Once};
+use std::thread::{self, JoinHandle, sleep};
 use std::time::{Duration, Instant};
 
 /// Builds the kernel, boots it in QEMU with `extra` arguments, and returns the exit status and serial lines.
@@ -15,12 +15,16 @@ fn boot(extra: &[&str]) -> (ExitStatus, Vec<String>) {
 /// `i + 1` times.
 fn boot_with_input(extra: &[&str], input: Option<(&str, &[&[u8]])>) -> (ExitStatus, Vec<String>) {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let build = Command::new(env!("CARGO"))
-        .args(["build", "-p", "qemu-virt"])
-        .current_dir(&root)
-        .status()
-        .unwrap();
-    assert!(build.success(), "kernel build failed");
+    // Once per run: even a fresh `cargo build` replaces `mog_os`, so a build beside a booting test can leave QEMU no ELF.
+    static BUILD: Once = Once::new();
+    BUILD.call_once(|| {
+        let build = Command::new(env!("CARGO"))
+            .args(["build", "-p", "qemu-virt"])
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        assert!(build.success(), "kernel build failed");
+    });
 
     let mut qemu = Command::new("qemu-system-aarch64")
         .args([
@@ -44,30 +48,22 @@ fn boot_with_input(extra: &[&str], input: Option<(&str, &[&[u8]])>) -> (ExitStat
             None => Stdio::null(),
         })
         .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
 
-    let out = Arc::new(Mutex::new(Vec::new()));
-    let mut stdout = qemu.stdout.take().unwrap();
-    let reader = thread::spawn({
-        let out = out.clone();
-        move || {
-            let mut buf = [0; 4096];
-            while let Ok(n @ 1..) = stdout.read(&mut buf) {
-                out.lock().unwrap().extend_from_slice(&buf[..n]);
-            }
-        }
-    });
-
+    let (out, out_reader) = drain(qemu.stdout.take().unwrap());
+    let (err, err_reader) = drain(qemu.stderr.take().unwrap());
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut sent = 0;
     let status = loop {
         if let Some(status) = qemu.try_wait().unwrap() {
-            break status;
+            break Some(status);
         }
         if Instant::now() > deadline {
             qemu.kill().unwrap();
-            panic!("QEMU timed out");
+            qemu.wait().unwrap();
+            break None;
         }
         if let Some((ready, chunks)) = input
             && sent < chunks.len()
@@ -82,14 +78,38 @@ fn boot_with_input(extra: &[&str], input: Option<(&str, &[&[u8]])>) -> (ExitStat
         sleep(Duration::from_millis(50));
     };
 
-    reader.join().unwrap();
+    out_reader.join().unwrap();
+    err_reader.join().unwrap();
     let out = String::from_utf8_lossy(&out.lock().unwrap()).into_owned();
-    println!("{out}");
+    let err = String::from_utf8_lossy(&err.lock().unwrap()).into_owned();
+    // Captured, so a failing test shows how QEMU ended.
+    println!("QEMU status: {status:?}\nQEMU stderr:\n{err}\nQEMU stdout:\n{out}");
+    let status = status.expect("QEMU timed out");
     let lines = out
         .lines()
         .map(|l| l.trim_end_matches('\r').to_string())
         .collect();
     (status, lines)
+}
+
+/// Collects everything `pipe` yields, on a thread that ends at EOF.
+fn drain(mut pipe: impl Read + Send + 'static) -> (Arc<Mutex<Vec<u8>>>, JoinHandle<()>) {
+    let out = Arc::new(Mutex::new(Vec::new()));
+    let reader = thread::spawn({
+        let out = out.clone();
+        move || {
+            let mut buf = [0; 4096];
+            loop {
+                match pipe.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => out.lock().unwrap().extend_from_slice(&buf[..n]),
+                    Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                    Err(e) => panic!("reading QEMU's output: {e}"),
+                }
+            }
+        }
+    });
+    (out, reader)
 }
 
 #[test]
