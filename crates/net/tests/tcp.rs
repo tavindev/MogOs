@@ -2018,3 +2018,182 @@ fn a_cookie_is_accepted_in_its_period_and_the_next_only() {
         );
     }
 }
+
+#[test]
+fn a_released_connection_with_a_slow_but_steady_reader_is_not_killed() {
+    let mut m = Mem::new(2, 4096, 16384, 4, 4);
+    host!(a, m, IP_A, [1, 1]);
+    let mut tap = Tap::new(MAC_A);
+    let (c, p) = accepted(&mut a, &mut tap);
+    feed(&mut a, &mut tap, 0, [p.seg(p.seq, p.ack, ACK, 0, &[], &[])]);
+    a.send(c, &[1; 16384]).unwrap();
+    a.tcp_close(c);
+    let (mut now, mut acked) = (0u64, p.ack);
+    for _ in 0..20 {
+        // The persist timer fires; the peer answers with its window still shut.
+        now = a.poll(&mut tap, now).unwrap();
+        let mut out = feed(&mut a, &mut tap, now, []);
+        feed(
+            &mut a,
+            &mut tap,
+            now,
+            [p.seg(p.seq, acked, ACK, 0, &[], &[])],
+        );
+        // The reader frees a segment's worth, takes it, and shuts the window again.
+        now += 50 * MS;
+        out.extend(feed(
+            &mut a,
+            &mut tap,
+            now,
+            [p.seg(p.seq, acked, ACK, 1460, &[], &[])],
+        ));
+        for s in out.iter().filter(|s| !s.data.is_empty()) {
+            let end = s.seq.wrapping_add(s.data.len() as u32);
+            if (end.wrapping_sub(acked) as i32) > 0 {
+                acked = end;
+            }
+        }
+        feed(
+            &mut a,
+            &mut tap,
+            now,
+            [p.seg(p.seq, acked, ACK, 0, &[], &[])],
+        );
+    }
+    let i = a.tcp_info(c).unwrap();
+    assert_eq!(i.error, None, "every burst made progress");
+    assert_eq!(
+        acked.wrapping_sub(p.ack),
+        16384,
+        "all of it, past the 8-probe limit"
+    );
+}
+
+#[test]
+fn a_syn_ack_never_takes_time_wait_over() {
+    let mut m = Mem::new(3, 4096, 4096, 4, 4);
+    host!(a, m, IP_A, [1, 1]);
+    let mut tap = Tap::new(MAC_A);
+    let (c, mut p) = accepted(&mut a, &mut tap);
+    a.tcp_close(c);
+    feed(&mut a, &mut tap, 0, []);
+    p.ack += 1;
+    feed(&mut a, &mut tap, MS, [p.now(ACK | FIN, &[])]);
+    p.seq += 1;
+    feed(
+        &mut a,
+        &mut tap,
+        2 * MS,
+        [p.seg(p.seq + 100, 12345, SYN | ACK, 65535, &[], &[])],
+    );
+    let fin = feed(
+        &mut a,
+        &mut tap,
+        3 * MS,
+        [p.seg(p.seq - 1, p.ack, ACK | FIN, 65535, &[], &[])],
+    );
+    assert_eq!(fin[0].flags, ACK, "TIME_WAIT is still there");
+}
+
+#[test]
+fn an_obligation_starts_its_timer_when_it_appears() {
+    let mut m = Mem::new(2, 4096, 4096, 4, 4);
+    host!(a, m, IP_A, [1, 1]);
+    let mut tap = Tap::new(MAC_A);
+    let (c, p) = accepted(&mut a, &mut tap);
+    let before = a.tcp_info(c).unwrap();
+    a.shutdown(c);
+    let out = feed(&mut a, &mut tap, 10 * SEC, [p.now(ACK, b"x")]);
+    let after = a.tcp_info(c).unwrap();
+    assert_eq!(
+        (after.timeouts, after.rto, after.cwnd),
+        (0, before.rto, before.cwnd)
+    );
+    assert!(
+        out.iter().any(|s| s.flags & FIN != 0),
+        "the FIN goes out, as a first transmission"
+    );
+
+    // The same for data queued after a long idle spell, and for a release.
+    let mut m = Mem::new(2, 4096, 4096, 4, 4);
+    host!(a, m, IP_A, [1, 1]);
+    let (d, q) = accepted(&mut a, &mut tap);
+    a.send(d, b"late").unwrap();
+    feed(&mut a, &mut tap, 30 * SEC, [q.now(ACK, b"y")]);
+    a.tcp_close(d);
+    feed(&mut a, &mut tap, 40 * SEC, [q.now(ACK, b"z")]);
+    assert_eq!(a.tcp_info(d).unwrap().timeouts, 0);
+}
+
+#[test]
+fn a_clean_link_never_times_out_whatever_the_application_does() {
+    for seed in 0..50 {
+        let clean = Faults {
+            delay: MS,
+            ..Faults::default()
+        };
+        let mut link = Link::new(seed, clean, [MAC_A, MAC_B]);
+        let (mut ma, mut mb) = (Mem::new(1, 8192, 8192, 4, 4), Mem::new(2, 8192, 8192, 4, 4));
+        host!(a, ma, IP_A, [seed, 1]);
+        host!(b, mb, IP_B, [seed, 2]);
+        let listener = b.listen(PORT).unwrap();
+        let ca = a.connect(0, 0, SocketAddrV4::new(IP_B, PORT)).unwrap();
+        let mut rng = Rng::new(seed);
+        // Requests and answers with idle spells of up to 30 s between them, then a close from either side.
+        let (mut cb, mut step, mut wake, mut buf) = (None, 0, 0u64, [0u8; 256]);
+        loop {
+            let now = link.now;
+            assert!(now < 3600 * SEC, "seed {seed}: not done in an hour");
+            let da = a.poll(&mut link.end(0), now);
+            let db = b.poll(&mut link.end(1), now);
+            cb = cb.or_else(|| b.accept(listener));
+            let next = [da, db, link.next()]
+                .into_iter()
+                .flatten()
+                .min()
+                .unwrap_or(wake);
+            let Some(cb) = cb else {
+                link.now = next.max(now);
+                continue;
+            };
+            while a.recv(ca, &mut buf).is_ok_and(|n| n > 0)
+                || b.recv(cb, &mut buf).is_ok_and(|n| n > 0)
+            {}
+            let timeouts = a.tcp_info(ca).unwrap().timeouts + b.tcp_info(cb).unwrap().timeouts;
+            assert_eq!(
+                timeouts, 0,
+                "seed {seed} step {step}: a timeout on a clean link"
+            );
+            if step > 13 && state(&a, ca) == State::Closed && state(&b, cb) == State::Closed {
+                break;
+            }
+            if now < wake {
+                link.now = next.max(now + 1).min(wake.max(now + 1));
+                continue;
+            }
+            wake = now + 1 + rng.below(30) * SEC;
+            step += 1;
+            // Either side or both act, and the next poll may come after the peer's frame has arrived.
+            let (on_a, on_b) = match rng.below(3) {
+                0 => (true, false),
+                1 => (false, true),
+                _ => (true, true),
+            };
+            match step {
+                1..=10 => {
+                    if on_a {
+                        a.send(ca, &[step as u8; 100]).unwrap();
+                    }
+                    if on_b {
+                        b.send(cb, &[step as u8; 100]).unwrap();
+                    }
+                }
+                11 => a.shutdown(ca),
+                12 => b.tcp_close(cb),
+                13 => a.tcp_close(ca),
+                _ => {}
+            }
+            link.now = now + rng.below(3) * MS;
+        }
+    }
+}

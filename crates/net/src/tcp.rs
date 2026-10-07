@@ -103,6 +103,8 @@ pub struct TcpInfo {
     pub queued: usize,
     /// The caller has released the connection (`tcp_close`); the stack finishes it on its own.
     pub released: bool,
+    /// Retransmission timeouts taken.
+    pub timeouts: u32,
 }
 
 /// A connection slot with its receive and send rings; a listener's receive ring sizes the window it offers.
@@ -169,11 +171,15 @@ pub struct TcpSocket<'a> {
     since: u64,
     /// `deadline()` as of the end of the last event that could change it.
     due: Option<u64>,
+    /// A call changed what the connection owes; the next event recomputes `due`.
+    stale: bool,
     retries: u8,
     probes: u8,
-    /// Persist probes the peer has not answered, and all sent since the caller released the connection.
+    /// Persist probes the peer has not answered, and those sent since the last progress after the caller released
+    /// the connection.
     unanswered: u8,
     orphan_probes: u8,
+    timeouts: u32,
     /// A listener's last SYN cookie: cookie ACKs are checked only within two periods of it.
     cookie_at: Option<u64>,
     /// When an ACK last answered an out-of-window segment.
@@ -233,10 +239,12 @@ impl<'a> TcpSocket<'a> {
             rto: INITIAL_RTO,
             since: 0,
             due: None,
+            stale: false,
             retries: 0,
             probes: 0,
             unanswered: 0,
             orphan_probes: 0,
+            timeouts: 0,
             cookie_at: None,
             oow_at: None,
             timed: None,
@@ -515,7 +523,7 @@ impl<'a> TcpSocket<'a> {
                 self.snd_nxt = self.snd_una;
             }
             self.grow(acked);
-            (self.retries, self.probes, self.since) = (0, 0, now);
+            (self.retries, self.probes, self.orphan_probes, self.since) = (0, 0, 0, now);
             if fin_acked {
                 self.state = match self.state {
                     State::FinWait1 => State::FinWait2,
@@ -651,6 +659,15 @@ impl<'a> TcpSocket<'a> {
     }
 
     /// Fires the deadline if it has come; true if it had, so the caller recomputes it.
+    /// Recomputes the deadline at the end of an event. An obligation appearing with none before starts its timer
+    /// now, so a timeout never counts against a segment that was owed but not yet sent.
+    fn refresh(&mut self, now: u64) {
+        if self.due.is_none() {
+            self.since = now;
+        }
+        (self.due, self.stale) = (self.deadline(), false);
+    }
+
     fn on_timer(&mut self, now: u64) -> bool {
         if self.due.is_none_or(|d| now < d) {
             return false;
@@ -676,6 +693,7 @@ impl<'a> TcpSocket<'a> {
             self.force = true;
         } else {
             self.retries += 1;
+            self.timeouts += 1;
             let tries = if self.synchronized() {
                 DATA_TRIES
             } else {
@@ -1011,7 +1029,7 @@ impl<'a> Stack<'a> {
         let s = &mut self.tcp.sockets[i];
         s.reset(State::SynSent, local, to);
         (s.iss, s.snd_una, s.snd_nxt, s.snd_max, s.recover) = (iss, iss, iss, iss, iss);
-        s.since = now;
+        s.refresh(now);
         Ok(TcpId(i))
     }
 
@@ -1038,7 +1056,7 @@ impl<'a> Stack<'a> {
         }
         let pos = (s.tx_head + s.tx_len) % s.tx.len();
         ring_put(s.tx, pos, &data[..n]);
-        s.tx_len += n;
+        (s.tx_len, s.stale) = (s.tx_len + n, true);
         Ok(n)
     }
 
@@ -1067,6 +1085,7 @@ impl<'a> Stack<'a> {
         let Some(s) = self.tcp.sockets.get_mut(id.0) else {
             return;
         };
+        s.stale = true;
         match s.state {
             State::SynSent | State::SynReceived => s.shut = true,
             State::Established => (s.state, s.shut) = (State::FinWait1, true),
@@ -1099,7 +1118,7 @@ impl<'a> Stack<'a> {
         }
         s.open = false;
         s.parent = None;
-        s.due = s.deadline();
+        s.stale = true;
         self.shutdown(id);
     }
 
@@ -1125,6 +1144,7 @@ impl<'a> Stack<'a> {
             deadline: s.due,
             queued: s.tx_len,
             released: !s.open,
+            timeouts: s.timeouts,
         })
     }
 
@@ -1176,12 +1196,14 @@ impl<'a> Stack<'a> {
             .position(|t| t.until > now && t.local == s.port && t.remote == s.from)
         {
             let w = self.tcp.time_wait[t];
-            // A new incarnation needs a listener and room for its gap ISS; else TIME_WAIT answers the SYN.
-            let room = self.listener(s.port).is_some()
+            // A new incarnation needs a SYN, a listener and room for its gap ISS; else TIME_WAIT answers.
+            let takeover = s.flags & (SYN | ACK) == SYN
+                && gt(s.seq, w.rcv_nxt)
+                && self.listener(s.port).is_some()
                 && self
                     .slots(s.port, s.from)
                     .any(|h| self.tcp.half_open[h].remote.port() == 0);
-            if s.flags & SYN != 0 && gt(s.seq, w.rcv_nxt) && room {
+            if takeover {
                 self.tcp.time_wait[t] = TimeWait::EMPTY;
                 let ips = (u32::from(self.config.ip) as u64) << 32 | u32::from(*s.from.ip()) as u64;
                 let ports = (s.port as u64) << 16 | s.from.port() as u64;
@@ -1233,7 +1255,7 @@ impl<'a> Stack<'a> {
         }
         self.settle(i, now);
         let c = &mut self.tcp.sockets[i];
-        c.due = c.deadline();
+        c.refresh(now);
         r
     }
 
@@ -1461,9 +1483,8 @@ impl<'a> Stack<'a> {
         let mut next = self.tcp.half_open_due;
         for i in 0..self.tcp.sockets.len() {
             let fired = self.tcp.sockets[i].on_timer(now);
-            if self.tcp_output(nic, now, i, mss) || fired {
-                let s = &mut self.tcp.sockets[i];
-                s.due = s.deadline();
+            if self.tcp_output(nic, now, i, mss) || fired || self.tcp.sockets[i].stale {
+                self.tcp.sockets[i].refresh(now);
             }
             next = crate::earliest(next, self.tcp.sockets[i].due);
         }
