@@ -305,6 +305,9 @@ impl<D: Disk> Fs<D> {
 
     /// Empties `file`.
     pub fn truncate(&mut self, file: Inode) -> Result<(), Error> {
+        if self.broken {
+            return Err(Error::Io);
+        }
         if self.file(file)?.size == 0 {
             return Ok(());
         }
@@ -318,6 +321,9 @@ impl<D: Disk> Fs<D> {
 
     /// Removes a file or an empty directory and frees its inode and blocks. `NoSpace` changes nothing.
     pub fn unlink(&mut self, dir: Inode, name: &[u8]) -> Result<(), Error> {
+        if self.broken {
+            return Err(Error::Io);
+        }
         let (e, inode) = self.find(dir, name)?;
         if inode == ROOT {
             return Err(Error::Corrupt);
@@ -337,7 +343,7 @@ impl<D: Disk> Fs<D> {
     }
 
     /// Moves an entry, possibly to another directory; `Exists` if `to_name` is taken, `InvalidName` if a directory would
-    /// move into itself or below itself. `NoSpace` changes nothing.
+    /// move into itself or below itself; renaming an entry to itself does nothing. `NoSpace` changes nothing.
     pub fn rename(
         &mut self,
         from_dir: Inode,
@@ -345,14 +351,34 @@ impl<D: Disk> Fs<D> {
         to_dir: Inode,
         to_name: &[u8],
     ) -> Result<(), Error> {
-        let (e, inode) = self.find(from_dir, from_name)?;
-        if !valid_name(to_name) {
+        if self.broken {
+            return Err(Error::Io);
+        }
+        if !valid_name(to_name) || !valid_name(from_name) {
             return Err(Error::InvalidName);
         }
-        if self
-            .scan(to_dir, 0, false, |n, _, _| n == to_name)?
-            .is_some()
-        {
+        if from_dir == to_dir && from_name == to_name {
+            return self.find(from_dir, from_name).map(|_| ());
+        }
+        let (mut e, mut k, mut found) = (None, 0, ROOT);
+        if from_dir != to_dir {
+            let (fe, fi) = self.find(from_dir, from_name)?;
+            (e, found) = (Some(fe), fi);
+        }
+        let taken = self
+            .scan(to_dir, 0, false, |n, i, _| {
+                if e.is_none() && n == from_name {
+                    (e, found) = (Some(k), i);
+                }
+                k += 1;
+                n == to_name
+            })?
+            .is_some();
+        let (e, inode) = match e {
+            Some(e) => (e, found),
+            None => self.find(from_dir, from_name)?,
+        };
+        if taken {
             return Err(Error::Exists);
         }
         let entry = dirent(inode, to_name);
@@ -365,7 +391,11 @@ impl<D: Disk> Fs<D> {
             self.write_data(&mut from, (e * DIRENT) as u64, &entry)?;
             return self.set(from_dir, from);
         }
-        if self.records[inode.0 as usize].kind == DIR && self.below(inode, to_dir)? {
+        if inode == to_dir
+            || (to_dir != ROOT
+                && self.records[inode.0 as usize].kind == DIR
+                && self.below(inode, to_dir)?)
+        {
             return Err(Error::InvalidName);
         }
         let mut to = self.dir(to_dir)?;
@@ -769,12 +799,16 @@ impl<D: Disk> Fs<D> {
         if e == last {
             return Ok((None, 0));
         }
+        // Keeps slot `e`'s buffered block when the last entry lives in another block.
+        let keep = self.cached == Some(d.ptrs[e / PER_DIR_BLOCK])
+            && e / PER_DIR_BLOCK != last / PER_DIR_BLOCK;
         match d.ptrs[last / PER_DIR_BLOCK] {
             0 => return Err(Error::Corrupt),
-            p => self.load(p, false)?,
+            p => self.load(p, keep)?,
         }
         let at = last % PER_DIR_BLOCK * DIRENT;
-        let entry = self.bufs[DATA][at..at + DIRENT].try_into().unwrap();
+        let buf = if keep { META } else { DATA };
+        let entry = self.bufs[buf][at..at + DIRENT].try_into().unwrap();
         Ok((Some(entry), !self.fresh(d.ptrs[e / PER_DIR_BLOCK]) as usize))
     }
 
@@ -802,10 +836,15 @@ impl<D: Disk> Fs<D> {
                 return Ok(true);
             }
             done[d / 64] |= 1 << (d % 64);
-            self.scan(Inode(d as u32), 0, false, |_, i, _| {
-                seen[i.0 as usize / 64] |= 1 << (i.0 % 64);
-                false
-            })?;
+            if self
+                .scan(Inode(d as u32), 0, false, |_, i, _| {
+                    seen[i.0 as usize / 64] |= 1 << (i.0 % 64);
+                    i == target
+                })?
+                .is_some()
+            {
+                return Ok(true);
+            }
             next = (0..MAX_INODES as usize).find(|&i| {
                 (seen[i / 64] & !done[i / 64]) >> (i % 64) & 1 != 0 && self.records[i].kind == DIR
             });
