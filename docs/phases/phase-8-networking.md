@@ -188,3 +188,13 @@ Decision: write `crates/net` fresh. smoltcp is a host-only dev-dependency of `cr
   is charged to the listener's creator (fails once it exits; peers can spend up to 64 of its frames; charging it at
   `listen` would fix both); the net task runs at priority 0 (`Board::spawn`), so any busy process delays the stack,
   until the board can spawn kernel tasks at a priority (the e2e host page then must read the whole request).
+- **Follow-ups (owner's list, after the merge into main).** A socket's charge follows ownership: every process holding
+  a handle to it pays its cost (a bitmask of process indices in the socket entry); `spawn` charges the child before
+  it starts (`ENOBUFS`) and refunds the parent if it kept no handle; a process's last handle (close or exit) refunds
+  it, so no socket is charged to nobody. `listen(socket, backlog)` takes a backlog of 1 to 8 and charges every holder
+  for it up front, so peers queue only prepaid connections and an exited creator no longer breaks a listener. Booting
+  with a NIC: the NIC probe and setup (about 45 us of MMIO exits under hvf), the ring memory and the stacks (15 us)
+  and the timer moved into the net task, and the DTB's `rng-seed` is now read in the bootargs walk (`Dtb::chosen`;
+  a second walk of the whole blob cost about 45000 instructions): boot with a NIC runs 164000 instructions against
+  157000 without one (TCG `-icount`; main: 264000 against 156000); of that, the DTB walk is removed, the NIC and network setup is moved past the `boot:` stamp (a scenario waits for it). A `net=` without a NIC starts nothing (`Board::has_nic` reads device IDs only). Still open: `accept` cannot report the peer's
+  address until `crates/net` exposes a connection's remote address (`TcpInfo` has none).

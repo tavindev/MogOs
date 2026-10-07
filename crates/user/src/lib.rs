@@ -333,9 +333,9 @@ pub fn bind(socket: u64, port: u16) -> i64 {
     syscall(21, [socket, port.into(), 0, 0])
 }
 
-/// Listens on the bound port.
-pub fn listen(socket: u64) -> i64 {
-    syscall(22, [socket, 0, 0, 0])
+/// Listens on the bound port, holding up to `backlog` (1 to 8) connections for accept; they are charged now.
+pub fn listen(socket: u64, backlog: u64) -> i64 {
+    syscall(22, [socket, backlog, 0, 0])
 }
 
 /// Starts `op` on `socket`; `io_wait` reports its result with `tag`. `ptr` and `len` are its buffer (`OP_CONNECT`:

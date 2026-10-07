@@ -8,7 +8,7 @@ use crate::handle::{
     CONNECT, EXEC, Handles, KILL as KILL_RIGHT, LISTEN, MAX_HANDLES, Object, READ, Rights, WRITE,
 };
 use crate::mutex::Mutex;
-use crate::network::{OP_ACCEPT, OP_CONNECT, OP_RECEIVE, OP_SEND, Sock};
+use crate::network::{BACKLOG, OP_ACCEPT, OP_CONNECT, OP_RECEIVE, OP_SEND, Sock};
 use crate::pipe::End;
 
 /// `exit(code)`: ends the calling process, every thread; `wait` reports the low 8 bits of `code`.
@@ -97,8 +97,10 @@ const SOCKET: u64 = 20;
 /// for `connect`; write right) and, for `listen`, the address: 0 listens on every interface, 127.0.0.1 (a big-endian
 /// `u32`) on loopback only, anything else is `EADDRNOTAVAIL`; returns 0. `EINVAL` once listening or connected.
 const BIND: u64 = 21;
-/// `listen(socket)`: listens on the bound port (`EINVAL` without one) on every interface (write right and `LISTEN`, else
-/// `EACCES`; `EADDRINUSE`); returns 0.
+/// `listen(socket, backlog)`: listens on the bound port (`EINVAL` without one) on every interface, or loopback only
+/// (`bind`), holding up to `backlog` (clamped to 1..=`BACKLOG`, 8) connections for accept (write right and `LISTEN`,
+/// else `EACCES`; `EADDRINUSE`); returns 0. Each process holding the socket is charged for the backlog now
+/// (`ENOBUFS`), so connections peers make are prepaid.
 const LISTEN_CALL: u64 = 22;
 /// `io_submit(socket, op, ptr, len, tag)`: starts `op` and returns 0 at once; `io_wait` reports its result with `tag`.
 /// `OP_RECEIVE` reads at most `len` bytes into `ptr` (read right; 0 is the end of the stream), `OP_SEND` queues up to
@@ -349,7 +351,10 @@ pub enum NetCall {
         port: u16,
         loopback: bool,
     },
-    Listen(Sock),
+    Listen {
+        sock: Sock,
+        backlog: u8,
+    },
     /// Submit `op` on `sock`; for a receive or send `ptr..ptr + len` is in `USER` unless empty, but may be unmapped.
     /// `rights` are the handle's: an accepted connection's handle gets no more.
     Submit {
@@ -531,7 +536,10 @@ pub fn dispatch(nr: u64, args: &[u64; 7], handles: &mut Handles) -> Result<Call,
                 loopback,
             }))
         }
-        LISTEN_CALL => Ok(Call::Net(NetCall::Listen(socket(handles, args[0], WRITE)?))),
+        LISTEN_CALL => Ok(Call::Net(NetCall::Listen {
+            sock: socket(handles, args[0], WRITE)?,
+            backlog: args[1].clamp(1, BACKLOG as u64) as u8,
+        })),
         IO_SUBMIT => {
             let (op, ptr, len, tag) = (args[1], args[2], args[3], args[4]);
             let need = match op {
