@@ -1,5 +1,5 @@
 use kernel::handle::{Handles, Object, READ, WRITE};
-use kernel::syscall::{Call, EACCES, ENOTDIR, EROFS, dispatch};
+use kernel::syscall::{Call, EACCES, EADDRNOTAVAIL, ENOTDIR, EROFS, dispatch};
 use mogfs::ROOT;
 
 const SYNC: u64 = 15;
@@ -43,6 +43,8 @@ fn bind_and_listen_change_a_socket_so_they_need_its_write_right() {
     });
     let read_only = handles.insert(sock, READ).unwrap();
     let writable = handles.insert(sock, WRITE).unwrap();
+    let elsewhere = dispatch(BIND, &[writable, 80, 0x0a00_020f, 0, 0, 0, 0], &mut handles);
+    assert_eq!(elsewhere.err(), Some(EADDRNOTAVAIL));
     for nr in [BIND, LISTEN] {
         let call = dispatch(nr, &[read_only, 80, 0, 0, 0, 0, 0], &mut handles);
         assert_eq!(call.err(), Some(EACCES), "syscall {nr}");

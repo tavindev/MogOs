@@ -121,7 +121,11 @@ const SOCKET_RIGHTS: u64 = READ | WRITE | DUPLICATE | TRANSFER;
 pub fn syscall(sched: &mut Sched, call: NetCall, tag: &mut u64) -> Option<i64> {
     Some(match call {
         NetCall::Socket(allowed) => socket(sched, allowed),
-        NetCall::Bind { sock, port } => status(net(sched, |n| n.bind(sock, port))),
+        NetCall::Bind {
+            sock,
+            port,
+            loopback,
+        } => status(net(sched, |n| n.bind(sock, port, loopback))),
         NetCall::Listen(sock) => status(net(sched, |n| n.listen(sock))),
         NetCall::Shutdown(sock) => status(net(sched, |n| n.shutdown(sock))),
         NetCall::Submit {
@@ -254,7 +258,7 @@ fn task(_: &mut QemuVirt, _: usize) -> ! {
         if let Some((nic, network)) = &mut *NET.lock() {
             let (deadline, more) = network.poll(nic.as_mut(), now(), &mut kernel.sched);
             DEADLINE.store(deadline.unwrap_or(u64::MAX), Relaxed);
-            PENDING.fetch_or(more, Relaxed);
+            PENDING.fetch_or(more || nic.as_ref().is_some_and(VirtioNet::capped), Relaxed);
         }
         kernel.sched.wake(Event::NetIo);
     }

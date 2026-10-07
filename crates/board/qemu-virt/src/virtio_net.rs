@@ -101,7 +101,9 @@ pub struct VirtioNet {
     /// Transmit descriptors not in flight, one bit each.
     tx_free: u64,
     /// Receive buffers re-posted since the last notify.
-    reposted: bool,
+    reposted: usize,
+    /// A poll stopped at `QUEUE_SIZE` frames with more waiting.
+    capped: bool,
 }
 
 const _: () = assert!(QUEUE_SIZE <= 64);
@@ -127,7 +129,8 @@ impl VirtioNet {
             seen: [0; 2],
             posted: [QUEUE_SIZE as u16, 0],
             tx_free: u64::MAX >> (64 - QUEUE_SIZE),
-            reposted: false,
+            reposted: 0,
+            capped: false,
         };
         let id = nic.reg(DEVICE_ID);
         if id != NET_DEVICE || nic.reg(VERSION) != 2 {
@@ -204,6 +207,11 @@ impl VirtioNet {
         self.set(STATUS, ACKNOWLEDGE | DRIVER | FEATURES_OK | DRIVER_OK);
         self.set(QUEUE_NOTIFY, RX);
         Some(())
+    }
+
+    /// Whether the last poll stopped with frames still waiting.
+    pub fn capped(&self) -> bool {
+        self.capped
     }
 
     /// Acknowledges the device's interrupt, so its level drops.
@@ -298,8 +306,15 @@ impl Nic for VirtioNet {
     }
 
     fn receive(&mut self, f: impl FnOnce(&[u8])) -> bool {
-        let Some((id, len)) = self.next_used(RX) else {
-            if core::mem::take(&mut self.reposted) {
+        // At most a ring's worth per poll, so a flood never holds the kernel lock without end.
+        self.capped = self.reposted == QUEUE_SIZE;
+        let used = if self.capped {
+            None
+        } else {
+            self.next_used(RX)
+        };
+        let Some((id, len)) = used else {
+            if core::mem::take(&mut self.reposted) > 0 {
                 fence(SeqCst);
                 self.set(QUEUE_NOTIFY, RX);
             }
@@ -313,7 +328,7 @@ impl Nic for VirtioNet {
             f(&self.buffer(RX, id)[HEADER..len]);
         }
         self.post(RX, id);
-        self.reposted = true;
+        self.reposted += 1;
         true
     }
 }

@@ -138,3 +138,12 @@ Decision: write `crates/net` fresh. smoltcp is a host-only dev-dependency of `cr
   a plain TCP client through `hostfwd` (more than the 16 TCP slots and 8 TIME_WAIT entries; the server closes
   first, so each leaves a TIME_WAIT entry), each echo checked byte for byte, and `fetch` printing the test's host
   page. Benchmarks in `docs/BENCHMARKS.md`.
+- **Review (steps 49-51).** Fixed: the NIC's receive stops at a ring's worth of frames per poll and the net task
+  polls again, so a flood never holds `KERNEL` without end; `bind` takes an address, 127.0.0.1 listening on loopback
+  only (musl passes `sin_addr`; any other address is `EADDRNOTAVAIL`), so a C server bound to loopback is not exposed
+  on the NIC. Open, for the step-47 owner and phase 10: a closed connection whose peer advertises a zero window stays
+  in FIN-WAIT-1 forever (`crates/net` persists without limit), so peers can fill the 16 TCP slots; a socket that
+  outlives its creator is charged to nobody (the parent's refund does not subtract it as it does pipes); the backlog
+  is charged to the listener's creator (fails once it exits; peers can spend up to 64 of its frames; charging it at
+  `listen` would fix both); the net task runs at priority 0 (`Board::spawn`), so any busy process delays the stack,
+  until the board can spawn kernel tasks at a priority (the e2e host page then must read the whole request).

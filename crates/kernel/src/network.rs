@@ -43,7 +43,7 @@ const PAGE: usize = 4096;
 pub const SOCKET_FRAMES: usize = 2 * RING / PAGE;
 const SOCKETS: usize = 32;
 /// Connections a listener holds before they are accepted; one past it is reset. Each is charged to the listener's
-/// owner until accepted, so a remote peer can make the kernel hold no connection nobody pays for.
+/// owner until accepted, so a peer cannot queue connections nobody pays for.
 pub const BACKLOG: usize = 8;
 /// Frames each direction of the loopback wire holds: more than every slot's window in flight at once.
 const WIRE: usize = 128;
@@ -167,6 +167,8 @@ struct Entry {
     /// `CONNECT` and `LISTEN`, as the NetStack handle that made it held them.
     allowed: Rights,
     port: u16,
+    /// Listen on `LO` only.
+    loopback: bool,
     conn: Conn,
     /// The receive-side op and the send.
     ops: [Option<Op>; 2],
@@ -180,6 +182,7 @@ const FREE: Entry = Entry {
     owner: (0, 0),
     allowed: 0,
     port: 0,
+    loopback: false,
     conn: Conn::Fresh,
     ops: [None; 2],
     backlog: [None; BACKLOG],
@@ -363,16 +366,16 @@ impl Network {
     }
 
     /// Sets the local port `listen` and `connect` use (0: an ephemeral one for `connect`).
-    pub fn bind(&mut self, sock: Sock, port: u16) -> Result<(), i64> {
+    pub fn bind(&mut self, sock: Sock, port: u16, loopback: bool) -> Result<(), i64> {
         let entry = self.entry(sock)?;
         if entry.conn != Conn::Fresh {
             return Err(EINVAL);
         }
-        entry.port = port;
+        (entry.port, entry.loopback) = (port, loopback);
         Ok(())
     }
 
-    /// Listens on the bound port on `ETH` (if up) and `LO`; `EADDRINUSE` if either has it.
+    /// Listens on the bound port on `LO` and, unless bound to loopback, `ETH` (if up); `EADDRINUSE` if either has it.
     pub fn listen(&mut self, sock: Sock) -> Result<(), i64> {
         let entry = *self.entry(sock)?;
         if entry.allowed & LISTEN == 0 {
@@ -386,6 +389,9 @@ impl Network {
             let Some(stack) = &mut self.stacks[s] else {
                 continue;
             };
+            if s == ETH && entry.loopback {
+                continue;
+            }
             match stack.listen(entry.port) {
                 Ok(listener) => *id = Some(listener),
                 Err(error) => {

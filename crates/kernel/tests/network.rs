@@ -137,7 +137,7 @@ impl World {
     /// A listener of `ME` on `port`, and `n` connections of `OTHER` to it, established.
     fn listen_and_connect(&mut self, port: u16, n: usize) -> (Sock, Vec<Sock>) {
         let listener = self.socket(ME, LISTEN).unwrap();
-        self.network.bind(listener, port).unwrap();
+        self.network.bind(listener, port, false).unwrap();
         self.network.listen(listener).unwrap();
         let clients: Vec<_> = (0..n)
             .map(|i| {
@@ -181,27 +181,27 @@ fn a_closed_socket_is_unreachable_and_refunds_its_owner() {
     assert_eq!(w.socket(ME, CONNECT), Err(ENOBUFS));
     w.network.close(a, &mut w.processes);
     assert_eq!(w.used(ME), SOCKET_FRAMES);
-    assert_eq!(w.network.bind(a, 1), Err(EBADF));
+    assert_eq!(w.network.bind(a, 1, false), Err(EBADF));
     // The freed entry is reused under a new generation, which the old value never reaches.
     let c = w.socket(ME, CONNECT).unwrap();
     assert_eq!(c.index, a.index);
     assert_ne!(c.generation, a.generation);
-    assert_eq!(w.network.bind(a, 1), Err(EBADF));
-    assert_eq!(w.network.bind(b, 1), Ok(()));
+    assert_eq!(w.network.bind(a, 1, false), Err(EBADF));
+    assert_eq!(w.network.bind(b, 1, false), Ok(()));
 }
 
 #[test]
 fn rights_ports_and_op_slots_are_checked() {
     let mut w = World::new(256);
     let connect_only = w.socket(ME, CONNECT).unwrap();
-    w.network.bind(connect_only, 5).unwrap();
+    w.network.bind(connect_only, 5, false).unwrap();
     assert_eq!(w.network.listen(connect_only), Err(EACCES));
     let listen_only = w.socket(ME, LISTEN).unwrap();
     let connect = (OP_CONNECT, LOCALHOST, 5, 0);
     assert_eq!(w.submit(ME, listen_only, connect), Err(EACCES));
     let (listener, clients) = w.listen_and_connect(6, 1);
     let again = w.socket(ME, LISTEN).unwrap();
-    w.network.bind(again, 6).unwrap();
+    w.network.bind(again, 6, false).unwrap();
     assert_eq!(w.network.listen(again), Err(EADDRINUSE));
     w.submit(OTHER, clients[0], (OP_RECEIVE, 0, 64, 7)).unwrap();
     let second = w.submit(OTHER, clients[0], (OP_RECEIVE, 0, 64, 8));
@@ -235,7 +235,7 @@ fn a_closed_listener_leaves_nothing_behind() {
         assert!(w.complete(OTHER).result < 0, "a queued connection is reset");
     }
     // The port is free, and connections to a new listener (likely on the old one's TCP slot) are its owner's alone.
-    w.network.bind(next, 13).unwrap();
+    w.network.bind(next, 13, false).unwrap();
     w.network.listen(next).unwrap();
     w.submit(OTHER, client, (OP_CONNECT, LOCALHOST, 13, 7))
         .unwrap();

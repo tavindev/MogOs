@@ -249,7 +249,7 @@ static long do_socket(int domain, int type, int protocol)
 	return install(fd, i, type & SOCK_CLOEXEC);
 }
 
-/* The port of an AF_INET address (its IP is not checked: a socket listens on every interface). */
+/* The port of an AF_INET address. */
 static long port_of(const struct sockaddr_in *a, socklen_t len)
 {
 	if (len < sizeof *a || a->sin_family != AF_INET) return -EINVAL;
@@ -759,7 +759,8 @@ long __mog_syscall(long n, long a, long b, long c, long d, long e, long f)
 		struct file *file = socket_file(a);
 		long port = port_of((void *)b, c);
 		if (!file) return fd_file(a) ? -ENOTSOCK : -EBADF;
-		return port < 0 ? port : svc(N_BIND, file->handle, port, 0, 0, 0, 0, 0);
+		/* The kernel takes any (0) or 127.0.0.1, which listens on loopback only. */
+		return port < 0 ? port : svc(N_BIND, file->handle, port, ntohl(((struct sockaddr_in *)b)->sin_addr.s_addr), 0, 0, 0, 0);
 	}
 	case SYS_listen:
 	case SYS_shutdown: {

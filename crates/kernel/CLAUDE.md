@@ -41,9 +41,13 @@ touches memory through raw addresses: the board reads user buffers, copies pages
   the fixed pool, so the charge is accounting) and refunded with the last handle if the owner runs (`Budgets`, which
   `Scheduler` implements). A listener holds at most `BACKLOG` (8) connections before they are accepted, each charged
   to the listener's owner by the net task's `poll` and moved to the accepter at accept; one past it, or past the
-  owner's budget, is reset, so a remote peer never makes the kernel hold a connection nobody pays for. Residual: a
-  closed connection keeps its TCP slot until its FIN exchange ends (FIN-WAIT-2 up to 60 s) after its charge is
-  refunded; the fixed slots bound that.
+  owner's budget, is reset, so a peer cannot queue connections nobody pays for. Open: a closed connection keeps its
+  TCP slot, uncharged, until its FIN exchange ends, and a peer advertising a zero window keeps it in FIN-WAIT-1
+  forever (`crates/net` probes a zero window without limit), so peers can fill the 16 slots; a socket that outlives
+  its creator is charged to nobody (the parent's `wait` refund does not subtract it, unlike pipes); the backlog's
+  charge falls on the listener's creator, so it fails once that process exits and peers can spend up to 64 of its
+  frames. The NIC's receive stops at a ring's worth of frames per poll (`VirtioNet::capped`), so a flood never holds
+  `KERNEL` without end.
   Ops run in the submitter's context (its buffers are mapped only there): tried at submit (not an accept) and by every
   `complete` (`io_wait`); the board's net task only polls and wakes `Event::NetIo`. One receive-side op (receive,
   accept, connect) and one send per socket: the ops a process has in flight are bounded by its sockets, so by its

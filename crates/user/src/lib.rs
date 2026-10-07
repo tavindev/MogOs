@@ -58,6 +58,7 @@ pub const ENAMETOOLONG: i64 = -36;
 pub const ENOSYS: i64 = -38;
 pub const ENOTEMPTY: i64 = -39;
 pub const EADDRINUSE: i64 = -98;
+pub const EADDRNOTAVAIL: i64 = -99;
 pub const ENETUNREACH: i64 = -101;
 pub const ECONNRESET: i64 = -104;
 pub const ENOBUFS: i64 = -105;
@@ -327,7 +328,7 @@ pub fn socket(net: u64) -> i64 {
     syscall(20, [net, 0, 0, 0])
 }
 
-/// Sets the local port.
+/// Sets the local port; a listener listens on every interface.
 pub fn bind(socket: u64, port: u16) -> i64 {
     syscall(21, [socket, port.into(), 0, 0])
 }

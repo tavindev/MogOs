@@ -93,8 +93,9 @@ const THREAD_EXIT: u64 = 19;
 /// needs `CONNECT` or `LISTEN` and passes the socket those of the two it holds. Its buffers are charged to the
 /// caller's budget until the last handle closes (`ENOBUFS`); `ENFILE` when the socket table is full.
 const SOCKET: u64 = 20;
-/// `bind(socket, port)`: sets the local port `listen` and `connect` use (0, the default, picks an ephemeral one for
-/// `connect`; write right); returns 0. `EINVAL` once listening or connected.
+/// `bind(socket, port, ip)`: sets the local port `listen` and `connect` use (0, the default, picks an ephemeral one
+/// for `connect`; write right) and, for `listen`, the address: 0 listens on every interface, 127.0.0.1 (a big-endian
+/// `u32`) on loopback only, anything else is `EADDRNOTAVAIL`; returns 0. `EINVAL` once listening or connected.
 const BIND: u64 = 21;
 /// `listen(socket)`: listens on the bound port (`EINVAL` without one) on every interface (write right and `LISTEN`, else
 /// `EACCES`; `EADDRINUSE`); returns 0.
@@ -184,6 +185,10 @@ const ENOSYS: i64 = -38;
 pub const ENOTEMPTY: i64 = -39;
 /// Listening on a port that is taken.
 pub const EADDRINUSE: i64 = -98;
+/// Binding to an address other than any or 127.0.0.1.
+pub const EADDRNOTAVAIL: i64 = -99;
+/// 127.0.0.1, as `bind` takes it.
+const LOCALHOST: u64 = 0x7f00_0001;
 /// Connecting off the loopback network without a NIC, or with no route.
 pub const ENETUNREACH: i64 = -101;
 /// The peer reset the connection.
@@ -342,6 +347,7 @@ pub enum NetCall {
     Bind {
         sock: Sock,
         port: u16,
+        loopback: bool,
     },
     Listen(Sock),
     /// Submit `op` on `sock`; for a receive or send `ptr..ptr + len` is in `USER` unless empty, but may be unmapped.
@@ -513,9 +519,15 @@ pub fn dispatch(nr: u64, args: &[u64; 7], handles: &mut Handles) -> Result<Call,
         },
         BIND => {
             let port = u16::try_from(args[1]).map_err(|_| EINVAL)?;
+            let loopback = match args[2] {
+                0 => false,
+                LOCALHOST => true,
+                _ => return Err(EADDRNOTAVAIL),
+            };
             Ok(Call::Net(NetCall::Bind {
                 sock: socket(handles, args[0], WRITE)?,
                 port,
+                loopback,
             }))
         }
         LISTEN_CALL => Ok(Call::Net(NetCall::Listen(socket(handles, args[0], WRITE)?))),
