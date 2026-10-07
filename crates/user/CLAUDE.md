@@ -66,7 +66,8 @@ board crate).
   `fsbench` (`fs_bench_reports_round_trips`), `spawnbench` / `nop` (`spawn_bench_reports_round_trip`), `fuzz` / `nop`
   (`fuzzer_never_crashes_the_kernel_or_leaks_frames`), `sysbench` / `nop` (`syscall_benches_report_every_call`),
   `shellsetup` / `msh` with arguments (`shell_bench_times_each_command_from_spawn_to_reap`), `nettest` and the C
-  `tcpecho` (`sockets_echo_over_loopback_wait_for_any_and_need_the_net_handle_and_budget`), all in
+  `tcpecho` (`sockets_echo_over_loopback_wait_for_any_and_need_the_net_handle_and_budget`), `httpd` and `fetch`
+  (`httpd_echoes_more_sequential_requests_than_its_tables_hold_and_fetch_gets_a_host_page`), all in
   `crates/e2e/tests/boot.rs`.
 - Clippy and fmt via the `crates/user` commands in `docs/DEVELOPMENT.md` must be clean.
 

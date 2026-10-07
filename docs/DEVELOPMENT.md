@@ -52,7 +52,7 @@ libcalls. Needs: Homebrew `llvm` (clang 19 or later for `-mabi=aapcs-soft`), `gs
 | `-global virtio-mmio.ioeventfd=off` | same | QEMU handles a queue notify in the vCPU thread instead of handing it to the main loop: hvf 4 KiB requests +9% write+flush, +19% read (21 interleaved boots); 256 KiB unchanged. |
 | `test-host` alias | `.cargo/config.toml` | Runs tests for the host target, excluding the bare-metal-only `qemu-virt` and `arch`. A string, not an array, so a nested worktree's copy overrides it instead of concatenating. A cargo alias cannot chain a second command, so `crates/user`'s host tests run from `crates/e2e/tests/user.rs`, a nested `cargo test` like the boot tests' nested build. |
 | `bench-host` alias | `.cargo/config.toml` | Runs the host `benches/*.rs` targets (`--bench '*'`) for the same crates as `test-host`. |
-| `mkfs`, `shell` aliases | `.cargo/config.toml` | `cargo mkfs` writes an empty 64 MiB MogFS `disk.img` in the current directory; `cargo shell` boots into msh with it attached (`-drive`/`-device` after the runner's `-kernel <path>`). Strings, so a worktree's copy overrides them. |
+| `mkfs`, `shell`, `httpd` aliases | `.cargo/config.toml` | `cargo mkfs` writes an empty 64 MiB MogFS `disk.img` in the current directory; `cargo shell` boots into msh with it attached (`-drive`/`-device` after the runner's `-kernel <path>`); `cargo httpd` boots into the HTTP echo server with a virtio-net NIC on QEMU's user network, the host's 127.0.0.1:8080 forwarded to the guest's port 80 (`test=httpd` alone implies `net=10.0.2.15/24,gw=10.0.2.2`, since a string alias cannot quote a two-word `-append`). Strings, so a worktree's copy overrides them. |
 | `make -C c` in the board's `build.rs` | `crates/board/qemu-virt/build.rs`, `c/Makefile` | busybox and the C programs join the boot archive in the same one-command build; the build is cached across worktrees by a hash of `c/` (about 0.4 s to check when it is built). |
 | soft-float C (`-march=armv8-a+nofp -mabi=aapcs-soft`) | `c/Makefile` | The kernel never enables FP/SIMD at EL0 (no `CPACR_EL1` FPEN), so traps and switches never save v-registers; C code follows the Rust programs. |
 | busybox `CONFIG_EXTRA_CFLAGS="-DBB_GLOBAL_CONST="` | `c/busybox.config` | clang 19 hoists the read of busybox's `const` globals pointer above its assignment (hush faulted at `0x140`); busybox's documented switch. |
@@ -110,6 +110,8 @@ cargo run -p mogfs --example mkfs --target aarch64-apple-darwin -- disk.img 1638
 [ -f disk.img ] || cargo mkfs; cargo shell  # formats disk.img if missing, boots into msh with it; files survive a reboot once synced (see "Using the shell")
 cargo run -- -drive file=disk.img,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0 -append test=bench-fs  # MogFS image; open(CREATE|TRUNC)+write+sync and open+close round trips in ns
 [ -f disk.img ] || cargo mkfs; cargo shell, then: sh -c cbench  # musl syscall round trip and busybox spawn in ns
+cargo httpd, then from the Mac: curl -v http://localhost:8080/anything -d hello  # the echo server answers 200 OK, text/plain, the request as received (see "The HTTP echo server")
+cargo run -- -netdev user,id=n0 -device virtio-net-device,netdev=n0 -append "test=httpd fetch=10.0.2.2:8000/,100"  # fetch GETs a host page 100 times (bench http-get), then the server runs
 scripts/oscompare.sh [runs]  # same C benchmarks (c/oscb.c) on MogOs, Linux and macOS, interleaved; docs/BENCHMARKS.md "Cross-OS comparison"
 cargo run -- -netdev user,id=n0 -device virtio-net-device,netdev=n0 -append "test=net net=10.0.2.15/24,gw=10.0.2.2 udp=7777"  # needs a UDP echo on the host's 127.0.0.1:7777; pings 10.0.2.2 (ping: reply from ...), echoes mog over UDP (udp: echo ...), prints the frame counters; a net= bootarg without a NIC prints net: no nic
 QEMU_ARGS="-netdev user,id=n0 -device virtio-net-device,netdev=n0" scripts/bench.sh "bench-net net=10.0.2.15/24,gw=10.0.2.2 udp=7777" 21 <mog_os>  # UDP round trip, burst send and 16-in-flight stream to the host echo (docs/BENCHMARKS.md)
@@ -137,6 +139,16 @@ Quit a hung QEMU with `Ctrl-A` then `X`.
 - Leak checks: every scenario that frees frames prints `<test>: free frames <n> before, <n> after` around all it
   spawned, and its e2e test asserts the two match (`assert_no_leak`).
 - Speed: per-call benchmarks run base and new kernels interleaved; any per-call slowdown fails (`docs/BENCHMARKS.md`).
+
+## The HTTP echo server
+
+`cargo httpd` boots MogOs with a NIC on QEMU's user network and runs `httpd` (`crates/user/src/bin/httpd.rs`) on port
+80, which QEMU forwards from the host's `127.0.0.1:8080`. For each request it answers `HTTP/1.1 200 OK` with
+`Content-Type: text/plain` and the request it received (request line, headers, body) as the body, then closes the
+connection; one connection at a time, forever. So `curl -v http://localhost:8080/anything -d hello` shows its own
+request back. The server holds only the console and a listen-only NetStack. Bootargs: `httpd=<n>` stops after `n`
+requests (the power-off follows); `fetch=<ip>:<port>[/<path>][,<times>]` first runs `fetch`, which prints that page's
+body (or, with `<times>`, GETs it that many times and prints `bench http-get: <ns> ns`). Quit with `Ctrl-A` then `X`.
 
 ## Using the shell
 

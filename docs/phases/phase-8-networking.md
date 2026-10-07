@@ -127,3 +127,14 @@ Decision: write `crates/net` fresh. smoltcp is a host-only dev-dependency of `cr
   only the accepting handle's rights (`tests/network.rs`, and `nettest: read-only accept send: EACCES` e2e); musl never
   passes the NetStack to a spawned child (`tcpecho: child socket: EBADF` e2e); a listener's connections waiting for
   accept are at most `BACKLOG` (8), each charged to its owner until accepted, the rest reset (`tests/network.rs`).
+- **51.** `httpd` is an echo server (the owner's change to "serves one page"): for each request on port 80 it answers
+  `200 OK`, `text/plain`, with the request it received (request line, headers, body) as the body, streaming a body of
+  any `Content-Length` back as it arrives, then closes; one connection at a time. As init (`test=httpd`) it runs
+  `fetch` with a connect-only NetStack, then itself as the server with a listen-only one and the console (no
+  directory: an echo serves no file). `fetch <ip>:<port>[/<path>] [<times>]` GETs over HTTP/1.0 and prints the body.
+  `cargo httpd` boots into it with `hostfwd=tcp:127.0.0.1:8080-10.0.2.15:80`; `test=httpd` alone implies QEMU's
+  user-network address, since a string alias cannot quote a two-word `-append`. e2e
+  `httpd_echoes_more_sequential_requests_than_its_tables_hold_and_fetch_gets_a_host_page`: 24 sequential POSTs from
+  a plain TCP client through `hostfwd` (more than the 16 TCP slots and 8 TIME_WAIT entries; the server closes
+  first, so each leaves a TIME_WAIT entry), each echo checked byte for byte, and `fetch` printing the test's host
+  page. Benchmarks in `docs/BENCHMARKS.md`.

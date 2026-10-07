@@ -1216,6 +1216,86 @@ fn a_net_bootarg_without_a_nic_boots_as_before() {
     assert!(status.success(), "QEMU exited with {status}");
 }
 
+/// A server on the host's loopback that answers every connection with an HTTP/1.0 page of `body`; returns its port.
+fn host_page(body: &'static str) -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let _ = stream.read(&mut [0; 1024]);
+            let head = format!("HTTP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+            let _ = stream.write_all((head + body).as_bytes());
+        }
+    });
+    port
+}
+
+/// Sends `request` to the host's `port` and reads the response to its end; `None` if the connection fails or closes
+/// at once (nothing listening behind QEMU's forward yet).
+fn exchange(port: u16, request: &str) -> Option<String> {
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).ok()?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .ok()?;
+    stream.write_all(request.as_bytes()).ok()?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response).ok()?;
+    (!response.is_empty()).then_some(response)
+}
+
+#[test]
+fn httpd_echoes_more_sequential_requests_than_its_tables_hold_and_fetch_gets_a_host_page() {
+    // More than the 16 TCP slots and 8 TIME_WAIT entries, so entries are reused.
+    const REQUESTS: usize = 24;
+    let page = host_page("hello from the host\n");
+    let forward = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let client = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(25);
+        let mut echoed = 0;
+        while echoed < REQUESTS && Instant::now() < deadline {
+            let body = format!("hello {echoed}");
+            let request = format!(
+                "POST /anything HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            match exchange(forward, &request) {
+                Some(response) => {
+                    let expected = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{request}",
+                        request.len()
+                    );
+                    assert_eq!(response, expected);
+                    echoed += 1;
+                }
+                None => sleep(Duration::from_millis(100)),
+            }
+        }
+        echoed
+    });
+    let netdev = format!("user,id=n0,hostfwd=tcp:127.0.0.1:{forward}-10.0.2.15:80");
+    let args =
+        format!("test=httpd net=10.0.2.15/24,gw=10.0.2.2 httpd={REQUESTS} fetch=10.0.2.2:{page}");
+    let (status, lines) = boot(&[
+        "-netdev",
+        &netdev,
+        "-device",
+        "virtio-net-device,netdev=n0",
+        "-append",
+        &args,
+    ]);
+    assert_eq!(client.join().unwrap(), REQUESTS, "requests echoed");
+    assert!(
+        lines.iter().any(|l| l == "hello from the host"),
+        "fetch did not print the host's page"
+    );
+    assert_no_leak(&lines, "httpd");
+    assert!(status.success(), "QEMU exited with {status}");
+}
+
 #[test]
 fn sockets_echo_over_loopback_wait_for_any_and_need_the_net_handle_and_budget() {
     let (status, lines) = boot(&["-append", "test=sockets"]);

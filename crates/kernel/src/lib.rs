@@ -154,6 +154,8 @@ const PI_BUDGET: usize = 38;
 /// `fuzz`'s own frames, its scratch memory and `map`s, its pipes and its `nop` children: a child whose handle closes
 /// before it exits gives its frames back to the system, not to `fuzz`, so a million calls spend a few thousand.
 const FUZZ_BUDGET: usize = 8192;
+/// `httpd`'s own frames and its two children's, one at a time.
+const HTTPD_BUDGET: usize = 64;
 /// `nettest`'s own frames and its children's: two C programs on musl at once, then its own copies with their sockets.
 const NET_BUDGET: usize = 512;
 /// `sysbench`'s own frames, its 11 batches of 64 `map`ped pages that it never returns, its pipes and 4 `nop` children.
@@ -205,10 +207,13 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
         .any(|a| a == "test=disk" || a == "test=bench-disk");
     let mounted = disk.take_if(|_| !raw).map(|disk| board.mount(disk));
 
+    // `test=httpd` alone takes QEMU's user network, so `cargo httpd` needs one bootarg (a string alias splits on spaces).
+    let serve = bootargs.split_whitespace().any(|a| a == "test=httpd");
     let config = bootargs
         .split_whitespace()
-        .find_map(|a| network::config(a.strip_prefix("net=")?));
-    // The NIC is probed only for a `net=` bootarg; loopback alone starts only for `test=sockets`.
+        .find_map(|a| network::config(a.strip_prefix("net=")?))
+        .or_else(|| serve.then(|| network::config("10.0.2.15/24,gw=10.0.2.2"))?);
+    // The NIC is probed only for a `net=` bootarg (or `test=httpd`); loopback alone starts only for `test=sockets`.
     let nic = config.and_then(|_| board.nic());
     let no_nic = config.is_some() && nic.is_none();
     let loopback = |a| a == "test=sockets" || a == "test=bench-sockets";
@@ -267,6 +272,7 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
             "test=bench-lock" => lock_bench(board),
             "test=smp" => smp_test(board),
             "test=fuzz" => fuzz(board, bootargs),
+            "test=httpd" => httpd(board, bootargs),
             "test=bench-shell" => shell_bench(board),
             "test=sockets" => {
                 run_archived(board, "sockets", "nettest", (NET_BUDGET, SHELL_ARCHIVE))
@@ -434,6 +440,26 @@ fn fuzz<B: Board>(board: &mut B, bootargs: &str) {
     run_checked(board, "fuzz", |board| {
         board
             .spawn_archived("fuzz", FUZZ_BUDGET, INIT_ARCHIVE, &args)
+            .expect("spawn")
+    });
+}
+
+/// Runs the boot archive's `httpd` with the bootargs `httpd=<requests>` (0, the default: forever) and
+/// `fetch=<ip>:<port>[/<path>][,<times>]` as its arguments.
+fn httpd<B: Board>(board: &mut B, bootargs: &str) {
+    let value = |key| {
+        bootargs
+            .split_whitespace()
+            .find_map(|a: &str| a.strip_prefix(key))
+    };
+    let mut args = b"httpd\0".to_vec();
+    args.extend(value("httpd=").unwrap_or("0").bytes().chain([0]));
+    if let Some(fetch) = value("fetch=") {
+        args.extend(fetch.split(',').flat_map(|v| v.bytes().chain([0])));
+    }
+    run_checked(board, "httpd", |board| {
+        board
+            .spawn_archived("httpd", HTTPD_BUDGET, INIT_ARCHIVE, &args)
             .expect("spawn")
     });
 }

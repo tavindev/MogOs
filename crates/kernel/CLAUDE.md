@@ -30,7 +30,8 @@ touches memory through raw addresses: the board reads user buffers, copies pages
   socket table; `config` parses `net=<ip>/<prefix>[,gw=<ip>]`; `test=net` / `test=bench-net`. `run` probes the NIC
   (`Board::nic`) only with that bootarg (`net: no nic` without one) and starts the network (`Board::memory` for the
   rings, `Network::new` with the DTB's `rng_seed` as the TCP key, `Board::start_net`) with a NIC or for
-  `test=sockets` / `test=bench-sockets`, before `start_cpus`. A socket is an entry reached by index and generation,
+  `test=sockets` / `test=bench-sockets`, before `start_cpus`. `test=httpd` runs `httpd` with the `httpd=` and `fetch=`
+  bootargs as arguments, and alone implies `net=10.0.2.15/24,gw=10.0.2.2` (QEMU's user network). A socket is an entry reached by index and generation,
   counted by handles like a pipe, charged `SOCKET_FRAMES` (8) to its creator's budget (`Budget::charge`; the memory is
   the fixed pool, so the charge is accounting) and refunded with the last handle if the owner runs (`Budgets`, which
   `Scheduler` implements). A listener holds at most `BACKLOG` (8) connections before they are accepted, each charged

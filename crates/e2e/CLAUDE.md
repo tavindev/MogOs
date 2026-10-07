@@ -33,7 +33,8 @@ lines and the exit status. `tests/user.rs` runs `crates/user`'s host tests (outs
   of `budget`, `spawn`, `pipe`, `wait`, `pi`, `echo`, `shell`, `bench-fs`, `bench-spawn`, `fuzz`, `bench-syscalls`, `bench-shell` and `sockets` uses it; a new scenario that frees frames should too.
 - Network scenarios boot with QEMU's user network and a `virtio-net-device` (`boot_with_nic`, devices after `extra`);
   the host side (a UDP echo, `udp_echo`) binds `127.0.0.1:0` so parallel tests never share a port, and the guest
-  reaches it as 10.0.2.2.
+  reaches it as 10.0.2.2. The httpd test forwards a free host port (bound to `127.0.0.1:0`, then released) to the
+  guest's port 80 with `hostfwd` and retries its requests until the server listens.
 - A new kernel behavior gets its failing scenario here first (`docs/WORKFLOW.md`, step 2).
 - Performance is the moat: a slowdown is never accepted because it has an explanation; it is removed, or shown to
   be unavoidable with before/after numbers (`docs/BENCHMARKS.md`).
