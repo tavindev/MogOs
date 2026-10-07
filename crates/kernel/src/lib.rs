@@ -109,8 +109,9 @@ const BOOT_BUDGET: usize = 25;
 const WAITER_BUDGET: usize = 28;
 /// `pi`'s 9 frames, its two pipes' pages and its three children's 9 each.
 const PI_BUDGET: usize = 38;
-/// `fuzz`'s own frames, its scratch memory and `map`s, its pipes and the `nop` children it spawns.
-const FUZZ_BUDGET: usize = 160;
+/// `fuzz`'s own frames, its scratch memory and `map`s, its pipes and its `nop` children: a child whose handle closes
+/// before it exits gives its frames back to the system, not to `fuzz`, so a million calls spend a few thousand.
+const FUZZ_BUDGET: usize = 8192;
 
 /// `reserved` lists physical ranges in use (kernel image, DTB).
 pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> ! {

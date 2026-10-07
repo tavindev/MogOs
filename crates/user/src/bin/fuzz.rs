@@ -259,7 +259,11 @@ impl Fuzzer {
                 self.len += 1;
                 self.len - 1
             }
-            None => pool.iter().position(|e| !e.2 || !checked(e.1)).unwrap(),
+            None => pool
+                .iter()
+                .position(|e| !e.2)
+                .or_else(|| pool.iter().position(|e| !checked(e.1)))
+                .unwrap(),
         };
         self.pool[i] = (value, kind, true);
     }
@@ -526,8 +530,9 @@ impl Fuzzer {
 
     /// Tracks the handles, pipe contents and mapped memory the call changed.
     fn record(&mut self, nr: u64, a: &[u64; 7], (result, x1): (i64, u64), list: usize) {
-        // A handle a spawn moved without the fuzzer knowing shows as closed here.
-        if result == EBADF && matches!(nr, 1..=3 | 5 | 8 | 10..=16) {
+        // A handle a spawn moved without the fuzzer knowing shows as closed here; not through `wait` or `kill`, whose
+        // EBADF can also mean a live handle to a reaped child whose slot was reused.
+        if result == EBADF && matches!(nr, 1..=3 | 5 | 10 | 11 | 13..=16) {
             self.drop(a[0]);
         }
         if result < 0 {
