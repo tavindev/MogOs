@@ -62,3 +62,115 @@ fn contiguous_alloc_skips_used_frames() {
     assert_eq!(frames.alloc_contiguous(2), Some(frame(0)..frame(2)));
     assert_eq!(frames.free_count(), 2);
 }
+
+#[test]
+fn contiguous_alloc_straddles_words() {
+    let mut frames = FrameAllocator::<3>::new(frame(0)..frame(192));
+    frames.reserve(frame(0)..frame(62));
+    assert_eq!(frames.alloc_contiguous(4), Some(frame(62)..frame(66)));
+    frames.reserve(frame(66)..frame(127));
+    assert_eq!(frames.alloc_contiguous(65), Some(frame(127)..frame(192)));
+    assert_eq!(frames.free_count(), 0);
+}
+
+#[test]
+fn contiguous_alloc_spans_a_whole_word() {
+    let mut frames = FrameAllocator::<4>::new(frame(0)..frame(256));
+    frames.reserve(frame(0)..frame(60));
+    frames.reserve(frame(190)..frame(191));
+    assert_eq!(frames.alloc_contiguous(130), Some(frame(60)..frame(190)));
+}
+
+#[test]
+fn contiguous_alloc_takes_the_run_at_the_very_end() {
+    let mut frames = FrameAllocator::<2>::new(frame(0)..frame(70));
+    frames.reserve(frame(0)..frame(65));
+    assert_eq!(frames.alloc_contiguous(6), None);
+    assert_eq!(frames.alloc_contiguous(5), Some(frame(65)..frame(70)));
+    assert_eq!(frames.alloc_contiguous(1), None);
+    let mut frames = FrameAllocator::<1>::new(frame(0)..frame(64));
+    frames.reserve(frame(0)..frame(1));
+    assert_eq!(frames.alloc_contiguous(63), Some(frame(1)..frame(64)));
+}
+
+#[test]
+fn contiguous_alloc_exhausts_and_reuses_freed_frames() {
+    let mut frames = FrameAllocator::<2>::new(frame(0)..frame(128));
+    assert_eq!(frames.alloc_contiguous(129), None);
+    assert_eq!(frames.alloc_contiguous(128), Some(frame(0)..frame(128)));
+    assert_eq!(frames.alloc_contiguous(1), None);
+    frames.free(frame(64));
+    assert_eq!(frames.alloc_contiguous(2), None);
+    assert_eq!(frames.alloc_contiguous(1), Some(frame(64)..frame(65)));
+    assert_eq!(FrameAllocator::<2>::empty().alloc_contiguous(1), None);
+}
+
+#[test]
+fn contiguous_alloc_skips_fragmented_runs() {
+    let mut frames = FrameAllocator::<4>::new(frame(0)..frame(256));
+    for i in (0..200).step_by(4) {
+        frames.reserve(frame(i)..frame(i + 1));
+    }
+    assert_eq!(frames.alloc_contiguous(3), Some(frame(1)..frame(4)));
+    assert_eq!(frames.alloc_contiguous(4), Some(frame(197)..frame(201)));
+}
+
+/// Drives the allocator and a bit-per-frame model with the same random operations and compares every result.
+#[test]
+fn matches_a_bit_by_bit_model() {
+    for seed in 1..=500u64 {
+        let mut rng = seed;
+        let mut next = move |n: u64| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng % n
+        };
+        let total = 1 + next(256);
+        let mut frames = FrameAllocator::<4>::new(frame(0)..frame(total));
+        let mut used = vec![false; total as usize];
+        for _ in 0..200 {
+            match next(4) {
+                0 => {
+                    let max = if next(4) == 0 { 140 } else { 8 };
+                    let count = 1 + next(max) as usize;
+                    let expect = used
+                        .windows(count)
+                        .position(|w| w.iter().all(|u| !u))
+                        .map(|s| {
+                            used[s..s + count].fill(true);
+                            frame(s as u64)..frame((s + count) as u64)
+                        });
+                    assert_eq!(frames.alloc_contiguous(count), expect, "seed {seed}");
+                }
+                1 => {
+                    let expect = used.iter().position(|u| !u).map(|s| {
+                        used[s] = true;
+                        frame(s as u64)
+                    });
+                    assert_eq!(frames.alloc(), expect, "seed {seed}");
+                }
+                2 => {
+                    let start = next(total);
+                    let end = start + next(8);
+                    used[start as usize..(end.min(total)) as usize].fill(true);
+                    frames.reserve(frame(start)..frame(end));
+                }
+                _ => {
+                    for _ in 0..next(16) {
+                        let i = next(total) as usize;
+                        if used[i] {
+                            used[i] = false;
+                            frames.free(frame(i as u64));
+                        }
+                    }
+                }
+            }
+            assert_eq!(
+                frames.free_count(),
+                used.iter().filter(|u| !**u).count(),
+                "seed {seed}"
+            );
+        }
+    }
+}
