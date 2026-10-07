@@ -103,6 +103,7 @@ cargo run -- -append test=pi         # timer on: L (priority 1) holds a mutex H 
 cargo run -- -append test=echo       # readlines prints E: ready, reads two lines typed on the console (echoed, backspace erases), prints got: <line> for each
 cargo run -- -append test=bench-spawn # spawnbench spawns nop, waits and closes it 1000 times without and then with two arguments; prints each round trip in ns
 cargo run -- -append test=bench-pipe # ping and pong echo one byte over two pipes 100000 times; prints the round trip in ns
+cargo run -- -smp 1 -append test=refund  # refund kills its child nop (a zombie it holds), hands its blocked last thread's handle to refundc, which kills it: R: the killer gained 0 pages (the zombie's frames go to the holder)
 cargo run -- -append test=threads    # timer on: four threads add to a shared counter (T: count 400000) and are joined with their TLS as exit codes; a process with a spinning and a blocked thread is killed; free frames before/after match
 cargo run -- -append test=bench-threads # threadbench: thread create + join + close 1000 times, then one byte to a thread of the same process and back over two pipes 100000 times; prints each round trip in ns
 cargo run -- -smp 12 -append test=bench-smp  # 1, 2, 4, 8, 12 smpwork processes at once (up to the cores) for 0-byte writes, pipe round trips with their own pong, spawn + wait of nop; prints ops/s and KERNEL's contended acquisitions per run

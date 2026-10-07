@@ -18,6 +18,24 @@ impl kernel::Clamp for Min {
 
 const STACK: PhysAddr = PhysAddr(0x9000);
 
+#[test]
+fn a_task_woken_between_its_block_and_its_switch_is_not_picked_by_another_core() {
+    let mut sched = Scheduler::<4, 4>::new();
+    sched.start_cores(2, 0xd0);
+    assert_eq!(sched.switch(1, 0xd1).0, 0xd1);
+    let ((a, _), _) = spawn(&mut sched, 0x100);
+    assert_eq!(sched.switch(1, 0xd1).0, 0x100);
+    sched.block(1, Event::Pipe(1));
+    sched.wake(Event::Pipe(1));
+    assert_eq!(sched.switch(0, 0x10).0, 0x10, "a still runs on core 1");
+    assert_eq!(sched.core_of(a), Some(1));
+    assert_eq!(
+        sched.switch(1, 0x110).0,
+        0x110,
+        "core 1 switches away, a is ready"
+    );
+}
+
 type Id = (usize, u64);
 
 /// A new process with `budget` frames and one thread at `frame` and `priority`; returns the thread and the process.
@@ -62,7 +80,7 @@ fn give<const N: usize, const P: usize>(sched: &mut Scheduler<N, P>, object: Obj
 fn exit<const N: usize, const P: usize>(sched: &mut Scheduler<N, P>, code: u64) -> usize {
     let (slot, _) = sched.current(0);
     assert_eq!(sched.end(slot, code), (STACK, None));
-    sched.switch(0, 0xdead)
+    sched.switch(0, 0xdead).0
 }
 
 #[test]
@@ -73,20 +91,20 @@ fn exited_slot_is_skipped_then_reused() {
     spawn(&mut sched, 0x200);
     assert_eq!(sched.count(), 3);
 
-    assert_eq!(sched.switch(0, 0x10), 0x100);
+    assert_eq!(sched.switch(0, 0x10).0, 0x100);
     assert_eq!(exit(&mut sched, 0), 0x200);
     assert_eq!(sched.current(0).0, 2);
     assert_eq!(sched.process(0), 2);
     assert_eq!(sched.space(2), PhysAddr(0x200));
     assert_eq!(sched.count(), 2);
 
-    assert_eq!(sched.switch(0, 0x210), 0x10);
-    assert_eq!(sched.switch(0, 0x11), 0x210, "the free slot 1 is skipped");
+    assert_eq!(sched.switch(0, 0x210).0, 0x10);
+    assert_eq!(sched.switch(0, 0x11).0, 0x210, "the free slot 1 is skipped");
 
     spawn(&mut sched, 0x300);
     assert_eq!(sched.count(), 3);
-    assert_eq!(sched.switch(0, 0x220), 0x11);
-    assert_eq!(sched.switch(0, 0x12), 0x300, "slot 1 is reused");
+    assert_eq!(sched.switch(0, 0x220).0, 0x11);
+    assert_eq!(sched.switch(0, 0x12).0, 0x300, "slot 1 is reused");
     assert_eq!(sched.current(0).0, 1);
     assert_eq!(sched.process(0), 1, "so is process index 1");
 }
@@ -119,17 +137,21 @@ fn blocked_tasks_are_skipped_until_woken_and_boot_runs_when_none_is_ready() {
     spawn(&mut sched, 0x200);
 
     sched.block(0, Event::Idle);
-    assert_eq!(sched.switch(0, 0x10), 0x100);
+    assert_eq!(sched.switch(0, 0x10).0, 0x100);
     sched.block(0, Event::Pipe(3));
-    assert_eq!(sched.switch(0, 0x110), 0x200, "boot is idle, 1 is blocked");
+    assert_eq!(
+        sched.switch(0, 0x110).0,
+        0x200,
+        "boot is idle, 1 is blocked"
+    );
     sched.block(0, Event::Exit(1));
-    assert_eq!(sched.switch(0, 0x210), 0x10, "none ready: boot");
+    assert_eq!(sched.switch(0, 0x210).0, 0x10, "none ready: boot");
     assert_eq!(sched.count(), 3);
 
     sched.wake(Event::Pipe(3));
-    assert_eq!(sched.switch(0, 0x11), 0x110, "woken");
-    assert_eq!(sched.switch(0, 0x111), 0x11, "2 still blocked");
-    assert_eq!(sched.switch(0, 0x12), 0x111);
+    assert_eq!(sched.switch(0, 0x11).0, 0x110, "woken");
+    assert_eq!(sched.switch(0, 0x111).0, 0x11, "2 still blocked");
+    assert_eq!(sched.switch(0, 0x12).0, 0x111);
     assert_eq!(exit(&mut sched, 0), 0x210, "process 1's end woke 2");
 }
 
@@ -140,14 +162,14 @@ fn an_exited_child_stays_a_zombie_until_reaped_and_one_without_a_handle_frees_at
     spawn(&mut sched, 0x100);
     let (_, child) = spawn(&mut sched, 0x200);
     let (_, orphan) = spawn(&mut sched, 0x300);
-    assert_eq!(sched.switch(0, 0x10), 0x100);
+    assert_eq!(sched.switch(0, 0x10).0, 0x100);
     let process = Object::Process {
         index: child.0,
         generation: child.1,
     };
     give(&mut sched, process);
 
-    assert_eq!(sched.switch(0, 0x110), 0x200);
+    assert_eq!(sched.switch(0, 0x110).0, 0x200);
     assert_eq!(exit(&mut sched, 7), 0x300);
     assert_eq!(
         sched.free_process(),
@@ -179,16 +201,16 @@ fn closing_the_handle_frees_an_exited_child_and_lets_a_running_one_free_at_exit(
     sched.start_cores(1, 0);
     spawn(&mut sched, 0x100);
     let (_, child) = spawn_with(&mut sched, 0x200, 12, 0);
-    assert_eq!(sched.switch(0, 0x10), 0x100);
+    assert_eq!(sched.switch(0, 0x10).0, 0x100);
     let process = Object::Process {
         index: child.0,
         generation: child.1,
     };
     let handle = give(&mut sched, process);
-    assert_eq!(sched.switch(0, 0x110), 0x200);
+    assert_eq!(sched.switch(0, 0x110).0, 0x200);
     assert_eq!(exit(&mut sched, 1), 0x10);
     assert_eq!(sched.free_process(), None);
-    assert_eq!(sched.switch(0, 0x11), 0x110);
+    assert_eq!(sched.switch(0, 0x11).0, 0x110);
 
     assert_eq!(sched.close(child.0, child.1 + 1), 0);
     assert_eq!(sched.free_process(), None, "another generation's close");
@@ -204,7 +226,7 @@ fn closing_the_handle_frees_an_exited_child_and_lets_a_running_one_free_at_exit(
     let handle = give(&mut sched, process);
     sched.handles(0).close(Handle::new::<Min>(handle)).unwrap();
     assert_eq!(sched.close(child.0, child.1), 0, "still running");
-    assert_eq!(sched.switch(0, 0x111), 0x300);
+    assert_eq!(sched.switch(0, 0x111).0, 0x300);
     exit(&mut sched, 2);
     assert_eq!(
         sched.free_process().unwrap().0,
@@ -224,7 +246,7 @@ fn a_process_ends_with_its_last_thread_and_its_code() {
     assert_eq!(sched.process_of(second.0), process.0);
 
     sched.block(0, Event::Exit(process.0));
-    assert_eq!(sched.switch(0, 0x10), 0x100);
+    assert_eq!(sched.switch(0, 0x10).0, 0x100);
     assert_eq!((sched.process(0), sched.generation(0)), process);
     assert_eq!(exit(&mut sched, 3), 0x200, "the boot context still waits");
     assert_eq!(sched.process_live(process.0, process.1), Ok(true));
@@ -245,7 +267,7 @@ fn a_join_reports_the_code_once_and_a_held_thread_stays_a_zombie() {
     let held = thread(&mut sched, process.0, 0x200, 0);
     let free = thread(&mut sched, process.0, 0x300, 0);
     sched.block(0, Event::Idle);
-    assert_eq!(sched.switch(0, 0x10), 0x100);
+    assert_eq!(sched.switch(0, 0x10).0, 0x100);
     let object = Object::Thread {
         slot: held.0,
         generation: held.1,
@@ -254,7 +276,7 @@ fn a_join_reports_the_code_once_and_a_held_thread_stays_a_zombie() {
     assert_eq!(sched.join(held.0, held.1), Ok(None), "still running");
     sched.block(0, Event::Join(held.0));
 
-    assert_eq!(sched.switch(0, 0x110), 0x200);
+    assert_eq!(sched.switch(0, 0x110).0, 0x200);
     assert_eq!(exit(&mut sched, 9), 0x300, "the joiner woke, after 2");
     assert_eq!(exit(&mut sched, 4), 0x110);
     assert_eq!(sched.free_slot().unwrap().0, free.0, "no handle: freed");
@@ -292,25 +314,29 @@ fn highest_priority_runs_round_robin_within_a_level_and_a_waiter_lends_its_prior
     spawn_with(&mut sched, 0x300, 0, 2);
     let ((high, _), _) = spawn_with(&mut sched, 0x400, 0, 3);
 
-    assert_eq!(sched.switch(0, 0x10), 0x400);
-    assert_eq!(sched.switch(0, 0x400), 0x400, "alone at its level");
+    assert_eq!(sched.switch(0, 0x10).0, 0x400);
+    assert_eq!(sched.switch(0, 0x400).0, 0x400, "alone at its level");
     sched.boost(0, low);
     sched.block(0, Event::Lock(5));
-    assert_eq!(sched.switch(0, 0x400), 0x100, "low runs at high's priority");
+    assert_eq!(
+        sched.switch(0, 0x400).0,
+        0x100,
+        "low runs at high's priority"
+    );
 
     sched.unboost(low, |e| e == Event::Lock(5));
     assert_eq!(
-        sched.switch(0, 0x100),
+        sched.switch(0, 0x100).0,
         0x100,
         "high still waits on a mutex low owns"
     );
     sched.unboost(low, |e| e == Event::Lock(6));
-    assert_eq!(sched.switch(0, 0x100), 0x200, "back to 1: the 2s run");
-    assert_eq!(sched.switch(0, 0x200), 0x300, "round robin");
-    assert_eq!(sched.switch(0, 0x300), 0x200);
+    assert_eq!(sched.switch(0, 0x100).0, 0x200, "back to 1: the 2s run");
+    assert_eq!(sched.switch(0, 0x200).0, 0x300, "round robin");
+    assert_eq!(sched.switch(0, 0x300).0, 0x200);
 
     sched.wake(Event::Lock(5));
-    assert_eq!(sched.switch(0, 0x200), 0x400);
+    assert_eq!(sched.switch(0, 0x200).0, 0x400);
     assert_eq!(sched.current(0).0, high);
 }
 
@@ -322,16 +348,16 @@ fn ending_a_waiter_reports_its_event_so_the_owner_drops_its_boost_and_is_outrank
     spawn_with(&mut sched, 0x200, 0, 2);
     let ((high, _), _) = spawn_with(&mut sched, 0x300, 0, 3);
 
-    assert_eq!(sched.switch(0, 0x10), 0x300);
+    assert_eq!(sched.switch(0, 0x10).0, 0x300);
     sched.boost(0, low);
     sched.block(0, Event::Lock(5));
-    assert_eq!(sched.switch(0, 0x300), 0x100);
+    assert_eq!(sched.switch(0, 0x300).0, 0x100);
     assert!(!sched.outranked(0), "low runs at high's priority");
 
     assert_eq!(sched.end(high, KILLED), (STACK, Some(Event::Lock(5))));
     sched.unboost(low, |e| e == Event::Lock(5));
     assert!(sched.outranked(0), "back to 1, below the 2");
-    assert_eq!(sched.switch(0, 0x100), 0x200);
+    assert_eq!(sched.switch(0, 0x100).0, 0x200);
 }
 
 #[test]
@@ -347,8 +373,8 @@ fn a_zombie_thread_stays_until_its_last_handle_closes_and_a_stale_close_counts_f
     give(&mut sched, object);
     give(&mut sched, object);
     sched.block(0, Event::Idle);
-    assert_eq!(sched.switch(0, 0x10), 0x100);
-    assert_eq!(sched.switch(0, 0x110), 0x200);
+    assert_eq!(sched.switch(0, 0x10).0, 0x100);
+    assert_eq!(sched.switch(0, 0x110).0, 0x200);
     assert_eq!(exit(&mut sched, 4), 0x110);
     sched.close_thread(held.0, held.1);
     assert_eq!(sched.free_slot(), None, "one handle left: a zombie");
@@ -358,7 +384,7 @@ fn a_zombie_thread_stays_until_its_last_handle_closes_and_a_stale_close_counts_f
 
     let reused = thread(&mut sched, process.0, 0x300, 0);
     sched.close_thread(held.0, held.1);
-    assert_eq!(sched.switch(0, 0x111), 0x300);
+    assert_eq!(sched.switch(0, 0x111).0, 0x300);
     assert_eq!(exit(&mut sched, 0), 0x111);
     assert_eq!(
         sched.free_slot(),
@@ -372,7 +398,7 @@ fn a_woken_task_signals_an_idle_core_only_while_it_still_waits_for_one() {
     let mut sched = Scheduler::<4, 4>::new();
     sched.start_cores(2, 0xd0);
     assert_eq!(
-        sched.switch(1, 0xd1),
+        sched.switch(1, 0xd1).0,
         0xd1,
         "core 1 comes up: nothing to run"
     );
@@ -380,20 +406,20 @@ fn a_woken_task_signals_an_idle_core_only_while_it_still_waits_for_one() {
     let ((b, _), _) = spawn(&mut sched, 0x200);
     sched.take_woken();
     sched.block(0, Event::Idle);
-    assert_eq!(sched.switch(0, 0x10), 0x100);
+    assert_eq!(sched.switch(0, 0x10).0, 0x100);
     sched.block(0, Event::Pipe(1));
-    assert_eq!(sched.switch(0, 0x110), 0x200);
+    assert_eq!(sched.switch(0, 0x110).0, 0x200);
     sched.block(0, Event::Pipe(2));
     sched.wake(Event::Pipe(1));
     assert_eq!(sched.take_woken(), 1, "a waits while core 1 idles");
     assert_eq!(
-        sched.switch(0, 0x210),
+        sched.switch(0, 0x210).0,
         0x110,
         "b blocked: this core takes a"
     );
     sched.wake(Event::Pipe(2));
     sched.block(0, Event::Pipe(1));
-    assert_eq!(sched.switch(0, 0x111), 0x210);
+    assert_eq!(sched.switch(0, 0x111).0, 0x210);
     assert_eq!(sched.current(0).0, b);
     assert_eq!(sched.take_woken(), 0, "b runs here: nothing waits");
 
@@ -412,21 +438,21 @@ fn a_core_runs_only_tasks_no_other_core_runs_and_core_0_resumes_boot_once_every_
     assert_eq!(sched.claim_idle(0), None, "core 1 is not up yet");
     sched.take_woken();
     assert_eq!(
-        sched.switch(1, 0xd1),
+        sched.switch(1, 0xd1).0,
         0x50,
         "up, it reschedules and finds the task"
     );
     let (x, _) = sched.current(1);
     assert_eq!(sched.end(x, 0), (STACK, None));
-    assert_eq!(sched.switch(1, 0xdead), 0xd1);
+    assert_eq!(sched.switch(1, 0xdead).0, 0xd1);
     let ((a, _), process) = spawn(&mut sched, 0x100);
     let b = thread(&mut sched, process.0, 0x200, 0);
     assert_eq!(sched.claim_idle(0), Some(1));
     assert_eq!(sched.claim_idle(0), None, "one signal per idle period");
-    assert_eq!(sched.switch(1, 0xd1), 0x100);
+    assert_eq!(sched.switch(1, 0xd1).0, 0x100);
     assert_eq!(sched.core_of(a), Some(1));
-    assert_eq!(sched.switch(0, 0x10), 0x200, "a runs on core 1");
-    assert_eq!(sched.switch(0, 0x210), 0x10, "round robin, never a");
+    assert_eq!(sched.switch(0, 0x10).0, 0x200, "a runs on core 1");
+    assert_eq!(sched.switch(0, 0x210).0, 0x10, "round robin, never a");
     assert_eq!(sched.thread_of(process.0, 0), Some(b.0));
     assert_eq!(sched.threads_elsewhere(process.0, 0), 1 << a);
 
@@ -435,13 +461,13 @@ fn a_core_runs_only_tasks_no_other_core_runs_and_core_0_resumes_boot_once_every_
     assert_eq!(sched.marked(0), None);
     assert_eq!(sched.end(a, 9), (STACK, None));
     assert_eq!(sched.marked(1), None);
-    assert_eq!(sched.switch(1, 0xdead), 0x210, "b is free");
+    assert_eq!(sched.switch(1, 0xdead).0, 0x210, "b is free");
     sched.block(0, Event::Idle);
-    assert_eq!(sched.switch(0, 0x11), 0xd0, "core 1 runs b: core 0 idles");
+    assert_eq!(sched.switch(0, 0x11).0, 0xd0, "core 1 runs b: core 0 idles");
     assert_eq!(sched.claim_idle(1), Some(0));
     assert_eq!(sched.end(b.0, 0), (STACK, None));
     assert!(sched.boot_waits());
-    assert_eq!(sched.switch(1, 0xdead), 0xd1, "slot 0 is core 0's");
-    assert_eq!(sched.switch(0, 0xd0), 0x11, "no core runs a task: boot");
+    assert_eq!(sched.switch(1, 0xdead).0, 0xd1, "slot 0 is core 0's");
+    assert_eq!(sched.switch(0, 0xd0).0, 0x11, "no core runs a task: boot");
     assert_eq!(sched.claim_idle(0), Some(1), "idle again: signalled again");
 }

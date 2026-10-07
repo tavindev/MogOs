@@ -1462,6 +1462,18 @@ fn threads_share_a_counter_keep_their_tls_and_end_with_their_process() {
 }
 
 #[test]
+fn a_killed_process_refunds_its_zombie_child_to_itself_not_to_its_killer() {
+    // One core: the killer ends the blocked last thread in place, in its own trap.
+    let (status, lines) = boot(&["-smp", "1", "-append", "test=refund"]);
+    assert!(
+        lines.iter().any(|l| l == "R: the killer gained 0 pages"),
+        "missing line: R: the killer gained 0 pages"
+    );
+    assert_no_leak(&lines, "refund");
+    assert!(status.success(), "QEMU exited with {status}");
+}
+
+#[test]
 fn thread_bench_reports_round_trips() {
     let (status, lines) = boot(&["-append", "test=bench-threads"]);
     assert!(
