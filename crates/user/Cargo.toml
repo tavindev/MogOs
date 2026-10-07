@@ -6,7 +6,7 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 
-# Its own workspace root, so a worktree nested under the main checkout does not attach it to the outer workspace.
+# Its own root, also when a worktree nests this repo inside another checkout.
 [workspace]
 
 [lints.rust]

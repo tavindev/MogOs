@@ -2,6 +2,7 @@
 
 extern crate alloc;
 
+pub mod console;
 pub mod cpio;
 pub mod elf;
 pub mod handle;
@@ -170,6 +171,7 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
             "test=spawn" => run_archived(board, "spawn", "spawner", BOOT_BUDGET),
             "test=pipe" => run_archived(board, "pipe", "reader", BOOT_BUDGET),
             "test=wait" => run_archived(board, "wait", "waiter", WAITER_BUDGET),
+            "test=echo" => run_archived(board, "echo", "echo", BOOT_BUDGET),
             "test=pi" => {
                 board.start_timer();
                 run_archived(board, "pi", "pi", PI_BUDGET);

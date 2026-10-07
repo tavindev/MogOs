@@ -10,7 +10,8 @@ use crate::pipe::End;
 const EXIT: u64 = 0;
 /// `io_submit_wait(handle, op, ptr, len)`: submits I/O on `handle` and waits for it to complete; returns the bytes
 /// moved. `op` is `IO_READ` (into `ptr`, read right) or `IO_WRITE` (from `ptr`, write right). libc's `read` and `write`.
-/// A `len` over `MAX_BUFFER` moves at most `MAX_BUFFER` bytes (a short read or write).
+/// A `len` over `MAX_BUFFER` moves at most `MAX_BUFFER` bytes (a short read or write). Reading the console waits for a
+/// line (`console::Line`); with two readers, whichever runs first gets it.
 const IO: u64 = 1;
 /// `dup(handle, rights)`: returns a new handle to the same object with `rights`, a subset of `handle`'s (duplicate right).
 const DUP: u64 = 2;
@@ -109,6 +110,11 @@ pub enum Call {
         ptr: u64,
         len: usize,
     },
+    /// Read a line from the console into `ptr..ptr + len`, as for `Write`.
+    Read {
+        ptr: u64,
+        len: usize,
+    },
     /// Read from (or, for a write end, write to) the pipe `end` reaches; `ptr..ptr + len` as for `Write`.
     Pipe {
         end: End,
@@ -176,6 +182,7 @@ pub fn dispatch(nr: u64, args: &[u64; 6], handles: &mut Handles) -> Result<Call,
             let len = len as usize;
             match object {
                 Object::Console if op == IO_WRITE => Ok(Call::Write { ptr, len }),
+                Object::Console => Ok(Call::Read { ptr, len }),
                 Object::Pipe(end) if end.write == (op == IO_WRITE) => {
                     Ok(Call::Pipe { end, ptr, len })
                 }
