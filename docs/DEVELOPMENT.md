@@ -73,7 +73,7 @@ Quit a hung QEMU with `Ctrl-A` then `X`.
 - `cargo run` must still boot and print the hello line.
 - Do not raise the `jobs` or linker `--threads` caps.
 - New crates use `[lints] workspace = true`. Never opt a crate out of `unsafe_code = "forbid"` unless it is an arch/board crate; put `unsafe` behind a safe API there.
-- Hot-path changes report before/after benchmark numbers; >5% regression needs justification (`docs/BENCHMARKS.md`).
+- Hot-path changes report before/after benchmark numbers; any regression fails unless no safe faster form exists (`docs/BENCHMARKS.md`).
 - Do not add dependencies without a stated reason.
 - Keep linker and profile settings unless a measurement (before/after `time cargo build`) justifies a change; record it in this file.
 - Do not touch the toolchain pin, `~/.rustup`, or global rustup config.

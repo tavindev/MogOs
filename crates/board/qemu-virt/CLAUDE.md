@@ -66,5 +66,6 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
 
 ---
 
-> After changing anything in this crate, run the `reviewer` pass (`docs/WORKFLOW.md`, step 5). Do **not** edit this
-> file without explicit user approval.
+> After changing anything in this crate, run the `reviewer` pass (`docs/WORKFLOW.md`, step 5). Facts a change makes
+> stale (names, signatures, constants, test names) are updated in the same commit; changing a boundary, rule or
+> invariant needs explicit user approval.
