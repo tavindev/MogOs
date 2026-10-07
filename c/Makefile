@@ -53,7 +53,11 @@ $(DL)/$(BUSYBOX).tar.bz2:
 $(OUT)/host/ld.lld:
 	mkdir -p $(OUT)/host
 	ln -sf $(RUSTLIB)/aarch64-apple-darwin/bin/rust-lld $@
-	ln -sf $(shell command -v gsed) $(OUT)/host/sed
+
+$(OUT)/host/sed:
+	@command -v gsed >/dev/null || { echo "busybox needs GNU sed: brew install gnu-sed" >&2; exit 1; }
+	mkdir -p $(OUT)/host
+	ln -sf "$$(command -v gsed)" $@
 
 MUSL_OVERLAY := $(shell find musl -type f)
 
@@ -71,7 +75,7 @@ $(OUT)/bin/%: %.c $(SYSROOT)/lib/libc.a mog-cc link.ld
 	mkdir -p $(OUT)/bin
 	$(CC) -s -o $@ $<
 
-$(OUT)/bin/busybox: $(DL)/$(BUSYBOX).tar.bz2 busybox.config $(SYSROOT)/lib/libc.a mog-cc link.ld
+$(OUT)/bin/busybox: $(DL)/$(BUSYBOX).tar.bz2 busybox.config $(SYSROOT)/lib/libc.a mog-cc link.ld | $(OUT)/host/sed
 	rm -rf $(OUT)/busybox && mkdir -p $(OUT)/busybox $(OUT)/bin
 	tar xjf $< -C $(OUT)/busybox --strip-components 1
 	cp busybox.config $(OUT)/busybox/.config

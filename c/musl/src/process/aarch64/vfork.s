@@ -3,6 +3,9 @@
 .global vfork
 .type vfork,%function
 vfork:
+	adrp x16, __mog_vfork_child
+	ldr w17, [x16, :lo12:__mog_vfork_child]
+	cbnz w17, 1f
 	adrp x16, __mog_vfork_jb
 	add x16, x16, :lo12:__mog_vfork_jb
 	stp x19, x20, [x16,#0]
@@ -14,6 +17,9 @@ vfork:
 	mov x17, sp
 	str x17, [x16,#96]
 	b __mog_vfork_enter
+1:	mov x0, #-11 // EAGAIN
+	.hidden __syscall_ret
+	b __syscall_ret
 
 .global __mog_vfork_resume
 .hidden __mog_vfork_resume

@@ -27,16 +27,24 @@ kernel's ABI is `crates/kernel/src/syscall.rs`, mirrored here by hand (numbers, 
 
 - Handles at start: 0-2 stdin, stdout, stderr; 3 the root directory; 4 the boot archive. An absent one fails on
   use. libc spawns children with the same five (a transfer-only placeholder for an absent slot).
-- Arguments: when the first string is `<argc> /<cwd>`, the next `argc` are argv and the rest envp, and the process
-  starts in `<cwd>`; otherwise all strings are argv and it starts at the root. libc and msh's `Grant::Posix` write
-  the header.
+- Arguments: when the first string is `<argc> <stdin> <stdout> <stderr> /<cwd>` (each stdio fd `t` console, `p`
+  pipe, `d` directory, `f<offset>` a file, `a<offset>` a file opened to append; msh's `Grant::Posix` writes
+  `<argc> /<cwd>`, stdio on the console), the next `argc` are argv and the rest envp, and the process starts in
+  `<cwd>`; otherwise all strings are argv and it starts at the root with stdio on the console. It is parsed before
+  TLS exists, so without libc calls that may set errno.
 - libc state: the fd table (fd -> open file: handle, offset, append flag, path below the root), the current
   directory as a path below the root (every path resolves lexically, `..` stops at the root, then through handle 3),
-  and the pid table (pid -> process handle). Offsets and the append flag do not cross a spawn.
+  and the pid table (pid -> process handle). A redirected stdio fd crosses a spawn with its kind and offset; the
+  offset is the child's own from then on (no shared offset with the parent).
 - `vfork` returns 0 in a child mode on the parent's stack; fd changes then work on the live table, saved at
   `vfork`; `execve` spawns natively and `_exit` records an exited child, and both restore the table and return the
   child's pid from `vfork`. `execve` outside a child spawns, waits and exits with the child's code.
-- Programs come only from the boot archive, by the last component of the path (`/bin/sh` is busybox).
+- Programs come only from the boot archive, by the last component of the path (`/bin/sh` is busybox), and only the
+  C programs (`sh`, `hello`, `cbench`): the native ones expect other handles, and `sh` must not reach programs
+  outside msh's table (`ENOENT`).
+- `wait4` has no native wait-for-any: it takes an exited pseudo-child, else blocks on the newest child (the
+  foreground one); `WNOHANG` sees only pseudo-children, so background jobs (`&`) are not reaped until waited for.
+  A vfork inside a vfork child is `EAGAIN`.
 - Signals: `kill` of SIGKILL, SIGTERM, SIGINT, SIGQUIT, SIGHUP kills a child through its process handle (the
   caller itself exits `128 + sig`); others are ignored; `sigaction` and `sigprocmask` succeed and do nothing.
 - Memory: `brk` fails so malloc uses `mmap`, which chains 64 KiB native `map`s (the kernel places them

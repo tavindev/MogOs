@@ -40,8 +40,8 @@ board crate).
   by `dup` to those rights plus transfer: `cat` a read-only file, `ls` a read-only directory, `mkdir` and `rm` the
   parent directory with write, `touch` and `write` the parent with read and write, `mv` both parents with write,
   `sync` the root with no right, `echo` nothing. The one exception is `sh` (busybox, `Grant::Posix`, the C layout of
-  `c/CLAUDE.md`): a shell reads commands, changes files anywhere and runs programs, so it gets the console with read
-  and write as stdin, stdout and stderr, the root with read and write, and the boot archive with read and exec, each
+  `c/CLAUDE.md`): a shell reads commands, changes files anywhere and runs programs, so it gets the console as stdin (read),
+  stdout and stderr (write), the root with read and write, and the boot archive with read and exec, each
   also with duplicate and transfer to hand on, plus 2048 frames (`POSIX_BUDGET`) and a first argument
   `<argc> /<cwd>`. msh's words are split on spaces, except a word in single quotes. The leaf name goes as an argument. A program never gets the root
   unless its job needs it (`sync`), nor a right it does not use; the lib's host test pins the table. A shell program

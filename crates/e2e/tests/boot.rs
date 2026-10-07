@@ -801,6 +801,33 @@ fn busybox_sh_changes_files_that_survive_a_reboot_once_synced() {
 }
 
 #[test]
+fn busybox_redirects_and_pipes_reach_spawned_programs_and_runs_only_c_programs() {
+    let image = mogfs_image("busybox-io", 1024);
+    let script = "sh -c 'echo a > f; cat < f; mkdir d; echo 1 > d/aaaa; echo 2 > d/b; ls d > out; echo x >> out; cat out; echo hi | cat; mid'";
+    let (status, got) = shell(&image, &[script, "exit"]);
+    std::fs::remove_file(&image).unwrap();
+    assert!(status.success(), "QEMU exited with {status}");
+    assert_eq!(
+        got,
+        session(&[
+            (
+                script,
+                &[
+                    "a",
+                    "aaaa",
+                    "b",
+                    "x",
+                    "hi",
+                    "sh: can't execute 'mid': No such file or directory",
+                    "msh: sh: 127"
+                ]
+            ),
+            ("exit", &[]),
+        ])
+    );
+}
+
+#[test]
 fn a_c_program_on_musl_prints_gets_enosys_and_exits_with_its_code() {
     let image = mogfs_image("hello", 1024);
     let (status, got) = shell(&image, &["sh -c hello", "exit"]);

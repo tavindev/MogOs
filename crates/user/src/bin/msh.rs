@@ -284,19 +284,22 @@ fn give(
     Ok(len)
 }
 
-/// `Grant::Posix`: the console three times (stdin, stdout, stderr), the root and the archive, and the arguments
-/// after `<argc> /<cwd>`, which tells musl's start code the current directory.
+/// `Grant::Posix`: the console as stdin (read), stdout and stderr (write), the root and the archive, and the
+/// arguments after `<argc> /<cwd>`, which tells musl's start code the current directory.
 fn posix(
     cwd: &Cwd,
     words: &[&[u8]],
     (handles, granted): (&mut [u64; 5], &mut usize),
     args: &mut [u8; PATH],
 ) -> Result<usize, i64> {
-    let stdio = [(CONSOLE, READ | WRITE); 3];
-    for (handle, rights) in stdio
-        .into_iter()
-        .chain([(ROOT, READ | WRITE), (ARCHIVE, READ | EXEC)])
-    {
+    let grants = [
+        (CONSOLE, READ),
+        (CONSOLE, WRITE),
+        (CONSOLE, WRITE),
+        (ROOT, READ | WRITE),
+        (ARCHIVE, READ | EXEC),
+    ];
+    for (handle, rights) in grants {
         let dup = dup(handle, rights | DUPLICATE | TRANSFER);
         if dup < 0 {
             return Err(dup);

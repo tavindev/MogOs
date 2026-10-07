@@ -10,6 +10,7 @@
 #include <signal.h>
 #include <spawn.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -56,11 +57,14 @@ static struct state {
 	char cwd[PATH];
 } st, saved;
 
-static struct child {
-	int pid, status;
+static struct kid {
+	int pid, status, order;
 	long handle; /* -1 once exited */
 } kids[CHILDREN];
-static int next_pid = 2, child;
+static int next_pid = 2, spawned;
+/* Set in a vfork child; vfork.s reads it to refuse a nested vfork. */
+int __mog_vfork_child;
+#define child __mog_vfork_child
 long __mog_vfork_jb[13];
 _Noreturn void __mog_vfork_resume(long);
 
@@ -235,7 +239,7 @@ static long rwv(int fd, const struct iovec *iov, int count, int write)
 		long r = rw(fd, iov[i].iov_base, iov[i].iov_len, write);
 		if (r < 0) return total ? total : r;
 		total += r;
-		if ((size_t)r < iov[i].iov_len) break;
+		if ((size_t)r < iov[i].iov_len || !write && fd_file(fd)->kind != NODE) break;
 	}
 	return total;
 }
@@ -329,22 +333,29 @@ static long do_unlinkat(int dirfd, const char *path, int flag)
 	return svc(N_UNLINK, H_ROOT, (long)p, strlen(p), 0, 0, 0, 0);
 }
 
-/* The kernel never replaces a name; POSIX replaces a file, so remove it first (not atomic). */
+/* The kernel never replaces a name; POSIX replaces a file, so remove it first (not atomic; a directory target
+ * stays EEXIST, a move below itself fails before anything is removed). */
 static long do_renameat(int olddir, const char *old, int newdir, const char *new)
 {
 	char a[PATH], b[PATH];
 	int r = resolve(olddir, old, a);
 	if (r || (r = resolve(newdir, new, b))) return r;
 	long rn = svc(N_RENAME, H_ROOT, (long)a, strlen(a), H_ROOT, (long)b, strlen(b), 0);
-	if (rn == -EEXIST && strcmp(a, b) && !do_unlinkat(AT_FDCWD, new, 0))
-		rn = svc(N_RENAME, H_ROOT, (long)a, strlen(a), H_ROOT, (long)b, strlen(b), 0);
-	return rn;
+	if (rn != -EEXIST || !strcmp(a, b) || !strncmp(b, a, strlen(a)) && b[strlen(a)] == '/') return rn;
+	long h = nopen(b, 0);
+	if (h < 0) return h;
+	int dir = isdir(h);
+	nclose(h);
+	if (dir) return -EEXIST;
+	if ((rn = svc(N_UNLINK, H_ROOT, (long)b, strlen(b), 0, 0, 0, 0))) return rn;
+	return svc(N_RENAME, H_ROOT, (long)a, strlen(a), H_ROOT, (long)b, strlen(b), 0);
 }
 
 static long do_dup3(int old, int new, int flags, int min)
 {
 	if (!fd_file(old)) return -EBADF;
-	if (new < 0 && (new = free_fd(min)) < 0) return new;
+	if (min < 0) return -EINVAL;
+	if (new == -1 && (new = free_fd(min)) < 0) return new;
 	if ((unsigned)new >= FDS) return -EBADF;
 	if (new == old) return -EINVAL;
 	return install(new, st.fds[old], flags & O_CLOEXEC);
@@ -413,7 +424,7 @@ static int add_child(long handle, int status)
 {
 	for (int i = 0; i < CHILDREN; i++)
 		if (!kids[i].pid) {
-			kids[i] = (struct child){ next_pid, status, handle };
+			kids[i] = (struct kid){ next_pid, status, ++spawned, handle };
 			next_pid = next_pid == 30000 ? 2 : next_pid + 1;
 			return kids[i].pid;
 		}
@@ -429,18 +440,27 @@ static size_t put(char *buf, size_t at, const char *s)
 	return at + n;
 }
 
-/* Spawns the boot archive's program named by `path`'s last component with the stdio fds, the root and the archive;
- * the arguments start with "<argc> /<cwd>", then argv, then as much of envp as fits. */
+/* Spawns the boot archive's C program (`sh`, `hello`, `cbench`; the native ones expect other handles) named by
+ * `path`'s last component with the stdio fds, the root and the archive. The arguments start with
+ * "<argc> <stdin> <stdout> <stderr> /<cwd>", each stdio fd `t` (console), `p` (pipe), `d`, or `f<offset>` (`a` if
+ * appending) for a file, then argv, then as much of envp as fits. */
 static long spawn(const char *path, char *const argv[], char *const envp[])
 {
-	char args[MAX_ARG_BYTES], head[PATH + 24], *h = head + 20;
+	char args[MAX_ARG_BYTES], head[PATH + 96], io[3][24];
 	int argc = 0, count = 1;
 	while (argv[argc]) argc++;
 	if (argc + 1 > MAX_ARGS) return -E2BIG;
-	for (int n = argc; h == head + 20 || n; n /= 10) *--h = '0' + n % 10;
-	head[20] = ' ', head[21] = '/';
-	strcpy(head + 22, st.cwd);
-	size_t len = put(args, 0, h);
+	const char *name = strrchr(path, '/');
+	name = name ? name + 1 : path;
+	if (strcmp(name, "sh") && strcmp(name, "hello") && strcmp(name, "cbench")) return -ENOENT;
+	for (int fd = 0; fd < 3; fd++) {
+		struct file *f = fd_file(fd);
+		int kind = f ? f->kind : TTY;
+		if (kind == NODE) snprintf(io[fd], sizeof io[fd], "%c%lld", f->append ? 'a' : 'f', f->off);
+		else snprintf(io[fd], sizeof io[fd], "%c", kind == PIPE ? 'p' : kind == DIRECTORY ? 'd' : 't');
+	}
+	snprintf(head, sizeof head, "%d %s %s %s /%s", argc, io[0], io[1], io[2], st.cwd);
+	size_t len = put(args, 0, head);
 	for (int i = 0; i < argc; i++, count++)
 		if (!(len = put(args, len, argv[i]))) return -E2BIG;
 	for (int i = 0; envp && envp[i] && count < MAX_ARGS; i++, count++) {
@@ -448,8 +468,6 @@ static long spawn(const char *path, char *const argv[], char *const envp[])
 		if (!next) break;
 		len = next;
 	}
-	const char *name = strrchr(path, '/');
-	name = name ? name + 1 : path;
 	long exe = svc(N_OPEN, H_ARCHIVE, (long)name, strlen(name), 0, 0, 0, 0);
 	if (exe < 0) return exe;
 	long handles[HANDLES], p = -ENOMEM;
@@ -473,6 +491,7 @@ static long spawn(const char *path, char *const argv[], char *const envp[])
 	return p;
 }
 
+/* Not nested: vfork.s answers EAGAIN in a child, before it overwrites the saved registers. */
 int __mog_vfork_enter(void)
 {
 	saved = st;
@@ -512,10 +531,14 @@ static long do_execve(const char *path, char *const argv[], char *const envp[])
 
 static long do_wait4(int pid, int *status, int options)
 {
-	struct child *k = 0;
-	for (int i = 0; i < CHILDREN; i++)
-		if (kids[i].pid && (pid == -1 || kids[i].pid == pid) && (!k || kids[i].handle < 0 && k->handle >= 0))
-			k = &kids[i];
+	struct kid *k = 0;
+	/* No native wait-for-any: an exited pseudo-child first, else the newest child (the foreground one). */
+	for (int i = 0; i < CHILDREN; i++) {
+		struct kid *c = &kids[i];
+		if (c->pid && (pid == -1 || c->pid == pid) &&
+		    (!k || (c->handle < 0) > (k->handle < 0) || (c->handle < 0) == (k->handle < 0) && c->order > k->order))
+			k = c;
+	}
 	if (!k) return -ECHILD;
 	if (k->handle >= 0) {
 		if (options & WNOHANG) return 0;
@@ -619,7 +642,7 @@ long __mog_syscall(long n, long a, long b, long c, long d, long e, long f)
 	case SYS_chdir: return do_chdir(-1, (char *)a);
 	case SYS_fchdir: return do_chdir(a, 0);
 	case SYS_dup: return do_dup3(a, -1, 0, 0);
-	case SYS_dup3: return do_dup3(a, b, c, 0);
+	case SYS_dup3: return b < 0 ? -EBADF : do_dup3(a, b, c, 0);
 	case SYS_fcntl: return do_fcntl(a, b, c);
 	case SYS_pipe2: return do_pipe2((int *)a, b);
 	case SYS_ioctl: {
@@ -675,9 +698,17 @@ long __mog_syscall(long n, long a, long b, long c, long d, long e, long f)
 	return -ENOSYS;
 }
 
+static long long digits(char *s, char **end)
+{
+	long long n = 0;
+	for (; *s >= '0' && *s <= '9'; s++) n = n * 10 + *s - '0';
+	*end = s;
+	return n;
+}
+
 /* From `_start` (x0-x2 as the kernel passed them): maps the stack and lays out argc, argv, envp and an auxv with
- * AT_PAGESZ on it for `_start_c`. Strings starting "<argc> /<cwd>" are a C parent's: argv, then envp; others are all
- * argv, from the root. */
+ * AT_PAGESZ on it for `_start_c`. Strings starting with `spawn`'s header (msh writes "<argc> /<cwd>": stdio on the
+ * console) are a C parent's: argv, then envp; others are all argv, from the root, stdio on the console. */
 long *__mog_start(long count, char *args, long len)
 {
 	char *strings[MAX_ARGS], *s = args;
@@ -687,8 +718,14 @@ long *__mog_start(long count, char *args, long len)
 	for (int i = 0; i < count && i < MAX_ARGS; i++, s += strlen(s) + 1) strings[i] = s;
 	char **argv = strings, *end;
 	if (count && *strings[0] >= '0' && *strings[0] <= '9') {
-		long n = 0;
-		for (end = strings[0]; *end >= '0' && *end <= '9'; end++) n = n * 10 + *end - '0';
+		/* By hand: libc functions may set errno, which needs the thread pointer `_start_c` sets up later. */
+		long n = digits(strings[0], &end);
+		for (int fd = 0; fd < 3 && end[0] == ' ' && end[1] != '/'; fd++) {
+			struct file *f = &st.files[st.fds[fd]];
+			f->kind = end[1] == 'p' ? PIPE : end[1] == 'd' ? DIRECTORY : end[1] == 't' ? TTY : NODE;
+			f->append = end[1] == 'a';
+			f->off = digits(end + 2, &end);
+		}
 		if (end[0] == ' ' && end[1] == '/' && n < count) {
 			resolve(AT_FDCWD, end + 1, st.cwd);
 			argc = n, argv++, count--;
