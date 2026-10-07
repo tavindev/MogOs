@@ -113,7 +113,9 @@ kernel, step 50), DHCP, DNS or IPv6 (phase 9), or IPv4 fragment reassembly.
 - Interop (`tests/interop.rs`): our TCP against smoltcp 0.12's (pinned in `Cargo.lock`, a dev-dependency only) over
   the simulated link, each side opening in turn, 256 KiB each way for 20 seeds at 0%, 1% and 5% loss. smoltcp 0.12
   drops its retransmission timer on entering CLOSING, so the test has it close only after its data is acknowledged.
-- Benchmark: `cargo bench-host` runs `benches/net.rs` (includes `tests/sim/mod.rs`); baseline rows in
+- Benchmark: `cargo bench-host` runs `benches/net.rs` (includes `tests/sim/mod.rs`): UDP over the link and its
+  receive path; TCP goodput on the loss-free link (64 KiB and 1 MiB windows), the per-segment receive path, connect
+  plus close, and simulated goodput at 1% and 5% loss with 10 and 50 ms RTT (step 48's baseline). Rows in
   `docs/BENCHMARKS.md`.
 
 ---

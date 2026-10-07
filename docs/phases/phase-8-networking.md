@@ -59,3 +59,25 @@ Decision: write `crates/net` fresh. smoltcp is a host-only dev-dependency of `cr
   reordering, duplication and corruption; 100k seeded mutations of recorded frames; ARP spoof, flood, LRU and retry;
   named socket errors; fragments. Checksum: copy then sum in 32-bit words measured faster than a fused copy-and-sum
   loop on the host, so the copy is a plain `memcpy`. Benchmarks in `docs/BENCHMARKS.md`.
+- **46 (security fix).** ARP requests never learn: a request aimed at us is answered from its own sender fields, and
+  only a reply to our own request writes the cache, so a host on the link cannot overwrite the gateway's entry by
+  asking about us. Cost: one ARP round trip the first time we talk back to a host that asked.
+- **47.** `crates/net/src/tcp.rs`: `Stack::with_tcp(Tcp::new(key, connections, half_open, time_wait))`, every table
+  and ring from the caller. RFC 9293 with MSS and window scaling, RFC 6298 RTO (floor 200 ms, Linux's; the RFC's 1 s
+  is a SHOULD), NewReno with RFC 3465 byte counting and go-back-N after a timeout, a persist timer, out-of-order data
+  kept in the receive ring (4 ranges). Half-open table with oldest eviction rather than SYN cookies: simpler (no
+  options to encode) and a real SYN keeps its entry for a round trip unless a table's worth of SYNs arrives within
+  it. ISNs and ephemeral ports from SipHash-2-4 under the caller's key. A pure ACK carries `snd_max` (BSD's rule):
+  with `snd_nxt` both ends of a go-back-N recovery rejected each other's ACKs forever, which the 64 MiB runs found.
+  Segments about a connection go to the MAC it resolved, so a challenge ACK never answers a spoofed frame's source.
+  Tests (`tests/tcp.rs`): 1 MiB each way for 200 seeds and 64 MiB for 3 at 0%, 1% and 5% loss with reordering,
+  duplication and corruption, ISNs half a transfer below 2^32; the attack list on a scripted peer; every timeout;
+  half-close, abort, refusal, simultaneous open; a reader stalled for 10 RTOs; 21 sequential connections through one
+  slot; the mutation test over TCP segments. The 64 MiB soak over 200 seeds is `--ignored` (about two minutes). The
+  gate's TCP tests take under a second. Interop (`tests/interop.rs`): our TCP and smoltcp 0.12's, each side opening,
+  256 KiB each way, 20 seeds at each loss rate; smoltcp 0.12 cancels its retransmission timer on entering CLOSING
+  with data in flight, so the test never closes both sides at once. The simulated link's queues became a binary
+  heap (the same delivery order), since the scan per frame made 1 MiB windows quadratic. Benchmarks in
+  `docs/BENCHMARKS.md`; the UDP rows did not move (interleaved with step 46, best minimums 29.6 against 29.8 ns and
+  69.9 against 69.1 ns, machine at load 15-18). Not done: a smoltcp-to-smoltcp goodput figure for the decision's
+  reopen clause.

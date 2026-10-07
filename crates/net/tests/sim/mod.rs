@@ -1,6 +1,9 @@
 //! A simulated Ethernet link between two NICs in virtual time, with seeded faults so a failing seed replays exactly.
 #![allow(dead_code)]
 
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
+
 use net::{Mac, Nic};
 
 /// Fault rates in parts per thousand, and the one-way delay in ns.
@@ -36,13 +39,17 @@ impl Rng {
     }
 }
 
+/// A frame in flight: delivery time, send order, frame; the heap pops the smallest.
+type InFlight = Reverse<(u64, u64, Vec<u8>)>;
+
 pub struct Link {
     pub rng: Rng,
     pub faults: Faults,
     pub now: u64,
     macs: [Mac; 2],
-    /// Frames in flight to each side, as (delivery time, frame).
-    queues: [Vec<(u64, Vec<u8>)>; 2],
+    /// Frames in flight to each side, earliest delivery first, then in the order sent.
+    queues: [BinaryHeap<InFlight>; 2],
+    sent: u64,
     spare: Vec<Vec<u8>>,
     /// Every frame sent, before faults, when set.
     pub record: Option<Vec<Vec<u8>>>,
@@ -55,7 +62,8 @@ impl Link {
             faults,
             now: 0,
             macs,
-            queues: [Vec::new(), Vec::new()],
+            queues: [BinaryHeap::new(), BinaryHeap::new()],
+            sent: 0,
             spare: Vec::new(),
             record: None,
         }
@@ -63,7 +71,11 @@ impl Link {
 
     /// When the next frame in flight arrives.
     pub fn next(&self) -> Option<u64> {
-        self.queues.iter().flatten().map(|q| q.0).min()
+        self.queues
+            .iter()
+            .filter_map(|q| q.peek())
+            .map(|q| q.0.0)
+            .min()
     }
 
     /// The NIC on `side` (0 or 1).
@@ -148,22 +160,25 @@ impl Nic for End<'_> {
         }
         let queue = &mut link.queues[1 - self.side];
         if link.rng.chance(f.duplicate) {
-            queue.push((at + link.rng.below(f.delay + 1), frame.clone()));
+            link.sent += 1;
+            queue.push(Reverse((
+                at + link.rng.below(f.delay + 1),
+                link.sent,
+                frame.clone(),
+            )));
         }
-        queue.push((at, frame));
+        link.sent += 1;
+        queue.push(Reverse((at, link.sent, frame)));
         true
     }
 
     fn receive(&mut self, f: impl FnOnce(&[u8])) -> bool {
         let link = &mut *self.link;
         let queue = &mut link.queues[self.side];
-        let Some(i) = (0..queue.len())
-            .filter(|&i| queue[i].0 <= link.now)
-            .min_by_key(|&i| queue[i].0)
-        else {
+        if queue.peek().is_none_or(|q| q.0.0 > link.now) {
             return false;
-        };
-        let (_, frame) = queue.remove(i);
+        }
+        let Reverse((_, _, frame)) = queue.pop().unwrap();
         f(&frame);
         link.spare.push(frame);
         true
