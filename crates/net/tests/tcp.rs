@@ -2018,3 +2018,37 @@ fn a_cookie_is_accepted_in_its_period_and_the_next_only() {
         );
     }
 }
+
+#[test]
+fn a_cookie_is_its_mss_index_and_30_bits_of_hash() {
+    for (now, mss, idx) in [
+        (0, 0x5b4, 3),
+        (16 * SEC, 0x5b4, 3),
+        (0, 0x218, 0),
+        (16 * SEC, 0x4c4, 1),
+    ] {
+        let mut m = Mem::new(2, 4096, 4096, 0, 4);
+        host!(a, m, IP_A, [3, 3]);
+        a.listen(PORT).unwrap();
+        let mut tap = Tap::new(MAC_A);
+        let p = Peer {
+            port: 3000,
+            to: PORT,
+            seq: 7000,
+            ack: 0,
+        };
+        let opts = [2, 4, (mss >> 8) as u8, mss as u8];
+        let cookie = feed(
+            &mut a,
+            &mut tap,
+            now,
+            [p.seg(7000, 0, SYN, 65535, &opts, &[])],
+        )[0]
+        .seq;
+        assert_eq!(
+            cookie >> 30,
+            idx,
+            "MSS {mss} at {now}: the top bits are the index, no clock bit"
+        );
+    }
+}

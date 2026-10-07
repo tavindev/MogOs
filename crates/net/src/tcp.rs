@@ -5,7 +5,7 @@
 //!   receive ring at its offset and tracked as up to `OOO` ranges; each segment is acknowledged at once.
 //! - A passive open lives in the half-open table until the handshake completes, so a SYN flood never takes a slot.
 //!   A keyed hash of the connection picks its run of `PROBES` slots, so lookups are O(1) at any table size.
-//!   A full run answers with SYN cookies (the ISS encodes the MSS and a keyed hash; no window scaling), accepted
+//!   A full run answers with SYN cookies (the ISS is an MSS index and a 30-bit keyed hash; no window scaling), accepted
 //!   only while the stack has sent cookies recently.
 //! - A connection entering TIME_WAIT leaves its slot for a compact entry; a full TIME_WAIT table reuses its oldest,
 //!   and a SYN above the entry's sequence number starts a new connection whose ISS is 65537 plus 24 keyed bits above
@@ -1299,13 +1299,13 @@ impl<'a> Stack<'a> {
         Ok(())
     }
 
-    /// The cookie ISS for a SYN: the clock's low bit, the 2-bit MSS index and 29 bits of keyed hash over the whole
-    /// clock, the index, the connection and the peer's ISN (so a cookie two periods old fails, low bit or not).
+    /// The cookie ISS for a SYN: the 2-bit MSS index and 30 bits of keyed hash over the clock, the index, the
+    /// connection and the peer's ISN. The clock is not sent: a cookie ACK is checked against both periods.
     fn cookie(&self, local: u16, from: SocketAddrV4, irs: u32, t: u64, idx: u32) -> u32 {
         let ips = (u32::from(self.config.ip) as u64) << 32 | u32::from(*from.ip()) as u64;
         let ports = (local as u64) << 48 | (from.port() as u64) << 32 | irs as u64;
         let hash = siphash(self.tcp.keys.cookie, [ips, ports, t << 2 | idx as u64]) as u32;
-        ((t as u32 & 1) << 31) | (idx << 29) | (hash & 0x1fff_ffff)
+        (idx << 30) | (hash & 0x3fff_ffff)
     }
 
     /// The half-open state a valid cookie ACK stands for: issued this period or the last, for this SYN, while
@@ -1315,7 +1315,7 @@ impl<'a> Stack<'a> {
             .cookie_at
             .filter(|&t| now.saturating_sub(t) < 2 * COOKIE_PERIOD)?;
         let (iss, irs) = (s.ack.wrapping_sub(1), s.seq.wrapping_sub(1));
-        let idx = (iss >> 29) & 3;
+        let idx = iss >> 30;
         let t = [now / COOKIE_PERIOD, (now / COOKIE_PERIOD).saturating_sub(1)];
         t.iter()
             .any(|&t| self.cookie(s.port, s.from, irs, t, idx) == iss)

@@ -116,4 +116,6 @@ Decision: write `crates/net` fresh. smoltcp is a host-only dev-dependency of `cr
   rows within noise, connect + close 398-407 against 427-430 ns; UDP 1472-byte receive reads 2 ns slower
   (66.3-67.8 against 64.3-65.2) with no change on its path, and both builds match with loops aligned to 64 bytes
   (65.5-67.7 against 65.2-66.1), so it is code placement; `-C llvm-args=-align-loops=64` in the build config is the
-  fix outside this crate.
+  fix outside this crate; it is queued as its own experiment (every benchmark measured), and the row records it.
+  The cookie then dropped its clock bit for a 30th hash bit: an ACK is checked against this period and the last,
+  at most two SipHashes, only on the flood path (cookie SYN and cookie handshake rows within noise).
