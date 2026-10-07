@@ -101,6 +101,7 @@ cargo run -- -append test=bench-spawn # spawnbench spawns nop, waits and closes 
 cargo run -- -append test=bench-pipe # ping and pong echo one byte over two pipes 100000 times; prints the round trip in ns
 cargo run -- -append test=threads    # timer on: four threads add to a shared counter (T: count 400000) and are joined with their TLS as exit codes; a process with a spinning and a blocked thread is killed; free frames before/after match
 cargo run -- -append test=bench-threads # threadbench: thread create + join + close 1000 times, then one byte to a thread of the same process and back over two pipes 100000 times; prints each round trip in ns
+cargo run -- -append test=bench-ipi  # core 0 sends core 1 an SGI that it answers with one, 1000 times; prints the round trip in ns
 cargo run -- -append test=bench-lock # uncontended acquire + release of the ticket and a test-and-set lock in ns; two timer-preempted tasks add 10^7 each under the lock (lock: count 20000000)
 cargo run -- -append test=smp  # cores 1-3 start (PSCI CPU_ON) and print cpu <n>: online; threads' victim is killed while one thread spins on another core; with the timer off four kernel tasks each print a distinct core (smp: spinner on cpu <n>); once every core took a timer tick, smp: 4 cpus ticked
 cargo run -p mogfs --example mkfs --target aarch64-apple-darwin -- b.img 1024; cargo run -- -drive file=b.img,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0 -append test=bench-syscalls  # fresh image; prints `bench <call>: <ns> ns` for every syscall's fast path

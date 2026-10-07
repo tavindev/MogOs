@@ -93,9 +93,11 @@ pub trait Board {
         &mut self,
         f: impl FnOnce(&mut network::Network, Option<&mut Self::Nic>, u64) -> R,
     ) -> R;
-    /// Makes `n` uncontended acquire + release round trips on a ticket lock like the board's kernel lock (`ticket`),
-    /// or on a test-and-set lock.
-    fn lock_round_trips(&mut self, n: u64, ticket: bool);
+    /// Makes `n` round trips of `kind`.
+    fn round_trips(&mut self, n: u64, kind: RoundTrip);
+    /// Sends core 1 an SGI `n` times, each answered with an SGI back before the next. Boot context only, two cores
+    /// or more.
+    fn ipi_round_trips(&mut self, n: u64);
     /// Adds 1 to a counter `n` times, taking a board `Lock` (the kind `KERNEL` is) for each; returns the counter.
     fn add_locked(&mut self, n: u64) -> u64;
     /// Starts the other cores without waiting for them; they idle until given work. Under `smp_test` each prints
@@ -107,6 +109,19 @@ pub trait Board {
     fn cpu(&self) -> usize;
     /// Cores that have taken a timer tick.
     fn ticked_cpus(&self) -> usize;
+}
+
+/// What `Board::round_trips` times.
+#[derive(Clone, Copy)]
+pub enum RoundTrip {
+    /// Uncontended acquire + release of a ticket lock like the board's kernel lock.
+    Ticket,
+    /// The same on a test-and-set lock.
+    TestAndSet,
+    /// Reading this core's index.
+    Cpu,
+    /// One access to a per-CPU value.
+    PerCpu,
 }
 
 /// Hand-written asm user programs the board provides; newer ones are ELF files in the boot archive.
@@ -135,6 +150,8 @@ pub enum Program {
 const BENCH_YIELDS: u64 = 100_000;
 /// Round trips per lock timed by `test=bench-lock`.
 const BENCH_LOCKS: u64 = 10_000_000;
+/// SGI round trips `test=bench-ipi` times.
+const IPI_ROUND_TRIPS: u64 = 1000;
 /// The additions each of `test=bench-lock`'s adders makes, one adder per core (at least two).
 const CONTENDED_LOCKS: u64 = 1_000_000;
 /// `test=bench-lock`'s adders that are done.
@@ -302,6 +319,12 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
             ),
             "test=bench-pipe" => pipe_bench(board),
             "test=bench-lock" => lock_bench(board),
+            "test=bench-ipi" => {
+                let start = board.uptime_us();
+                board.ipi_round_trips(IPI_ROUND_TRIPS);
+                let ns = (board.uptime_us() - start) * 1000 / IPI_ROUND_TRIPS;
+                let _ = writeln!(board.console(), "ipi: {ns} ns/round-trip");
+            }
             "test=smp" => smp_test(board),
             "test=fuzz" => fuzz(board, bootargs),
             "test=httpd" => httpd(board, bootargs),
@@ -573,13 +596,19 @@ fn pipe_bench<B: Board>(board: &mut B) {
     let _ = writeln!(board.console(), "pipe: {ns} ns/round-trip");
 }
 
-/// Times uncontended acquire + release of the ticket and the test-and-set lock; then one task per core (at least two,
+/// Times uncontended acquire + release of the ticket and the test-and-set lock, reading the core index and a per-CPU
+/// access; then one task per core (at least two,
 /// so the timer interleaves them on one) each adds `CONTENDED_LOCKS` to a counter under the board's lock, timed from
 /// their spawn until all are done, and the total must be exact.
 fn lock_bench<B: Board>(board: &mut B) {
-    for (name, ticket) in [("ticket", true), ("test-and-set", false)] {
+    for (name, kind) in [
+        ("ticket", RoundTrip::Ticket),
+        ("test-and-set", RoundTrip::TestAndSet),
+        ("cpu", RoundTrip::Cpu),
+        ("per-cpu", RoundTrip::PerCpu),
+    ] {
         let start = board.uptime_us();
-        board.lock_round_trips(BENCH_LOCKS, ticket);
+        board.round_trips(BENCH_LOCKS, kind);
         let tenths = (board.uptime_us() - start) * 10_000 / BENCH_LOCKS;
         let (ns, tenth) = (tenths / 10, tenths % 10);
         let _ = writeln!(board.console(), "lock: {name} {ns}.{tenth} ns/round-trip");

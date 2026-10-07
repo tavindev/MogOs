@@ -14,7 +14,7 @@ mod virtio_net;
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::fmt::{self, Write};
-use core::hint::spin_loop;
+use core::hint::{black_box, spin_loop};
 use core::ops::Range;
 use core::panic::PanicInfo;
 use core::ptr::{self, NonNull};
@@ -22,7 +22,7 @@ use core::slice;
 use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 
-use arch::{Guard, Lock, MemoryType, l1_block};
+use arch::{Guard, Lock, MemoryType, PerCpu, l1_block};
 use dtb::Dtb;
 use fs::FsDisk;
 use kernel::console::Line;
@@ -32,7 +32,7 @@ use kernel::mutex::Mutexes;
 use kernel::network::Network;
 use kernel::pipe::Pipes;
 use kernel::syscall::{ENOENT, MAX_BUFFER};
-use kernel::{Event, FRAME_WORDS, Full, PRIORITIES, Program, Scheduler};
+use kernel::{Event, FRAME_WORDS, Full, PRIORITIES, Program, RoundTrip, Scheduler};
 use linked_list_allocator::Heap;
 use mm::{FrameAllocator, PhysAddr};
 use mogfs::{Error, Fs};
@@ -76,6 +76,9 @@ const TICK_US: u64 = 10_000;
 
 /// The SGI that wakes an idle core to reschedule, or a core to end its marked thread; enabled on every core.
 const RESCHEDULE_SGI: u32 = 0;
+/// `test=bench-ipi`'s SGI: core 0 sends it, the target answers with it, and core 0 counts the answer in `PONGS`.
+const PING_SGI: u32 = 1;
+static PONGS: AtomicU64 = AtomicU64::new(0);
 const PSCI_CPU_ON: u64 = 0xc400_0003;
 /// Each secondary core's stack, and core 0's idle context's, reserved in `linker.ld` above `__stack_top`.
 const SECONDARY_STACK: u64 = 0x4000;
@@ -370,20 +373,31 @@ impl kernel::Board for QemuVirt {
         net::with(f)
     }
 
-    fn lock_round_trips(&mut self, n: u64, ticket: bool) {
+    fn round_trips(&mut self, n: u64, kind: RoundTrip) {
         static TICKET: Lock<()> = Lock::new(());
         static TAS: AtomicBool = AtomicBool::new(false);
-        if ticket {
-            for _ in 0..n {
-                drop(TICKET.lock_masked());
-            }
-            return;
-        }
+        static COUNT: PerCpu<u64> = PerCpu::new(0);
         for _ in 0..n {
-            while TAS.swap(true, Acquire) {
-                spin_loop();
+            match kind {
+                RoundTrip::Ticket => drop(TICKET.lock_masked()),
+                RoundTrip::TestAndSet => {
+                    while TAS.swap(true, Acquire) {
+                        spin_loop();
+                    }
+                    TAS.store(false, Release);
+                }
+                RoundTrip::Cpu => _ = black_box(arch::cpu()),
+                RoundTrip::PerCpu => COUNT.with(|c| *c += 1),
             }
-            TAS.store(false, Release);
+        }
+    }
+
+    fn ipi_round_trips(&mut self, n: u64) {
+        for i in 1..=n {
+            send(1, PING_SGI);
+            while PONGS.load(Acquire) < i {
+                arch::irq::window();
+            }
         }
     }
 
@@ -463,7 +477,10 @@ extern "C" fn kmain() -> ! {
         // SAFETY: as above; UART_IRQ is an SPI and core 0's CPU interface is 0.
         unsafe { arch::gic::route(gic.0, UART_IRQ, 0) };
         // SAFETY: as above.
-        unsafe { arch::gic::unmask(gic.0, RESCHEDULE_SGI) };
+        for irq in [RESCHEDULE_SGI, PING_SGI] {
+            // SAFETY: as above.
+            unsafe { arch::gic::unmask(gic.0, irq) };
+        }
     }
 
     kernel::run(
@@ -507,7 +524,7 @@ extern "C" fn kmain_secondary() -> ! {
     let dist = PhysAddr(GIC_DIST.load(Relaxed));
     // SAFETY: the DTB's GICv2 CPU interface, stored by `kmain` before it started this core, in device-mapped GiB 0.
     unsafe { arch::gic::enable_cpu(PhysAddr(GIC_CPU.load(Relaxed))) };
-    for irq in [TIMER_IRQ, RESCHEDULE_SGI] {
+    for irq in [TIMER_IRQ, RESCHEDULE_SGI, PING_SGI] {
         // SAFETY: as above, the distributor; below 32, so this core's banked ISENABLER0.
         unsafe { arch::gic::unmask(dist, irq) };
     }
@@ -527,9 +544,14 @@ extern "C" fn idle(_: usize) -> ! {
 
 /// Sends `cpu` the reschedule SGI.
 fn send_sgi(cpu: usize) {
+    send(cpu, RESCHEDULE_SGI);
+}
+
+/// Sends `cpu` SGI `sgi`.
+fn send(cpu: usize, sgi: u32) {
     // SAFETY: the DTB's GICv2 distributor, stored before any IRQ or secondary core, in device-mapped GiB 0; `cpu` is
     // below `MAX_CPUS`.
-    unsafe { arch::gic::send_sgi(PhysAddr(GIC_DIST.load(Relaxed)), cpu, RESCHEDULE_SGI) };
+    unsafe { arch::gic::send_sgi(PhysAddr(GIC_DIST.load(Relaxed)), cpu, sgi) };
 }
 
 /// Signals an idle core for each task made ready since the last call, while one is left to signal.

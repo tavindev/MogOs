@@ -1,7 +1,7 @@
 //! Trap hooks: switch, IRQ, syscall and user fault, and the thread and process ends and releases they run.
 
 use core::fmt::Write;
-use core::sync::atomic::Ordering::Relaxed;
+use core::sync::atomic::Ordering::{Relaxed, Release};
 
 use arch::Guard;
 use kernel::Event;
@@ -17,8 +17,8 @@ use crate::net;
 use crate::process::{free_stack, map, spawn, thread};
 use crate::usermem::{UserIn, UserOut, copy_in};
 use crate::{
-    ARCHIVE, CONSOLE, GIC_CPU, KERNEL, Kernel, MAX_MUTEXES, MAX_PIPES, Sched, TICK_US, TICKED,
-    TICKS, TIMER_IRQ, UART_IRQ, kick, send_sgi,
+    ARCHIVE, CONSOLE, GIC_CPU, KERNEL, Kernel, MAX_MUTEXES, MAX_PIPES, PING_SGI, PONGS, Sched,
+    TICK_US, TICKED, TICKS, TIMER_IRQ, UART_IRQ, kick, send, send_sgi,
 };
 
 /// # Safety
@@ -297,6 +297,11 @@ unsafe extern "C" fn board_irq(frame: usize) -> usize {
     if tick {
         TICKED.fetch_or(1 << cpu, Relaxed);
         net::tick(&mut kernel.sched);
+    } else if irq == PING_SGI {
+        match cpu {
+            0 => _ = PONGS.fetch_add(1, Release),
+            _ => send(0, PING_SGI),
+        }
     } else if irq == net::IRQ.load(Relaxed) {
         net::interrupt(&mut kernel.sched);
     } else if irq == UART_IRQ {

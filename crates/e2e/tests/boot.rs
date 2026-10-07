@@ -524,7 +524,7 @@ fn lock_bench_reports_round_trips_and_an_exact_count() {
         !lines.iter().any(|l| l.starts_with("panic:")),
         "kernel panicked"
     );
-    for lock in ["ticket", "test-and-set", "contended"] {
+    for lock in ["ticket", "test-and-set", "cpu", "per-cpu", "contended"] {
         lines
             .iter()
             .find_map(|l| {
@@ -547,6 +547,22 @@ fn lock_bench_reports_round_trips_and_an_exact_count() {
         lines.iter().any(|l| l == "lock: count 4000000"),
         "the four adders' count is not exact"
     );
+    assert!(status.success(), "QEMU exited with {status}");
+}
+
+#[test]
+fn ipi_bench_reports_an_sgi_round_trip_between_cores() {
+    let (status, lines) = boot(&["-append", "test=bench-ipi"]);
+    assert!(
+        !lines.iter().any(|l| l.starts_with("panic:")),
+        "kernel panicked"
+    );
+    lines
+        .iter()
+        .find_map(|l| l.strip_prefix("ipi: ")?.strip_suffix(" ns/round-trip"))
+        .expect("missing ipi line")
+        .parse::<u64>()
+        .unwrap();
     assert!(status.success(), "QEMU exited with {status}");
 }
 
