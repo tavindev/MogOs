@@ -1392,6 +1392,8 @@ fn sockets_echo_over_loopback_wait_for_any_and_need_the_net_handle_and_budget() 
         "nettest: read-only accept send: EACCES",
         // Socket buffers are charged to the budget.
         "nettest: ENOBUFS after 3 sockets",
+        // A socket's charge follows it to the process that holds it.
+        "nettest: a moved socket is charged to its new holder",
     ] {
         assert!(
             lines.iter().any(|l| l == expected),

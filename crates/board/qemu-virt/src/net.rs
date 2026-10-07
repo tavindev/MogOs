@@ -7,8 +7,9 @@ use arch::Lock;
 use core::fmt::Write;
 use kernel::handle::{DUPLICATE, Object, READ, TRANSFER, WRITE};
 
+use kernel::handle::{Handles, MAX_HANDLES};
 use kernel::network::{self, Network, Sock, UserMemory};
-use kernel::syscall::{EINVAL, NetCall};
+use kernel::syscall::{EINVAL, ENOBUFS, NetCall};
 use kernel::{Board, Event};
 use mm::PhysAddr;
 use net::Config;
@@ -151,7 +152,14 @@ pub fn syscall(sched: &mut Sched, call: NetCall, tag: &mut u64) -> Option<i64> {
             port,
             loopback,
         } => status(net(sched, |n| n.bind(sock, port, loopback))),
-        NetCall::Listen(sock) => status(net(sched, |n| n.listen(sock))),
+        NetCall::Listen { sock, backlog } => {
+            let mut net = NET.lock();
+            let network = &mut net.as_mut().expect("a socket without a network").1;
+            let result = network.listen(sock, backlog.into(), sched);
+            drop(net);
+            wake(sched);
+            status(result)
+        }
         NetCall::Shutdown(sock) => status(net(sched, |n| n.shutdown(sock))),
         NetCall::Submit {
             sock,
@@ -176,10 +184,9 @@ pub fn syscall(sched: &mut Sched, call: NetCall, tag: &mut u64) -> Option<i64> {
 
 /// A socket of the current process with NetStack rights `allowed`, and its handle.
 fn socket(sched: &mut Sched, allowed: u64) -> i64 {
-    let owner = (sched.process(), sched.generation());
     let mut net = NET.lock();
     let network = &mut net.as_mut().expect("a NetStack without a network").1;
-    let made = network.socket(owner, allowed, sched);
+    let made = network.socket(sched.process(), allowed, sched);
     drop(net);
     match made {
         Ok(sock) => handle(sched, sock, SOCKET_RIGHTS),
@@ -192,7 +199,7 @@ fn handle(sched: &mut Sched, sock: Sock, rights: u64) -> i64 {
     match sched.handles().insert(Object::Socket(sock), rights) {
         Ok(handle) => handle as i64,
         Err(error) => {
-            close(sched, sock);
+            close(sched, sock, sched.process());
             error
         }
     }
@@ -238,11 +245,62 @@ pub fn open(sock: Sock) {
 }
 
 /// Drops a handle to `sock`; the last one refunds its owner, if it still runs.
-pub fn close(sched: &mut Sched, sock: Sock) {
+/// Drops a handle of process `holder` to `sock`; refunds `holder` once it has no other handle to it.
+pub fn close(sched: &mut Sched, sock: Sock, holder: usize) {
+    // A process other than the current one is ending, its table already emptied.
+    let last =
+        holder != sched.process() || !sched.handles().objects().any(|o| o == Object::Socket(sock));
     if let Some((_, network)) = NET.lock().as_mut() {
-        network.close(sock, sched);
+        network.close(sock, holder, last, sched);
     }
     wake(sched);
+}
+
+/// Moves the charge for the sockets `spawn` moves from the current process to its child at `index` (`child`, the
+/// child's table, and `parent`, the current one's after the move): the child's `budget` pays for each before the
+/// spawn (`ENOBUFS`); `spawned` records it after.
+pub fn spawn_charge(child: &Handles, budget: &mut mm::Budget) -> Result<(), i64> {
+    if !STARTED.load(Relaxed) {
+        return Ok(());
+    }
+    let mut net = NET.lock();
+    let Some((_, network)) = net.as_mut() else {
+        return Ok(());
+    };
+    let frames = sockets(child).map(|s| network.cost(s)).sum();
+    budget.charge(frames).then_some(()).ok_or(ENOBUFS)
+}
+
+/// After a spawn `spawn_charge` allowed: the child at `index` holds its sockets, and the current process stops
+/// paying for those it no longer holds.
+pub fn spawned(sched: &mut Sched, index: usize, child: &Handles) {
+    if !STARTED.load(Relaxed) {
+        return;
+    }
+    let mut net = NET.lock();
+    let Some((_, network)) = net.as_mut() else {
+        return;
+    };
+    let current = sched.process();
+    for sock in sockets(child) {
+        network.hold(sock, index);
+        if !sched.handles().objects().any(|o| o == Object::Socket(sock)) {
+            network.unhold(sock, current, sched);
+        }
+    }
+}
+
+/// The distinct sockets `handles` reaches.
+fn sockets(handles: &Handles) -> impl Iterator<Item = Sock> {
+    let mut found = [None; MAX_HANDLES];
+    for (i, object) in handles.objects().enumerate() {
+        if let Object::Socket(sock) = object
+            && !found.contains(&Some(sock))
+        {
+            found[i] = Some(sock);
+        }
+    }
+    found.into_iter().flatten()
 }
 
 fn status(result: Result<(), i64>) -> i64 {
@@ -283,7 +341,7 @@ fn task(board: &mut QemuVirt, _: usize) -> ! {
             continue;
         }
         if let Some((nic, network)) = &mut *NET.lock() {
-            let (deadline, more) = network.poll(nic.as_mut(), now(), &mut kernel.sched);
+            let (deadline, more) = network.poll(nic.as_mut(), now());
             DEADLINE.store(deadline.unwrap_or(u64::MAX), Relaxed);
             PENDING.fetch_or(more || nic.as_ref().is_some_and(VirtioNet::capped), Relaxed);
         }

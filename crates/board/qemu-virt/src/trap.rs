@@ -109,7 +109,7 @@ fn end_process(kernel: &mut Kernel, index: usize, code: u64) -> PhysAddr {
         ..
     } = kernel;
     for object in sched.take_handles(index).objects() {
-        release(sched, frames, pipes, mutexes, object);
+        release(sched, frames, pipes, mutexes, (object, index));
     }
     while let Some(slot) = sched.thread_of(index) {
         end_thread(sched, frames, mutexes, slot, code);
@@ -181,12 +181,12 @@ fn release(
     frames: &mut FrameAllocator<FRAME_WORDS>,
     pipes: &mut Pipes<MAX_PIPES>,
     mutexes: &mut Mutexes<MAX_MUTEXES>,
-    object: Object,
+    (object, holder): (Object, usize),
 ) {
     let end = match object {
         Object::Pipe(end) => end,
         Object::Mutex(mutex) => return mutexes.close(mutex),
-        Object::Socket(sock) => return net::close(sched, sock),
+        Object::Socket(sock) => return net::close(sched, sock, holder),
         Object::Process { index, generation } => {
             let limit = sched.close(index, generation);
             let held = pipes.charged_to((index, generation));
@@ -408,7 +408,8 @@ unsafe extern "C" fn board_syscall(frame: &mut arch::TrapFrame) -> usize {
             handle
         }
         Ok(Call::Close(object)) => {
-            release(sched, frames, pipes, mutexes, object);
+            let current = sched.process();
+            release(sched, frames, pipes, mutexes, (object, current));
             0
         }
         Ok(Call::Map { pages }) => map(sched, frames, pages).unwrap_or(ENOMEM as u64),

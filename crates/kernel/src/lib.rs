@@ -174,7 +174,8 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
     let _ = writeln!(board.console(), "exceptions: ok");
 
     let _ = writeln!(board.console(), "mmu: on");
-    let bootargs = dtb.bootargs().unwrap_or_default();
+    let (bootargs, seed) = dtb.chosen();
+    let bootargs = bootargs.unwrap_or_default();
     if bootargs.split_whitespace().any(|a| a == "test=mmu-fault") {
         board.read_unmapped();
     }
@@ -224,7 +225,7 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
     // The NIC is probed only for a network address; loopback alone starts only for the socket tests.
     let net = config.is_some() || loopback;
     if net {
-        board.start_net(config, dtb.rng_seed().expect("no rng-seed in DTB"));
+        board.start_net(config, seed.expect("no rng-seed in DTB"));
     }
 
     board.start_cpus(bootargs.split_whitespace().any(|a| a == "test=smp"));
