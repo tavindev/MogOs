@@ -39,6 +39,10 @@ name = "mm"
 version = "0.1.0"
 
 [[package]]
+name = "mogfs"
+version = "0.1.0"
+
+[[package]]
 name = "qemu-virt"
 version = "0.1.0"
 dependencies = [

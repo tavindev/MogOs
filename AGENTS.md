@@ -48,6 +48,7 @@ Every new `.md` file must be linked from its parent so it stays reachable from t
 - `crates/kernel` — OS logic, `#![no_std]`, **no `unsafe`** (`forbid`). Defines ports (traits) like `Board`, the scheduler, handles, pipes, mutexes, syscall decoding and the boot archive's cpio and ELF parsers.
 - `crates/mm` — arch-independent memory management (`PhysAddr`, frame allocator). Safe, host-tested.
 - `crates/dtb` — minimal FDT parser. Safe, host-tested.
+- `crates/mogfs` — MogFS: checksummed copy-on-write file system over a `Disk` trait (format at the top of `src/lib.rs`). Safe, `no_std`, host-tested; `examples/mkfs.rs` writes an empty image.
 - `crates/arch` — the only arch-specific crate, `unsafe` allowed; AArch64 code in `src/aarch64/` (boot, traps, MMU and page tables, GICv2, timer).
 - `crates/board/qemu-virt` — board crate, `unsafe` allowed: drivers, memory map, `linker.ld`, `#[global_allocator]`, trap hooks (switch, syscall, fault), process setup and ELF loading, asm user programs (`user.s`); builds the `mog_os` binary. Its `build.rs` builds `crates/user` and bundles the programs as the boot archive (cpio).
 - `crates/user` — user programs (`src/bin/*.rs`, static ELFs at 4 GiB via `link.ld`) and their syscall stubs (`src/lib.rs`); user space, outside the workspace, `unsafe` only for `svc`.

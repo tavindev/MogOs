@@ -28,6 +28,8 @@ Speed is a primary goal, so performance is tested like behavior: measured, recor
 | Benchmark | Mode | Min | Median | Commit |
 | --- | --- | --- | --- | --- |
 | `mm` frames: alloc+free of 1000 frames, 128 MiB allocator (ns/op) | Host, M4 Pro | 4.6 | 5.2 | uncommitted |
+| `mogfs` create + 100-byte write + commit, 400 files in one directory, in-memory disk (ns/op) | Host, M4 Pro | 6065 | 6227 | phase 4 step 21 |
+| `mogfs` lookup in a 400-entry directory, in-memory disk (ns/op) | Host, M4 Pro | 1529 | 1585 | phase 4 step 21 |
 | Kernel boot, kmain to end of init (us) | QEMU TCG, dev build | 2928 | 3140 | uncommitted |
 | Kernel boot, kmain to end of init (us) | QEMU hvf (`-cpu cortex-a72`), dev build, 21 boots | 157 | 178 | phase 3 step 11 |
 | Yield round trip via `svc`, `test=bench`, 100000 trips (ns) | QEMU TCG, dev build, 11 boots | 1178 | 1218 | uncommitted |
