@@ -34,7 +34,7 @@ kernel's ABI is `crates/kernel/src/syscall.rs`, mirrored here by hand (numbers, 
 - Sockets: `AF_INET` `SOCK_STREAM` only. `socket` makes a native socket on handle 5; `bind` takes the port and
   `INADDR_ANY` (every interface) or 127.0.0.1 (loopback only; any other address is `EADDRNOTAVAIL`); `connect`, `accept`, `read`/`write`,
   `send`/`recv`(`to`/`from`) submit one native op and wait for it at once (one thread, so it is the only one in
-  flight); `shutdown` ends the send side (`SHUT_RD` alone does nothing); `setsockopt(SO_REUSEADDR)` succeeds (ports
+  flight); `listen` passes its backlog (the kernel clamps it to 1..=8 and charges it at once); `shutdown` ends the send side (`SHUT_RD` alone does nothing); `setsockopt(SO_REUSEADDR)` succeeds (ports
   rebind once closed), other options are `ENOPROTOOPT`; `accept` does not report the peer's address.
 - Arguments: when the first string is `<argc> <stdin> <stdout> <stderr> /<cwd>` (each stdio fd `t` console, `p`
   pipe, `d` directory, `f<offset>` a file, `a<offset>` a file opened to append; msh's `Grant::Posix` writes

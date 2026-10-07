@@ -768,7 +768,8 @@ long __mog_syscall(long n, long a, long b, long c, long d, long e, long f)
 		if (!file) return fd_file(a) ? -ENOTSOCK : -EBADF;
 		/* SHUT_RD alone has nothing to do: received data is simply not read. */
 		if (n == SYS_shutdown && b == SHUT_RD) return 0;
-		return svc1(n == SYS_listen ? N_LISTEN : N_SHUTDOWN, file->handle);
+		/* The kernel clamps the backlog to 1..=8 and charges it now. */
+		return svc(n == SYS_listen ? N_LISTEN : N_SHUTDOWN, file->handle, b, 0, 0, 0, 0, 0);
 	}
 	case SYS_accept: return do_accept(a, (void *)b, (void *)c, 0);
 	case SYS_accept4: return do_accept(a, (void *)b, (void *)c, d);

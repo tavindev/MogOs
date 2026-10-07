@@ -339,16 +339,12 @@ impl kernel::Board for QemuVirt {
         mounted
     }
 
-    fn nic(&mut self) -> Option<VirtioNet> {
-        net::nic()
+    fn has_nic(&self) -> bool {
+        net::present()
     }
 
-    fn memory(&mut self, frames: usize) -> Option<&'static mut [u8]> {
-        net::memory(frames)
-    }
-
-    fn start_net(&mut self, network: &'static mut Network, nic: Option<VirtioNet>) {
-        net::start(self, network, nic)
+    fn start_net(&mut self, config: Option<::net::Config>, key: [u64; 2]) {
+        net::start(self, config, key)
     }
 
     fn with_net<R>(&mut self, f: impl FnOnce(&mut Network, Option<&mut VirtioNet>, u64) -> R) -> R {

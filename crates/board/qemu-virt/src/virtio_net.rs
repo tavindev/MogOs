@@ -4,7 +4,7 @@ use core::sync::atomic::{Ordering::SeqCst, fence};
 use mm::PhysAddr;
 use net::{MAX_FRAME, Mac, Nic};
 
-const NET_DEVICE: u32 = 1;
+pub const NET_DEVICE: u32 = 1;
 
 // virtio-mmio registers (virtio 1.2, 4.2.2).
 const VERSION: usize = 0x004;

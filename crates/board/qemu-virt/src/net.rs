@@ -4,43 +4,50 @@ use core::sync::atomic::Ordering::Relaxed;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 
 use arch::Lock;
-use kernel::handle::{DUPLICATE, Object, READ, TRANSFER, WRITE};
-use kernel::network::{Network, Sock, UserMemory};
-use kernel::syscall::{EINVAL, NetCall};
+use kernel::handle::{DUPLICATE, Handles, MAX_HANDLES, Object, READ, TRANSFER, WRITE};
+use kernel::network::{self, Network, Sock, UserMemory};
+use kernel::syscall::{EINVAL, ENOBUFS, NetCall};
 use kernel::{Board, Event};
 use mm::PhysAddr;
+use net::Config;
 
 use crate::usermem::{UserIn, UserOut};
-use crate::virtio_net::{POOL_FRAMES, VirtioNet};
-use crate::{CPUS, GIC_DIST, KERNEL, QemuVirt, Sched, VIRTIO, VIRTIO_COUNT, VIRTIO_STRIDE};
+use crate::virtio_net::{NET_DEVICE, POOL_FRAMES, VirtioNet};
+use crate::{
+    CPUS, GIC_DIST, KERNEL, MAX_PROCESSES, QemuVirt, Sched, VIRTIO, VIRTIO_COUNT, VIRTIO_STRIDE,
+};
+
+const _: () = assert!(MAX_PROCESSES <= network::MAX_HOLDERS);
 
 /// QEMU `virt` wires virtio-mmio transport `i` to SPI `16 + i`.
 const VIRTIO_IRQ: u32 = 48;
 
-/// Set by `start`. Lock order: `KERNEL`, then `NET`.
+/// Set by the net task once it set the network up. Lock order: `KERNEL`, then `NET`.
 static NET: Lock<Option<(Option<VirtioNet>, &'static mut Network)>> = Lock::new(None);
+/// What `start` hands the net task to set up: the NIC's address, if any, and the TCP key.
+static SETUP: Lock<Option<(Option<Config>, [u64; 2])>> = Lock::new(None);
 /// The NIC's interrupt ID, `u32::MAX` without one.
 pub static IRQ: AtomicU32 = AtomicU32::new(u32::MAX);
 /// The net task has work: a frame arrived, a socket call ran, or frames wait on the loopback wire.
 static PENDING: AtomicBool = AtomicBool::new(false);
 /// The next deadline in ns, `u64::MAX` for none.
 static DEADLINE: AtomicU64 = AtomicU64::new(u64::MAX);
-/// `start` ran: boot-spawned processes get a NetStack handle.
+/// `start` ran: boot-spawned processes get a NetStack handle, and the net task is not counted as a task.
 pub static STARTED: AtomicBool = AtomicBool::new(false);
 
 fn now() -> u64 {
     arch::uptime_us() * 1000
 }
 
-/// `Board::nic`: sets up the first net device among the transports.
-pub fn nic() -> Option<VirtioNet> {
+/// Sets up the first net device among the transports.
+fn nic() -> Option<VirtioNet> {
     let alloc = || KERNEL.lock().frames.alloc();
     let pool = || Some(KERNEL.lock().frames.alloc_contiguous(POOL_FRAMES)?.start);
     // QEMU `virt` fills the transports from the highest address down with no gaps, as `Board::disk` relies on.
     let (nic, index) = (0..VIRTIO_COUNT).rev().find_map(|i| {
         let base = PhysAddr(VIRTIO.0 + i * VIRTIO_STRIDE);
-        // SAFETY: QEMU `virt`'s virtio-mmio transports, in the device-mapped GiB 0; `Board::nic` runs once, so nothing
-        // else drives a net device; frames from the allocator are identity-mapped RAM nobody else uses.
+        // SAFETY: QEMU `virt`'s virtio-mmio transports, in the device-mapped GiB 0; the net task's setup runs once, so
+        // nothing else drives a net device; frames from the allocator are identity-mapped RAM nobody else uses.
         match unsafe { VirtioNet::new(base, alloc, pool) } {
             Ok(nic) => Some(Some((nic, i))),
             Err(0) => Some(None),
@@ -51,19 +58,46 @@ pub fn nic() -> Option<VirtioNet> {
     Some(nic)
 }
 
-/// `Board::memory`.
-pub fn memory(frames: usize) -> Option<&'static mut [u8]> {
-    let range = KERNEL.lock().frames.alloc_contiguous(frames)?;
-    // SAFETY: fresh identity-mapped frames that nothing else references, never freed.
-    Some(unsafe { core::slice::from_raw_parts_mut(range.start.0 as *mut u8, frames * 4096) })
+/// `Board::has_nic`: one device-ID read per transport, down to the first empty one.
+pub fn present() -> bool {
+    let id = |i| {
+        let base = VIRTIO.0 + i * VIRTIO_STRIDE;
+        // SAFETY: QEMU `virt`'s virtio-mmio transports, in the device-mapped GiB 0; reading the device ID changes nothing.
+        unsafe { ((base + 8) as *const u32).read_volatile() }
+    };
+    // QEMU `virt` fills the transports from the highest address down with no gaps, as `Board::disk` relies on.
+    (0..VIRTIO_COUNT)
+        .rev()
+        .map(id)
+        .take_while(|&id| id != 0)
+        .any(|id| id == NET_DEVICE)
 }
 
-/// `Board::start_net`: routes the NIC's interrupt to core 0.
-pub fn start(board: &mut QemuVirt, network: &'static mut Network, nic: Option<VirtioNet>) {
-    let irq = nic.is_some().then(|| IRQ.load(Relaxed));
-    *NET.lock() = Some((nic, network));
+/// `Board::start_net`: only spawns the net task, which does the setup.
+pub fn start(board: &mut QemuVirt, config: Option<Config>, key: [u64; 2]) {
+    *SETUP.lock() = Some((config, key));
     STARTED.store(true, Relaxed);
-    if let Some(irq) = irq {
+    board.spawn(task, 0).expect("net task");
+}
+
+/// Sets up the NIC (with an address), routing its interrupt to core 0, and the network, and starts the timer.
+fn setup(board: &mut QemuVirt) {
+    let (eth, key) = SETUP.lock().take().expect("net setup");
+    let nic = eth.map(|_| nic().expect("a net device, as `present` found"));
+    let frames = network::frames(eth.is_some());
+    let range = KERNEL
+        .lock()
+        .frames
+        .alloc_contiguous(frames)
+        .expect("net memory");
+    // SAFETY: fresh identity-mapped frames that nothing else references, never freed.
+    let memory =
+        unsafe { core::slice::from_raw_parts_mut(range.start.0 as *mut u8, frames * 4096) };
+    let network = Network::new(eth, key, memory)
+        .and_then(network::leak_one)
+        .expect("net heap");
+    if nic.is_some() {
+        let irq = IRQ.load(Relaxed);
         let dist = PhysAddr(GIC_DIST.load(Relaxed));
         if CPUS.load(Relaxed) > 1 {
             // SAFETY: the DTB's GICv2 distributor, in the device-mapped GiB 0; `irq` is an SPI, core 0's interface is 0.
@@ -72,15 +106,26 @@ pub fn start(board: &mut QemuVirt, network: &'static mut Network, nic: Option<Vi
         // SAFETY: as above.
         unsafe { arch::gic::unmask(dist, irq) };
     }
-    board.spawn(task, 0).expect("net task");
     board.start_timer();
+    // Last, so `with` returns only once everything is up.
+    let _kernel = KERNEL.lock();
+    *NET.lock() = Some((nic, network));
 }
 
-/// `Board::with_net`.
+/// `Board::with_net`: first lets the net task finish its setup (boot context only).
 pub fn with<R>(f: impl FnOnce(&mut Network, Option<&mut VirtioNet>, u64) -> R) -> R {
+    loop {
+        let mut kernel = KERNEL.lock();
+        if NET.lock().is_some() {
+            break;
+        }
+        kernel.sched.block(Event::Idle);
+        drop(kernel);
+        arch::yield_now();
+    }
     let mut kernel = KERNEL.lock();
     let mut net = NET.lock();
-    let (nic, network) = net.as_mut().expect("with_net before start_net");
+    let (nic, network) = net.as_mut().expect("set up above");
     let result = f(network, nic.as_mut(), now());
     wake(&mut kernel.sched);
     result
@@ -126,7 +171,14 @@ pub fn syscall(sched: &mut Sched, call: NetCall, tag: &mut u64) -> Option<i64> {
             port,
             loopback,
         } => status(net(sched, |n| n.bind(sock, port, loopback))),
-        NetCall::Listen(sock) => status(net(sched, |n| n.listen(sock))),
+        NetCall::Listen { sock, backlog } => {
+            let mut net = NET.lock();
+            let network = &mut net.as_mut().expect("a socket without a network").1;
+            let result = network.listen(sock, backlog.into(), sched);
+            drop(net);
+            wake(sched);
+            status(result)
+        }
         NetCall::Shutdown(sock) => status(net(sched, |n| n.shutdown(sock))),
         NetCall::Submit {
             sock,
@@ -151,10 +203,9 @@ pub fn syscall(sched: &mut Sched, call: NetCall, tag: &mut u64) -> Option<i64> {
 
 /// A socket of the current process with NetStack rights `allowed`, and its handle.
 fn socket(sched: &mut Sched, allowed: u64) -> i64 {
-    let owner = (sched.process(), sched.generation());
     let mut net = NET.lock();
     let network = &mut net.as_mut().expect("a NetStack without a network").1;
-    let made = network.socket(owner, allowed, sched);
+    let made = network.socket(sched.process(), allowed, sched);
     drop(net);
     match made {
         Ok(sock) => handle(sched, sock, SOCKET_RIGHTS),
@@ -167,7 +218,7 @@ fn handle(sched: &mut Sched, sock: Sock, rights: u64) -> i64 {
     match sched.handles().insert(Object::Socket(sock), rights) {
         Ok(handle) => handle as i64,
         Err(error) => {
-            close(sched, sock);
+            close(sched, sock, sched.process());
             error
         }
     }
@@ -212,12 +263,61 @@ pub fn open(sock: Sock) {
     }
 }
 
-/// Drops a handle to `sock`; the last one refunds its owner, if it still runs.
-pub fn close(sched: &mut Sched, sock: Sock) {
+/// Drops a handle of process `holder` to `sock`; refunds `holder` once it has no other handle to it.
+pub fn close(sched: &mut Sched, sock: Sock, holder: usize) {
+    // A process other than the current one is ending, its table already emptied.
+    let last =
+        holder != sched.process() || !sched.handles().objects().any(|o| o == Object::Socket(sock));
     if let Some((_, network)) = NET.lock().as_mut() {
-        network.close(sock, sched);
+        network.close(sock, holder, last, sched);
     }
     wake(sched);
+}
+
+/// Before a `spawn`: the child's `budget` pays for each socket its table `child` reaches (`ENOBUFS`); `spawned`
+/// records it after.
+pub fn spawn_charge(child: &Handles, budget: &mut mm::Budget) -> Result<(), i64> {
+    if !STARTED.load(Relaxed) {
+        return Ok(());
+    }
+    let mut net = NET.lock();
+    let Some((_, network)) = net.as_mut() else {
+        return Ok(());
+    };
+    let frames = sockets(child).map(|s| network.cost(s)).sum();
+    budget.charge(frames).then_some(()).ok_or(ENOBUFS)
+}
+
+/// After a spawn `spawn_charge` allowed: the child at `index` holds its sockets, and the current process stops
+/// paying for those it no longer holds.
+pub fn spawned(sched: &mut Sched, index: usize, child: &Handles) {
+    if !STARTED.load(Relaxed) {
+        return;
+    }
+    let mut net = NET.lock();
+    let Some((_, network)) = net.as_mut() else {
+        return;
+    };
+    let current = sched.process();
+    for sock in sockets(child) {
+        network.hold(sock, index);
+        if !sched.handles().objects().any(|o| o == Object::Socket(sock)) {
+            network.unhold(sock, current, sched);
+        }
+    }
+}
+
+/// The distinct sockets `handles` reaches.
+fn sockets(handles: &Handles) -> impl Iterator<Item = Sock> {
+    let mut found = [None; MAX_HANDLES];
+    for (i, object) in handles.objects().enumerate() {
+        if let Object::Socket(sock) = object
+            && !found.contains(&Some(sock))
+        {
+            found[i] = Some(sock);
+        }
+    }
+    found.into_iter().flatten()
 }
 
 fn status(result: Result<(), i64>) -> i64 {
@@ -245,8 +345,10 @@ fn wake(sched: &mut Sched) {
     sched.wake(Event::Net);
 }
 
-/// Polls the network whenever there is work and wakes every `io_wait`, then sleeps until the next wake.
-fn task(_: &mut QemuVirt, _: usize) -> ! {
+/// Sets the network up, then polls it whenever there is work and wakes every `io_wait`, and sleeps until the next
+/// wake.
+fn task(board: &mut QemuVirt, _: usize) -> ! {
+    setup(board);
     loop {
         let mut kernel = KERNEL.lock();
         if !PENDING.swap(false, Relaxed) {
@@ -256,7 +358,7 @@ fn task(_: &mut QemuVirt, _: usize) -> ! {
             continue;
         }
         if let Some((nic, network)) = &mut *NET.lock() {
-            let (deadline, more) = network.poll(nic.as_mut(), now(), &mut kernel.sched);
+            let (deadline, more) = network.poll(nic.as_mut(), now());
             DEADLINE.store(deadline.unwrap_or(u64::MAX), Relaxed);
             PENDING.fetch_or(more || nic.as_ref().is_some_and(VirtioNet::capped), Relaxed);
         }

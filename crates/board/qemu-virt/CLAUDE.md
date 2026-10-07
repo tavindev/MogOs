@@ -44,15 +44,18 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
   each owning a fixed 2 KiB buffer of one `POOL_FRAMES` (64) pool; RX buffers stay posted (re-posted after the stack
   reads them, one notify per poll), TX descriptors are a free bitmask reclaimed from the used ring on demand, and only
   RX interrupts. Used-ring ids and lengths are device-written and range-checked before a buffer is touched.
-- `src/net.rs`: `Board::nic` scans the transports for the first net device (the kernel asks only with a `net=`
-  bootarg, so no boot without one pays for it); `Board::memory` hands out frames as a `&'static mut [u8]`;
-  `Board::start_net` stores the NIC and the kernel's `Network` in `NET`, unmasks the SPI (`VIRTIO_IRQ` + transport
-  index, routed to core 0), spawns the net task, starts the timer and sets `STARTED`, after which `spawn_init` adds a
-  NetStack handle (connect, listen, duplicate, transfer) and `Board::tasks` stops counting the net task. The task polls
+- `src/net.rs`: `Board::start_net` only spawns the net task and sets `STARTED`, after which `spawn_init` adds a
+  NetStack handle (connect, listen, duplicate, transfer) and `Board::tasks` stops counting the net task. The task first
+  sets up (`setup`): it scans the transports for the first net device (only with an address, so no boot without one
+  pays for it), takes the ring memory from the frame allocator, builds the kernel's `Network`, stores both in `NET`,
+  unmasks the SPI (`VIRTIO_IRQ` + transport index, routed to core 0) and starts the timer; `with_net` waits for it.
+  Then it polls
   whenever `PENDING` is set (the NIC's interrupt, which `board_irq` acks; the tick once `DEADLINE` passed; every socket
   call; frames left on the loopback wire), then wakes `Event::NetIo`; otherwise it blocks on `Event::Net`. The socket
-  syscalls (`socket`, `bind`, `listen`, `shutdown`, `submit`, `io_wait`) and a socket handle's `dup` and last `close`
-  (which refunds the owner's budget) are thin calls into `Network` under `NET`.
+  syscalls (`socket`, `bind`, `listen`, `shutdown`, `submit`, `io_wait`) and a socket handle's `dup` and `close` are
+  thin calls into `Network` under `NET`; `release` passes the process a handle leaves, and `spawn` calls
+  `spawn_charge` (the child's budget pays for the sockets it gets, before the process is built) and `spawned` (it
+  holds them; the parent stops paying for those it no longer holds).
 - `build.rs`: nested `cargo build` of `crates/user` into `target/user`, `make -C c` (musl, busybox and the C
   programs into `target/c`, `c/CLAUDE.md`), newc `boot.cpio` into `OUT_DIR` (every user program, busybox as `sh`,
   `hello`, `cbench`, plus a non-ELF `bad` entry), `-T linker.ld`. Why it is built this way: `docs/DEVELOPMENT.md` settings table.
