@@ -71,7 +71,7 @@ const TICK_US: u64 = 10_000;
 /// The SGI that will wake a core to reschedule (step 25b); enabled on every core.
 const RESCHEDULE_SGI: u32 = 0;
 const PSCI_CPU_ON: u64 = 0xc400_0003;
-/// Each secondary core's 4 KiB guard page and 16 KiB stack, reserved in `linker.ld` above `__stack_top`.
+/// Each secondary core's 16 KiB stack and the 4 KiB guard page below it, below core 0's guard (`linker.ld`).
 const SECONDARY_STACK: u64 = 0x5000;
 const _: () = assert!(
     arch::MAX_CPUS == 4,
@@ -107,8 +107,13 @@ struct Nospec;
 
 impl kernel::Clamp for Nospec {
     #[inline(always)]
-    fn clamp<const N: usize>(values: [u64; N], limits: [u64; N]) -> [u64; N] {
-        arch::clamp(values, limits)
+    fn clamp<const N: usize>(values: [u64; N], maxes: [u64; N]) -> [u64; N] {
+        arch::clamp(values, maxes)
+    }
+
+    #[inline(always)]
+    fn mask(value: u64, mask: u64) -> u64 {
+        arch::mask(value, mask)
     }
 }
 /// Kernel stack per task: 16 KiB.
@@ -452,38 +457,37 @@ unsafe extern "C" {
     static __text_end: u8;
     static __rodata_end: u8;
     static __boot_guard: u8;
+    static __stacks: u8;
     static __kernel_end: u8;
-    static __stack_top: u8;
 }
 
 #[unsafe(no_mangle)]
 extern "C" fn kmain() -> ! {
     let entry_us = arch::uptime_us();
-    let stack_top = &raw const __stack_top as u64;
+    // SAFETY: RAM base is RAM, read with the MMU off as Device memory; we only read the 8-byte FDT header there.
+    let header = unsafe { slice::from_raw_parts(DTB.0 as *const u8, 8) };
+    let size = dtb::total_size(header).expect("no DTB at RAM base");
+    let stacks = PhysAddr(&raw const __stacks as u64);
+    let dtb_range = DTB..PhysAddr(DTB.0 + size as u64);
+    assert!(
+        dtb_range.end.0 <= stacks.0,
+        "the DTB reaches the boot stacks"
+    );
+    let boot_guard = &raw const __boot_guard as u64;
     let map = KernelMap {
         device: PhysAddr(0),
         ram: PhysAddr(GIB),
-        dtb: DTB,
+        dtb: dtb_range.clone(),
+        guards: core::array::from_fn(|cpu| PhysAddr(boot_guard - cpu as u64 * SECONDARY_STACK)),
         image: PhysAddr(&raw const __kernel_start as u64),
         text_end: PhysAddr(&raw const __text_end as u64),
         rodata_end: PhysAddr(&raw const __rodata_end as u64),
-        guards: core::array::from_fn(|cpu| match cpu {
-            0 => PhysAddr(&raw const __boot_guard as u64),
-            cpu => PhysAddr(stack_top + (cpu as u64 - 1) * SECONDARY_STACK),
-        }),
     };
-    // SAFETY: core 0, MMU off, before any atomic RMW; MMIO is in GiB 0, the image (`linker.ld` keeps it in its 2 MiB),
-    // stacks and DTB in RAM in GiB 1.
+    // SAFETY: core 0, MMU off, before any atomic RMW; MMIO is in GiB 0, the image, stacks and DTB in RAM in GiB 1.
     unsafe { arch::enable_mmu(&map) };
 
-    // SAFETY: RAM base is mapped RAM; we only read the 8-byte FDT header there.
-    let header = unsafe { slice::from_raw_parts(DTB.0 as *const u8, 8) };
-    let size = dtb::total_size(header).expect("no DTB at RAM base");
     // SAFETY: the magic matched, so QEMU loaded `size` bytes of DTB here and nothing writes them.
     let blob = unsafe { slice::from_raw_parts(DTB.0 as *const u8, size) };
-
-    // The DTB's whole 2 MiB block is read-only, so no frame comes from it.
-    let reserved = DTB..PhysAddr(&raw const __kernel_end as u64);
 
     let dtb = Dtb::new(blob).expect("bad DTB");
     let method = match dtb.psci_method() {
@@ -519,13 +523,13 @@ extern "C" fn kmain() -> ! {
             entry_us,
         },
         dtb,
-        &[reserved],
+        &[dtb_range, stacks..PhysAddr(&raw const __kernel_end as u64)],
     )
 }
 
 /// Starts core `cpu` (MPIDR `cpu` on QEMU `virt`) at `arch::secondary_entry` on its stack, without waiting for it.
 fn start_cpu(cpu: usize) {
-    let stack_top = &raw const __stack_top as u64 + cpu as u64 * SECONDARY_STACK;
+    let stack_top = &raw const __boot_guard as u64 - (cpu as u64 - 1) * SECONDARY_STACK;
     let status: i64;
     // SAFETY: CPU_ON starts an off core on an unused stack; `dsb ish` first completes the stores it reads.
     unsafe {

@@ -199,10 +199,11 @@ fn unmapped_access_reports_data_abort() {
 /// word (`exec`) or recurses past core 0's stack into its guard page (`guard`); each ends in the fault report.
 #[test]
 fn kernel_text_is_read_only_data_never_executes_and_the_boot_stack_has_a_guard() {
-    // (scenario, exception class, fault status code: permission or translation fault, level 3)
+    // (scenario, exception class, fault status code: a permission fault on a level-2 block, a translation fault on a
+    // level-3 page)
     for (name, class, status) in [
-        ("text", 0x25, 0x0f),
-        ("exec", 0x21, 0x0f),
+        ("text", 0x25, 0x0e),
+        ("exec", 0x21, 0x0e),
         ("guard", 0x25, 0x07),
     ] {
         let (status_code, lines) = boot(&["-append", &format!("test=wx-{name}")]);

@@ -119,8 +119,13 @@ impl World {
         rights: Rights,
     ) -> Result<(), i64> {
         let (user, processes) = (&mut self.user, &mut self.processes);
+        // A connect's address and port travel apart from the buffer, as `dispatch` passes them.
+        let (op, peer) = match op {
+            (OP_CONNECT, ip, port, tag) => ((OP_CONNECT, 0, 0, tag), (ip as u32, port as u16)),
+            op => (op, (0, 0)),
+        };
         self.network
-            .submit(sock, op, rights, (owner, self.now), processes, user)
+            .submit(sock, (op, peer), rights, (owner, self.now), processes, user)
     }
 
     fn poll(&mut self) {

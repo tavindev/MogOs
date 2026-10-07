@@ -186,11 +186,12 @@ pub fn syscall(sched: &mut Sched, call: NetCall, out: &mut [u64; 2]) -> Option<i
             rights,
             ptr,
             len,
+            peer,
             tag,
         } => submit(
             sched,
             sock,
-            (op.into(), ptr, len as usize, tag),
+            ((op.into(), ptr, len as usize, tag), peer),
             rights.into(),
         ),
         NetCall::IoWait => {
@@ -225,11 +226,16 @@ fn handle(sched: &mut Sched, sock: Sock, rights: u64) -> i64 {
 }
 
 /// `io_submit` of `op` on `sock` for the current process.
-fn submit(sched: &mut Sched, sock: Sock, op: (u64, u64, usize, u64), rights: u64) -> i64 {
+fn submit(
+    sched: &mut Sched,
+    sock: Sock,
+    (op, peer): ((u64, u64, usize, u64), (u32, u16)),
+    rights: u64,
+) -> i64 {
     let current = (sched.process(), sched.generation());
     let mut net = NET.lock();
     let network = &mut net.as_mut().expect("a socket without a network").1;
-    let result = network.submit(sock, op, rights, (current, now()), sched, &mut User);
+    let result = network.submit(sock, (op, peer), rights, (current, now()), sched, &mut User);
     drop(net);
     wake(sched);
     status(result)

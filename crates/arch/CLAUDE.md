@@ -23,12 +23,13 @@ It is **NOT** board-specific: no MMIO addresses, no memory map, no drivers, no s
   EL1 `brk #0` (self-test); anything else panics with ESR/FAR/ELR.
 - `new_task`, `new_user_task`, `switch_el0_regs`, `TrapFrame::restart`.
 - Descriptor encoding (the private `kernel`, `user_page`), `enable_mmu(&KernelMap)` (core 0 builds the boot tables: the
-  device GiB PXN; the RAM GiB's level-2 table of 2 MiB blocks, RW and PXN, the DTB's read-only; the image's 2 MiB by a
-  level-3 table, text RX, rodata RO and PXN, the rest RW and PXN, guard pages unmapped; all UXN and global; SCTLR's WXN
-  set; then `aarch64_mmu_on`),
+  device GiB PXN; the RAM GiB's level-2 table of 2 MiB blocks: the image's text blocks RX, its rodata blocks RO and PXN,
+  the rest RW and PXN; RAM's first 2 MiB by a level-3 table: the DTB's pages RO and PXN, guard pages unmapped, the rest
+  RW and PXN; all UXN and global; SCTLR's WXN set; then `aarch64_mmu_on`; the fill is plain stores of precomputed
+  attributes, since every access is uncached with the MMU off),
   `secondary_entry` (PSCI `CPU_ON`'s entry: `aarch64_mmu_on` on the same table, the stack top from the context id),
-  `map_page`, `unmap_page`, `free_space`, `set_ttbr0`, `flush_asid` (`tlbi aside1is`), `clamp` (each of N values bounded below its limit by `cmp`/`csel`, then one
-  `csdb`), `user_readable` /
+  `map_page`, `unmap_page`, `free_space`, `set_ttbr0`, `flush_asid` (`tlbi aside1is`), `clamp` (each of N values bounded by its max by `cmp`/`csel`, then one
+  `csdb`), `mask` (an `and` the compiler cannot see through), `user_readable` /
   `user_writable` (`at` probes), `clean_dcache` / `invalidate_icache` (`ic ialluis`; clean each code page, invalidate once).
 - `irq::disable` / `restore` / `wait`, `gic::enable` / `enable_cpu` / `route` / `unmask` / `ack` / `eoi`, `timer::arm`,
   `timer::allow_user_counter`.
