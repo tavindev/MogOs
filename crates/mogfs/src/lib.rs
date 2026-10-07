@@ -30,6 +30,8 @@ pub const NAME_MAX: usize = DIRENT - 5;
 pub const ROOT: Inode = Inode(0);
 
 const PAYLOAD: usize = BLOCK_SIZE - 8;
+/// Two superblock slots and one inode table block.
+const MIN_BLOCKS: u32 = 3;
 const MAGIC: u64 = u64::from_le_bytes(*b"MogFS\0\0\x01");
 const TABLE_BLOCKS: usize = 8;
 const RECORD: usize = 64;
@@ -100,9 +102,11 @@ impl<D: Disk> Fs<D> {
     /// Writes an empty file system (only a root directory) and commits it.
     pub fn format(disk: D) -> Result<Self, Error> {
         let mut fs = Self::new(disk);
+        if fs.blocks < MIN_BLOCKS {
+            return Err(Error::NoSpace);
+        }
         // A stale superblock in slot 0 could outrank generation 1.
         fs.disk.write(0, &fs.buf)?;
-        fs.used[0] = 0b11;
         let root = Record {
             kind: DIR,
             ..Record::default()
@@ -124,6 +128,7 @@ impl<D: Disk> Fs<D> {
         if let Some(older) = older
             && fs.load_table(older).is_ok()
         {
+            fs.table = older;
             fs.newest = fs.reach();
         }
         (fs.generation, fs.blocks, fs.table) = newest;
@@ -214,8 +219,9 @@ impl<D: Disk> Fs<D> {
             table: [0; TABLE_BLOCKS],
             records: [Record::default(); MAX_INODES as usize],
             newest: [0; WORDS],
-            committed: [0; WORDS],
-            used: [0; WORDS],
+            // The superblock slots are never free.
+            committed: core::array::from_fn(|w| if w == 0 { 0b11 } else { 0 }),
+            used: core::array::from_fn(|w| if w == 0 { 0b11 } else { 0 }),
             buf: [0; BLOCK_SIZE],
             cached: None,
             meta: [0; BLOCK_SIZE],
@@ -226,12 +232,16 @@ impl<D: Disk> Fs<D> {
     /// Generation, block count and inode table of a valid superblock slot.
     fn superblock(&mut self, slot: u32) -> Result<(u64, u32, [u32; TABLE_BLOCKS]), Error> {
         self.load(slot)?;
-        let blocks = le32(&self.buf, 16);
+        let (generation, blocks) = (le64(&self.buf, 8), le32(&self.buf, 16));
         let table = core::array::from_fn(|i| le32(&self.buf, 20 + 4 * i));
-        if le64(&self.buf, 0) != MAGIC || blocks > self.blocks || !valid(&table, blocks) {
+        if le64(&self.buf, 0) != MAGIC
+            || generation == u64::MAX
+            || !(MIN_BLOCKS..=self.blocks).contains(&blocks)
+            || !valid(&table, blocks)
+        {
             return Err(Error::Corrupt);
         }
-        Ok((le64(&self.buf, 8), blocks, table))
+        Ok((generation, blocks, table))
     }
 
     fn load_table(&mut self, table: [u32; TABLE_BLOCKS]) -> Result<(), Error> {
@@ -319,6 +329,9 @@ impl<D: Disk> Fs<D> {
 
     /// Writes `meta` (table and superblock blocks) or `buf` (data blocks, which then stay cached) to block `b`.
     fn store(&mut self, b: u32, meta: bool) -> Result<(), Error> {
+        if self.broken {
+            return Err(Error::Io);
+        }
         let buf = if meta { &mut self.meta } else { &mut self.buf };
         let sum = checksum(b, buf);
         buf[PAYLOAD..].copy_from_slice(&sum.to_le_bytes());

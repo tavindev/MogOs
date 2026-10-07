@@ -171,6 +171,94 @@ fn mount_falls_back_to_the_older_superblock() {
     assert_eq!(snapshot(&mut bad).err(), Some(Error::Corrupt));
 }
 
+/// Rewrites `block`'s checksum (the format's hash, restated) so a crafted change passes the check.
+fn reseal(disk: &mut MemDisk, block: usize) {
+    let mix = |h: u64, w: u64| (h ^ w).wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(29);
+    let buf = &mut disk.blocks[block];
+    let mut lanes = [block as u64, 1, 2, 3];
+    for (i, w) in buf[..BLOCK_SIZE - 8].chunks(8).enumerate() {
+        lanes[i % 4] = mix(lanes[i % 4], u64::from_le_bytes(w.try_into().unwrap()));
+    }
+    let sum = lanes.into_iter().fold(0, mix);
+    buf[BLOCK_SIZE - 8..].copy_from_slice(&sum.to_le_bytes());
+}
+
+/// `hello` with `value` written at `at` in `block` (or both superblock slots for `None`), resealed.
+fn crafted(block: Option<usize>, at: usize, value: &[u8]) -> MemDisk {
+    let mut disk = hello();
+    for b in block.map_or(vec![0, 1], |b| vec![b]) {
+        disk.blocks[b][at..at + value.len()].copy_from_slice(value);
+        reseal(&mut disk, b);
+    }
+    disk
+}
+
+fn le32(b: &[u8], at: usize) -> usize {
+    u32::from_le_bytes(b[at..at + 4].try_into().unwrap()) as usize
+}
+
+#[test]
+fn crafted_superblocks_are_corrupt() {
+    // The next commit's generation would overflow.
+    let mut disk = crafted(None, 8, &u64::MAX.to_le_bytes());
+    assert_eq!(snapshot(&mut disk).err(), Some(Error::Corrupt));
+    // Block counts too small to hold the slots and a table (free space would underflow), or past the disk.
+    for blocks in [0u32, 1, 2, 65] {
+        let mut disk = crafted(None, 16, &blocks.to_le_bytes());
+        assert_eq!(snapshot(&mut disk).err(), Some(Error::Corrupt), "{blocks}");
+    }
+    // A table block at a superblock slot or past the end.
+    for ptr in [1u32, 64] {
+        let mut disk = crafted(None, 20, &ptr.to_le_bytes());
+        assert_eq!(snapshot(&mut disk).err(), Some(Error::Corrupt), "{ptr}");
+    }
+    assert_eq!(Fs::format(&mut MemDisk::new(2)).err(), Some(Error::NoSpace));
+}
+
+#[test]
+fn crafted_records_and_entries_are_corrupt() {
+    let disk = hello();
+    // Slot 0 holds hello; inode 1 is `docs`, inode 2 `a.txt`, 64-byte records.
+    let table = le32(&disk.blocks[0], 20);
+    let docs = le32(&disk.blocks[table], 64 + 8);
+    let bad = [
+        // A size past the file limit.
+        (table, 128 + 4, MAX_FILE_SIZE as u32 + 1),
+        // A data block at a superblock slot or past the end.
+        (table, 128 + 8, 1),
+        (table, 128 + 8, 64),
+        // A directory entry naming an inode past the table, or a name longer than NAME_MAX.
+        (docs, 0, MAX_INODES),
+        (docs, 4, NAME_MAX as u32 + 1),
+    ];
+    // Control: a legal crafted size passes the checksum.
+    let mut disk = crafted(Some(table), 128 + 4, &3u32.to_le_bytes());
+    assert_eq!(
+        snapshot(&mut disk),
+        Ok(vec![entry("/docs/", b""), entry("/docs/a.txt", b"hel")])
+    );
+    for (block, at, value) in bad {
+        let mut disk = crafted(Some(block), at, &value.to_le_bytes());
+        assert_eq!(
+            snapshot(&mut disk).err(),
+            Some(Error::Corrupt),
+            "{block} {at}"
+        );
+    }
+}
+
+#[test]
+fn uncommitted_changes_leave_the_older_slot_intact() {
+    let mut disk = hello();
+    let mut fs = Fs::mount(&mut disk).unwrap();
+    let docs = fs.lookup(ROOT, b"docs").unwrap();
+    fs.create(docs, b"b").unwrap();
+    fs.mkdir(ROOT, b"c").unwrap();
+    // Slot 0 holds hello; slot 1 the empty file system from `format`.
+    disk.blocks[0][0] ^= 1;
+    assert_eq!(snapshot(&mut disk), Ok(vec![]));
+}
+
 #[test]
 fn power_cut_at_any_write_leaves_the_old_or_the_new_state() {
     let base = hello();
