@@ -94,8 +94,8 @@ impl Record {
     };
 }
 
-/// A file system on `D`, about 48 KiB: keep it in a static or on the heap. `Io` from any change leaves it refusing
-/// writes and commits until the next `mount`; `Io` from `commit` means the commit may or may not be durable.
+/// A file system on `D`, about 48 KiB: keep it in a static or on the heap. `Io` from any change, or a failed `mount`,
+/// leaves it refusing writes and commits until a `mount` succeeds; after `Io` from `commit`, durability is unknown.
 pub struct Fs<D> {
     disk: D,
     blocks: u32,
@@ -113,6 +113,8 @@ pub struct Fs<D> {
     free: u32,
     /// Every word of `used` before it is full.
     hint: usize,
+    /// Every inode before it is in use; inodes are only freed by `mount`.
+    inode_hint: usize,
     buf: [u8; BLOCK_SIZE],
     /// The data block `buf` holds unchanged.
     cached: Option<u32>,
@@ -136,6 +138,7 @@ impl<D: Disk> Fs<D> {
             replaced: [0; WORDS],
             free: 0,
             hint: 0,
+            inode_hint: 0,
             buf: [0; BLOCK_SIZE],
             cached: None,
             meta: [0; BLOCK_SIZE],
@@ -166,6 +169,7 @@ impl<D: Disk> Fs<D> {
     /// Loads the newest valid slot, or the older one if the newest's table is corrupt; drops uncommitted changes.
     pub fn mount(&mut self) -> Result<(), Error> {
         self.reset();
+        self.broken = true;
         let (a, b) = (self.superblock(0), self.superblock(1));
         if a == Err(Error::Io) || b == Err(Error::Io) {
             return Err(Error::Io);
@@ -204,8 +208,17 @@ impl<D: Disk> Fs<D> {
                 *c |= n;
             }
             self.committed[0] |= 0b11;
+            if i == 1
+                && let Some((_, _, damaged)) = slots[0]
+            {
+                // Writes must not reseal the damaged newest slot's table as valid.
+                for b in damaged.into_iter().filter(|&b| b != 0 && b < self.blocks) {
+                    self.committed[b as usize / 64] |= 1 << (b % 64);
+                }
+            }
             self.used = self.committed;
             self.count_free();
+            self.broken = false;
             return Ok(());
         }
         Err(Error::Corrupt)
@@ -304,13 +317,13 @@ impl<D: Disk> Fs<D> {
         if self.dirty == 0 {
             return Ok(());
         }
+        let generation = self.generation.checked_add(1).ok_or(Error::Corrupt)?;
         let dirty = self.dirty;
         for t in (0..TABLE_BLOCKS).filter(|t| dirty & 1 << t != 0) {
             self.encode(t);
             self.store(self.table[t], true)?;
         }
         self.flush()?;
-        let generation = self.generation + 1;
         let sb = &mut self.meta;
         sb.fill(0);
         sb[..8].copy_from_slice(&MAGIC.to_le_bytes());
@@ -323,7 +336,8 @@ impl<D: Disk> Fs<D> {
         self.flush()?;
         self.generation = generation;
         self.dirty = 0;
-        let maps = self.newest.iter_mut().zip(&mut self.committed);
+        let words = self.blocks.div_ceil(64) as usize;
+        let maps = self.newest[..words].iter_mut().zip(&mut self.committed);
         for (((newest, committed), used), replaced) in
             maps.zip(&mut self.used).zip(&mut self.replaced)
         {
@@ -345,6 +359,7 @@ impl<D: Disk> Fs<D> {
         self.table = [0; TABLE_BLOCKS];
         self.dirty = 0;
         self.records.fill(Record::EMPTY);
+        self.inode_hint = 0;
         self.newest.fill(0);
         self.committed.fill(0);
         self.used.fill(0);
@@ -357,7 +372,8 @@ impl<D: Disk> Fs<D> {
     }
 
     fn count_free(&mut self) {
-        let used: u32 = self.used.iter().map(|w| w.count_ones()).sum();
+        let words = self.blocks.div_ceil(64) as usize;
+        let used: u32 = self.used[..words].iter().map(|w| w.count_ones()).sum();
         self.free = self.blocks.saturating_sub(used);
         self.hint = 0;
     }
@@ -368,7 +384,6 @@ impl<D: Disk> Fs<D> {
         let (generation, blocks) = (le64(&self.meta, 8), le32(&self.meta, 16));
         let table = core::array::from_fn(|i| le32(&self.meta, 20 + 4 * i));
         if le64(&self.meta, 0) != MAGIC
-            || generation == u64::MAX
             || generation % 2 != slot as u64
             || !(MIN_BLOCKS..=self.blocks).contains(&blocks)
             || !valid(&table, blocks)
@@ -541,6 +556,10 @@ impl<D: Disk> Fs<D> {
             || r.size as u64 > MAX_FILE_SIZE
             || (r.kind == DIR && !(r.size as usize).is_multiple_of(DIRENT))
             || !valid(&r.ptrs, self.blocks)
+            || (r.kind == FREE && r.size != 0)
+            || r.ptrs[(r.size as usize).div_ceil(PAYLOAD)..]
+                .iter()
+                .any(|&p| p != 0)
         {
             return Err(Error::Corrupt);
         }
@@ -653,12 +672,11 @@ impl<D: Disk> Fs<D> {
         if d.size as u64 + DIRENT as u64 > MAX_FILE_SIZE {
             return Err(Error::TooBig);
         }
-        let inode = self
-            .records
+        self.inode_hint += self.records[self.inode_hint..]
             .iter()
             .position(|r| r.kind == FREE)
             .ok_or(Error::NoSpace)?;
-        let inode = Inode(inode as u32);
+        let inode = Inode(self.inode_hint as u32);
         // Entries never straddle blocks, so the new one needs at most its own block.
         let need = !self.fresh(d.ptrs[d.size as usize / PAYLOAD]) as usize;
         self.reserve(need, &[dir, inode])?;
@@ -713,3 +731,6 @@ fn le32(b: &[u8], at: usize) -> u32 {
 fn le64(b: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
 }
+
+#[cfg(test)]
+mod tests;

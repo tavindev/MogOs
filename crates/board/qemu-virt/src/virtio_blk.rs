@@ -121,7 +121,7 @@ impl VirtioBlk {
             blocks: 0,
             idx: 0,
         };
-        // Device ID first, so an empty transport (ID 0) costs one read; the DTB vouches for the magic value.
+        // Device ID first, so an empty transport (ID 0) costs one read; the caller vouches for the magic value.
         let id = disk.reg(DEVICE_ID);
         if id != BLOCK_DEVICE || disk.reg(VERSION) != 2 {
             return Err(id);
