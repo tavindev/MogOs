@@ -846,11 +846,13 @@ impl<'a, D: Disk> Fs<'a, D> {
                 }
             }
         }
-        // Pages shared with the live index were skipped: their bits are the live ones.
+        // Pages shared with the live index were skipped: their bits are the live ones. Blocks past this disk's size
+        // (the other slot may claim more) are never allocated, so need no check.
         let has = |b: u64| {
             let i = (b / 64) as usize;
-            let word = self.bits[map * w + i] | if live { 0 } else { self.bits[i] };
-            b >= self.blocks || word >> (b % 64) & 1 != 0
+            b >= self.blocks
+                || (self.bits[map * w + i] | if live { 0 } else { self.bits[i] }) >> (b % 64) & 1
+                    != 0
         };
         let buf = if live {
             &self.cache[0]

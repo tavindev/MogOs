@@ -1,3 +1,5 @@
+use std::cell::Cell;
+
 use mogfs2::{
     BLOCK_SIZE, Block, Disk, Error, Fs, Inode, Kind, MAX_FILE_SIZE, NAME_MAX, ROOT, bitmap_words,
     cache_blocks,
@@ -979,4 +981,253 @@ fn pages_past_the_largest_file_map_to_nothing() {
     for page in [1 << 40, 1 << 62, 1 << 63, u64::MAX] {
         assert_eq!(fs.map(a, page), Ok(None), "page {page}");
     }
+}
+
+/// Counts the read, write and flush requests that reach `disk`.
+struct Counted<'a>(&'a mut MemDisk, &'a Cell<[usize; 3]>);
+
+impl Counted<'_> {
+    fn bump(&self, i: usize) {
+        let mut c = self.1.get();
+        c[i] += 1;
+        self.1.set(c);
+    }
+}
+
+impl Disk for Counted<'_> {
+    fn read(&mut self, block: u64, bufs: &mut [Block]) -> Result<(), Error> {
+        self.bump(0);
+        (&mut *self.0).read(block, bufs)
+    }
+
+    fn write(&mut self, block: u64, bufs: &[Block]) -> Result<(), Error> {
+        self.bump(1);
+        (&mut *self.0).write(block, bufs)
+    }
+
+    fn flush(&mut self) -> Result<(), Error> {
+        self.bump(2);
+        (&mut *self.0).flush()
+    }
+
+    fn blocks(&self) -> u64 {
+        self.0.durable.len() as u64
+    }
+}
+
+#[test]
+fn block_io_per_operation() {
+    let mut disk = MemDisk::new(1024);
+    let mut mem = Mem::new(1024, POOL);
+    let mut fs = format(&mut mem, &mut disk);
+    let docs = fs.mkdir(ROOT, b"docs").unwrap();
+    let a = fs.create(docs, b"a.txt").unwrap();
+    fs.write(a, 0, b"hello").unwrap();
+    let many = fs.mkdir(ROOT, b"many").unwrap();
+    for i in 0..300 {
+        fs.create(many, format!("{i:0>100}").as_bytes()).unwrap();
+    }
+    fs.commit().unwrap();
+    let io = Cell::new([0; 3]);
+    let mut fs = mem.fs(Counted(&mut disk, &io));
+    // [reads, writes, flushes]: both superblocks in one request, the live bitmap index and page, the rightmost path
+    // (root and last leaf), then the older slot's index and page.
+    fs.mount().unwrap();
+    assert_eq!(io.take(), [7, 0, 0]);
+    assert_eq!(fs.height(), 2);
+    // The leaf with the root's entries and the first inodes; the root node is cached.
+    let docs = fs.lookup(ROOT, b"docs").unwrap();
+    assert_eq!(io.take(), [1, 0, 0]);
+    // Every node it changes is cached and stays dirty in memory until the commit.
+    let b = fs.create(docs, b"b.txt").unwrap();
+    assert_eq!(io.take(), [0, 0, 0]);
+    fs.write(b, 0, &[1; 100]).unwrap();
+    assert_eq!(io.take(), [0, 1, 0]);
+    // The page written since the last commit is rewritten in place from the buffer.
+    fs.write(b, 100, &[2; 100]).unwrap();
+    assert_eq!(io.take(), [0, 1, 0]);
+    // The dirty nodes, the bitmap page and a new index in one request, then the superblock between two flushes.
+    fs.commit().unwrap();
+    assert_eq!(io.take(), [0, 2, 2]);
+    fs.commit().unwrap();
+    assert_eq!(io.take(), [0, 0, 0]);
+    let a = fs.lookup(docs, b"a.txt").unwrap();
+    fs.read(a, 0, &mut [0; 5]).unwrap();
+    assert_eq!(io.take(), [1, 0, 0]);
+    // The entry's leaf and the leaf with its inode.
+    fs.lookup(many, format!("{:0>100}", 7).as_bytes()).unwrap();
+    assert_eq!(io.take(), [2, 0, 0]);
+    // One read per leaf of 300 entries.
+    let mut n = 0;
+    let end = fs
+        .readdir(many, 0, |_, _, _| {
+            n += 1;
+            false
+        })
+        .unwrap();
+    assert_eq!((n, end, io.take()), (300, u64::MAX, [12, 0, 0]));
+    // Renames and unlinks change cached nodes only; the commit after them is one request again.
+    fs.rename(docs, b"b.txt", docs, b"c.txt").unwrap();
+    fs.rename(docs, b"c.txt", many, b"c.txt").unwrap();
+    fs.unlink(many, b"c.txt").unwrap();
+    assert_eq!(io.take(), [0, 0, 0]);
+    fs.commit().unwrap();
+    assert_eq!(io.take(), [0, 2, 2]);
+}
+
+#[test]
+fn a_directory_of_100k_entries_lists_in_linear_requests() {
+    const N: usize = 100_000;
+    let mut disk = MemDisk::new(16384);
+    let mut mem = Mem::new(16384, POOL);
+    let mut fs = format(&mut mem, &mut disk);
+    let d = fs.mkdir(ROOT, b"d").unwrap();
+    let name = |i: usize| format!("entry-{i:06}");
+    let files: Vec<_> = (0..N)
+        .map(|i| fs.create(d, name(i).as_bytes()).unwrap())
+        .collect();
+    fs.commit().unwrap();
+    let io = Cell::new([0; 3]);
+    let mut fs = mem.fs(Counted(&mut disk, &io));
+    fs.mount().unwrap();
+    assert_eq!(fs.height(), 3);
+    for (i, f) in files.iter().enumerate() {
+        assert_eq!(fs.lookup(d, name(i).as_bytes()), Ok(*f));
+    }
+    // As the kernel lists: 64 entries a call, resuming from the cursor.
+    io.take();
+    let (mut cursor, mut listed) = (0, 0);
+    while cursor != u64::MAX {
+        let mut n = 0;
+        cursor = fs
+            .readdir(d, cursor, |_, _, _| {
+                n += 1;
+                n > 64
+            })
+            .unwrap();
+        listed += n.min(64);
+    }
+    let reads = io.take()[0];
+    assert_eq!(listed, N);
+    // About one read per leaf of entries (each holds about a hundred), never one per entry.
+    assert!(reads < N / 50, "{reads} reads");
+    // Unlinking nine in ten merges leaves and internal nodes back together.
+    for i in (0..N).filter(|i| i % 10 != 0) {
+        fs.unlink(d, name(i).as_bytes()).unwrap();
+    }
+    fs.commit().unwrap();
+    let mut fs = mount(&mut mem, &mut disk).unwrap();
+    for (i, f) in files.iter().enumerate() {
+        let r = fs.lookup(d, name(i).as_bytes());
+        assert_eq!(
+            r,
+            if i % 10 == 0 {
+                Ok(*f)
+            } else {
+                Err(Error::NotFound)
+            }
+        );
+    }
+    assert_eq!(names(&mut fs, d).len(), N / 10);
+}
+
+/// A sparse host file of `blocks` blocks.
+struct FileDisk(std::fs::File, u64);
+
+impl Disk for FileDisk {
+    fn read(&mut self, block: u64, bufs: &mut [Block]) -> Result<(), Error> {
+        use std::os::unix::fs::FileExt;
+        self.0
+            .read_exact_at(bufs.as_flattened_mut(), block * BLOCK_SIZE as u64)
+            .map_err(|_| Error::Io)
+    }
+
+    fn write(&mut self, block: u64, bufs: &[Block]) -> Result<(), Error> {
+        use std::os::unix::fs::FileExt;
+        self.0
+            .write_all_at(bufs.as_flattened(), block * BLOCK_SIZE as u64)
+            .map_err(|_| Error::Io)
+    }
+
+    fn flush(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn blocks(&self) -> u64 {
+        self.1
+    }
+}
+
+/// Writes `size` bytes in 1 MiB chunks (each 8-byte word holds its offset), commits every 64 MiB, remounts, and checks
+/// every byte, on a sparse file with room for the file and 64 MiB more.
+fn big_file(size: u64) {
+    const CHUNK: usize = 1 << 20;
+    let blocks = size / BLOCK_SIZE as u64 + 16384;
+    let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("mogfs2-{size}.img"));
+    let file = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)
+        .unwrap();
+    file.set_len(blocks * BLOCK_SIZE as u64).unwrap();
+    let mut mem = Mem::new(blocks as usize, 64);
+    let mut fs = mem.fs(FileDisk(file.try_clone().unwrap(), blocks));
+    fs.format(SEED).unwrap();
+    let f = fs.create(ROOT, b"big").unwrap();
+    let mut buf = vec![0u8; CHUNK];
+    let fill = |buf: &mut [u8], at: u64| {
+        for (i, w) in buf.chunks_mut(8).enumerate() {
+            w.copy_from_slice(&(at + 8 * i as u64).to_le_bytes());
+        }
+    };
+    for at in (0..size).step_by(CHUNK) {
+        fill(&mut buf, at);
+        fs.write(f, at, &buf).unwrap();
+        if (at + CHUNK as u64).is_multiple_of(64 << 20) {
+            fs.commit().unwrap();
+        }
+    }
+    fs.commit().unwrap();
+    let mut fs = mem.fs(FileDisk(file, blocks));
+    fs.mount().unwrap();
+    let f = fs.lookup(ROOT, b"big").unwrap();
+    assert_eq!(fs.stat(f).unwrap().size, size);
+    let mut expected = vec![0u8; CHUNK];
+    for at in (0..size).step_by(CHUNK) {
+        fill(&mut expected, at);
+        assert_eq!(fs.read(f, at, &mut buf), Ok(CHUNK));
+        assert!(buf == expected, "bytes from {at}");
+    }
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn a_1_gib_file_round_trips_on_a_sparse_disk() {
+    big_file(1 << 30);
+}
+
+#[test]
+fn an_older_slot_larger_than_the_memory_is_reserved_without_reading_past_it() {
+    let mut disk = MemDisk::new(70000);
+    let mut mem = Mem::new(70000, POOL);
+    let mut fs = format(&mut mem, &mut disk);
+    fs.create(ROOT, b"a").unwrap();
+    fs.commit().unwrap();
+    // Slot 0 (generation 2) shrinks to 16384 blocks: one bitmap page whose sum covers 256 words.
+    let ix = le64(&disk.durable[0], 13 * 8) as usize;
+    let page = le64(&disk.durable[ix], 0) as usize;
+    let s = sum(page as u64, &disk.durable[page][..2048]);
+    disk.durable[ix][8..16].copy_from_slice(&s.to_le_bytes());
+    let s = sum(ix as u64, &disk.durable[ix][..16]);
+    disk.durable[ix][BLOCK_SIZE - 8..].copy_from_slice(&s.to_le_bytes());
+    let disk = crafted(disk, &[0], 14, s);
+    let disk = crafted(disk, &[0], 2, 16384);
+    // Slot 1 keeps 70000 blocks but puts its root past what memory for 16384 blocks holds.
+    let mut disk = crafted(disk, &[1], 9, 69000);
+    let mut small = Mem::new(16384, POOL);
+    let mut fs = small.fs(&mut disk);
+    fs.mount().unwrap();
+    assert_eq!(names(&mut fs, ROOT), ["a"]);
 }

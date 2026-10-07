@@ -81,8 +81,9 @@ fn tree_nodes(disk: &[Block], root: u64, sum: u64) -> Vec<(u64, Option<(u64, usi
             continue;
         }
         out.push((b, parent));
-        if n[0] > 0 {
-            for i in 0..count(n).min(FANOUT) {
+        // A node whose count breaks the format holds no entries.
+        if n[0] > 0 && count(n) <= FANOUT {
+            for i in 0..count(n) {
                 let e = eptr(n, i);
                 stack.push((e.block, e.sum, Some((b, i))));
             }
@@ -91,15 +92,20 @@ fn tree_nodes(disk: &[Block], root: u64, sum: u64) -> Vec<(u64, Option<(u64, usi
     out
 }
 
-/// The extents (first block, pages, sums offset) a leaf's items hold, read without trusting its layout.
+/// The extents (first block, pages, sums offset) a leaf's items hold; none if its items break the format's layout
+/// (bytes past the count, as a removed item leaves, are not items).
 fn extents(n: &Block) -> Vec<(u64, usize, usize)> {
-    let mut out = vec![];
-    if n[0] != 0 {
+    let (mut out, c, mut top) = (vec![], count(n), END);
+    if n[0] != 0 || c * ITEM > CAP {
         return out;
     }
-    for i in 0..count(n).min(CAP / ITEM) {
+    for i in 0..c {
         let (k, off, len) = (ikey(n, i), voff(n, i), vlen(n, i));
-        if (k as u64) >> 62 == EXTENT && off + len <= END && len >= 16 {
+        if off + len != top || off < HDR + ITEM * c {
+            return vec![];
+        }
+        top = off;
+        if (k as u64) >> 62 == EXTENT && len >= 16 {
             out.push((le64(n, off), (len - 8) / 8, off + 8));
         }
     }
@@ -531,7 +537,11 @@ fn write(disk: &mut [Block], b: u64, at: usize, width: usize, rng: &mut u64) {
 /// takes a walk of every root (step 41's scrub), not a check when decoded.
 fn mutate(disk: &mut [Block], rng: &mut u64) -> bool {
     let slot = next(rng, 2) as usize;
-    let f = superblock_fields(disk, slot as u64).unwrap();
+    // A slot an earlier change already made invalid takes no more.
+    let Some(f) = superblock_fields(disk, slot as u64).filter(|f| bitmap_blocks(disk, f).is_some())
+    else {
+        return true;
+    };
     let ix = f[13];
     match next(rng, 8) {
         0 => {
@@ -563,14 +573,20 @@ fn mutate(disk: &mut [Block], rng: &mut u64) -> bool {
         _ => {
             let reached = reachable(disk);
             let nodes = tree_nodes(disk, f[9], f[10]);
+            if nodes.is_empty() {
+                return true;
+            }
             let parents: HashMap<_, _> = nodes.iter().copied().collect();
             let b = nodes[next(rng, nodes.len() as u64) as usize].0;
             let n = &disk[b as usize];
             let c = count(n);
-            let (stride, values) = match (n[0], c) {
-                (0, 0) => (ITEM, END),
-                (0, _) => (ITEM, voff(n, c - 1)),
-                _ => (ENTRY, END),
+            // An earlier change may have broken this node's count or offsets; keep the regions inside it.
+            let stride = if n[0] == 0 { ITEM } else { ENTRY };
+            let c = c.min(CAP / stride);
+            let values = if n[0] == 0 && c > 0 {
+                voff(n, c - 1).min(END)
+            } else {
+                END
             };
             let width = [1, 2, 8, 16][next(rng, 4) as usize];
             let (lo, hi) =
@@ -685,7 +701,7 @@ impl Drop for Seed {
     }
 }
 
-/// A decoded field changed and resealed up to the superblock, then mount and every operation: no panic, no write to a
+/// Decoded fields changed and resealed up to the superblock, then mount and every operation: no panic, no write to a
 /// block a valid slot reaches, only `Ok` or a named error.
 #[test]
 fn mutated_images_never_panic_or_write_reachable_blocks() {
@@ -696,7 +712,8 @@ fn mutated_images_never_panic_or_write_reachable_blocks() {
     for seed in 1..=seeds {
         let rng = &mut seed.wrapping_mul(0x9e37_79b9_7f4a_7c15);
         let mut image = base.clone();
-        if !mutate(&mut image, rng) {
+        // One to three fields, so that changes that only matter together (a slot's size and its root) meet.
+        if !(0..1 + next(rng, 3)).all(|_| mutate(&mut image, rng)) {
             left_out += 1;
             continue;
         }
@@ -712,7 +729,7 @@ fn mutated_images_never_panic_or_write_reachable_blocks() {
         assert_eq!(disk.violation, None, "seed {seed}");
     }
     assert!(
-        left_out * 10 < run && mounted * 2 > run,
+        left_out * 4 < run && mounted * 2 > run,
         "{run} run, {mounted} mounted, {left_out} left out"
     );
 }
