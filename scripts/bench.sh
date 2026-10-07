@@ -15,30 +15,33 @@ if [ "$1" = host ]; then
     [ $# -ge 4 ] || { sed -n '2,9s/^# //p' "$0"; exit 2; }
     rounds=$2 base=$3 package=$4
     shift 4
-    src="$root/target/bench-base-src"
+    src="$root/target/bench-base-src" log="$root/target/bench-host.log"
     git -C "$root" worktree remove --force "$src" 2>/dev/null || true
     git -C "$root" worktree add -q --detach "$src" "$base"
     trap 'git -C "$root" worktree remove --force "$src"' EXIT
     # One baseline directory for both trees, so the compare step sees both.
     export CRITERION_HOME="$root/target/criterion"
-    # bench <tree> <target dir> <criterion args>; runs in <tree> so its .cargo/config.toml applies.
+    # bench <tree> <target dir> <criterion args>: output to $log, shown on failure; runs in <tree> for its config.
     bench() {
         tree=$1 dir=$2
         shift 2
-        (cd "$tree" && CARGO_TARGET_DIR=$dir cargo bench -q --target aarch64-apple-darwin -p "$package" --bench '*' -- "$@")
+        (cd "$tree" && CARGO_TARGET_DIR=$dir cargo bench -q --target aarch64-apple-darwin -p "$package" --bench '*' \
+            -- "$@") >"$log" 2>&1 || { cat "$log" >&2; exit 1; }
     }
+    # Not "base" or "new": criterion keeps its own last run under those names.
     i=0
     while [ "$i" -lt "$rounds" ]; do
         if [ $((i % 2)) -eq 0 ]; then
-            bench "$src" "$root/target/bench-base" --save-baseline base "$@" >/dev/null
-            bench "$root" "$root/target" --save-baseline new "$@" >/dev/null
+            bench "$src" "$root/target/bench-base" --save-baseline before "$@"
+            bench "$root" "$root/target" --save-baseline after "$@"
         else
-            bench "$root" "$root/target" --save-baseline new "$@" >/dev/null
-            bench "$src" "$root/target/bench-base" --save-baseline base "$@" >/dev/null
+            bench "$root" "$root/target" --save-baseline after "$@"
+            bench "$src" "$root/target/bench-base" --save-baseline before "$@"
         fi
         i=$((i + 1))
         echo "round $i, load $(sysctl -n vm.loadavg | cut -d' ' -f2):"
-        bench "$root" "$root/target" --load-baseline new --baseline base "$@" | grep -vE '^(Benchmarking|Found|  [0-9])|^$'
+        bench "$root" "$root/target" --load-baseline after --baseline before "$@"
+        grep -vE '^(Benchmarking|Found|  [0-9])|^$' "$log"
     done
     exit
 fi
