@@ -19,9 +19,11 @@
 //!   from byte 4088 in item order. Internal: `count` entries (key u128, block u64, sum u64, birth generation u64);
 //!   child `i` holds keys from entry `i`'s (the node's own lower bound for `i = 0`) up to entry `i + 1`'s.
 //! - Items. Inode (kind 0, offset 0): kind u8 (1 file, 2 directory, 3 symlink: reserved), zero u8, mode u16, links
-//!   u32, size u64, parent u64, mtime, ctime and btime u64 (ns). Directory entry (kind 1; offset: the seeded hash of
-//!   the name, low 3 bits the slot in its collision chain of 8): inode u64, kind u8, name. Extent (kind 2; offset:
-//!   its first page): first block u64, then each of its 1 to 128 pages' sums.
+//!   u32, size u64, parent u64, entry u64 (the offset of the entry naming it in `parent`), mtime, ctime and btime u64
+//!   (ns). Directory entry (kind 1; offset: the seeded hash of the name, low 3 bits the slot in its collision chain of
+//!   8): inode u64 (never the root or the directory itself), kind u8, name; it is followed only if that inode records
+//!   it back (parent, entry and kind). Extent (kind 2; offset: its first page): first block u64, then each of its 1
+//!   to 128 pages' sums.
 //! - Inode numbers come from the superblock's counter and are never reused.
 //! - Copy-on-write: no block reachable from either slot is written. Data pages are written at once to free blocks
 //!   (or over one written since the last commit). `commit` gives the dirty nodes, the changed bitmap pages and a new
@@ -66,7 +68,7 @@ const ENTRY: usize = 40;
 const CAP: usize = END - HDR;
 const FANOUT: usize = CAP / ENTRY;
 const QUARTER: usize = CAP / 4;
-const INODE_LEN: usize = 48;
+const INODE_LEN: usize = 56;
 const EXTENT_ITEM: usize = ITEM + 8 + 8 * EXTENT_MAX as usize;
 
 const INODE: u64 = 0;
@@ -178,6 +180,8 @@ struct Item {
     links: u32,
     size: u64,
     parent: u64,
+    /// The offset of the one directory entry that names it.
+    entry: u64,
     mtime: u64,
     ctime: u64,
     btime: u64,
@@ -333,6 +337,7 @@ impl<'a, D: Disk> Fs<'a, D> {
             links: 1,
             size: 0,
             parent: 0,
+            entry: 0,
             mtime: self.now,
             ctime: self.now,
             btime: self.now,
@@ -356,7 +361,6 @@ impl<'a, D: Disk> Fs<'a, D> {
         if slots[0].as_ref().map(|s| s.generation) < slots[1].as_ref().map(|s| s.generation) {
             slots.swap(0, 1);
         }
-        let mut protect = None;
         for i in 0..2 {
             let Some(s) = &slots[i] else { continue };
             if s.flags != 0 {
@@ -369,9 +373,7 @@ impl<'a, D: Disk> Fs<'a, D> {
                 continue;
             }
             self.setup(s.blocks)?;
-            let r = self.load_bitmap(s, LIVE, true);
-            let loaded = r.is_ok();
-            let r = r.and_then(|()| {
+            let r = self.load_bitmap(s, LIVE).and_then(|()| {
                 (self.root, self.height) = (s.root, s.level + 1);
                 (self.generation, self.next_inode) = (s.generation, s.next_inode);
                 self.seed = s.seed;
@@ -379,30 +381,18 @@ impl<'a, D: Disk> Fs<'a, D> {
             });
             match r {
                 Ok(()) => {}
-                Err(Error::Corrupt) => {
-                    // The newest tree failed but its bitmap held: keep its blocks reserved.
-                    if loaded && i == 0 {
-                        protect = Some(s.blocks);
-                        let w = self.words;
-                        self.bits.copy_within(..w, COMMITTED * w);
-                    }
-                    continue;
-                }
+                Err(Error::Corrupt) => continue,
                 Err(e) => return Err(e),
             }
+            // The other slot's blocks stay reserved while its bitmap holds, even if its tree failed above.
             let w = self.words;
-            if protect != Some(s.blocks) {
+            if let Some(o) = &slots[1 - i]
+                && o.valid
+                && let Err(e) = self.load_bitmap(o, COMMITTED)
+            {
                 self.bits[COMMITTED * w..3 * w].fill(0);
-                if let Some(o) = &slots[1 - i]
-                    && o.valid
-                    && o.flags == 0
-                    && o.blocks == s.blocks
-                    && let Err(e) = self.load_bitmap(o, COMMITTED, false)
-                {
-                    self.bits[COMMITTED * w..3 * w].fill(0);
-                    if e != Error::Corrupt {
-                        return Err(e);
-                    }
+                if e != Error::Corrupt {
+                    return Err(e);
                 }
             }
             self.bits.copy_within(..w, NEWEST * w);
@@ -429,10 +419,9 @@ impl<'a, D: Disk> Fs<'a, D> {
             return Err(Error::InvalidName);
         }
         self.dir(dir)?;
-        match self.find_entry(dir.0, name)?.0 {
-            Some((_, inode, _)) => Ok(inode),
-            None => Err(Error::NotFound),
-        }
+        let e = self.find_entry(dir.0, name)?.0.ok_or(Error::NotFound)?;
+        self.child(dir.0, e)?;
+        Ok(e.1)
     }
 
     /// Calls `f` with each entry's name, inode and kind from `cursor` on (0: the first), in hash order, until `f`
@@ -520,6 +509,9 @@ impl<'a, D: Disk> Fs<'a, D> {
     /// The block holding `page` of `file` and that page's sum (check it with `verify`), or `None` for a hole.
     pub fn map(&mut self, file: Inode, page: u64) -> Result<Option<(u64, u64)>, Error> {
         self.file(file.0)?;
+        if page >= MAX_FILE_SIZE / BLOCK_SIZE as u64 {
+            return Ok(None);
+        }
         Ok(self.extent_at(file.0, page)?.map(|(off, start, _)| {
             let j = page - off;
             (start + j, le64(&self.bufs[META], 8 + 8 * j as usize))
@@ -581,11 +573,9 @@ impl<'a, D: Disk> Fs<'a, D> {
             return Err(Error::InvalidName);
         }
         let mut d = self.dir(dir)?;
-        let (off, inode, _) = self.find_entry(dir.0, name)?.0.ok_or(Error::NotFound)?;
-        if inode == ROOT || inode == dir {
-            return Err(Error::Corrupt);
-        }
-        let it = self.inode(inode.0)?;
+        let e = self.find_entry(dir.0, name)?.0.ok_or(Error::NotFound)?;
+        let (off, inode, _) = e;
+        let it = self.child(dir.0, e)?;
         if it.kind == DIR
             && let Some((s, i, _)) = self.seek(key(inode.0, DIRENT, 0))?
             && ikey(&self.cache[s], i) < key(inode.0, EXTENT, 0)
@@ -622,10 +612,12 @@ impl<'a, D: Disk> Fs<'a, D> {
             return Err(Error::InvalidName);
         }
         let mut from = self.dir(from_dir)?;
-        let (off, inode, kind) = self
+        let e = self
             .find_entry(from_dir.0, from_name)?
             .0
             .ok_or(Error::NotFound)?;
+        let (off, inode, kind) = e;
+        let mut it = self.child(from_dir.0, e)?;
         if from_dir == to_dir && from_name == to_name {
             return Ok(());
         }
@@ -635,7 +627,6 @@ impl<'a, D: Disk> Fs<'a, D> {
             return Err(Error::Exists);
         }
         let slot = slot.ok_or(Error::Collision)?;
-        let mut it = self.inode(inode.0)?;
         if from_dir != to_dir && kind == DIR && self.below(inode.0, to_dir.0)? {
             return Err(Error::InvalidName);
         }
@@ -644,7 +635,7 @@ impl<'a, D: Disk> Fs<'a, D> {
             .delete(key(from_dir.0, DIRENT, off))
             .and_then(|()| self.put_entry(to_dir.0, slot, inode.0, kind, to_name))
             .and_then(|()| {
-                (it.ctime, it.parent) = (self.now, to_dir.0);
+                (it.ctime, it.parent, it.entry) = (self.now, to_dir.0, slot);
                 self.set_inode(inode.0, &it)?;
                 (from.mtime, from.ctime) = (self.now, self.now);
                 self.set_inode(from_dir.0, &from)?;
@@ -803,9 +794,10 @@ impl<'a, D: Disk> Fs<'a, D> {
         Ok(())
     }
 
-    /// Reads `s`'s bitmap into `map`, its index into `cache[0]` (`live`) or `bufs[DATA]`; skips pages the live index
-    /// shares with it.
-    fn load_bitmap(&mut self, s: &Super, map: usize, live: bool) -> Result<(), Error> {
+    /// Reads `s`'s bitmap into `map` (the words of this disk's size), its index into `cache[0]` for `LIVE` or else
+    /// `bufs[DATA]`; skips pages the live index shares with it. The bitmap must mark its own blocks and the root.
+    fn load_bitmap(&mut self, s: &Super, map: usize) -> Result<(), Error> {
+        let live = map == LIVE;
         let (ix, sum) = s.index;
         let buf = if live {
             &mut self.cache[0]
@@ -813,16 +805,17 @@ impl<'a, D: Disk> Fs<'a, D> {
             &mut self.bufs[DATA]
         };
         self.disk.read(ix, from_mut(buf))?;
-        let len = 16 * self.pages;
+        let (pages, words) = (pages(s.blocks), s.blocks.div_ceil(64) as usize);
+        let len = 16 * pages;
         if le64(buf, END) != sum
             || checksum(ix, &buf[..len]) != sum
             || buf[len..END].iter().any(|&b| b != 0)
         {
             return Err(Error::Corrupt);
         }
-        let (w, words) = (self.words, self.blocks.div_ceil(64) as usize);
+        let w = self.words;
         self.bits[map * w..(map + 1) * w].fill(0);
-        for p in 0..self.pages {
+        for p in 0..pages {
             let buf = if live {
                 &self.cache[0]
             } else {
@@ -832,30 +825,40 @@ impl<'a, D: Disk> Fs<'a, D> {
             if b == 0 && sum == 0 {
                 continue;
             }
-            if !(2..self.blocks).contains(&b) {
+            if !(2..s.blocks).contains(&b) {
                 return Err(Error::Corrupt);
             }
-            if !live && le64(&self.cache[0], 16 * p) == b {
+            if !live && p < self.pages && le64(&self.cache[0], 16 * p) == b {
                 continue;
             }
             self.disk.read(b, from_mut(&mut self.cache[1]))?;
-            let (page, len) = (&self.cache[1], 8 * min(PAGE_WORDS, words - p * PAGE_WORDS));
-            if checksum(b, &page[..len]) != sum || page[len..].iter().any(|&b| b != 0) {
+            let (page, n) = (&self.cache[1], min(PAGE_WORDS, words - p * PAGE_WORDS));
+            let tail = le64(page, 8 * (n - 1)) >> (s.blocks % 64);
+            if checksum(b, &page[..8 * n]) != sum
+                || page[8 * n..].iter().any(|&b| b != 0)
+                || (p == pages - 1 && !s.blocks.is_multiple_of(64) && tail != 0)
+            {
                 return Err(Error::Corrupt);
             }
-            for (i, word) in page[..len].as_chunks::<8>().0.iter().enumerate() {
-                self.bits[map * w + p * PAGE_WORDS + i] = u64::from_le_bytes(*word);
+            for (i, word) in page[..8 * n].as_chunks::<8>().0.iter().enumerate() {
+                if p * PAGE_WORDS + i < w {
+                    self.bits[map * w + p * PAGE_WORDS + i] = u64::from_le_bytes(*word);
+                }
             }
         }
-        if !self.blocks.is_multiple_of(64) && self.bits[map * w + words - 1] >> (self.blocks % 64) != 0 {
-            return Err(Error::Corrupt);
-        }
-        if !live {
-            return Ok(());
-        }
-        let has = |b: u64| self.bits[map * w + (b / 64) as usize] >> (b % 64) & 1 != 0;
-        let pages_held = (0..self.pages).all(|p| {
-            let b = le64(&self.cache[0], 16 * p);
+        // Pages shared with the live index were skipped: their bits are the live ones.
+        let has = |b: u64| {
+            let i = (b / 64) as usize;
+            let word = self.bits[map * w + i] | if live { 0 } else { self.bits[i] };
+            b >= self.blocks || word >> (b % 64) & 1 != 0
+        };
+        let buf = if live {
+            &self.cache[0]
+        } else {
+            &self.bufs[DATA]
+        };
+        let pages_held = (0..pages).all(|p| {
+            let b = le64(buf, 16 * p);
             b == 0 || has(b)
         });
         if !(has(0) && has(1) && has(ix) && has(s.root.block) && pages_held) {
@@ -911,6 +914,15 @@ impl<'a, D: Disk> Fs<'a, D> {
         Ok(it)
     }
 
+    /// The inode entry `e` of `dir` names, if it records that entry back; `Corrupt` if not.
+    fn child(&mut self, dir: u64, e: Entry) -> Result<Item, Error> {
+        let it = self.inode(e.1.0).map_err(|_| Error::Corrupt)?;
+        if it.parent != dir || it.entry != e.0 || it.kind != e.2 {
+            return Err(Error::Corrupt);
+        }
+        Ok(it)
+    }
+
     fn set_inode(&mut self, inode: u64, it: &Item) -> Result<(), Error> {
         let (s, at) = self.value_mut(key(inode, INODE, 0))?;
         encode(&mut self.cache[s][at..at + INODE_LEN], it);
@@ -934,7 +946,7 @@ impl<'a, D: Disk> Fs<'a, D> {
                 if &v[9..] == name {
                     return Ok((Some((ik as u64 & OFFSET, Inode(le64(v, 0)), v[8])), None));
                 }
-                used |= 1 << (ik as u64 - base);
+                used |= 1 << ((ik as u64 & OFFSET) - base);
             }
             if hi >= end {
                 break;
@@ -952,7 +964,7 @@ impl<'a, D: Disk> Fs<'a, D> {
         let mut d = self.dir(dir)?;
         let (found, slot) = self.find_entry(dir.0, name)?;
         match found {
-            Some((_, inode, _)) if kind == FILE => return Ok(inode),
+            Some(e) if kind == FILE => return self.child(dir.0, e).map(|_| e.1),
             Some(_) => return Err(Error::Exists),
             None => {}
         }
@@ -969,6 +981,7 @@ impl<'a, D: Disk> Fs<'a, D> {
             links: 1,
             size: 0,
             parent: dir.0,
+            entry: slot,
             mtime: self.now,
             ctime: self.now,
             btime: self.now,
@@ -1368,9 +1381,12 @@ impl<'a, D: Disk> Fs<'a, D> {
                         && v[1] == 0
                         && le16(v, 2) <= 0o7777
                         && le64(v, 8) <= MAX_FILE_SIZE
+                        && le64(v, 24) <= OFFSET
                 }
                 DIRENT => {
                     (10..=9 + NAME_MAX).contains(&len)
+                        && le64(v, 0) != ROOT.0
+                        && le64(v, 0) != inode
                         && matches!(v[8], FILE | DIR)
                         && valid_name(&v[9..])
                 }
@@ -1668,6 +1684,7 @@ impl<'a, D: Disk> Fs<'a, D> {
 
     /// Writes every dirty node out (not a commit), leaving them clean.
     fn spill(&mut self) -> Result<(), Error> {
+        let generation = self.generation.checked_add(1).ok_or(Error::Corrupt)?;
         if (self.free as usize) < self.ndirty {
             self.broken = true;
             return Err(Error::NoSpace);
@@ -1678,7 +1695,7 @@ impl<'a, D: Disk> Fs<'a, D> {
                 self.blk[s] = self.claim(&mut b);
             }
         }
-        self.finalize(self.generation + 1);
+        self.finalize(generation);
         self.write_out(1, 1)?;
         self.clean();
         Ok(())
@@ -1779,7 +1796,7 @@ fn tagged(s: usize) -> Ptr {
 }
 
 fn key(inode: u64, kind: u64, offset: u64) -> u128 {
-    (inode as u128) << 64 | (kind << 62 | offset) as u128
+    ((inode as u128) << 64) + ((kind as u128) << 62) + offset as u128
 }
 
 fn kind_of(kind: u8) -> Kind {
@@ -1844,7 +1861,7 @@ fn encode(v: &mut [u8], it: &Item) {
     v[1] = 0;
     v[2..4].copy_from_slice(&it.mode.to_le_bytes());
     v[4..8].copy_from_slice(&it.links.to_le_bytes());
-    for (i, f) in [it.size, it.parent, it.mtime, it.ctime, it.btime]
+    for (i, f) in [it.size, it.parent, it.entry, it.mtime, it.ctime, it.btime]
         .iter()
         .enumerate()
     {
@@ -1859,9 +1876,10 @@ fn decode(v: &[u8]) -> Item {
         links: u32::from_le_bytes(v[4..8].try_into().unwrap()),
         size: le64(v, 8),
         parent: le64(v, 16),
-        mtime: le64(v, 24),
-        ctime: le64(v, 32),
-        btime: le64(v, 40),
+        entry: le64(v, 24),
+        mtime: le64(v, 32),
+        ctime: le64(v, 40),
+        btime: le64(v, 48),
     }
 }
 

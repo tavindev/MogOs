@@ -6,74 +6,117 @@ use super::*;
 pub(crate) fn reachable(disk: &[Block]) -> Vec<bool> {
     let mut reached = vec![false; disk.len()];
     for slot in 0..2 {
-        if let Some(set) = slot_blocks(disk, slot) {
-            for b in set {
-                reached[b as usize] = true;
-            }
+        for b in slot_blocks(disk, slot).into_iter().flatten() {
+            reached[b as usize] = true;
         }
     }
     reached
 }
 
-/// The blocks slot `slot` reaches, if its superblock and bitmap verify.
-fn slot_blocks(disk: &[Block], slot: u64) -> Option<HashSet<u64>> {
+/// Slot `slot`'s superblock fields, if they keep the format's rules.
+fn superblock_fields(disk: &[Block], slot: u64) -> Option<[u64; 15]> {
     let sb = &disk[slot as usize];
-    let f = |i: usize| le64(sb, 8 * i);
-    if le64(sb, END) != checksum(slot, &sb[..SB_LEN]) || f(0) != MAGIC || f(1) % 2 != slot {
-        return None;
-    }
-    let blocks = f(2).min(disk.len() as u64);
-    let words = blocks.div_ceil(64) as usize;
-    let (ix, ix_sum) = (f(13), f(14));
-    let len = 16 * pages(blocks);
-    if ix >= disk.len() as u64
-        || le64(&disk[ix as usize], END) != ix_sum
-        || checksum(ix, &disk[ix as usize][..len]) != ix_sum
+    let f: [u64; 15] = std::array::from_fn(|i| le64(sb, 8 * i));
+    let blocks = f[2];
+    let ok = le64(sb, END) == checksum(slot, &sb[..SB_LEN])
+        && f[0] == MAGIC
+        && f[1] % 2 == slot
+        && (MIN_BLOCKS..=disk.len() as u64).contains(&blocks)
+        && f[4] >= 1
+        && (f[6], f[7], f[8]) == (0, 0, 1)
+        && f[12] < MAX_HEIGHT as u64
+        && f[11] <= f[1]
+        && (2..blocks).contains(&f[9])
+        && (2..blocks).contains(&f[13])
+        && sb[SB_LEN..END].iter().all(|&b| b == 0);
+    ok.then_some(f)
+}
+
+/// The bitmap index and page blocks of a slot, if its bitmap verifies, is well formed and marks them and the root.
+fn bitmap_blocks(disk: &[Block], f: &[u64; 15]) -> Option<Vec<u64>> {
+    let (blocks, ix) = (f[2], f[13]);
+    let (pages, words) = (pages(blocks), blocks.div_ceil(64) as usize);
+    let index = &disk[ix as usize];
+    let len = 16 * pages;
+    if le64(index, END) != f[14]
+        || checksum(ix, &index[..len]) != f[14]
+        || index[len..END].iter().any(|&b| b != 0)
     {
         return None;
     }
-    let mut set = HashSet::from([ix]);
-    for p in 0..pages(blocks) {
-        let (b, sum) = (
-            le64(&disk[ix as usize], 16 * p),
-            le64(&disk[ix as usize], 16 * p + 8),
-        );
-        if b == 0 {
+    let mut bits = vec![0u64; pages * PAGE_WORDS];
+    let mut held = vec![ix];
+    for p in 0..pages {
+        let (b, sum) = (le64(index, 16 * p), le64(index, 16 * p + 8));
+        if (b, sum) == (0, 0) {
             continue;
         }
-        let len = 8 * PAGE_WORDS.min(words - p * PAGE_WORDS);
-        if b >= disk.len() as u64 || checksum(b, &disk[b as usize][..len]) != sum {
+        let n = PAGE_WORDS.min(words - p * PAGE_WORDS);
+        if !(2..blocks).contains(&b)
+            || checksum(b, &disk[b as usize][..8 * n]) != sum
+            || disk[b as usize][8 * n..].iter().any(|&b| b != 0)
+        {
             return None;
         }
-        set.insert(b);
+        for i in 0..n {
+            bits[p * PAGE_WORDS + i] = le64(&disk[b as usize], 8 * i);
+        }
+        held.push(b);
     }
-    let mut stack = vec![(f(9), f(10))];
-    while let Some((b, sum)) = stack.pop() {
-        if b >= disk.len() as u64 || !set.insert(b) {
+    let has = |b: u64| bits[(b / 64) as usize] >> (b % 64) & 1 != 0;
+    let tail = (blocks..(words as u64 * 64)).any(has);
+    (!tail && [0, 1, f[9]].iter().chain(&held).all(|&b| has(b))).then_some(held)
+}
+
+/// Each node a root reaches through pointers that verify, with its parent node and entry (`None` for the root).
+fn tree_nodes(disk: &[Block], root: u64, sum: u64) -> Vec<(u64, Option<(u64, usize)>)> {
+    let (mut out, mut seen) = (vec![], HashSet::new());
+    let mut stack = vec![(root, sum, None)];
+    while let Some((b, sum, parent)) = stack.pop() {
+        if b >= disk.len() as u64 || !seen.insert(b) {
             continue;
         }
         let n = &disk[b as usize];
         if le64(n, END) != sum || checksum(b, &n[..END]) != sum {
-            set.remove(&b);
             continue;
         }
-        let c = count(n);
+        out.push((b, parent));
         if n[0] > 0 {
-            for i in 0..c.min(FANOUT) {
+            for i in 0..count(n).min(FANOUT) {
                 let e = eptr(n, i);
-                stack.push((e.block, e.sum));
+                stack.push((e.block, e.sum, Some((b, i))));
             }
-            continue;
         }
-        for i in 0..c.min(CAP / ITEM) {
-            let (k, off, len) = (ikey(n, i), voff(n, i), vlen(n, i));
-            if (k as u64) >> 62 != EXTENT || off + len > END || len < 16 {
-                continue;
-            }
-            let v = &n[off..off + len];
-            for j in 0..(len - 8) / 8 {
-                let p = le64(v, 0).wrapping_add(j as u64);
-                if p < disk.len() as u64 && checksum(p, &disk[p as usize]) == le64(v, 8 + 8 * j) {
+    }
+    out
+}
+
+/// The extents (first block, pages, sums offset) a leaf's items hold, read without trusting its layout.
+fn extents(n: &Block) -> Vec<(u64, usize, usize)> {
+    let mut out = vec![];
+    if n[0] != 0 {
+        return out;
+    }
+    for i in 0..count(n).min(CAP / ITEM) {
+        let (k, off, len) = (ikey(n, i), voff(n, i), vlen(n, i));
+        if (k as u64) >> 62 == EXTENT && off + len <= END && len >= 16 {
+            out.push((le64(n, off), (len - 8) / 8, off + 8));
+        }
+    }
+    out
+}
+
+/// The blocks slot `slot` reaches, if it is valid: its bitmap, nodes and data pages that verify.
+fn slot_blocks(disk: &[Block], slot: u64) -> Option<HashSet<u64>> {
+    let f = superblock_fields(disk, slot)?;
+    let mut set: HashSet<u64> = bitmap_blocks(disk, &f)?.into_iter().collect();
+    for (b, _) in tree_nodes(disk, f[9], f[10]) {
+        set.insert(b);
+        let n = &disk[b as usize];
+        for (start, pages, at) in extents(n) {
+            for j in 0..pages {
+                let p = start.wrapping_add(j as u64);
+                if p < disk.len() as u64 && checksum(p, &disk[p as usize]) == le64(n, at + 8 * j) {
                     set.insert(p);
                 }
             }
@@ -386,4 +429,290 @@ fn random_changes_keep_the_tree_and_free_space_consistent() {
             check(&mut fs, &ctx);
         }
     }
+}
+
+/// An image both slots reach parts of: a root of 150 long-named files (a tree of height 2), a directory with files, a
+/// 20-page file and a sparse one; the second commit overwrites a page, unlinks and renames.
+fn mutation_base() -> Vec<Block> {
+    let blocks = 700;
+    let mut disk = Guarded::new(vec![[0; BLOCK_SIZE]; blocks], true);
+    let mut mem = Mem::new(blocks);
+    let mut fs = mem.fs(&mut disk);
+    fs.format(7).unwrap();
+    let sub = fs.mkdir(ROOT, b"sub").unwrap();
+    for i in 0..150 {
+        let f = fs.create(ROOT, format!("{i:0>40}").as_bytes()).unwrap();
+        fs.write(f, 0, &[i as u8; 100]).unwrap();
+    }
+    for i in 0..20 {
+        fs.create(sub, format!("s{i}").as_bytes()).unwrap();
+    }
+    let big = fs.create(sub, b"big").unwrap();
+    fs.write(big, 0, &[9; 20 * BLOCK_SIZE]).unwrap();
+    let sparse = fs.create(ROOT, b"sparse").unwrap();
+    fs.write(sparse, 50 * BLOCK_SIZE as u64, b"tail").unwrap();
+    fs.commit().unwrap();
+    fs.write(big, 5 * BLOCK_SIZE as u64, &[1; 10]).unwrap();
+    for i in 0..10 {
+        fs.unlink(ROOT, format!("{i:0>40}").as_bytes()).unwrap();
+    }
+    fs.rename(ROOT, b"sparse", sub, b"moved").unwrap();
+    fs.commit().unwrap();
+    assert!(fs.height() >= 2);
+    disk.blocks
+}
+
+fn reseal_superblock(disk: &mut [Block], slot: usize) {
+    let sum = checksum(slot as u64, &disk[slot][..SB_LEN]);
+    disk[slot][END..].copy_from_slice(&sum.to_le_bytes());
+}
+
+/// Reseals node `b` and each parent up to slot `slot`'s superblock.
+fn reseal_up(
+    disk: &mut [Block],
+    slot: usize,
+    parents: &HashMap<u64, Option<(u64, usize)>>,
+    mut b: u64,
+) {
+    loop {
+        let sum = seal(b, &mut disk[b as usize], END);
+        match parents[&b] {
+            None => {
+                disk[slot][80..88].copy_from_slice(&sum.to_le_bytes());
+                return reseal_superblock(disk, slot);
+            }
+            Some((p, i)) => {
+                disk[p as usize][HDR + ENTRY * i + 24..][..8].copy_from_slice(&sum.to_le_bytes());
+                b = p;
+            }
+        }
+    }
+}
+
+/// Reseals the bitmap index `ix` of slot `slot` and its superblock.
+fn reseal_index(disk: &mut [Block], slot: usize, ix: u64, blocks: u64) {
+    let sum = seal(ix, &mut disk[ix as usize], 16 * pages(blocks));
+    disk[slot][112..120].copy_from_slice(&sum.to_le_bytes());
+    reseal_superblock(disk, slot);
+}
+
+/// `old`, a field of `width` bytes, changed one of several ways, some aimed at block and inode numbers.
+fn mutated(old: u128, width: usize, rng: &mut u64) -> u128 {
+    let mask = if width == 16 {
+        u128::MAX
+    } else {
+        (1 << (8 * width)) - 1
+    };
+    let v = match next(rng, 7) {
+        0 => old ^ 1 << next(rng, 8 * width as u64),
+        1 => old.wrapping_add(1),
+        2 => old.wrapping_sub(1),
+        3 => 0,
+        4 => u128::MAX,
+        5 => next(rng, 1500) as u128,
+        _ => (next(rng, u64::MAX) as u128) << 64 | next(rng, u64::MAX) as u128,
+    };
+    v & mask
+}
+
+fn read(disk: &[Block], b: u64, at: usize, width: usize) -> u128 {
+    let mut v = [0; 16];
+    v[..width].copy_from_slice(&disk[b as usize][at..at + width]);
+    u128::from_le_bytes(v)
+}
+
+fn write(disk: &mut [Block], b: u64, at: usize, width: usize, rng: &mut u64) {
+    let v = mutated(read(disk, b, at, width), width, rng);
+    disk[b as usize][at..at + width].copy_from_slice(&v.to_le_bytes()[..width]);
+}
+
+/// Changes one decoded field of a slot's superblock, bitmap index, bitmap page or tree node, resealing every sum
+/// above it. Returns false, leaving the change out, for an extent moved onto blocks a slot reaches: catching that
+/// takes a walk of every root (step 41's scrub), not a check when decoded.
+fn mutate(disk: &mut [Block], rng: &mut u64) -> bool {
+    let slot = next(rng, 2) as usize;
+    let f = superblock_fields(disk, slot as u64).unwrap();
+    let ix = f[13];
+    match next(rng, 8) {
+        0 => {
+            write(disk, slot as u64, 8 * next(rng, 15) as usize, 8, rng);
+            reseal_superblock(disk, slot);
+            true
+        }
+        1 => {
+            write(
+                disk,
+                ix,
+                8 * next(rng, 2 * pages(f[2]) as u64) as usize,
+                8,
+                rng,
+            );
+            reseal_index(disk, slot, ix, f[2]);
+            true
+        }
+        2 => {
+            // Only marking a block used: a bitmap that frees a reachable block is also a scrub finding.
+            let page = le64(&disk[ix as usize], 0) as usize;
+            let bit = next(rng, f[2]);
+            disk[page][(bit / 8) as usize] |= 1 << (bit % 8);
+            let sum = checksum(page as u64, &disk[page][..8 * f[2].div_ceil(64) as usize]);
+            disk[ix as usize][8..16].copy_from_slice(&sum.to_le_bytes());
+            reseal_index(disk, slot, ix, f[2]);
+            true
+        }
+        _ => {
+            let reached = reachable(disk);
+            let nodes = tree_nodes(disk, f[9], f[10]);
+            let parents: HashMap<_, _> = nodes.iter().copied().collect();
+            let b = nodes[next(rng, nodes.len() as u64) as usize].0;
+            let n = &disk[b as usize];
+            let c = count(n);
+            let (stride, values) = match (n[0], c) {
+                (0, 0) => (ITEM, END),
+                (0, _) => (ITEM, voff(n, c - 1)),
+                _ => (ENTRY, END),
+            };
+            let width = [1, 2, 8, 16][next(rng, 4) as usize];
+            let (lo, hi) =
+                [(0, HDR), (HDR, HDR + stride * c), (values, END)][next(rng, 3) as usize];
+            if hi < lo + width {
+                return false;
+            }
+            let before = extents(n);
+            let at = lo + next(rng, (hi - lo - width + 1) as u64) as usize;
+            if next(rng, 3) == 0 && lo == HDR && c > 1 {
+                // Another item's or entry's same field, give or take one: a neighbour in a hash chain, a block or
+                // an inode another pointer already names.
+                let other = HDR + (at - HDR) % stride + stride * next(rng, c as u64) as usize;
+                let v = read(disk, b, other, width)
+                    .wrapping_add(next(rng, 3) as u128)
+                    .wrapping_sub(1);
+                disk[b as usize][at..at + width].copy_from_slice(&v.to_le_bytes()[..width]);
+            } else {
+                write(disk, b, at, width, rng);
+            }
+            reseal_up(disk, slot, &parents, b);
+            !extents(&disk[b as usize])
+                .into_iter()
+                .any(|(start, pages, at)| {
+                    !before
+                        .iter()
+                        .any(|&(s, p, a)| (s, p, a) == (start, pages, at))
+                        && (0..pages as u64)
+                            .any(|j| reached.get(start.wrapping_add(j) as usize) == Some(&true))
+                })
+        }
+    }
+}
+
+/// Reads, lists, stats and maps everything reachable, then changes and commits a lot, remounts and does it again.
+/// Results are ignored: only panics, an inode `lookup` reaches twice from the root, and writes to reachable blocks fail
+/// the test.
+fn exercise<D: Disk>(fs: &mut Fs<D>) {
+    for round in 0..2 {
+        let (mut dirs, mut files, mut names) = (vec![ROOT], vec![], vec![]);
+        let mut seen = HashSet::from([ROOT.0]);
+        let mut i = 0;
+        while i < dirs.len() && i < 50 {
+            let d = dirs[i];
+            i += 1;
+            let mut entries = vec![];
+            let _ = fs.readdir(d, 0, |n, inode, _| {
+                entries.push((n.to_vec(), inode));
+                entries.len() > 400
+            });
+            for (n, inode) in entries {
+                let _ = fs.stat(inode);
+                // A changed entry may repeat a name; looking it up twice is not a second way in.
+                if names.contains(&(d, n.clone())) {
+                    continue;
+                }
+                let found = fs.lookup(d, &n).and_then(|x| Ok((x, fs.kind(x)?)));
+                if let Ok((x, _)) = found {
+                    assert!(seen.insert(x.0), "{x:?} reached twice from the root");
+                }
+                match found {
+                    Ok((x, Kind::Dir)) => dirs.push(x),
+                    Ok((x, Kind::File)) => files.push(x),
+                    Err(_) => {}
+                }
+                names.push((d, n));
+            }
+        }
+        // Names the image was built with, whose hash chains a changed entry may sit in.
+        for i in 0..150 {
+            let _ = fs.lookup(ROOT, format!("{i:0>40}").as_bytes());
+        }
+        let mut buf = vec![0; 30 * BLOCK_SIZE];
+        for &f in files.iter().take(30) {
+            let _ = fs.read(f, 0, &mut buf);
+            for p in [0, 1, 5, 50] {
+                let _ = fs.map(f, p);
+            }
+        }
+        for (j, &f) in files.iter().take(10).enumerate() {
+            let _ = fs.write(f, (j * 3000) as u64, &[j as u8; 5000]);
+        }
+        if let Some(&f) = files.get(10) {
+            let _ = fs.truncate(f);
+        }
+        for (d, n) in names.iter().take(15) {
+            let _ = fs.unlink(*d, n);
+        }
+        for (k, (d, n)) in names.iter().skip(15).take(10).enumerate() {
+            let _ = fs.rename(*d, n, dirs[k % dirs.len()], format!("moved{k}").as_bytes());
+        }
+        for (k, &d) in dirs.iter().take(4).enumerate() {
+            // Enough to write dirty nodes out before the commit.
+            for i in 0..80 {
+                let _ = fs.create(d, format!("{round}{k}-{i:0>100}").as_bytes());
+            }
+            let _ = fs.mkdir(d, format!("new{round}").as_bytes());
+        }
+        let _ = fs.commit();
+        let _ = fs.mount();
+    }
+}
+
+/// Names the seed of a mutation whose run panics.
+struct Seed(u64);
+
+impl Drop for Seed {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!("mutation seed {}", self.0);
+        }
+    }
+}
+
+/// A decoded field changed and resealed up to the superblock, then mount and every operation: no panic, no write to a
+/// block a valid slot reaches, only `Ok` or a named error.
+#[test]
+fn mutated_images_never_panic_or_write_reachable_blocks() {
+    let base = mutation_base();
+    let (mut run, mut mounted, mut left_out) = (0, 0, 0);
+    // `MUTATION_SEEDS=20000` for a deeper run.
+    let seeds = std::env::var("MUTATION_SEEDS").map_or(1500u64, |s| s.parse().unwrap());
+    for seed in 1..=seeds {
+        let rng = &mut seed.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let mut image = base.clone();
+        if !mutate(&mut image, rng) {
+            left_out += 1;
+            continue;
+        }
+        let _seed = Seed(seed);
+        let mut disk = Guarded::new(image, false);
+        let mut mem = Mem::new(base.len());
+        let mut fs = mem.fs(&mut disk);
+        if fs.mount().is_ok() {
+            mounted += 1;
+            exercise(&mut fs);
+        }
+        run += 1;
+        assert_eq!(disk.violation, None, "seed {seed}");
+    }
+    assert!(
+        left_out * 10 < run && mounted * 2 > run,
+        "{run} run, {mounted} mounted, {left_out} left out"
+    );
 }
