@@ -11,14 +11,16 @@ board crate).
 ## Boundaries (hard)
 
 - Outside the workspace (own `Cargo.lock`): lint and format with the `--manifest-path` commands in
-  `docs/DEVELOPMENT.md`. `cargo test-host` does not build it; its lib's host test (the command table) runs with the
-  `cargo test --manifest-path` command there.
+  `docs/DEVELOPMENT.md`. `cargo test-host` builds it only for its lib's host test (the command
+  table), through `crates/e2e/tests/user.rs`, which runs the `cargo test --manifest-path` command there.
 - `#![no_std]` (the lib `cfg_attr(not(test))`), `#![no_main]`, no dependencies. `unsafe` only in `src/lib.rs` for
-  `svc`, `map`'s slice and `start`'s argument slice, and in bins for `#[unsafe(no_mangle)]` and the one call to the
-  `unsafe fn start`; each block with a `// SAFETY:`.
+  `svc`, `map`'s slice and `start`'s argument slice, and in bins for `#[unsafe(no_mangle)]`, the one call to the
+  `unsafe fn start`, and `fuzz`'s and `sysbench`'s calls to `unsafe fn raw` (any syscall, all seven arguments; the caller keeps what the
+  kernel may write unreferenced); each block with a `// SAFETY:`.
 - A program that takes arguments defines `_start(argc, _, len)` and calls `unsafe { start(argc, len, main) }` with
   its x0 and x2, which hands `main` the arguments as `&[&[u8]]` (the kernel puts them at the end of the top stack page,
-  `STACK_TOP`) and exits with its result; boot-spawned programs get none.
+  `STACK_TOP`) and exits with its result; boot-spawned programs get none, except `fuzz` and msh under
+  `test=bench-shell`, which get the kernel's.
 - Talks to the kernel only through `svc #0`; handles arrive at values 0, 1, ... as the spawner passed them
   (init: 0 console, 1 itself, 2 boot archive, 3 the MogFS root directory when a disk is mounted).
 - `read`/`write` are `read_at`/`write_at` at offset 0: `io_submit_wait` takes the file offset in x4, which the console
@@ -59,7 +61,9 @@ board crate).
   `ping` / `pong` (`pipe_bench_reports_round_trip`), `readlines` (`console_reads_edited_lines_typed_ahead`), `msh`
   and its programs `ls`, `mkdir`, `touch`, `write`, `cat`, `rm`, `mv`, `echo`, `sync`
   (`shell_files_survive_a_reboot_only_once_synced`, `sync_reports_a_failed_flush`), and `sh` (the musl tests in `c/CLAUDE.md`),
-  `fsbench` (`fs_bench_reports_round_trips`), `spawnbench` / `nop` (`spawn_bench_reports_round_trip`), all in `crates/e2e/tests/boot.rs`.
+  `fsbench` (`fs_bench_reports_round_trips`), `spawnbench` / `nop` (`spawn_bench_reports_round_trip`), `fuzz` / `nop`
+  (`fuzzer_never_crashes_the_kernel_or_leaks_frames`), `sysbench` / `nop` (`syscall_benches_report_every_call`),
+  `shellsetup` / `msh` with arguments (`shell_bench_times_each_command_from_spawn_to_reap`), all in `crates/e2e/tests/boot.rs`.
 - Clippy and fmt via the `crates/user` commands in `docs/DEVELOPMENT.md` must be clean.
 
 ---

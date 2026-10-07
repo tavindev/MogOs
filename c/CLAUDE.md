@@ -5,9 +5,9 @@
 The C userland: `Makefile` fetches musl 1.2.5 and busybox 1.36.1 (pinned SHA-256) and builds them with Homebrew
 clang and the pinned toolchain's `rust-lld` into one cache shared by every worktree, the main checkout's
 `target/c-cache/<key>`, the key a hash of the inputs and the toolchain (`docs/DEVELOPMENT.md`); `target/c` links to
-it. `crates/board/qemu-virt/build.rs` runs it and bundles `target/c/bin/busybox` (as `sh`), `hello` and `cbench`
-into the boot archive. `musl/` is copied
-over the musl release before it builds; `src/mogos/mogos.c` there is the MogOs syscall layer.
+it. `crates/board/qemu-virt/build.rs` runs it and bundles `target/c/bin/busybox` (as `sh`), `hello`, `cbench`, and
+`oscb` with its spawn target `oscnop` (the cross-OS benchmarks, `scripts/oscompare.sh`) into the boot archive.
+`musl/` is copied over the musl release before it builds; `src/mogos/mogos.c` there is the MogOs syscall layer.
 
 It is **NOT** a Linux compatibility layer for unmodified binaries (phase 9), and **NOT** a kernel interface: the
 kernel's ABI is `crates/kernel/src/syscall.rs`, mirrored here by hand (numbers, rights, `KILLED`).
@@ -42,8 +42,8 @@ kernel's ABI is `crates/kernel/src/syscall.rs`, mirrored here by hand (numbers, 
   `vfork`; `execve` spawns natively and `_exit` records an exited child, and both restore the table and return the
   child's pid from `vfork`. `execve` outside a child spawns, waits and exits with the child's code.
 - Programs come only from the boot archive, by the last component of the path (`/bin/sh` is busybox), and only the
-  C programs (`sh`, `hello`, `cbench`): the native ones expect other handles, and `sh` must not reach programs
-  outside msh's table (`ENOENT`).
+  C programs (`sh`, `hello`, `cbench`, `oscb`, `oscnop`): the native ones expect other handles, and `sh` must not
+  reach programs outside msh's table (`ENOENT`).
 - `wait4` has no native wait-for-any: it takes an exited pseudo-child, else blocks on the newest child (the
   foreground one); `WNOHANG` sees only pseudo-children, so background jobs (`&`) are not reaped until waited for.
   A vfork inside a vfork child is `EAGAIN`.
@@ -59,7 +59,8 @@ kernel's ABI is `crates/kernel/src/syscall.rs`, mirrored here by hand (numbers, 
 ## How it's tested
 
 - End to end in `crates/e2e/tests/boot.rs`: `a_c_program_on_musl_prints_gets_enosys_and_exits_with_its_code`,
-  `busybox_sh_changes_files_that_survive_a_reboot_once_synced`, `musl_bench_reports_round_trips` (`cbench`).
+  `busybox_sh_changes_files_that_survive_a_reboot_once_synced`, `musl_bench_reports_round_trips` (`cbench`),
+  `oscb_runs_the_cross_os_benchmarks`.
 - `make -C c` alone builds everything; it is a no-op once the key is built. A new input file in `c/` must join
   `INPUTS` in the Makefile, or a change to it reuses a stale build.
 

@@ -52,7 +52,14 @@ fn main() {
         })
         .collect();
     // busybox goes in as `sh`, the path its applets re-exec (`CONFIG_BUSYBOX_EXEC_PATH`).
-    for (name, file) in [("sh", "busybox"), ("hello", "hello"), ("cbench", "cbench")] {
+    let programs = [
+        ("sh", "busybox"),
+        ("hello", "hello"),
+        ("cbench", "cbench"),
+        ("oscb", "oscb"),
+        ("oscnop", "oscnop"),
+    ];
+    for (name, file) in programs {
         files.push((name.into(), fs::read(c_out.join("bin").join(file)).unwrap()));
     }
     files.sort();

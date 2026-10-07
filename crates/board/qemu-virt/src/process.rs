@@ -197,13 +197,15 @@ pub(crate) fn executable(
     Ok((file, elf.segments(), entry))
 }
 
-/// Queues `executable` from boot context with init's handles, a budget of `budget` frames and `priority`.
+/// Queues `executable` from boot context with init's handles, a budget of `budget` frames, `priority` and `args`.
 pub(crate) fn spawn_init(
     executable: (&[u8], impl Iterator<Item = Segment>, u64),
     budget: usize,
     priority: u8,
     archive: Rights,
+    args: &[u8],
 ) -> Result<(), i64> {
+    let argc = kernel::syscall::argc(args)?;
     let mut kernel = KERNEL.lock();
     let Kernel {
         sched,
@@ -223,7 +225,7 @@ pub(crate) fn spawn_init(
             executable,
             Budget::new(budget),
             init,
-            (&[], 0),
+            (args, argc),
         )
     })
 }

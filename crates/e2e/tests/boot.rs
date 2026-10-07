@@ -1,9 +1,9 @@
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::{Arc, Mutex};
-use std::thread::{self, sleep};
+use std::sync::{Arc, Mutex, Once};
+use std::thread::{self, JoinHandle, sleep};
 use std::time::{Duration, Instant};
 
 /// Builds the kernel, boots it in QEMU with `extra` arguments, and returns the exit status and serial lines.
@@ -15,12 +15,16 @@ fn boot(extra: &[&str]) -> (ExitStatus, Vec<String>) {
 /// `i + 1` times.
 fn boot_with_input(extra: &[&str], input: Option<(&str, &[&[u8]])>) -> (ExitStatus, Vec<String>) {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let build = Command::new(env!("CARGO"))
-        .args(["build", "-p", "qemu-virt"])
-        .current_dir(&root)
-        .status()
-        .unwrap();
-    assert!(build.success(), "kernel build failed");
+    // Once per run: even a fresh `cargo build` replaces `mog_os`, so a build beside a booting test can leave QEMU no ELF.
+    static BUILD: Once = Once::new();
+    BUILD.call_once(|| {
+        let build = Command::new(env!("CARGO"))
+            .args(["build", "-p", "qemu-virt"])
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        assert!(build.success(), "kernel build failed");
+    });
 
     let mut qemu = Command::new("qemu-system-aarch64")
         .args([
@@ -44,30 +48,22 @@ fn boot_with_input(extra: &[&str], input: Option<(&str, &[&[u8]])>) -> (ExitStat
             None => Stdio::null(),
         })
         .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
 
-    let out = Arc::new(Mutex::new(Vec::new()));
-    let mut stdout = qemu.stdout.take().unwrap();
-    let reader = thread::spawn({
-        let out = out.clone();
-        move || {
-            let mut buf = [0; 4096];
-            while let Ok(n @ 1..) = stdout.read(&mut buf) {
-                out.lock().unwrap().extend_from_slice(&buf[..n]);
-            }
-        }
-    });
-
+    let (out, out_reader) = drain(qemu.stdout.take().unwrap());
+    let (err, err_reader) = drain(qemu.stderr.take().unwrap());
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut sent = 0;
     let status = loop {
         if let Some(status) = qemu.try_wait().unwrap() {
-            break status;
+            break Some(status);
         }
         if Instant::now() > deadline {
             qemu.kill().unwrap();
-            panic!("QEMU timed out");
+            qemu.wait().unwrap();
+            break None;
         }
         if let Some((ready, chunks)) = input
             && sent < chunks.len()
@@ -82,14 +78,38 @@ fn boot_with_input(extra: &[&str], input: Option<(&str, &[&[u8]])>) -> (ExitStat
         sleep(Duration::from_millis(50));
     };
 
-    reader.join().unwrap();
+    out_reader.join().unwrap();
+    err_reader.join().unwrap();
     let out = String::from_utf8_lossy(&out.lock().unwrap()).into_owned();
-    println!("{out}");
+    let err = String::from_utf8_lossy(&err.lock().unwrap()).into_owned();
+    // Captured, so a failing test shows how QEMU ended.
+    println!("QEMU status: {status:?}\nQEMU stderr:\n{err}\nQEMU stdout:\n{out}");
+    let status = status.expect("QEMU timed out");
     let lines = out
         .lines()
         .map(|l| l.trim_end_matches('\r').to_string())
         .collect();
     (status, lines)
+}
+
+/// Collects everything `pipe` yields, on a thread that ends at EOF.
+fn drain(mut pipe: impl Read + Send + 'static) -> (Arc<Mutex<Vec<u8>>>, JoinHandle<()>) {
+    let out = Arc::new(Mutex::new(Vec::new()));
+    let reader = thread::spawn({
+        let out = out.clone();
+        move || {
+            let mut buf = [0; 4096];
+            loop {
+                match pipe.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => out.lock().unwrap().extend_from_slice(&buf[..n]),
+                    Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                    Err(e) => panic!("reading QEMU's output: {e}"),
+                }
+            }
+        }
+    });
+    (out, reader)
 }
 
 #[test]
@@ -932,6 +952,35 @@ fn musl_bench_reports_round_trips() {
 }
 
 #[test]
+fn oscb_runs_the_cross_os_benchmarks() {
+    let image = mogfs_image("oscb", 1024);
+    let script = "sh -c 'oscb syscalls / oscnop; oscb pipe / oscnop; oscb spawn / oscnop; oscb files / oscnop'";
+    let (status, got) = shell(&image, &[script, "exit"]);
+    std::fs::remove_file(&image).unwrap();
+    assert!(status.success(), "QEMU exited with {status}");
+    let names: Vec<&str> = got[0]
+        .1
+        .iter()
+        .map(|l| {
+            l.strip_prefix("oscb: ")
+                .and_then(|l| l.split(' ').next())
+                .unwrap_or(l)
+        })
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "getppid",
+            "write0",
+            "pipe",
+            "spawn",
+            "create+write+fsync",
+            "open+close"
+        ]
+    );
+}
+
+#[test]
 fn sync_reports_a_failed_flush() {
     let image = mogfs_image("shell-flush", 1024);
     let blockdev = flush_fails(&image);
@@ -992,4 +1041,120 @@ fn spawn_bench_reports_round_trip() {
     }
     assert_no_leak(&lines, "bench-spawn");
     assert!(status.success(), "QEMU exited with {status}");
+}
+
+/// The `bench <name>: <ns> ns` lines' times by name, in boot order.
+fn bench_lines(lines: &[String]) -> Vec<(String, f64)> {
+    lines
+        .iter()
+        .filter_map(|l| {
+            let (name, ns) = l.strip_prefix("bench ")?.rsplit_once(": ")?;
+            Some((name.to_string(), ns.strip_suffix(" ns")?.parse().ok()?))
+        })
+        .collect()
+}
+
+#[test]
+fn syscall_benches_report_every_call() {
+    let image = mogfs_image("bench-syscalls", 1024);
+    let (status, lines) = boot_with_disk(&image, "test=bench-syscalls");
+    std::fs::remove_file(&image).unwrap();
+    assert!(
+        !lines.iter().any(|l| l.starts_with("panic:")),
+        "kernel panicked"
+    );
+    let names: Vec<_> = bench_lines(&lines).into_iter().map(|b| b.0).collect();
+    assert_eq!(
+        names,
+        [
+            "console-write",
+            "console-read",
+            "pipe-write",
+            "pipe-read",
+            "file-write",
+            "file-read",
+            "dup",
+            "close",
+            "open",
+            "open-create",
+            "open-trunc",
+            "mkdir",
+            "readdir",
+            "unlink",
+            "rename",
+            "sync",
+            "sync-change",
+            "map",
+            "pipe",
+            "spawn",
+            "spawn-args",
+            "wait",
+            "kill",
+            "mutex",
+            "lock",
+            "unlock",
+            "enosys",
+        ]
+    );
+    assert_no_leak(&lines, "bench-syscalls");
+    assert!(status.success(), "QEMU exited with {status}");
+}
+
+#[test]
+fn shell_bench_times_each_command_from_spawn_to_reap() {
+    let image = mogfs_image("bench-shell", 1024);
+    let (status, lines) = boot_with_disk(&image, "test=bench-shell");
+    std::fs::remove_file(&image).unwrap();
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.starts_with("panic:") || l.starts_with("msh: ")),
+        "kernel panicked or a command failed"
+    );
+    let commands = [
+        "ls d1",
+        "ls d100",
+        "ls d390",
+        "cat small",
+        "cat big",
+        "write w hello",
+        "mkdir m",
+        "rm m",
+        "mv a b",
+        "mv b a",
+        "echo hi",
+    ];
+    let names: Vec<_> = bench_lines(&lines).into_iter().map(|b| b.0).collect();
+    // Five rounds; the 390 entries are the most MogFS v1 has inodes for beside the other fixtures.
+    assert_eq!(names, commands.repeat(5));
+    assert_eq!(lines.iter().filter(|l| *l == "hi").count(), 5);
+    assert_no_leak(&lines, "bench-shell");
+    assert!(status.success(), "QEMU exited with {status}");
+}
+
+/// Calls the fuzzer makes per seed, sized to the test-host time budget under TCG.
+const FUZZ_CALLS: u64 = 20000;
+
+#[test]
+fn fuzzer_never_crashes_the_kernel_or_leaks_frames() {
+    for seed in [1, 2, 3] {
+        // Each seed boots on a fresh image, so `test=fuzz fuzz=<seed>,<calls>` reproduces it exactly.
+        let image = mogfs_image(&format!("fuzz-{seed}"), 1024);
+        let (status, lines) =
+            boot_with_disk(&image, &format!("test=fuzz fuzz={seed},{FUZZ_CALLS}"));
+        std::fs::remove_file(&image).unwrap();
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.starts_with("panic:") || l.starts_with("fault:")),
+            "seed {seed}: the kernel panicked or the fuzzer faulted"
+        );
+        let ok = format!("fuzz: seed {seed}: {FUZZ_CALLS} calls ok");
+        assert!(
+            lines.iter().any(|l| l.starts_with(&ok)),
+            "seed {seed}: missing line: {ok}"
+        );
+        assert_no_leak(&lines, "fuzz");
+        assert!(status.success(), "QEMU exited with {status}");
+    }
 }
