@@ -13,7 +13,8 @@
 //! - Each connection has one deadline, derived from its state (`deadline`) and cached at the end of every event that
 //!   can move it: retransmission, persist (given up after 10 unanswered probes), or a released connection's
 //!   FIN-WAIT-2 idle limit.
-//! - ISNs (RFC 6528) and ephemeral ports (RFC 6056, algorithm 3) come from SipHash-2-4 keyed by the caller.
+//! - ISNs (RFC 6528) and ephemeral ports (RFC 6056, algorithm 3) come from SipHash-2-4; every keyed use (ISNs,
+//!   ports, cookies, TIME_WAIT takeover, the half-open mix) has its own key derived from the caller's seed.
 //! - RFC 5961: an inexact in-window RST, any SYN on a synchronized connection and an ACK outside the sent range get
 //!   a challenge ACK, at most `CHALLENGES` per second per connection. RFC 5927: an ICMP error must name a sequence
 //!   number in flight, and a hard error aborts only a connection still in SYN-SENT.
@@ -868,9 +869,32 @@ impl TimeWait {
     };
 }
 
-/// TCP's memory and secret: connection slots, the half-open and TIME_WAIT tables, and the key for ISNs and ports.
+/// One key per use, each SipHash of the caller's seed and a label, so no use's output (least of all the
+/// half-open table's weak mix) tells anything about another's key.
+struct Keys {
+    isn: [u64; 2],
+    port: [u64; 2],
+    cookie: [u64; 2],
+    time_wait: [u64; 2],
+    slots: [u64; 2],
+}
+
+impl Keys {
+    fn derive(seed: [u64; 2]) -> Self {
+        let key = |label: u64| [siphash(seed, [label, 0]), siphash(seed, [label, 1])];
+        Keys {
+            isn: key(1),
+            port: key(2),
+            cookie: key(3),
+            time_wait: key(4),
+            slots: key(5),
+        }
+    }
+}
+
+/// TCP's memory and secret: connection slots, the half-open and TIME_WAIT tables, and the seed every key comes from.
 pub struct Tcp<'a> {
-    key: [u64; 2],
+    keys: Keys,
     sockets: &'a mut [TcpSocket<'a>],
     half_open: &'a mut [HalfOpen],
     time_wait: &'a mut [TimeWait],
@@ -883,13 +907,13 @@ pub struct Tcp<'a> {
 
 impl<'a> Tcp<'a> {
     pub fn new(
-        key: [u64; 2],
+        seed: [u64; 2],
         sockets: &'a mut [TcpSocket<'a>],
         half_open: &'a mut [HalfOpen],
         time_wait: &'a mut [TimeWait],
     ) -> Self {
         Tcp {
-            key,
+            keys: Keys::derive(seed),
             sockets,
             half_open,
             time_wait,
@@ -1139,7 +1163,10 @@ impl<'a> Stack<'a> {
             let w = self.tcp.time_wait[t];
             if s.flags & SYN != 0 && gt(s.seq, w.rcv_nxt) {
                 self.tcp.time_wait[t] = TimeWait::EMPTY;
-                let keyed = self.isn(s.port, s.from, now) & 0xff_ffff;
+                let ips = (u32::from(self.config.ip) as u64) << 32 | u32::from(*s.from.ip()) as u64;
+                let ports = (s.port as u64) << 16 | s.from.port() as u64;
+                let keyed = siphash(self.tcp.keys.time_wait, [ips, ports, w.snd_nxt as u64]) as u32
+                    & 0xff_ffff;
                 iss = Some(w.snd_nxt.wrapping_add(TIME_WAIT_GAP + keyed));
             } else if s.flags & RST != 0 {
                 // RFC 1337: a RST never cuts TIME_WAIT short.
@@ -1251,16 +1278,13 @@ impl<'a> Stack<'a> {
         Ok(())
     }
 
-    /// The cookie ISS for a SYN: the clock's low bit, the 2-bit MSS index and 29 bits of keyed hash over both,
-    /// the connection and the peer's ISN.
+    /// The cookie ISS for a SYN: the clock's low bit, the 2-bit MSS index and 29 bits of keyed hash over the whole
+    /// clock, the index, the connection and the peer's ISN (so a cookie two periods old fails, low bit or not).
     fn cookie(&self, local: u16, from: SocketAddrV4, irs: u32, t: u64, idx: u32) -> u32 {
         let ips = (u32::from(self.config.ip) as u64) << 32 | u32::from(*from.ip()) as u64;
         let ports = (local as u64) << 48 | (from.port() as u64) << 32 | irs as u64;
-        let key = [
-            self.tcp.key[0] ^ t,
-            self.tcp.key[1] ^ (0xc00c_1e00 | idx as u64),
-        ];
-        ((t as u32 & 1) << 31) | (idx << 29) | (siphash(key, [ips, ports]) as u32 & 0x1fff_ffff)
+        let hash = siphash(self.tcp.keys.cookie, [ips, ports, t << 2 | idx as u64]) as u32;
+        ((t as u32 & 1) << 31) | (idx << 29) | (hash & 0x1fff_ffff)
     }
 
     /// The half-open state a valid cookie ACK stands for: issued this period or the last, for this SYN, while
@@ -1526,9 +1550,9 @@ impl<'a> Stack<'a> {
     fn slots(&self, local: u16, from: SocketAddrV4) -> impl Iterator<Item = usize> + Clone + use<> {
         let n = self.tcp.half_open.len();
         let ips = (u32::from(self.config.ip) as u64) << 32 | u32::from(*from.ip()) as u64;
-        let ports = 3 << 32 | (local as u64) << 16 | from.port() as u64;
+        let ports = (local as u64) << 16 | from.port() as u64;
         // A keyed mix, not SipHash: steering SYNs into one run only sends them to cookies.
-        let k = self.tcp.key;
+        let k = self.tcp.keys.slots;
         let x = (ips ^ k[0]).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ (ports ^ k[1]);
         let h = (x.wrapping_mul(0xbf58_476d_1ce4_e5b9) >> 32) as usize;
         (0..PROBES.min(n)).map(move |i| (h + i) % n)
@@ -1562,7 +1586,7 @@ impl<'a> Stack<'a> {
     fn ephemeral(&mut self, to: SocketAddrV4, now: u64) -> Result<u16, Error> {
         let range = 65536 - EPHEMERAL;
         let ips = (u32::from(self.config.ip) as u64) << 32 | u32::from(*to.ip()) as u64;
-        let offset = siphash(self.tcp.key, [ips, 1 << 32 | to.port() as u64]) as u32;
+        let offset = siphash(self.tcp.keys.port, [ips, to.port() as u64]) as u32;
         for n in 0..range {
             let port = (EPHEMERAL + offset.wrapping_add(self.tcp.next_port.wrapping_add(n)) % range)
                 as u16;
@@ -1578,7 +1602,7 @@ impl<'a> Stack<'a> {
     fn isn(&self, local: u16, to: SocketAddrV4, now: u64) -> u32 {
         let ips = (u32::from(self.config.ip) as u64) << 32 | u32::from(*to.ip()) as u64;
         let ports = (local as u64) << 16 | to.port() as u64;
-        (siphash(self.tcp.key, [ips, ports]) as u32).wrapping_add((now / 4000) as u32)
+        (siphash(self.tcp.keys.isn, [ips, ports]) as u32).wrapping_add((now / 4000) as u32)
     }
 }
 
@@ -1729,8 +1753,8 @@ fn gt(a: u32, b: u32) -> bool {
     lt(b, a)
 }
 
-/// SipHash-2-4 of a 16-byte message given as two little-endian words.
-fn siphash(key: [u64; 2], m: [u64; 2]) -> u64 {
+/// SipHash-2-4 of a message given as little-endian words.
+fn siphash<const N: usize>(key: [u64; 2], m: [u64; N]) -> u64 {
     let mut v = [
         key[0] ^ 0x736f_6d65_7073_6575,
         key[1] ^ 0x646f_7261_6e64_6f6d,
@@ -1749,12 +1773,16 @@ fn siphash(key: [u64; 2], m: [u64; 2]) -> u64 {
         v[1] = v[1].rotate_left(17) ^ v[2];
         v[2] = v[2].rotate_left(32);
     };
-    for w in [m[0], m[1], 16 << 56] {
+    let mut eat = |w: u64| {
         v[3] ^= w;
         round(&mut v);
         round(&mut v);
         v[0] ^= w;
+    };
+    for w in m {
+        eat(w);
     }
+    eat((N as u64 * 8) << 56);
     v[2] ^= 0xff;
     for _ in 0..4 {
         round(&mut v);
@@ -1778,6 +1806,34 @@ mod tests {
         h.write(&m[0].to_le_bytes());
         h.write(&m[1].to_le_bytes());
         assert_eq!(siphash(key, m), h.finish());
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn siphash_of_three_words_matches_the_reference() {
+        use std::hash::Hasher;
+        let (key, m) = ([3, 4], [7u64, 8, 9]);
+        let mut h = std::hash::SipHasher::new_with_keys(key[0], key[1]);
+        m.iter().for_each(|w| h.write(&w.to_le_bytes()));
+        assert_eq!(siphash(key, m), h.finish());
+    }
+
+    #[test]
+    fn each_use_gets_its_own_key_derived_from_the_seed() {
+        let seed = [1, 2];
+        let k = Tcp::new(seed, &mut [], &mut [], &mut []).keys;
+        let all = [seed, k.isn, k.port, k.cookie, k.time_wait, k.slots];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a, b, "two uses share a key");
+            }
+        }
+        assert_ne!(
+            k.slots, k.cookie,
+            "the weak half-open mix never sees the cookie key"
+        );
+        let other = Tcp::new([1, 3], &mut [], &mut [], &mut []).keys;
+        assert_ne!(other.cookie, k.cookie, "every key depends on the seed");
     }
 
     #[test]

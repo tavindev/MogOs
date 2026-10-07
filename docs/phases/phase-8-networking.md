@@ -103,3 +103,6 @@ Decision: write `crates/net` fresh. smoltcp is a host-only dev-dependency of `cr
   The half-open table is found in O(1) (a keyed mix picks a run of 8 slots; a full run means a cookie), for tables
   sized from RAM: filling 4096 entries costs 45 ns per SYN, down from 2.0 us for the linear scan, and 64 entries 48 ns
   against 68. Still linear: the per-`poll` walks over the half-open table and the slots, and the TIME_WAIT lookup.
+  A security scan flagged key reuse (one key for ISNs, ports, cookies, TIME_WAIT and the weak half-open mix, and the
+  cookie clock XORed into the key): each use now has a key derived from the seed, and the cookie's clock and index
+  are hashed as message words. Cost: 1.5 ns per cookie SYN (a third message word); connect + close unchanged.
