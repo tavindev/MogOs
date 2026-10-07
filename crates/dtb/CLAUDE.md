@@ -2,16 +2,15 @@
 
 ## What this crate is
 
-Reads the flattened device tree QEMU passes: `total_size`, then `Dtb::memory`, `uart` (PL011), `gic` (GICv2),
-`virtio_mmio` (every `virtio,mmio` transport, in DTB order, through a callback) and `bootargs` (`/chosen`). All in `src/lib.rs`. It is **NOT** a general device-tree library: no writing, no phandles, no
+Reads the flattened device tree QEMU passes: `total_size`, then `Dtb::memory`, `uart` (PL011), `gic` (GICv2) and
+`bootargs` (`/chosen`). All in `src/lib.rs`. It is **NOT** a general device-tree library: no writing, no phandles, no
 nested-bus address translation.
 
 ## Boundaries (hard)
 
 - `#![cfg_attr(not(test), no_std)]`, depends only on `mm` (`PhysAddr`), workspace `forbid(unsafe_code)`.
 - Works on a `&[u8]`; the board (`kmain` in `crates/board/qemu-virt`) builds that slice from RAM base.
-- Callers: `qemu-virt` (`uart`, `gic`, `virtio_mmio`) and `kernel::run` (`memory`, `bootargs`, and the `Dtb` it passes
-  to `Board::disk`).
+- Callers: `qemu-virt` (`uart`, `gic`) and `kernel::run` (`memory`, `bootargs`).
 
 ## Invariants & rules
 
@@ -24,8 +23,7 @@ nested-bus address translation.
 
 ## How it's tested
 
-- Host: `cargo test --target aarch64-apple-darwin -p dtb` (`tests/virt.rs`: bad and truncated headers; the 32
-  `virtio_mmio` transports in ascending order, from `tests/virt.dtb`, QEMU 9.2's `virt` blob compacted by `dtc`).
+- Host: `cargo test --target aarch64-apple-darwin -p dtb` (`tests/virt.rs`: bad and truncated headers).
 - The real QEMU blob: e2e `boots_and_powers_off` asserts the `ram: 0x40000000..0x48000000` line; every `test=*`
   scenario depends on `bootargs`.
 

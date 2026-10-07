@@ -64,8 +64,10 @@ const TICK_US: u64 = 10_000;
 static GIC_CPU: AtomicU64 = AtomicU64::new(0);
 /// Set once `Board::disk` handed out the block device.
 static DISK_TAKEN: AtomicBool = AtomicBool::new(false);
-/// QEMU `virt` has 32 virtio-mmio transports.
-const MAX_VIRTIO: usize = 32;
+/// QEMU `virt`'s 32 virtio-mmio transports: the first one's base, and the stride between them.
+const VIRTIO: PhysAddr = PhysAddr(0x0a00_0000);
+const VIRTIO_STRIDE: u64 = 0x200;
+const VIRTIO_COUNT: u64 = 32;
 /// Boot context included; a task's slot is its ASID (8 bits).
 const MAX_TASKS: usize = 8;
 const _: () = assert!(MAX_TASKS <= 256);
@@ -732,7 +734,7 @@ impl kernel::Board for QemuVirt {
         count
     }
 
-    fn disk(&mut self, dtb: &Dtb) -> Option<VirtioBlk> {
+    fn disk(&mut self) -> Option<VirtioBlk> {
         let alloc = || {
             let irq = arch::irq::disable();
             // SAFETY: IRQs are masked on the only core, so this is the sole reference.
@@ -743,15 +745,10 @@ impl kernel::Board for QemuVirt {
         if DISK_TAKEN.swap(true, Relaxed) {
             return None;
         }
-        let (mut bases, mut count) = ([PhysAddr(0); MAX_VIRTIO], 0);
-        dtb.virtio_mmio(|base| {
-            *bases.get_mut(count)? = base;
-            count += 1;
-            None::<()>
-        });
         // QEMU `virt` fills the transports from the highest address down with no gaps, so the first empty one ends them.
-        for &base in bases[..count].iter().rev() {
-            // SAFETY: the DTB's virtio-mmio transports, in the device-mapped GiB 0, driven only here (`DISK_TAKEN`);
+        for i in (0..VIRTIO_COUNT).rev() {
+            let base = PhysAddr(VIRTIO.0 + i * VIRTIO_STRIDE);
+            // SAFETY: QEMU `virt`'s virtio-mmio transports, in the device-mapped GiB 0, driven only here (`DISK_TAKEN`);
             // frames from the allocator are identity-mapped RAM nobody else uses.
             match unsafe { VirtioBlk::new(base, alloc) } {
                 Ok(disk) => return Some(disk),

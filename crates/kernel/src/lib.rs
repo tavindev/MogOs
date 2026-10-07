@@ -62,8 +62,8 @@ pub trait Board {
     fn spawn_archived(&mut self, name: &str, budget: usize) -> Result<(), i64>;
     /// Tasks in the run queue, the boot context included.
     fn tasks(&self) -> usize;
-    /// The first block device in `dtb`, set up with memory from the frame allocator; call once, after `init_frames`.
-    fn disk(&mut self, dtb: &Dtb) -> Option<Self::Disk>;
+    /// The board's block device, set up with memory from the frame allocator; call once, after `init_frames`.
+    fn disk(&mut self) -> Option<Self::Disk>;
 }
 
 /// Bytes per disk block.
@@ -156,7 +156,7 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
     let _ = writeln!(board.console(), "heap: ok");
     board.init_frames(frames);
 
-    let mut disk = board.disk(&dtb);
+    let mut disk = board.disk();
 
     let boot_us = board.uptime_us();
     let _ = writeln!(board.console(), "boot: {boot_us} us");
