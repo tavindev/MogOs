@@ -145,7 +145,8 @@ pub struct Processes<const P: usize> {
     handles: [Handles; P],
     /// An ended process's budget stays here until `reap`.
     memory: [Memory; P],
-    threads: [usize; P],
+    /// A bit per slot of its live threads.
+    threads: [u64; P],
     entries: Entries<P>,
 }
 
@@ -228,7 +229,7 @@ impl<const N: usize, const P: usize> Scheduler<N, P> {
         self.priority[slot] = priority;
         self.effective[slot] = priority;
         self.end = self.end.max(slot + 1);
-        self.processes.threads[process] += 1;
+        self.processes.threads[process] |= 1 << slot;
     }
 
     /// The slot the next `add` takes, if any is free, and the generation it gives the thread there.
@@ -277,7 +278,7 @@ impl<const N: usize, const P: usize> Scheduler<N, P> {
         self.slots.end(slot, code);
         self.wake(Event::Join(slot));
         let index = self.process[slot];
-        self.processes.threads[index] -= 1;
+        self.processes.threads[index] &= !(1 << slot);
         if self.processes.threads[index] == 0 {
             self.processes.entries.end(index, code);
             self.wake(Event::Exit(index));
@@ -320,6 +321,7 @@ impl<const N: usize, const P: usize> Scheduler<N, P> {
 
     /// A handle to the process at `index` with `generation` was closed: if it was the last one to the ended process,
     /// frees its index and returns its budget's limit, as `reap` would; otherwise 0.
+    #[inline]
     pub fn close(&mut self, index: usize, generation: u64) -> usize {
         if !self.processes.entries.dropped(index, generation) {
             return 0;
@@ -381,13 +383,13 @@ impl<const N: usize, const P: usize> Scheduler<N, P> {
 
     /// The live threads of the process at `index`.
     pub fn threads(&self, index: usize) -> usize {
-        self.processes.threads[index]
+        self.processes.threads[index].count_ones() as usize
     }
 
     /// A live thread of the process at `index`, if it has one.
     pub fn thread_of(&self, index: usize) -> Option<usize> {
-        let live = |s: usize| matches!(self.slots.state[s], State::Ready | State::Blocked(_));
-        (1..self.end).find(|&s| self.process[s] == index && live(s))
+        let threads = self.processes.threads[index];
+        (threads != 0).then(|| threads.trailing_zeros() as usize)
     }
 
     /// The current task's own priority.

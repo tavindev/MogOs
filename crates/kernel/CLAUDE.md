@@ -20,7 +20,7 @@ touches memory through raw addresses: the board reads user buffers, copies pages
   writing whole `name\n` / `name/\n` entries, at most 64 per call), `list_archive`, and `errno` (mogfs error to musl
   errno; `Io` and `Corrupt` are `EIO`).
 - `Scheduler<N, P>` (`src/sched.rs`): thread slots (frame, process, kernel stack, state, priorities) and the process
-  table `Processes<P>` (address space, `Handles`, `Memory` with the budget and map cursor, live thread count,
+  table `Processes<P>` (address space, `Handles`, `Memory` with the budget and map cursor, live threads (a slot bitmask),
   generation); states (`Ready`, `Blocked`, `Exited`, `Zombie`) for both; `end` (a thread, and its process with its last
   thread), `reap` (a process), `join` (a thread).
 - `Handles` (`src/handle.rs`): per-process handle tables, rights, `dup`, `split` for `spawn`.
