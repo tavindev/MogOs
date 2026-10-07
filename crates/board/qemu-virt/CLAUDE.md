@@ -87,6 +87,8 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
 - Ending a process (`exit`, a fault, `kill`) takes and releases its handles first, then ends every thread (mutexes
   released, a lent boost dropped, stacks refunded), all before `switch` picks the next task, so whatever they woke can
   be it.
+- Every new `Process` or `Thread` handle is counted (`Scheduler::held`): the one `spawn_process` hands out (the
+  spawner's, or init's own), `thread`'s, and each `dup`; `release` uncounts each closed one.
 - A blocking call rewinds its `svc` (`block` calls `TrapFrame::restart`) and reruns when woken.
 - User memory is reached only through `UserIn` / `UserOut` (`src/usermem.rs`), which probe every page with
   `arch::user_readable` / `user_writable` once and then move bytes by raw copy, in the same trap, before any switch;

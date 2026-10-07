@@ -173,6 +173,9 @@ fn spawn_process(
     };
     sched.add_process(process, l1, memory, handles);
     sched.add(slot, process.0, (frame, stack.start), priority);
+    // Its one handle: the spawner's, or init's own.
+    let (index, generation) = process;
+    sched.held(Object::Process { index, generation });
     Ok(())
 }
 
@@ -287,6 +290,7 @@ pub(crate) fn thread(
     let frame = unsafe { arch::new_user_task(stack.end.0 as usize, entry, (sp, tls), [arg, 0, 0]) };
     let priority = sched.priority();
     sched.add((slot, generation), index, (frame, stack.start), priority);
+    sched.held(thread);
     *sched.handles() = handles;
     Ok(handle)
 }

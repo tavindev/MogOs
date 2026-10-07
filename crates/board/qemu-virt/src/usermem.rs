@@ -73,7 +73,11 @@ impl UserOut {
 
 /// Copies the `len` bytes at user address `ptr` to the start of `buf`, if EL0 may read them; returns the copy, which
 /// the kernel then validates and parses.
+#[inline]
 pub(crate) fn copy_in(ptr: u64, len: usize, buf: &mut [u8]) -> Option<&[u8]> {
+    if len == 0 {
+        return Some(&[]);
+    }
     let input = UserIn::new(ptr, len)?;
     let buf = &mut buf[..len];
     input.read(0, buf);

@@ -47,8 +47,7 @@ touches memory through raw addresses: the board reads user buffers, copies pages
   and kernel tasks, boot table, ASID 0). A process handle (`Object::Process`) names an index and its generation.
 - **Generation**: per-slot, per-process (and per pipe/mutex entry) counter that tells a live object from a later one
   in the same place.
-- **Zombie**: an ended thread or process whose slot or index is kept because some handle table still holds a handle to
-  it.
+- **Zombie**: an ended thread or process whose slot or index is kept because a handle to it is still open.
 - **Budget**: frames a process may hold (`mm::Budget`), its threads' kernel stacks included; `spawn` moves part of
   the parent's to the child.
 - **Boot archive**: the cpio of `crates/user` programs; `Object::Archive` / `Object::File` reach it, read-only.
@@ -64,10 +63,13 @@ touches memory through raw addresses: the board reads user buffers, copies pages
 - `Scheduler::add` and `add_process` take the generation from `free_slot` / `free_process` (old + 1); `reap`,
   `join`, `process_live`, `thread_live` return `EBADF` for a stale generation, `budget` `None`. Slot 0 never ends
   (`assert!` in `Scheduler::end`), nor does process 0.
-- `end` decides `Zombie` vs `Exited` by whether any table holds a handle to the thread, and, when it ends the last
-  thread, to the process; the caller first takes and releases the process's handles (`take_handles`), so a process's
-  handle to itself does not keep it. `reap` hands out the budget limit once (later calls get 0); `close` /
-  `close_thread` on a zombie's handle frees its index or slot like `reap` / `join` (`src/sched.rs`).
+- Thread slots and process indices share one lifecycle (`Entries`): state, generation, a count of open handles
+  (`held` on each new `Process` or `Thread` handle, `close` / `close_thread` on each closed one, ignored for an older
+  generation) and a bitmask of free entries, so `end` and `free_slot` / `free_process` are O(1) (at most 64 entries,
+  const-asserted). `end` makes a thread, and with its last thread the process, a zombie while its count is above 0;
+  the caller first takes and releases the process's own handles (`take_handles`), so its handle to itself does not
+  keep it. `reap` hands out the budget limit once (later calls get 0); the last `close` / `close_thread` of a zombie
+  frees its index or slot like `reap` / `join` (`src/sched.rs`).
 - `advance` runs the highest effective priority, round robin within a level, boot context when none is ready.
   Priority inheritance is one level only (`unboost` doc). The board calls `unboost(slot, ..)` when an owner loses a
   waiter (an unlock that woke one, or the end of a thread blocked on `Lock`); after such an unlock it switches at once if

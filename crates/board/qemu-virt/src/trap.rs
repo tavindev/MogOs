@@ -397,7 +397,7 @@ unsafe extern "C" fn board_syscall(frame: &mut arch::TrapFrame) -> usize {
             match object {
                 Object::Pipe(end) => pipes.open(end),
                 Object::Mutex(mutex) => mutexes.open(mutex),
-                _ => {}
+                object => sched.held(object),
             }
             handle
         }

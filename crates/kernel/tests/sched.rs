@@ -39,6 +39,12 @@ fn thread<const N: usize, const P: usize>(
     slot
 }
 
+/// A handle (wait) to `object` in the current process's table, counted as the board counts it.
+fn give<const N: usize, const P: usize>(sched: &mut Scheduler<N, P>, object: Object) -> u64 {
+    sched.held(object);
+    sched.handles().insert(object, WAIT).unwrap()
+}
+
 /// Ends the current thread, as `thread_exit`, and switches; returns the next frame.
 fn exit<const N: usize, const P: usize>(sched: &mut Scheduler<N, P>, code: u64) -> usize {
     let (slot, _) = sched.current();
@@ -122,7 +128,7 @@ fn an_exited_child_stays_a_zombie_until_reaped_and_one_without_a_handle_frees_at
         index: child.0,
         generation: child.1,
     };
-    sched.handles().insert(process, WAIT).unwrap();
+    give(&mut sched, process);
 
     assert_eq!(sched.switch(0x110), 0x200);
     assert_eq!(exit(&mut sched, 7), 0x300);
@@ -160,7 +166,7 @@ fn closing_the_handle_frees_an_exited_child_and_lets_a_running_one_free_at_exit(
         index: child.0,
         generation: child.1,
     };
-    let handle = sched.handles().insert(process, WAIT).unwrap();
+    let handle = give(&mut sched, process);
     assert_eq!(sched.switch(0x110), 0x200);
     assert_eq!(exit(&mut sched, 1), 0x10);
     assert_eq!(sched.free_process(), None);
@@ -177,7 +183,7 @@ fn closing_the_handle_frees_an_exited_child_and_lets_a_running_one_free_at_exit(
         index: child.0,
         generation: child.1,
     };
-    let handle = sched.handles().insert(process, WAIT).unwrap();
+    let handle = give(&mut sched, process);
     sched.handles().close(handle).unwrap();
     assert_eq!(sched.close(child.0, child.1), 0, "still running");
     assert_eq!(sched.switch(0x111), 0x300);
@@ -224,7 +230,7 @@ fn a_join_reports_the_code_once_and_a_held_thread_stays_a_zombie() {
         slot: held.0,
         generation: held.1,
     };
-    let handle = sched.handles().insert(object, WAIT).unwrap();
+    let handle = give(&mut sched, object);
     assert_eq!(sched.join(held.0, held.1), Ok(None), "still running");
     sched.block(Event::Join(held.0));
 
@@ -248,7 +254,7 @@ fn a_join_reports_the_code_once_and_a_held_thread_stays_a_zombie() {
         slot: held.0,
         generation: held.1,
     };
-    sched.handles().insert(object, WAIT).unwrap();
+    give(&mut sched, object);
     let (stack, blocked) = sched.end(held.0, KILLED);
     assert_eq!((stack, blocked), (STACK, None));
     assert_eq!(sched.free_slot(), None, "killed, held: a zombie");
@@ -304,4 +310,29 @@ fn ending_a_waiter_reports_its_event_so_the_owner_drops_its_boost_and_is_outrank
     sched.unboost(low, |e| e == Event::Lock(5));
     assert!(sched.outranked(), "back to 1, below the 2");
     assert_eq!(sched.switch(0x100), 0x200);
+}
+
+#[test]
+fn a_zombie_stays_until_its_last_handle_closes_and_a_stale_close_counts_for_nothing() {
+    let mut sched = Scheduler::<4, 3>::new();
+    spawn(&mut sched, 0x100);
+    let (_, child) = spawn_with(&mut sched, 0x200, 5, 0);
+    let process = Object::Process {
+        index: child.0,
+        generation: child.1,
+    };
+    give(&mut sched, process);
+    give(&mut sched, process);
+    sched.block(Event::Idle);
+    assert_eq!(sched.switch(0x10), 0x100);
+    assert_eq!(sched.switch(0x110), 0x200);
+    assert_eq!(exit(&mut sched, 3), 0x110);
+    assert_eq!(sched.close(child.0, child.1), 0, "one handle left");
+    assert_eq!(sched.free_process(), None);
+    assert_eq!(sched.close(child.0, child.1), 5, "the last one frees it");
+    let (index, generation) = sched.free_process().unwrap();
+    assert_eq!(index, child.0);
+    spawn(&mut sched, 0x300);
+    assert_eq!(sched.close(index, generation - 1), 0, "an older generation");
+    assert_eq!(sched.process_live(index, generation), Ok(true));
 }
