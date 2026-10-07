@@ -1,10 +1,10 @@
-//! The network stack's L2/L3: Ethernet, ARP, IPv4, ICMP echo and UDP over a `Nic`, in caller-supplied memory.
+//! The network stack: Ethernet, ARP, IPv4, ICMP echo, UDP and TCP (`tcp.rs`) over a `Nic`, in caller-supplied memory.
 //!
 //! - No clock: every entry point takes `now` in ns, and `poll` returns the next deadline, so a seed replays a run.
 //! - Every received frame is untrusted: each field is range-checked once when decoded, and a frame that fails is
 //!   dropped and counted in `Counters`, never a panic. IPv4 fragments are dropped and counted (no reassembly).
-//! - ARP learns only from replies to our requests and from requests aimed at us whose sender MAC matches the
-//!   Ethernet source; a full cache evicts its least recently used entry.
+//! - ARP learns only from replies to our own requests whose sender MAC matches the Ethernet source; a request
+//!   aimed at us is answered but never learned. A full cache evicts its least recently used entry.
 //! - Sockets are UDP ports and ICMP echo identifiers (a Linux ping socket: the caller sends and receives whole echo
 //!   messages, the stack sets the identifier and checksum). Each socket queues received datagrams in its own buffer
 //!   as records: length u16, source address u32, source port u16 (0 for ICMP), data.
@@ -13,6 +13,9 @@
 #![cfg_attr(not(test), no_std)]
 
 use core::net::{Ipv4Addr, SocketAddrV4};
+
+mod tcp;
+pub use tcp::{HalfOpen, State, Tcp, TcpId, TcpInfo, TcpSocket, TimeWait};
 
 pub type Mac = [u8; 6];
 
@@ -32,6 +35,8 @@ const PROTO_ICMP: u8 = 1;
 const PROTO_UDP: u8 = 17;
 const ECHO_REPLY: u8 = 0;
 const ECHO_REQUEST: u8 = 8;
+const DEST_UNREACHABLE: u8 = 3;
+const TIME_EXCEEDED: u8 = 11;
 const SEC: u64 = 1_000_000_000;
 const ARP_RETRY: u64 = SEC;
 const ARP_TRIES: u8 = 3;
@@ -67,6 +72,16 @@ pub enum Error {
     Unresolved,
     /// The NIC has no free transmit buffer.
     Busy,
+    /// Nothing to receive yet, or no room to send.
+    WouldBlock,
+    /// The peer reset the connection.
+    Reset,
+    /// The peer refused the connection (a RST answered our SYN).
+    Refused,
+    /// The peer stopped acknowledging.
+    TimedOut,
+    /// An ICMP hard error answered our SYN.
+    Unreachable,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -97,6 +112,16 @@ pub struct Counters {
     pub socket_full: u64,
     /// Frames not sent because the NIC had no free buffer.
     pub tx_busy: u64,
+    /// TCP segments, and ICMP errors about a connection, that TCP accepted.
+    pub tcp: u64,
+    /// TCP segments (and ICMP errors) that failed a sequence, acknowledgment or state check.
+    pub unacceptable: u64,
+    /// Challenge ACKs sent (RFC 5961), at most `CHALLENGES` per second per connection.
+    pub challenge_acks: u64,
+    /// Half-open connections evicted by a newer SYN.
+    pub syn_evicted: u64,
+    /// TIME_WAIT entries reused before they expired because the table was full.
+    pub time_wait_reused: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -107,6 +132,7 @@ enum Reason {
     Ignored,
     NoSocket,
     SocketFull,
+    Unacceptable,
 }
 
 /// An ARP cache entry; the caller provides the table, filled with `Neighbor::EMPTY`.
@@ -184,6 +210,7 @@ pub struct Stack<'a> {
     /// A reply built while the received frame is borrowed, sent once it is released.
     reply: [u8; MAX_FRAME],
     reply_len: usize,
+    tcp: Tcp<'a>,
     pub counters: Counters,
 }
 
@@ -200,6 +227,7 @@ impl<'a> Stack<'a> {
             ip_id: 0,
             reply: [0; MAX_FRAME],
             reply_len: 0,
+            tcp: Tcp::new([0; 2], &mut [], &mut [], &mut []),
             counters: Counters::default(),
         }
     }
@@ -320,10 +348,10 @@ impl<'a> Stack<'a> {
 
     /// Handles every received frame and due timer; returns the next deadline, if any.
     pub fn poll(&mut self, nic: &mut impl Nic, now: u64) -> Option<u64> {
-        let ours = nic.mac();
+        let (ours, mss) = (nic.mac(), tcp::mss(nic));
         while nic.receive(|frame| {
             self.counters.rx += 1;
-            if let Err(d) = self.handle(frame, ours, now) {
+            if let Err(d) = self.handle(frame, ours, now, mss) {
                 let c = &mut self.counters;
                 *match d {
                     Reason::Malformed => &mut c.malformed,
@@ -332,6 +360,7 @@ impl<'a> Stack<'a> {
                     Reason::Ignored => &mut c.ignored,
                     Reason::NoSocket => &mut c.no_socket,
                     Reason::SocketFull => &mut c.socket_full,
+                    Reason::Unacceptable => &mut c.unacceptable,
                 } += 1;
             }
         }) {
@@ -361,17 +390,17 @@ impl<'a> Stack<'a> {
             }
             next = Some(next.map_or(due, |t| t.min(due)));
         }
-        next
+        earliest(next, self.tcp_poll(nic, now))
     }
 
-    fn handle(&mut self, frame: &[u8], ours: Mac, now: u64) -> Result<(), Reason> {
+    fn handle(&mut self, frame: &[u8], ours: Mac, now: u64, mss: u16) -> Result<(), Reason> {
         let (eth, body) = frame.split_at_checked(ETH).ok_or(Reason::Malformed)?;
         if eth[..6] != ours && eth[..6] != BROADCAST {
             return Err(Reason::Ignored);
         }
         match [eth[12], eth[13]] {
             TYPE_ARP => self.arp_in(eth, body, ours, now),
-            TYPE_IPV4 => self.ipv4_in(eth, body, ours),
+            TYPE_IPV4 => self.ipv4_in(eth, body, ours, now, mss),
             _ => Err(Reason::Ignored),
         }
     }
@@ -391,11 +420,6 @@ impl<'a> Stack<'a> {
         }
         match a[7] {
             1 => {
-                let i = self
-                    .find(spa)
-                    .or_else(|| self.slot())
-                    .ok_or(Reason::Ignored)?;
-                self.learn(i, spa, sha, now);
                 write_arp(&mut self.reply, 2, ours, self.config.ip, sha, spa);
                 self.reply_len = ETH + ARP;
                 Ok(())
@@ -412,7 +436,14 @@ impl<'a> Stack<'a> {
         }
     }
 
-    fn ipv4_in(&mut self, eth: &[u8], body: &[u8], ours: Mac) -> Result<(), Reason> {
+    fn ipv4_in(
+        &mut self,
+        eth: &[u8],
+        body: &[u8],
+        ours: Mac,
+        now: u64,
+        mss: u16,
+    ) -> Result<(), Reason> {
         let h = body.get(..IP).ok_or(Reason::Malformed)?;
         let ihl = (h[0] & 15) as usize * 4;
         let total = u16::from_be_bytes([h[2], h[3]]) as usize;
@@ -437,6 +468,7 @@ impl<'a> Stack<'a> {
         match h[9] {
             PROTO_ICMP => self.icmp_in(eth, src, payload, ours),
             PROTO_UDP => self.udp_in(src, payload),
+            tcp::PROTO_TCP => self.tcp_in(eth, src, payload, ours, now, mss),
             _ => Err(Reason::Ignored),
         }
     }
@@ -475,6 +507,13 @@ impl<'a> Stack<'a> {
             (ECHO_REPLY, 0) => {
                 let id = u16::from_be_bytes([msg[4], msg[5]]);
                 self.deliver(Proto::Icmp, id, SocketAddrV4::new(src, 0), msg, Some(0))
+            }
+            (DEST_UNREACHABLE | TIME_EXCEEDED, code) => {
+                if fold(sum(msg)) != 0xffff {
+                    return Err(Reason::Checksum);
+                }
+                let hard = msg[0] == DEST_UNREACHABLE && matches!(code, 2..=4);
+                self.tcp_icmp(&msg[ICMP..], hard)
             }
             _ => Err(Reason::Ignored),
         }
@@ -603,6 +642,13 @@ impl<'a> Stack<'a> {
     }
 }
 
+fn earliest(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        _ => a.or(b),
+    }
+}
+
 fn ip_at(b: &[u8]) -> Ipv4Addr {
     Ipv4Addr::new(b[0], b[1], b[2], b[3])
 }
@@ -656,6 +702,13 @@ fn ring_write(buf: &mut [u8], pos: usize, src: &[u8]) -> u64 {
     let sb = copy_sum(&mut buf[..b.len()], b);
     // A piece that starts at an odd offset sums with its bytes swapped.
     sa + if first % 2 == 1 { swap(sb) } else { sb }
+}
+
+fn ring_put(buf: &mut [u8], pos: usize, src: &[u8]) {
+    let first = (buf.len() - pos).min(src.len());
+    let (a, b) = src.split_at(first);
+    buf[pos..pos + first].copy_from_slice(a);
+    buf[..b.len()].copy_from_slice(b);
 }
 
 fn ring_read(buf: &[u8], pos: usize, dst: &mut [u8]) {
