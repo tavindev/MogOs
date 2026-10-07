@@ -26,6 +26,7 @@ version = "0.1.0"
 dependencies = [
  "dtb",
  "mm",
+ "mogfs",
 ]
 
 [[package]]
@@ -51,4 +52,5 @@ dependencies = [
  "kernel",
  "linked_list_allocator",
  "mm",
+ "mogfs",
 ]

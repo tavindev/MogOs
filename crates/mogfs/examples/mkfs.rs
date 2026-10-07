@@ -9,15 +9,15 @@ use mogfs::{BLOCK_SIZE, Disk, Error, Fs};
 struct FileDisk(File, u64);
 
 impl Disk for FileDisk {
-    fn read(&mut self, block: u64, buf: &mut [u8; BLOCK_SIZE]) -> Result<(), Error> {
+    fn read(&mut self, block: u64, bufs: &mut [[u8; BLOCK_SIZE]]) -> Result<(), Error> {
         self.0
-            .read_exact_at(buf, block * BLOCK_SIZE as u64)
+            .read_exact_at(bufs.as_flattened_mut(), block * BLOCK_SIZE as u64)
             .map_err(|_| Error::Io)
     }
 
-    fn write(&mut self, block: u64, buf: &[u8; BLOCK_SIZE]) -> Result<(), Error> {
+    fn write(&mut self, block: u64, bufs: &[[u8; BLOCK_SIZE]]) -> Result<(), Error> {
         self.0
-            .write_all_at(buf, block * BLOCK_SIZE as u64)
+            .write_all_at(bufs.as_flattened(), block * BLOCK_SIZE as u64)
             .map_err(|_| Error::Io)
     }
 
@@ -43,5 +43,6 @@ fn main() {
         .expect("create image");
     file.set_len(blocks * BLOCK_SIZE as u64)
         .expect("size image");
-    Fs::format(FileDisk(file, blocks)).expect("format");
+    let mut fs = Fs::new(FileDisk(file, blocks));
+    fs.format().expect("format");
 }

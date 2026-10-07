@@ -9,13 +9,13 @@ const FILES: usize = 400;
 struct MemDisk(Vec<[u8; BLOCK_SIZE]>);
 
 impl Disk for &mut MemDisk {
-    fn read(&mut self, block: u64, buf: &mut [u8; BLOCK_SIZE]) -> Result<(), Error> {
-        *buf = self.0[block as usize];
+    fn read(&mut self, block: u64, bufs: &mut [[u8; BLOCK_SIZE]]) -> Result<(), Error> {
+        bufs.copy_from_slice(&self.0[block as usize..][..bufs.len()]);
         Ok(())
     }
 
-    fn write(&mut self, block: u64, buf: &[u8; BLOCK_SIZE]) -> Result<(), Error> {
-        self.0[block as usize] = *buf;
+    fn write(&mut self, block: u64, bufs: &[[u8; BLOCK_SIZE]]) -> Result<(), Error> {
+        self.0[block as usize..][..bufs.len()].copy_from_slice(bufs);
         Ok(())
     }
 
@@ -44,7 +44,8 @@ fn main() {
     let mut lookup = Vec::new();
     for _ in 0..RUNS {
         let mut disk = MemDisk(vec![[0; BLOCK_SIZE]; 1024]);
-        let mut fs = Fs::format(&mut disk).unwrap();
+        let mut fs = Fs::new(&mut disk);
+        fs.format().unwrap();
         let start = Instant::now();
         for name in &names {
             let f = fs.create(ROOT, name.as_bytes()).unwrap();

@@ -11,6 +11,7 @@ pub mod pipe;
 mod sched;
 pub mod syscall;
 
+pub use mogfs::{BLOCK_SIZE, Disk};
 pub use sched::{Event, Full, Memory, PRIORITIES, Scheduler};
 
 use alloc::vec;
@@ -20,7 +21,6 @@ use core::ops::Range;
 
 use dtb::Dtb;
 use mm::{FrameAllocator, PhysAddr};
-use syscall::EIO;
 
 /// What the kernel needs from the hardware; each board implements it.
 pub trait Board {
@@ -64,22 +64,6 @@ pub trait Board {
     fn tasks(&self) -> usize;
     /// The board's block device, set up with memory from the frame allocator; call once, after `init_frames`.
     fn disk(&mut self) -> Option<Self::Disk>;
-}
-
-/// Bytes per disk block.
-pub const BLOCK: usize = 4096;
-
-/// A block device of `BLOCK`-byte blocks; each call is one request, returning once the device completed it. A failed
-/// request, or one past the last block, is `EIO`; buffers must be kernel memory (identity-mapped RAM), else `EFAULT`.
-pub trait Disk {
-    /// Capacity in blocks.
-    fn blocks(&self) -> u64;
-    /// Reads `data.len()` consecutive blocks from `block` on.
-    fn read(&mut self, block: u64, data: &mut [[u8; BLOCK]]) -> Result<(), i64>;
-    /// Writes `data.len()` consecutive blocks from `block` on.
-    fn write(&mut self, block: u64, data: &[[u8; BLOCK]]) -> Result<(), i64>;
-    /// Makes every completed write durable.
-    fn flush(&mut self) -> Result<(), i64>;
 }
 
 /// Hand-written asm user programs the board provides; newer ones are ELF files in the boot archive.
@@ -323,14 +307,17 @@ fn yield_forever<B: Board>(board: &mut B, _: usize) -> ! {
 /// Reads blocks 1 and 2 in one request and prints `disk: read ok` if they hold the test pattern (byte `i` of the two
 /// is `i % 251`); otherwise writes it in one request, flushes and prints `disk: wrote` (`disk: flush failed` if the
 /// flush fails). So the first boot on a zeroed image writes, and the next one reads it back. Empty reads and writes
-/// must succeed, and a read straddling the last block must be `EIO`.
+/// must succeed, and a read straddling the last block must be `Io`.
 fn disk_test<B: Board>(board: &mut B, disk: &mut B::Disk) {
-    let pattern: [[u8; BLOCK]; 2] =
-        core::array::from_fn(|b| core::array::from_fn(|i| ((b * BLOCK + i) % 251) as u8));
-    let mut block = [[0; BLOCK]; 2];
+    let pattern: [[u8; BLOCK_SIZE]; 2] =
+        core::array::from_fn(|b| core::array::from_fn(|i| ((b * BLOCK_SIZE + i) % 251) as u8));
+    let mut block = [[0; BLOCK_SIZE]; 2];
     disk.read(0, &mut []).expect("empty read");
     disk.write(0, &[]).expect("empty write");
-    assert_eq!(disk.read(disk.blocks() - 1, &mut block), Err(EIO));
+    assert_eq!(
+        disk.read(disk.blocks() - 1, &mut block),
+        Err(mogfs::Error::Io)
+    );
     disk.read(1, &mut block).expect("read");
     let done = if block == pattern {
         "read ok"
@@ -347,10 +334,10 @@ fn disk_test<B: Board>(board: &mut B, disk: &mut B::Disk) {
 /// Writes `DISK_BENCH_BLOCKS` blocks in order and flushes, then reads them back, one block and then `DISK_BATCH`
 /// blocks per request; prints each throughput in MiB/s.
 fn disk_bench<B: Board>(board: &mut B, disk: &mut B::Disk) {
-    let mut blocks = vec![[0x5a; BLOCK]; DISK_BATCH];
-    let mib_s = |us: u64| ((DISK_BENCH_BLOCKS * BLOCK as u64) >> 20) * 1_000_000 / us;
+    let mut blocks = vec![[0x5a; BLOCK_SIZE]; DISK_BATCH];
+    let mib_s = |us: u64| ((DISK_BENCH_BLOCKS * BLOCK_SIZE as u64) >> 20) * 1_000_000 / us;
     for batch in [1, DISK_BATCH] {
-        let kib = batch * BLOCK / 1024;
+        let kib = batch * BLOCK_SIZE / 1024;
         let start = board.uptime_us();
         for n in (0..DISK_BENCH_BLOCKS).step_by(batch) {
             disk.write(n, &blocks[..batch]).expect("write");

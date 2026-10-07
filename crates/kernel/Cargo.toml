@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 dtb = { path = "../dtb" }
 mm = { path = "../mm" }
+mogfs = { path = "../mogfs" }
 
 [lints]
 workspace = true

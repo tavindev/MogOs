@@ -3,9 +3,9 @@ use core::ops::Range;
 use core::ptr;
 use core::sync::atomic::{Ordering::SeqCst, fence};
 
-use kernel::syscall::{EFAULT, EIO};
-use kernel::{BLOCK, Disk};
+use kernel::{BLOCK_SIZE, Disk};
 use mm::PhysAddr;
+use mogfs::Error;
 
 use crate::GIB;
 
@@ -154,7 +154,7 @@ impl VirtioBlk {
             return None;
         }
         let sectors = self.reg(CAPACITY) as u64 | (self.reg(CAPACITY + 4) as u64) << 32;
-        self.blocks = sectors / (BLOCK as u64 / SECTOR);
+        self.blocks = sectors / (BLOCK_SIZE as u64 / SECTOR);
         self.queue = alloc()?;
         // SAFETY: the caller of `new` hands over the queue frame, which no reference aliases.
         unsafe { ptr::write_bytes(self.queue.0 as *mut u8, 0, PAGE) };
@@ -206,20 +206,20 @@ impl VirtioBlk {
     }
 
     /// Submits a `kind` request for the blocks from `block` on at the addresses `data` (empty for a flush, which has no
-    /// data) and polls until the device completes it. An empty read or write does nothing (QEMU fails it); `EFAULT`
-    /// unless `data` is in the identity-mapped RAM GiB, where every kernel buffer lives at its physical address; `EIO`
-    /// past the last block.
-    fn request(&mut self, kind: u32, block: u64, data: Range<u64>) -> Result<(), i64> {
+    /// data) and polls until the device completes it. An empty read or write does nothing (QEMU fails it); `Io` unless
+    /// `data` is in the identity-mapped RAM GiB, where every kernel buffer lives at its physical address, past the last
+    /// block, or if the device fails the request.
+    fn request(&mut self, kind: u32, block: u64, data: Range<u64>) -> Result<(), Error> {
         match data.is_empty() {
             true if kind != T_FLUSH => return Ok(()),
-            false if !(GIB <= data.start && data.end <= 2 * GIB) => return Err(EFAULT),
+            false if !(GIB <= data.start && data.end <= 2 * GIB) => return Err(Error::Io),
             _ => {}
         }
-        let count = (data.end - data.start) / BLOCK as u64;
+        let count = (data.end - data.start) / BLOCK_SIZE as u64;
         if block.checked_add(count).is_none_or(|end| end > self.blocks) {
-            return Err(EIO);
+            return Err(Error::Io);
         }
-        let sector = block * (BLOCK as u64 / SECTOR);
+        let sector = block * (BLOCK_SIZE as u64 / SECTOR);
         let idx = self.idx.wrapping_add(1);
         let queue = self.queue();
         queue.header = Header {
@@ -251,7 +251,7 @@ impl VirtioBlk {
         self.idx = idx;
         match self.queue().status {
             0 => Ok(()),
-            _ => Err(EIO),
+            _ => Err(Error::Io),
         }
     }
 }
@@ -261,17 +261,17 @@ impl Disk for VirtioBlk {
         self.blocks
     }
 
-    fn read(&mut self, block: u64, data: &mut [[u8; BLOCK]]) -> Result<(), i64> {
+    fn read(&mut self, block: u64, data: &mut [[u8; BLOCK_SIZE]]) -> Result<(), Error> {
         let start = data.as_mut_ptr() as u64;
         self.request(T_IN, block, start..start + size_of_val(data) as u64)
     }
 
-    fn write(&mut self, block: u64, data: &[[u8; BLOCK]]) -> Result<(), i64> {
+    fn write(&mut self, block: u64, data: &[[u8; BLOCK_SIZE]]) -> Result<(), Error> {
         let start = data.as_ptr() as u64;
         self.request(T_OUT, block, start..start + size_of_val(data) as u64)
     }
 
-    fn flush(&mut self) -> Result<(), i64> {
+    fn flush(&mut self) -> Result<(), Error> {
         self.request(T_FLUSH, 0, 0..0)
     }
 }
