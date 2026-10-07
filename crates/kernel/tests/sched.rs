@@ -3,13 +3,22 @@ use kernel::syscall::{EBADF, KILLED};
 use kernel::{Event, Memory, Scheduler};
 use mm::{Budget, PhysAddr};
 
+/// The host's clamp: no speculation to bound.
+struct Min;
+
+impl kernel::Clamp for Min {
+    fn clamp(index: usize, len: usize) -> usize {
+        index.min(len - 1)
+    }
+}
+
 const STACK: PhysAddr = PhysAddr(0x9000);
 
 type Id = (usize, u64);
 
 /// A new process with `budget` frames and one thread at `frame` and `priority`; returns the thread and the process.
 fn spawn_with<const N: usize, const P: usize>(
-    sched: &mut Scheduler<N, P>,
+    sched: &mut Scheduler<N, P, Min>,
     frame: usize,
     budget: usize,
     priority: u8,
@@ -19,17 +28,25 @@ fn spawn_with<const N: usize, const P: usize>(
         budget: Budget::new(budget),
         next: 0,
     };
-    sched.add_process(process, PhysAddr(frame as u64), memory, Handles::new());
+    sched.add_process(
+        process,
+        PhysAddr(frame as u64),
+        memory,
+        Handles::<Min>::new(),
+    );
     (thread(sched, process.0, frame, priority), process)
 }
 
-fn spawn<const N: usize, const P: usize>(sched: &mut Scheduler<N, P>, frame: usize) -> (Id, Id) {
+fn spawn<const N: usize, const P: usize>(
+    sched: &mut Scheduler<N, P, Min>,
+    frame: usize,
+) -> (Id, Id) {
     spawn_with(sched, frame, 0, 0)
 }
 
 /// A new thread of `process` at `frame` and `priority`.
 fn thread<const N: usize, const P: usize>(
-    sched: &mut Scheduler<N, P>,
+    sched: &mut Scheduler<N, P, Min>,
     process: usize,
     frame: usize,
     priority: u8,
@@ -40,13 +57,13 @@ fn thread<const N: usize, const P: usize>(
 }
 
 /// A handle (wait) to `object` in the current process's table, counted as the board counts it.
-fn give<const N: usize, const P: usize>(sched: &mut Scheduler<N, P>, object: Object) -> u64 {
+fn give<const N: usize, const P: usize>(sched: &mut Scheduler<N, P, Min>, object: Object) -> u64 {
     sched.held(object);
     sched.handles().insert(object, WAIT).unwrap()
 }
 
 /// Ends the current thread, as `thread_exit`, and switches; returns the next frame.
-fn exit<const N: usize, const P: usize>(sched: &mut Scheduler<N, P>, code: u64) -> usize {
+fn exit<const N: usize, const P: usize>(sched: &mut Scheduler<N, P, Min>, code: u64) -> usize {
     let (slot, _) = sched.current();
     assert_eq!(sched.end(slot, code), (STACK, None));
     sched.switch(0xdead)
@@ -54,7 +71,7 @@ fn exit<const N: usize, const P: usize>(sched: &mut Scheduler<N, P>, code: u64) 
 
 #[test]
 fn exited_slot_is_skipped_then_reused() {
-    let mut sched = Scheduler::<4, 4>::new();
+    let mut sched = Scheduler::<4, 4, Min>::new();
     spawn(&mut sched, 0x100);
     spawn(&mut sched, 0x200);
     assert_eq!(sched.count(), 3);
@@ -79,7 +96,7 @@ fn exited_slot_is_skipped_then_reused() {
 
 #[test]
 fn reap_reports_the_exit_once_and_a_reused_index_is_ebadf() {
-    let mut sched = Scheduler::<4, 4>::new();
+    let mut sched = Scheduler::<4, 4, Min>::new();
     let (_, (index, old)) = spawn_with(&mut sched, 0x100, 12, 0);
     assert_eq!(sched.reap(index, old), Ok(None), "still running");
 
@@ -98,7 +115,7 @@ fn reap_reports_the_exit_once_and_a_reused_index_is_ebadf() {
 
 #[test]
 fn blocked_tasks_are_skipped_until_woken_and_boot_runs_when_none_is_ready() {
-    let mut sched = Scheduler::<4, 4>::new();
+    let mut sched = Scheduler::<4, 4, Min>::new();
     spawn(&mut sched, 0x100);
     spawn(&mut sched, 0x200);
 
@@ -119,7 +136,7 @@ fn blocked_tasks_are_skipped_until_woken_and_boot_runs_when_none_is_ready() {
 
 #[test]
 fn an_exited_child_stays_a_zombie_until_reaped_and_one_without_a_handle_frees_at_exit() {
-    let mut sched = Scheduler::<4, 4>::new();
+    let mut sched = Scheduler::<4, 4, Min>::new();
     spawn(&mut sched, 0x100);
     let (_, child) = spawn(&mut sched, 0x200);
     let (_, orphan) = spawn(&mut sched, 0x300);
@@ -158,7 +175,7 @@ fn an_exited_child_stays_a_zombie_until_reaped_and_one_without_a_handle_frees_at
 
 #[test]
 fn closing_the_handle_frees_an_exited_child_and_lets_a_running_one_free_at_exit() {
-    let mut sched = Scheduler::<3, 3>::new();
+    let mut sched = Scheduler::<3, 3, Min>::new();
     spawn(&mut sched, 0x100);
     let (_, child) = spawn_with(&mut sched, 0x200, 12, 0);
     assert_eq!(sched.switch(0x10), 0x100);
@@ -197,7 +214,7 @@ fn closing_the_handle_frees_an_exited_child_and_lets_a_running_one_free_at_exit(
 
 #[test]
 fn a_process_ends_with_its_last_thread_and_its_code() {
-    let mut sched = Scheduler::<4, 3>::new();
+    let mut sched = Scheduler::<4, 3, Min>::new();
     let (main, process) = spawn(&mut sched, 0x100);
     let second = thread(&mut sched, process.0, 0x200, 0);
     assert_eq!(sched.free_process().unwrap().0, 2, "one index for both");
@@ -220,7 +237,7 @@ fn a_process_ends_with_its_last_thread_and_its_code() {
 
 #[test]
 fn a_join_reports_the_code_once_and_a_held_thread_stays_a_zombie() {
-    let mut sched = Scheduler::<4, 3>::new();
+    let mut sched = Scheduler::<4, 3, Min>::new();
     let (_, process) = spawn(&mut sched, 0x100);
     let held = thread(&mut sched, process.0, 0x200, 0);
     let free = thread(&mut sched, process.0, 0x300, 0);
@@ -265,7 +282,7 @@ fn a_join_reports_the_code_once_and_a_held_thread_stays_a_zombie() {
 
 #[test]
 fn highest_priority_runs_round_robin_within_a_level_and_a_waiter_lends_its_priority() {
-    let mut sched = Scheduler::<5, 5>::new();
+    let mut sched = Scheduler::<5, 5, Min>::new();
     let ((low, _), _) = spawn_with(&mut sched, 0x100, 0, 1);
     spawn_with(&mut sched, 0x200, 0, 2);
     spawn_with(&mut sched, 0x300, 0, 2);
@@ -295,7 +312,7 @@ fn highest_priority_runs_round_robin_within_a_level_and_a_waiter_lends_its_prior
 
 #[test]
 fn ending_a_waiter_reports_its_event_so_the_owner_drops_its_boost_and_is_outranked() {
-    let mut sched = Scheduler::<4, 4>::new();
+    let mut sched = Scheduler::<4, 4, Min>::new();
     let ((low, _), _) = spawn_with(&mut sched, 0x100, 0, 1);
     spawn_with(&mut sched, 0x200, 0, 2);
     let ((high, _), _) = spawn_with(&mut sched, 0x300, 0, 3);
@@ -314,7 +331,7 @@ fn ending_a_waiter_reports_its_event_so_the_owner_drops_its_boost_and_is_outrank
 
 #[test]
 fn a_zombie_thread_stays_until_its_last_handle_closes_and_a_stale_close_counts_for_nothing() {
-    let mut sched = Scheduler::<3, 2>::new();
+    let mut sched = Scheduler::<3, 2, Min>::new();
     let (_, process) = spawn(&mut sched, 0x100);
     let held = thread(&mut sched, process.0, 0x200, 0);
     let object = Object::Thread {

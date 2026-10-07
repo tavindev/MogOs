@@ -129,7 +129,7 @@ fn boots_and_powers_off() {
         "mmu: on",
         "heap: ok",
         "disk: none",
-        "spec: v1 vulnerable, v2 vulnerable, bhb not mitigated (v2 vulnerable), ssb vulnerable, meltdown not affected, bse vulnerable, table plain on 1/1 cores",
+        "spec: v1 mitigated, v2 vulnerable, bhb not mitigated (v2 vulnerable), ssb vulnerable, meltdown not affected, bse vulnerable, table plain on 1/1 cores",
     ] {
         assert!(
             lines.iter().any(|l| l == expected),
@@ -304,7 +304,7 @@ fn spec_line_matches_the_cpu() {
             "test=bench-syscall test=pipe",
         ];
         let (status, lines) = boot(&args);
-        let expected = format!("spec: v1 vulnerable, {spec} on 4/4 cores");
+        let expected = format!("spec: v1 mitigated, {spec} on 4/4 cores");
         assert!(lines.contains(&expected), "{cpu}: missing line: {expected}");
         assert!(
             lines.iter().any(|l| l.starts_with("syscall: ")),
@@ -693,6 +693,10 @@ fn disk_bench_reports_throughput() {
 struct FileDisk(std::fs::File, u64);
 
 impl mogfs::Disk for FileDisk {
+    fn clamp(index: usize, len: usize) -> usize {
+        index.min(len - 1)
+    }
+
     fn read(&mut self, block: u64, bufs: &mut [[u8; 4096]]) -> Result<(), mogfs::Error> {
         self.0
             .read_exact_at(bufs.as_flattened_mut(), block * 4096)

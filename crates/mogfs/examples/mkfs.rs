@@ -9,6 +9,10 @@ use mogfs::{BLOCK_SIZE, Disk, Error, Fs};
 struct FileDisk(File, u64);
 
 impl Disk for FileDisk {
+    fn clamp(index: usize, len: usize) -> usize {
+        index.min(len - 1)
+    }
+
     fn read(&mut self, block: u64, bufs: &mut [[u8; BLOCK_SIZE]]) -> Result<(), Error> {
         self.0
             .read_exact_at(bufs.as_flattened_mut(), block * BLOCK_SIZE as u64)

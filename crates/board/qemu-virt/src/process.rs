@@ -17,8 +17,8 @@ use mogfs::ROOT;
 
 use crate::usermem::copy_in;
 use crate::{
-    ARCHIVE, IMAGE, KERNEL, KERNEL_L1, Kernel, MAP_BASE, PAGE, Sched, TASK_STACK_FRAMES, USER_BASE,
-    USER_STACK_TOP,
+    ARCHIVE, IMAGE, KERNEL, KERNEL_L1, Kernel, MAP_BASE, Nospec, PAGE, Sched, TASK_STACK_FRAMES,
+    USER_BASE, USER_STACK_TOP,
 };
 
 /// Returns a thread's kernel stack at `stack` to `frames`, refunding `budget`.
@@ -118,7 +118,7 @@ fn spawn_process(
     frames: &mut FrameAllocator<FRAME_WORDS>,
     (file, segments, entry): (&[u8], impl Iterator<Item = Segment>, u64),
     mut budget: Budget,
-    (process, slot, handles, priority): ((usize, u64), (usize, u64), Handles, u8),
+    (process, slot, handles, priority): ((usize, u64), (usize, u64), Handles<Nospec>, u8),
     (args, argc): (&[u8], usize),
 ) -> Result<(), i64> {
     let l1 = zeroed(frames, &mut budget).ok_or(ENOMEM)?;

@@ -1,6 +1,15 @@
 use kernel::handle::{EXEC, Handles, Object};
 use kernel::syscall::{E2BIG, EFAULT, EINVAL, MAX_ARGS, argc, dispatch};
 
+/// The host's clamp: no speculation to bound.
+struct Min;
+
+impl kernel::Clamp for Min {
+    fn clamp(index: usize, len: usize) -> usize {
+        index.min(len - 1)
+    }
+}
+
 #[test]
 fn argc_counts_nul_terminated_strings_up_to_the_limit() {
     assert_eq!(argc(b""), Ok(0));
@@ -21,12 +30,12 @@ fn argc_counts_nul_terminated_strings_up_to_the_limit() {
 #[test]
 fn spawn_checks_the_argument_buffer() {
     const SPAWN: u64 = 6;
-    let mut handles = Handles::new();
+    let mut handles = Handles::<Min>::new();
     let exe = handles
         .insert(Object::File { start: 0, end: 0 }, EXEC)
         .unwrap();
     let user = 1 << 32;
-    let spawn = |handles: &mut Handles, ptr: u64, len: u64| {
+    let spawn = |handles: &mut Handles<Min>, ptr: u64, len: u64| {
         dispatch(SPAWN, &[exe, 0, 0, 0, 0, ptr, len], handles).err()
     };
     assert_eq!(spawn(&mut handles, user, 4096), None);

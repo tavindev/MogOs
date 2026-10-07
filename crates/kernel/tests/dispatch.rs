@@ -2,6 +2,15 @@ use kernel::handle::{Handles, Object, READ, WRITE};
 use kernel::syscall::{Call, EACCES, ENOTDIR, EROFS, dispatch};
 use mogfs::ROOT;
 
+/// The host's clamp: no speculation to bound.
+struct Min;
+
+impl kernel::Clamp for Min {
+    fn clamp(index: usize, len: usize) -> usize {
+        index.min(len - 1)
+    }
+}
+
 const SYNC: u64 = 15;
 const UNLINK: u64 = 16;
 const RENAME: u64 = 17;
@@ -9,7 +18,7 @@ const USER: u64 = 1 << 32;
 
 #[test]
 fn unlink_and_rename_need_a_writable_mogfs_directory() {
-    let mut handles = Handles::new();
+    let mut handles = Handles::<Min>::new();
     let archive = handles.insert(Object::Archive, READ | WRITE).unwrap();
     let read_only = handles.insert(Object::Dir(ROOT), READ).unwrap();
     let writable = handles.insert(Object::Dir(ROOT), WRITE).unwrap();
@@ -34,7 +43,7 @@ fn unlink_and_rename_need_a_writable_mogfs_directory() {
 
 #[test]
 fn sync_takes_any_mogfs_handle_without_a_right() {
-    let mut handles = Handles::new();
+    let mut handles = Handles::<Min>::new();
     let dir = handles.insert(Object::Dir(ROOT), 0).unwrap();
     let file = handles.insert(Object::Node(ROOT), 0).unwrap();
     let console = handles.insert(Object::Console, WRITE).unwrap();

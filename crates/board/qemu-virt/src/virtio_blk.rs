@@ -257,6 +257,10 @@ impl VirtioBlk {
 }
 
 impl Disk for VirtioBlk {
+    fn clamp(index: usize, len: usize) -> usize {
+        arch::clamp(index, len)
+    }
+
     fn blocks(&self) -> u64 {
         self.blocks
     }

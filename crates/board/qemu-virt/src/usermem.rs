@@ -1,6 +1,7 @@
 //! Checked access to the current process's memory from a trap. A sibling thread may write that memory at any time,
 //! so the kernel never holds a reference into it: bytes move by raw copy, and inputs the kernel parses are copied in
-//! once and then validated.
+//! once and then validated. Each range's pointer is masked once (`arch::mask_user`), so a mispredicted range check
+//! cannot reach kernel memory.
 
 use core::ptr;
 
@@ -23,6 +24,7 @@ impl UserIn {
     /// The `len` bytes at user address `ptr` (in user space unless `len` is 0, checked by `dispatch`) if EL0 may read
     /// all of them.
     pub(crate) fn new(ptr: u64, len: usize) -> Option<Self> {
+        let ptr = arch::mask_user(ptr, len as u64);
         (len == 0 || user_pages(ptr, len, arch::user_readable)).then_some(Self { ptr, len })
     }
 
@@ -55,6 +57,7 @@ impl UserOut {
     /// The `len` bytes at user address `ptr` (in user space unless `len` is 0, checked by `dispatch`) if EL0 may
     /// write all of them.
     pub(crate) fn new(ptr: u64, len: usize) -> Option<Self> {
+        let ptr = arch::mask_user(ptr, len as u64);
         (len == 0 || user_pages(ptr, len, arch::user_writable)).then_some(Self { ptr, len })
     }
 

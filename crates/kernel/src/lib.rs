@@ -93,6 +93,12 @@ pub trait Board {
     fn report_speculation(&mut self);
 }
 
+/// Bounds a user-derived index under speculation; the board's ends in a barrier (`csdb`), host tests use `min`.
+pub trait Clamp {
+    /// `index` if below `len`, else a value below `len`, also on a mispredicted path; the caller still bounds-checks.
+    fn clamp(index: usize, len: usize) -> usize;
+}
+
 /// Hand-written asm user programs the board provides; newer ones are ELF files in the boot archive.
 pub enum Program {
     /// Checks that `write` rejects bad pointers, prints `A: 0`..`A: 9` with a spin after each, exits.

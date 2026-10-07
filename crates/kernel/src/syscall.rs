@@ -4,6 +4,7 @@ use core::ops::Range;
 
 use mogfs::Inode;
 
+use crate::Clamp;
 use crate::handle::{EXEC, Handles, KILL as KILL_RIGHT, MAX_HANDLES, Object, READ, WRITE};
 use crate::mutex::Mutex;
 use crate::pipe::End;
@@ -292,7 +293,11 @@ const _: () = assert!(size_of::<Call>() == 56, "every syscall returns a Call");
 
 /// Runs syscall `nr` with arguments `args` (`x0`-`x6`) against the caller's `handles`, leaving the board the parts
 /// that touch hardware or tasks; `Err` holds the result to return.
-pub fn dispatch(nr: u64, args: &[u64; 7], handles: &mut Handles) -> Result<Call, i64> {
+pub fn dispatch<C: Clamp>(nr: u64, args: &[u64; 7], handles: &mut Handles<C>) -> Result<Call, i64> {
+    if nr > THREAD_EXIT {
+        return Err(ENOSYS);
+    }
+    let nr = C::clamp(nr as usize, THREAD_EXIT as usize + 1) as u64;
     match nr {
         EXIT => Ok(Call::Exit(args[0] & 0xff)),
         THREAD_EXIT => Ok(Call::ThreadExit(args[0] & 0xff)),
@@ -440,7 +445,12 @@ pub fn dispatch(nr: u64, args: &[u64; 7], handles: &mut Handles) -> Result<Call,
 }
 
 /// The directory `handle` (write right) and the path buffer `ptr..ptr + len` a call that changes it names.
-fn path(handles: &Handles, handle: u64, ptr: u64, len: u64) -> Result<(Inode, u64, usize), i64> {
+fn path<C: Clamp>(
+    handles: &Handles<C>,
+    handle: u64,
+    ptr: u64,
+    len: u64,
+) -> Result<(Inode, u64, usize), i64> {
     let dir = match handles.entry(handle)? {
         (Object::Archive, _) => return Err(EROFS),
         (Object::Dir(_), rights) if rights & WRITE == 0 => return Err(EACCES),
@@ -464,6 +474,7 @@ pub fn argc(args: &[u8]) -> Result<usize, i64> {
 
 /// `EFAULT` unless `len` is 0 (any `ptr`, as Rust passes empty slices) or `ptr..ptr + len` lies in `USER` and `len`
 /// is at most `MAX_BUFFER`.
+#[inline]
 fn user_buffer(ptr: u64, len: u64) -> Result<(), i64> {
     if len == 0 {
         return Ok(());

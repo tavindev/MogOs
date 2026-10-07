@@ -24,7 +24,8 @@ It is **NOT** board-specific: no MMIO addresses, no memory map, no drivers, no s
 - `new_task`, `new_user_task`, `switch_el0_regs`, `TrapFrame::restart`.
 - Descriptor encoding (`l1_block`, `user_page`), `enable_mmu` (core 0 fills the boot table, then runs `aarch64_mmu_on`),
   `secondary_entry` (PSCI `CPU_ON`'s entry: `aarch64_mmu_on` on the same table, the stack top from the context id),
-  `map_page`, `unmap_page`, `free_space`, `set_ttbr0`, `flush_asid` (`tlbi aside1is`), `user_readable` /
+  `map_page`, `unmap_page`, `free_space`, `set_ttbr0`, `flush_asid` (`tlbi aside1is`), `clamp` (an index bounded under speculation: `cmp`, `csel`, `csdb`) and `mask_user` (a user range's pointer, or
+  null outside 4 GiB..512 GiB, by `cmp`/`ccmp`/`csel`, then `csdb`), `user_readable` /
   `user_writable` (`at` probes), `clean_dcache` / `invalidate_icache` (`ic ialluis`; clean each code page, invalidate once).
 - `irq::disable` / `restore` / `wait`, `gic::enable` / `enable_cpu` / `route` / `unmask` / `ack` / `eoi`, `timer::arm`,
   `timer::allow_user_counter`.

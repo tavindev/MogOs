@@ -8,6 +8,10 @@ use mogfs::{BLOCK_SIZE, Disk, Error, Fs, ROOT};
 struct MemDisk(Vec<[u8; BLOCK_SIZE]>);
 
 impl Disk for MemDisk {
+    fn clamp(index: usize, len: usize) -> usize {
+        index.min(len - 1)
+    }
+
     fn read(&mut self, block: u64, bufs: &mut [[u8; BLOCK_SIZE]]) -> Result<(), Error> {
         let block = block as usize;
         bufs.copy_from_slice(&self.0[block..block + bufs.len()]);

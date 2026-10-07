@@ -2,8 +2,11 @@
 //! so a closed handle's value never reaches whatever reuses its entry. An entry is retired once its generation
 //! reaches 2^31, so handle values stay positive (never read as an error) and generations never wrap.
 
+use core::marker::PhantomData;
+
 use mogfs::Inode;
 
+use crate::Clamp;
 use crate::mutex::Mutex;
 use crate::pipe::End;
 use crate::syscall::{EACCES, EBADF, EMFILE};
@@ -58,12 +61,23 @@ pub enum Object {
     Mutex(Mutex),
 }
 
-#[derive(Clone, Copy)]
-pub struct Handles([(u32, Option<(Object, Rights)>); MAX_HANDLES]);
+/// A handle table; `C` clamps each user handle's index before its load.
+pub struct Handles<C>(
+    [(u32, Option<(Object, Rights)>); MAX_HANDLES],
+    PhantomData<C>,
+);
 
-impl Handles {
+impl<C> Clone for Handles<C> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<C> Copy for Handles<C> {}
+
+impl<C: Clamp> Handles<C> {
     pub const fn new() -> Self {
-        Self([(0, None); MAX_HANDLES])
+        Self([(0, None); MAX_HANDLES], PhantomData)
     }
 
     /// init's handles: 0 is the console (read, write, duplicate, transfer), 1 is the process itself (kill), at `index`
@@ -86,6 +100,7 @@ impl Handles {
     }
 
     /// A new handle to `handle`'s object with `rights`, a subset of its own, and the object; needs the duplicate right.
+    #[inline]
     pub fn dup(&mut self, handle: u64, rights: Rights) -> Result<(u64, Object), i64> {
         let (object, held) = self.entry(handle)?;
         if held & DUPLICATE == 0 || rights & !held != 0 {
@@ -122,10 +137,14 @@ impl Handles {
 
     /// Closes `handle`; returns the object it reached.
     pub fn close(&mut self, handle: u64) -> Result<Object, i64> {
-        let (object, _) = self.entry(handle)?;
-        let entry = &mut self.0[handle as u32 as usize];
-        *entry = (entry.0 + 1, None);
-        Ok(object)
+        let entry = &mut self.0[Self::index(handle)?];
+        match entry.1 {
+            Some((object, _)) if entry.0 == (handle >> 32) as u32 => {
+                *entry = (entry.0 + 1, None);
+                Ok(object)
+            }
+            _ => Err(EBADF),
+        }
     }
 
     /// The objects the open handles reach.
@@ -135,14 +154,23 @@ impl Handles {
 
     /// The object `handle` reaches and its rights.
     pub fn entry(&self, handle: u64) -> Result<(Object, Rights), i64> {
-        match self.0.get(handle as u32 as usize) {
-            Some(&(generation, Some(entry))) if generation == (handle >> 32) as u32 => Ok(entry),
+        match self.0[Self::index(handle)?] {
+            (generation, Some(entry)) if generation == (handle >> 32) as u32 => Ok(entry),
             _ => Err(EBADF),
         }
     }
+
+    /// `handle`'s index, bounded, then clamped for the load.
+    fn index(handle: u64) -> Result<usize, i64> {
+        let index = handle as u32 as usize;
+        if index >= MAX_HANDLES {
+            return Err(EBADF);
+        }
+        Ok(C::clamp(index, MAX_HANDLES))
+    }
 }
 
-impl Default for Handles {
+impl<C: Clamp> Default for Handles<C> {
     fn default() -> Self {
         Self::new()
     }
