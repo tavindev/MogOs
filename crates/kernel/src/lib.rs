@@ -210,17 +210,24 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
         .any(|a| a == "test=disk" || a == "test=bench-disk");
     let mounted = disk.take_if(|_| !raw).map(|disk| board.mount(disk));
 
-    // `test=httpd` alone takes QEMU's user network, so `cargo httpd` needs one bootarg (a string alias splits on spaces).
-    let serve = bootargs.split_whitespace().any(|a| a == "test=httpd");
-    let config = bootargs
-        .split_whitespace()
-        .find_map(|a| network::config(a.strip_prefix("net=")?))
-        .or_else(|| serve.then(|| network::config("10.0.2.15/24,gw=10.0.2.2"))?);
-    // The NIC is probed only for a `net=` bootarg (or `test=httpd`); loopback alone starts only for `test=sockets`.
+    // One pass, as boot pays for each. `test=httpd` alone takes QEMU's user network, so `cargo httpd` needs one
+    // bootarg (a string alias splits on spaces).
+    let (mut config, mut loopback) = (None, false);
+    for arg in bootargs.split_whitespace() {
+        match arg {
+            "test=sockets" | "test=bench-sockets" => loopback = true,
+            "test=httpd" => config = config.or(network::config("10.0.2.15/24,gw=10.0.2.2")),
+            _ => {
+                if let Some(value) = arg.strip_prefix("net=") {
+                    config = network::config(value);
+                }
+            }
+        }
+    }
+    // The NIC is probed only for a network address; loopback alone starts only for the socket tests.
     let nic = config.and_then(|_| board.nic());
     let no_nic = config.is_some() && nic.is_none();
-    let loopback = |a| a == "test=sockets" || a == "test=bench-sockets";
-    if nic.is_some() || bootargs.split_whitespace().any(loopback) {
+    if nic.is_some() || loopback {
         let eth = config.filter(|_| nic.is_some());
         let memory = board
             .memory(network::frames(eth.is_some()))

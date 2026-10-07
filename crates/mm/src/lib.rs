@@ -47,8 +47,13 @@ impl<const WORDS: usize> FrameAllocator<WORDS> {
     pub fn reserve(&mut self, range: Range<PhysAddr>) {
         let first = range.start.0.saturating_sub(self.base) / FRAME_SIZE;
         let end = range.end.0.saturating_sub(self.base).div_ceil(FRAME_SIZE);
-        for i in first as usize..(end as usize).min(self.frames) {
-            self.used[i / 64] |= 1 << (i % 64);
+        let (mut i, end) = (first as usize, (end as usize).min(self.frames));
+        // A word at a time where the range covers one, so boot pays per 64 frames of the image.
+        while i < end {
+            match i % 64 {
+                0 if end - i >= 64 => (self.used[i / 64], i) = (u64::MAX, i + 64),
+                _ => (self.used[i / 64], i) = (self.used[i / 64] | 1 << (i % 64), i + 1),
+            }
         }
     }
 
