@@ -78,14 +78,32 @@ impl<'a> Dtb<'a> {
         })
     }
 
-    /// `/chosen/bootargs` (QEMU sets it from `-append`).
-    pub fn bootargs(&self) -> Option<&'a str> {
+    /// `/chosen`'s `bootargs` (QEMU sets it from `-append`) and the first 16 bytes of its `rng-seed` (random on every
+    /// boot), in one walk: the node is the blob's last, so each lookup walks it all.
+    pub fn chosen(&self) -> (Option<&'a str>, Option<[u64; 2]>) {
+        let (mut bootargs, mut seed) = (None, None);
         self.find(|p| {
-            if p.depth != 2 || p.node != b"chosen" || p.name != b"bootargs" {
+            if p.depth != 2 || p.node != b"chosen" {
                 return None;
             }
-            core::str::from_utf8(p.value.strip_suffix(&[0])?).ok()
-        })
+            match p.name {
+                b"bootargs" => {
+                    bootargs = p
+                        .value
+                        .strip_suffix(&[0])
+                        .and_then(|v| core::str::from_utf8(v).ok())
+                }
+                b"rng-seed" => {
+                    seed = p.value.split_first_chunk::<16>().map(|(s, _)| {
+                        let (a, b) = s.split_at(8);
+                        [a, b].map(|half| u64::from_be_bytes(half.try_into().unwrap()))
+                    })
+                }
+                _ => {}
+            }
+            (bootargs.is_some() && seed.is_some()).then_some(())
+        });
+        (bootargs, seed)
     }
 
     /// `/psci/method`: the conduit for PSCI and SMCCC calls, `hvc` or `smc`.
@@ -95,18 +113,6 @@ impl<'a> Dtb<'a> {
                 return None;
             }
             core::str::from_utf8(p.value.strip_suffix(&[0])?).ok()
-        })
-    }
-
-    /// The first 16 bytes of `/chosen/rng-seed` (QEMU fills it with random bytes on every boot).
-    pub fn rng_seed(&self) -> Option<[u64; 2]> {
-        self.find(|p| {
-            if p.depth != 2 || p.node != b"chosen" || p.name != b"rng-seed" {
-                return None;
-            }
-            let (seed, _) = p.value.split_first_chunk::<16>()?;
-            let (a, b) = seed.split_at(8);
-            Some([a, b].map(|half| u64::from_be_bytes(half.try_into().unwrap())))
         })
     }
 

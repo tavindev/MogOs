@@ -73,6 +73,10 @@ const RESCHEDULE_SGI: u32 = 0;
 const PSCI_CPU_ON: u64 = 0xc400_0003;
 /// Each secondary core's 4 KiB guard page and 16 KiB stack, reserved in `linker.ld` above `__stack_top`.
 const SECONDARY_STACK: u64 = 0x5000;
+const _: () = assert!(
+    arch::MAX_CPUS == 4,
+    "linker.ld reserves 3 secondary stacks and guards"
+);
 
 /// GIC distributor and CPU interface bases, set before the first IRQ can be delivered and before any secondary starts.
 static GIC_DIST: AtomicU64 = AtomicU64::new(0);
@@ -369,16 +373,12 @@ impl kernel::Board for QemuVirt {
         mounted
     }
 
-    fn nic(&mut self) -> Option<VirtioNet> {
-        net::nic()
+    fn has_nic(&self) -> bool {
+        net::present()
     }
 
-    fn memory(&mut self, frames: usize) -> Option<&'static mut [u8]> {
-        net::memory(frames)
-    }
-
-    fn start_net(&mut self, network: &'static mut Network, nic: Option<VirtioNet>) {
-        net::start(self, network, nic)
+    fn start_net(&mut self, config: Option<::net::Config>, key: [u64; 2]) {
+        net::start(self, config, key)
     }
 
     fn with_net<R>(&mut self, f: impl FnOnce(&mut Network, Option<&mut VirtioNet>, u64) -> R) -> R {

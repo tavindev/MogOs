@@ -80,6 +80,13 @@ impl Handle {
         Self::clamped(value, index)
     }
 
+    /// Whether the value names the entry at its index with `generation`. Checked after the load through the clamped
+    /// index, so no branch picks between the clamped index and another.
+    #[inline(always)]
+    fn valid(self, generation: u32) -> bool {
+        (self.value as u32 as usize) < MAX_HANDLES && (self.value >> 32) as u32 == generation
+    }
+
     /// The handle `value` with `index`, its index as `dispatch` clamped it with the call's other values.
     #[inline]
     pub(crate) fn clamped(value: u64, index: u64) -> Self {
@@ -159,9 +166,9 @@ impl Handles {
     /// Closes `handle`; returns the object it reached.
     #[inline(always)]
     pub fn close(&mut self, handle: Handle) -> Result<Object, i64> {
-        let entry = &mut self.0[Self::index(handle)?];
+        let entry = &mut self.0[handle.index];
         match entry.1 {
-            Some((object, _)) if entry.0 == (handle.value >> 32) as u32 => {
+            Some((object, _)) if handle.valid(entry.0) => {
                 *entry = (entry.0 + 1, None);
                 Ok(object)
             }
@@ -177,17 +184,8 @@ impl Handles {
     /// The object `handle` reaches and its rights.
     #[inline(always)]
     pub fn entry(&self, handle: Handle) -> Result<(Object, Rights), i64> {
-        match self.0[Self::index(handle)?] {
-            (generation, Some(entry)) if generation == (handle.value >> 32) as u32 => Ok(entry),
-            _ => Err(EBADF),
-        }
-    }
-
-    /// `handle`'s clamped index, once its value is checked in bounds.
-    #[inline(always)]
-    fn index(handle: Handle) -> Result<usize, i64> {
-        match handle.value as u32 as usize {
-            ..MAX_HANDLES => Ok(handle.index),
+        match self.0[handle.index] {
+            (generation, Some(entry)) if handle.valid(generation) => Ok(entry),
             _ => Err(EBADF),
         }
     }

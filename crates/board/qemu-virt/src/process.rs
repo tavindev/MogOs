@@ -255,7 +255,10 @@ pub(crate) fn spawn(
     for (handle, bytes) in list.iter_mut().zip(bytes.as_chunks::<8>().0) {
         *handle = u64::from_le_bytes(*bytes);
     }
-    let (mut parent, child) = sched.handles().split::<Nospec>(&list[..len])?;
+    // `len` is at most `MAX_HANDLES` (`dispatch`); the modulo keeps the slice in bounds on a mispredicted path too.
+    let (mut parent, child) = sched
+        .handles()
+        .split::<Nospec>(&list[..len % (MAX_HANDLES + 1)])?;
     let current = sched.process();
     if budget > sched.memory(current).budget.remaining() {
         return Err(ENOMEM);
@@ -264,17 +267,14 @@ pub(crate) fn spawn(
     let (index, generation) = process;
     let handle = parent.insert(Object::Process { index, generation }, WAIT | KILL)?;
     let priority = priority.min(sched.priority());
+    let mut child_budget = Budget::new(budget);
+    crate::net::spawn_charge(&child, &mut child_budget)?;
+    let moved = child;
     let child = (process, slot, child, priority);
-    spawn_process(
-        sched,
-        frames,
-        executable,
-        Budget::new(budget),
-        child,
-        (args, argc),
-    )?;
+    spawn_process(sched, frames, executable, child_budget, child, (args, argc))?;
     sched.memory(current).budget.shrink(budget);
     *sched.handles() = parent;
+    crate::net::spawned(sched, index, &moved);
     Ok(handle)
 }
 

@@ -35,22 +35,20 @@ impl UserMemory for Arena {
     }
 }
 
-/// Every process's budget.
-struct Processes(HashMap<Owner, Budget>);
+/// Every process's budget, by index.
+struct Processes(HashMap<usize, Budget>);
 
 impl Budgets for Processes {
-    fn charge(&mut self, owner: Owner, frames: usize) -> bool {
-        self.0.get_mut(&owner).is_some_and(|b| b.charge(frames))
+    fn charge(&mut self, index: usize, frames: usize) -> bool {
+        self.0.get_mut(&index).unwrap().charge(frames)
     }
 
-    fn refund(&mut self, owner: Owner, frames: usize) {
-        if let Some(b) = self.0.get_mut(&owner) {
-            b.refund(frames);
-        }
+    fn refund(&mut self, index: usize, frames: usize) {
+        self.0.get_mut(&index).unwrap().refund(frames);
     }
 
     fn alive(&mut self, owner: Owner) -> bool {
-        self.0.contains_key(&owner)
+        self.0.contains_key(&owner.0)
     }
 }
 
@@ -82,7 +80,7 @@ struct World {
 impl World {
     fn new(budget: usize) -> Self {
         let memory = vec![0; frames(false) * 4096].leak();
-        let processes = [ME, OTHER].map(|o| (o, Budget::new(budget)));
+        let processes = [ME, OTHER].map(|o| (o.0, Budget::new(budget)));
         World {
             network: Network::new(None, [1, 2], memory).unwrap(),
             processes: Processes(processes.into_iter().collect()),
@@ -92,12 +90,21 @@ impl World {
     }
 
     fn used(&self, owner: Owner) -> usize {
-        let budget = &self.processes.0[&owner];
+        let budget = &self.processes.0[&owner.0];
         budget.limit() - budget.remaining()
     }
 
     fn socket(&mut self, owner: Owner, rights: Rights) -> Result<Sock, i64> {
-        self.network.socket(owner, rights, &mut self.processes)
+        self.network.socket(owner.0, rights, &mut self.processes)
+    }
+
+    /// Closes `owner`'s one handle to `sock`.
+    fn close(&mut self, sock: Sock, owner: Owner) {
+        self.network.close(sock, owner.0, true, &mut self.processes);
+    }
+
+    fn listen(&mut self, sock: Sock, backlog: usize) -> Result<(), i64> {
+        self.network.listen(sock, backlog, &mut self.processes)
     }
 
     fn submit(&mut self, owner: Owner, sock: Sock, op: (u64, u64, usize, u64)) -> Result<(), i64> {
@@ -118,8 +125,7 @@ impl World {
 
     fn poll(&mut self) {
         self.now += 1_000_000;
-        self.network
-            .poll(None::<&mut NoNic>, self.now, &mut self.processes);
+        self.network.poll(None::<&mut NoNic>, self.now);
     }
 
     /// Polls until an op of `owner` finishes.
@@ -138,7 +144,7 @@ impl World {
     fn listen_and_connect(&mut self, port: u16, n: usize) -> (Sock, Vec<Sock>) {
         let listener = self.socket(ME, LISTEN).unwrap();
         self.network.bind(listener, port, false).unwrap();
-        self.network.listen(listener).unwrap();
+        self.listen(listener, BACKLOG).unwrap();
         let clients: Vec<_> = (0..n)
             .map(|i| {
                 let client = self.socket(OTHER, CONNECT).unwrap();
@@ -179,7 +185,7 @@ fn a_closed_socket_is_unreachable_and_refunds_its_owner() {
     let a = w.socket(ME, CONNECT).unwrap();
     let b = w.socket(ME, CONNECT).unwrap();
     assert_eq!(w.socket(ME, CONNECT), Err(ENOBUFS));
-    w.network.close(a, &mut w.processes);
+    w.close(a, ME);
     assert_eq!(w.used(ME), SOCKET_FRAMES);
     assert_eq!(w.network.bind(a, 1, false), Err(EBADF));
     // The freed entry is reused under a new generation, which the old value never reaches.
@@ -195,20 +201,20 @@ fn rights_ports_and_op_slots_are_checked() {
     let mut w = World::new(256);
     let connect_only = w.socket(ME, CONNECT).unwrap();
     w.network.bind(connect_only, 5, false).unwrap();
-    assert_eq!(w.network.listen(connect_only), Err(EACCES));
+    assert_eq!(w.listen(connect_only, 1), Err(EACCES));
     let listen_only = w.socket(ME, LISTEN).unwrap();
     let connect = (OP_CONNECT, LOCALHOST, 5, 0);
     assert_eq!(w.submit(ME, listen_only, connect), Err(EACCES));
     let (listener, clients) = w.listen_and_connect(6, 1);
     let again = w.socket(ME, LISTEN).unwrap();
     w.network.bind(again, 6, false).unwrap();
-    assert_eq!(w.network.listen(again), Err(EADDRINUSE));
+    assert_eq!(w.listen(again, 1), Err(EADDRINUSE));
     w.submit(OTHER, clients[0], (OP_RECEIVE, 0, 64, 7)).unwrap();
     let second = w.submit(OTHER, clients[0], (OP_RECEIVE, 0, 64, 8));
     assert_eq!(second, Err(EBUSY));
     // Closing the listener frees its port.
-    w.network.close(listener, &mut w.processes);
-    assert_eq!(w.network.listen(again), Ok(()));
+    w.close(listener, ME);
+    assert_eq!(w.listen(again, 1), Ok(()));
 }
 
 #[test]
@@ -217,7 +223,11 @@ fn an_accepted_handle_gets_no_more_rights_than_the_accepting_one() {
     let (listener, _) = w.listen_and_connect(10, 1);
     w.submit_with(ME, listener, (OP_ACCEPT, 0, 0, 1), READ)
         .unwrap();
-    assert_eq!(w.complete(ME).accepted.unwrap().1, READ);
+    let (_, rights, peer) = w.complete(ME).accepted.unwrap();
+    assert_eq!(rights, READ);
+    // The peer is this host: `PEER`'s 127.0.0.2 reads as 127.0.0.1, from an ephemeral port.
+    assert_eq!(*peer.ip(), std::net::Ipv4Addr::LOCALHOST);
+    assert!(peer.port() >= 49152);
 }
 
 #[test]
@@ -227,7 +237,7 @@ fn a_closed_listener_leaves_nothing_behind() {
     // Sockets made before the close, so the old listener's entry is not reused.
     let next = w.socket(OTHER, LISTEN).unwrap();
     let client = w.socket(OTHER, CONNECT).unwrap();
-    w.network.close(listener, &mut w.processes);
+    w.close(listener, ME);
     assert_eq!(w.used(ME), 0, "the listener and its backlog are refunded");
     for (i, &client) in clients.iter().enumerate() {
         w.submit(OTHER, client, (OP_RECEIVE, 0, 64, i as u64))
@@ -236,7 +246,7 @@ fn a_closed_listener_leaves_nothing_behind() {
     }
     // The port is free, and connections to a new listener (likely on the old one's TCP slot) are its owner's alone.
     w.network.bind(next, 13, false).unwrap();
-    w.network.listen(next).unwrap();
+    w.listen(next, 1).unwrap();
     w.submit(OTHER, client, (OP_CONNECT, LOCALHOST, 13, 7))
         .unwrap();
     assert_eq!(w.complete(OTHER).result, 0);
@@ -251,25 +261,70 @@ fn a_closed_listener_leaves_nothing_behind() {
 }
 
 #[test]
-fn queued_connections_are_bounded_and_charged_to_the_listener_until_accepted() {
+fn the_backlog_is_charged_at_listen_and_bounds_queued_connections() {
     let mut w = World::new(1024);
     let (listener, clients) = w.listen_and_connect(11, BACKLOG + 2);
-    // The listener and its full backlog; the two connections past it were reset, charging nobody.
+    // The listener and its backlog, paid at `listen`; peers queued 8 and the two past it were reset.
     assert_eq!(w.used(ME), (1 + BACKLOG) * SOCKET_FRAMES);
     for (i, &client) in clients.iter().enumerate() {
         w.submit(OTHER, client, (OP_RECEIVE, 0, 64, i as u64))
             .unwrap();
     }
     for _ in 0..2 {
-        assert!(
-            w.complete(OTHER).result < 0,
-            "a connection past the backlog is reset"
-        );
+        let reset = w.complete(OTHER).result < 0;
+        assert!(reset, "a connection past the backlog is reset");
     }
-    // Accepting moves one connection's charge to the accepter (here the same process).
-    w.accept(listener);
-    assert_eq!(w.used(ME), (1 + BACKLOG) * SOCKET_FRAMES);
-    // Closing the listener resets what it still queues and refunds it, with the listener's own charge.
-    w.network.close(listener, &mut w.processes);
+    // An accepted connection is a socket of its own, charged to the accepter.
+    let accepted = w.accept(listener);
+    assert_eq!(w.used(ME), (2 + BACKLOG) * SOCKET_FRAMES);
+    // Closing the listener resets what it still queues and refunds it with its backlog.
+    w.close(listener, ME);
     assert_eq!(w.used(ME), SOCKET_FRAMES);
+    w.close(accepted, ME);
+    assert_eq!(w.used(ME), 0);
+}
+
+#[test]
+fn a_listen_its_holders_cannot_all_pay_for_charges_nobody() {
+    let mut w = World::new(SOCKET_FRAMES * 4);
+    let listener = w.socket(ME, LISTEN).unwrap();
+    w.network.bind(listener, 14, false).unwrap();
+    assert_eq!(w.listen(listener, BACKLOG), Err(ENOBUFS));
+    assert_eq!(w.used(ME), SOCKET_FRAMES);
+    // OTHER holds it too (a spawn moved it a handle, OTHER paid); a backlog of 2 fits ME but not OTHER after it.
+    let cost = w.network.cost(listener);
+    assert!(w.processes.charge(OTHER.0, cost));
+    w.network.hold(listener, OTHER.0);
+    w.processes.charge(OTHER.0, SOCKET_FRAMES * 2);
+    assert_eq!(w.listen(listener, 2), Err(ENOBUFS));
+    assert_eq!(w.used(ME), SOCKET_FRAMES, "ME's backlog charge was undone");
+    assert_eq!(w.listen(listener, 1), Ok(()));
+    assert_eq!(w.used(ME), 2 * SOCKET_FRAMES);
+    assert_eq!(w.used(OTHER), 4 * SOCKET_FRAMES);
+}
+
+#[test]
+fn a_socket_is_charged_to_every_process_holding_it_until_its_last_handle_there_closes() {
+    let mut w = World::new(64);
+    let sock = w.socket(ME, CONNECT).unwrap();
+    // A spawn moves ME's handle to OTHER: OTHER pays first, holds, then ME, holding none, is refunded.
+    let cost = w.network.cost(sock);
+    assert!(w.processes.charge(OTHER.0, cost));
+    w.network.hold(sock, OTHER.0);
+    w.network.unhold(sock, ME.0, &mut w.processes);
+    assert_eq!((w.used(ME), w.used(OTHER)), (0, SOCKET_FRAMES));
+    // A refund happens once, whatever releases ME's handles.
+    w.network.unhold(sock, ME.0, &mut w.processes);
+    assert_eq!(w.used(ME), 0);
+    // A second handle in OTHER (`dup`) costs nothing; closing one of two keeps the charge.
+    w.network.open(sock);
+    w.network.close(sock, OTHER.0, false, &mut w.processes);
+    assert_eq!(w.used(OTHER), SOCKET_FRAMES);
+    w.close(sock, OTHER);
+    assert_eq!(w.used(OTHER), 0);
+    assert_eq!(
+        w.network.bind(sock, 1, false),
+        Err(EBADF),
+        "the last handle closed it"
+    );
 }

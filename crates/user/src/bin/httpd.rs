@@ -15,8 +15,9 @@ const PORT: u16 = 80;
 /// Largest request head (request line and headers), and body: the body streams through, so its bound is a choice.
 const HEAD: usize = 8192;
 const BODY: u64 = 1 << 30;
-/// The server's and `fetch`'s own frames (measured, as `nettest`'s) and their sockets'.
-const SERVER_BUDGET: usize = 16 + 2 * 8;
+/// The server's and `fetch`'s own frames (measured, as `nettest`'s) and their sockets': the server's listener with a
+/// backlog of 1, and a connection.
+const SERVER_BUDGET: usize = 16 + 3 * 8;
 const FETCH_BUDGET: usize = 16 + 8;
 const OK: &[u8] =
     b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\nContent-Length: ";
@@ -71,19 +72,28 @@ fn join(out: &mut [u8], words: &[&[u8]]) -> usize {
 /// Serves `requests` requests (0: forever), one connection at a time.
 fn serve(requests: u64) -> u64 {
     let listener = socket(NET) as u64;
-    if bind(listener, PORT) != 0 || listen(listener) != 0 {
+    if bind(listener, PORT) != 0 || listen(listener, 1) != 0 {
         return 1;
     }
     let buf = map(HEAD).unwrap_or_else(|| exit(2));
     let mut served = 0;
     while requests == 0 || served < requests {
-        let conn = match accept(listener, 0) {
+        let (conn, (ip, port)) = match accept(listener, 0) {
             0 => wait_for(0),
-            error => error,
+            error => (error, ([0; 4], 0)),
         };
         if conn < 0 {
             return 3;
         }
+        // An access log: who connected.
+        write(CONSOLE, b"httpd: ");
+        for (i, octet) in ip.into_iter().enumerate() {
+            write(CONSOLE, if i == 0 { b"" } else { b"." });
+            write_u64(CONSOLE, octet.into());
+        }
+        write(CONSOLE, b":");
+        write_u64(CONSOLE, port.into());
+        write(CONSOLE, b"\n");
         echo(conn as u64, buf);
         close(conn as u64);
         served += 1;

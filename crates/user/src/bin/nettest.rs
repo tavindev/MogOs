@@ -45,10 +45,12 @@ fn main(args: &[&[u8]]) -> u64 {
                 connect(sock as u64, [127, 0, 0, 1], 1, 0),
             )
         }
+        b"hold" => 0,
+        b"move" => move_socket(),
         b"readaccept" => {
             // Handle 1 is a read-only listener: what it accepts must not be writable.
             let conn = match accept(1, 0) {
-                0 => wait_for(0),
+                0 => wait_for(0).0,
                 error => error,
             };
             report(b"read-only accept send", send(conn as u64, b"x"))
@@ -116,7 +118,12 @@ fn init() -> u64 {
         let budget = OWN_BUDGET + sockets * SOCKET_FRAMES;
         spawn_at(me, handles, budget, u64::MAX, args)
     };
-    let server = child(b"nettest\0serve\0", &[console(), net()], 1 + CONNECTIONS);
+    // The listener and its backlog of 8, and the 8 connections.
+    let server = child(
+        b"nettest\0serve\0",
+        &[console(), net()],
+        1 + 2 * CONNECTIONS,
+    );
     let client = child(b"nettest\0connect\0", &[console(), net()], CONNECTIONS);
     if !reaped(server) || !reaped(client) {
         return 2;
@@ -132,19 +139,86 @@ fn init() -> u64 {
             return 3;
         }
     }
+    if !transfer() {
+        return 9;
+    }
     read_only_accept()
+}
+
+/// A socket moved to a child is charged to the child before anything else: a budget without room for it fails the
+/// spawn with `ENOBUFS`.
+fn transfer() -> bool {
+    let sock = socket(net_handle());
+    let me = open(DIR, b"nettest", 0) as u64;
+    let short = spawn_at(
+        me,
+        &[console(), sock as u64],
+        SOCKET_FRAMES - 1,
+        u64::MAX,
+        b"nettest\0hold\0",
+    );
+    let fits = OWN_BUDGET + SOCKET_FRAMES;
+    let child = spawn_at(
+        me,
+        &[console(), sock as u64],
+        fits,
+        u64::MAX,
+        b"nettest\0hold\0",
+    );
+    if sock < 0 || short != ENOBUFS || !reaped(child) {
+        return false;
+    }
+    write(
+        CONSOLE,
+        b"nettest: a moved socket is charged to its new holder\n",
+    );
+    // A child whose budget holds its own frames, one socket and its grandchild's budget, nothing more.
+    let exe = open(DIR, b"nettest", 0) as u64;
+    let handles = [console(), net(), exe, console()];
+    let budget = OWN_BUDGET + SOCKET_FRAMES + MOVED_BUDGET;
+    reaped(spawn_at(me, &handles, budget, u64::MAX, b"nettest\0move\0"))
+}
+
+/// A `hold` child's budget: its own frames and the socket it gets.
+const MOVED_BUDGET: usize = OWN_BUDGET + SOCKET_FRAMES;
+
+/// Moves its only socket to a child (`hold`); while that child is not reaped, a new socket fits only if the move
+/// refunded this process.
+fn move_socket() -> u64 {
+    // Handles: 0 the console, 1 a NetStack, 2 `nettest`, 3 a console for the child.
+    let sock = socket(CHILD_NET);
+    let child = spawn_at(
+        2,
+        &[3, sock as u64],
+        MOVED_BUDGET,
+        u64::MAX,
+        b"nettest\0hold\0",
+    );
+    if sock < 0 || child < 0 {
+        return 1;
+    }
+    let again = socket(CHILD_NET);
+    if again < 0 || wait(child as u64) != 0 {
+        return status(again);
+    }
+    write(
+        CONSOLE,
+        b"nettest: moving a socket refunds its old holder\n",
+    );
+    0
 }
 
 /// A child accepts through a read-only duplicate of a listener; the connection's handle must not write.
 fn read_only_accept() -> u64 {
     let net = net_handle();
     let listener = socket(net) as u64;
-    if bind(listener, 12) != 0 || listen(listener) != 0 {
+    if bind(listener, 12) != 0 || listen(listener, 1) != 0 {
         return 5;
     }
     let read_only = dup(listener, READ | TRANSFER) as u64;
     let child = open(DIR, b"nettest", 0) as u64;
-    let budget = OWN_BUDGET + SOCKET_FRAMES;
+    // The listener with its backlog of 1, then the connection it accepts.
+    let budget = OWN_BUDGET + 3 * SOCKET_FRAMES;
     let process = spawn_at(
         child,
         &[console(), read_only],
@@ -153,7 +227,7 @@ fn read_only_accept() -> u64 {
         b"nettest\0readaccept\0",
     );
     let client = socket(net) as u64;
-    if process < 0 || connect(client, [127, 0, 0, 1], 12, 0) != 0 || wait_for(0) != 0 {
+    if process < 0 || connect(client, [127, 0, 0, 1], 12, 0) != 0 || wait_for(0).0 != 0 {
         return 6;
     }
     if !reaped(process) {
@@ -187,7 +261,7 @@ const BENCH_PORT: u16 = 9;
 /// stream; prints each as a `bench` line.
 fn bench() -> u64 {
     let me = open(DIR, b"nettest", 0) as u64;
-    let budget = OWN_BUDGET + 2 * SOCKET_FRAMES;
+    let budget = OWN_BUDGET + 3 * SOCKET_FRAMES;
     let server = spawn_at(
         me,
         &[console(), net()],
@@ -236,7 +310,7 @@ fn dial(net: u64) -> u64 {
     loop {
         let sock = socket(net) as u64;
         match connect(sock, [127, 0, 0, 1], BENCH_PORT, 0) {
-            0 => match wait_for(0) {
+            0 => match wait_for(0).0 {
                 0 => return sock,
                 ECONNREFUSED => close(sock),
                 _ => exit(5),
@@ -270,11 +344,11 @@ fn report_ns(name: &[u8], start: u64, n: u64) {
 /// and answers one byte.
 fn bench_serve() -> u64 {
     let listener = socket(CHILD_NET) as u64;
-    if bind(listener, BENCH_PORT) != 0 || listen(listener) != 0 {
+    if bind(listener, BENCH_PORT) != 0 || listen(listener, 1) != 0 {
         return 1;
     }
     let next = || match accept(listener, 0) {
-        0 => wait_for(0),
+        0 => wait_for(0).0,
         error => error,
     };
     let buf = map(4096).unwrap_or_else(|| exit(4));
@@ -308,13 +382,16 @@ fn buffers() -> &'static mut [u8] {
 /// connection closes at its end of stream.
 fn serve() -> u64 {
     let listener = socket(CHILD_NET) as u64;
-    if bind(listener, ECHO_PORT) != 0 || listen(listener) != 0 || accept(listener, ACCEPT) != 0 {
+    if bind(listener, ECHO_PORT) != 0
+        || listen(listener, CONNECTIONS as u64) != 0
+        || accept(listener, ACCEPT) != 0
+    {
         return 1;
     }
     let buf = buffers().as_mut_ptr() as u64;
     let (mut conns, mut accepted, mut closed) = ([0; CONNECTIONS], 0, 0);
     while closed < CONNECTIONS {
-        let (result, tag) = io_wait();
+        let (result, tag, _) = io_wait();
         if result < 0 {
             return 2;
         }
@@ -364,7 +441,7 @@ fn connect_all() -> u64 {
     let message = |i: usize| [b'e', b'c', b'h', b'o', b' ', b'0' + i as u8];
     let mut echoes = 0;
     while echoes < CONNECTIONS {
-        let (result, tag) = io_wait();
+        let (result, tag, _) = io_wait();
         let i = (tag % SEND) as usize;
         let at = buf.as_mut_ptr() as u64 + 64 * i as u64;
         let submitted = match tag {

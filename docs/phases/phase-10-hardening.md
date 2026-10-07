@@ -243,3 +243,12 @@ Filled in as each step lands.
   frames out of the page-mapped block measured no gain either. TCG instructions: syscall, pipe and yield 0; `map`
   +25 and `spawn` +318 (the frame allocator's first-fit scan starts behind 1 MiB more of reserved frames), `kill`
   +26; boot +25000 (the table fill).
+- Review of 60a-60c (security focus), fixed: firmware workaround 1 answering "unaffected" (1) now makes v2 not
+  affected, as in Linux, so BHB is still mitigated (it read as vulnerable and skipped BHB); a handle lookup loads
+  through the clamped index unconditionally and checks the value's range and generation after the load (the
+  compiler had merged the range check into a select, so a mispredicted branch could load at a fixed offset before
+  the table); `spawn`'s handle list is sliced `% (MAX_HANDLES + 1)`; the board const-asserts `MAX_CPUS == 4`, which
+  `linker.ld`'s three secondary stacks and guards assume. Open: an `io_submit` connect passes its address and port
+  in the buffer's fields, so two mispredicted branches on the op could run a receive with them as a buffer (a
+  speculative store); and the 4 KiB below core 0's guard page, where a stack overflow's report runs, holds live
+  `.bss` (the boot level-3 table is one page lower).

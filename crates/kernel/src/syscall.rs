@@ -10,7 +10,7 @@ use crate::handle::{
     WRITE,
 };
 use crate::mutex::Mutex;
-use crate::network::{OP_ACCEPT, OP_CONNECT, OP_RECEIVE, OP_SEND, Sock};
+use crate::network::{BACKLOG, OP_ACCEPT, OP_CONNECT, OP_RECEIVE, OP_SEND, Sock};
 use crate::pipe::End;
 
 /// `exit(code)`: ends the calling process, every thread; `wait` reports the low 8 bits of `code`.
@@ -99,8 +99,10 @@ const SOCKET: u64 = 20;
 /// for `connect`; write right) and, for `listen`, the address: 0 listens on every interface, 127.0.0.1 (a big-endian
 /// `u32`) on loopback only, anything else is `EADDRNOTAVAIL`; returns 0. `EINVAL` once listening or connected.
 const BIND: u64 = 21;
-/// `listen(socket)`: listens on the bound port (`EINVAL` without one) on every interface (write right and `LISTEN`, else
-/// `EACCES`; `EADDRINUSE`); returns 0.
+/// `listen(socket, backlog)`: listens on the bound port (`EINVAL` without one) on every interface, or loopback only
+/// (`bind`), holding up to `backlog` (clamped to 1..=`BACKLOG`, 8) connections for accept (write right and `LISTEN`,
+/// else `EACCES`; `EADDRINUSE`); returns 0. Each process holding the socket is charged for the backlog now
+/// (`ENOBUFS`), so connections peers make are prepaid.
 const LISTEN_CALL: u64 = 22;
 /// `io_submit(socket, op, ptr, len, tag)`: starts `op` and returns 0 at once; `io_wait` reports its result with `tag`.
 /// `OP_RECEIVE` reads at most `len` bytes into `ptr` (read right; 0 is the end of the stream), `OP_SEND` queues up to
@@ -111,8 +113,8 @@ const LISTEN_CALL: u64 = 22;
 /// `MAX_BUFFER` moves at most `MAX_BUFFER`. A socket takes one op that receives (receive, accept, connect) and one send
 /// at a time (`EBUSY`). Closing the last handle drops its ops unreported.
 const IO_SUBMIT: u64 = 23;
-/// `io_wait()`: waits until an op the caller submitted finishes; returns its result, and its tag in x1. `EINVAL` if
-/// none is in flight.
+/// `io_wait()`: waits until an op the caller submitted finishes; returns its result, its tag in x1 and, for an
+/// accept, the peer's IPv4 address and port in x2 (`ip << 16 | port`, 0 otherwise). `EINVAL` if none is in flight.
 const IO_WAIT: u64 = 24;
 /// `shutdown(socket)`: ends the send side (write right): a FIN follows the queued data; returns 0. `ENOTCONN` unless
 /// connected.
@@ -351,7 +353,10 @@ pub enum NetCall {
         port: u16,
         loopback: bool,
     },
-    Listen(Sock),
+    Listen {
+        sock: Sock,
+        backlog: u8,
+    },
     /// Submit `op` on `sock`; for a receive or send `ptr..ptr + len` is in `USER` unless empty, but may be unmapped.
     /// `rights` are the handle's: an accepted connection's handle gets no more.
     Submit {
@@ -589,7 +594,10 @@ pub fn dispatch<C: Clamp>(nr: u64, args: &[u64; 7], handles: &mut Handles) -> Re
                 loopback,
             }))
         }
-        LISTEN_CALL => Ok(Call::Net(NetCall::Listen(socket(handles, h0, WRITE)?))),
+        LISTEN_CALL => Ok(Call::Net(NetCall::Listen {
+            sock: socket(handles, h0, WRITE)?,
+            backlog: args[1].clamp(1, BACKLOG as u64) as u8,
+        })),
         IO_SUBMIT => {
             let (op, tag) = (args[1], args[4]);
             let need = match op {

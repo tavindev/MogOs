@@ -6,21 +6,37 @@ Speed is a primary goal, so performance is tested like behavior: measured, recor
 
 | Kind | What | How | Use for |
 | --- | --- | --- | --- |
-| Host | Pure-logic crates (allocators, parsers, encodings) | `benches/*.rs` with `harness = false`, timed with `std::time::Instant`, run on macOS | Algorithmic cost of safe crates |
+| Host | Pure-logic crates (allocators, parsers, encodings) | `benches/*.rs` (`harness = false`) on criterion, timed in the benchmark thread's CPU time, run on macOS | Algorithmic cost of safe crates |
 | Kernel | Hot paths in the running kernel (exception entry, context switch, syscall, pipe, page fault, allocation) | Boot QEMU in bench mode, time with the ARM generic timer (`CNTVCT_EL0`), print results over the UART | Real kernel paths end to end |
 
 - Kernel numbers under QEMU's default emulator (TCG) are only meaningful as relative comparisons between commits, not as absolute speed.
 - For realistic absolute numbers, run with Apple's hypervisor, which executes natively on the M-series CPU. The boot path works under `-accel hvf -cpu cortex-a72` (PSCI power-off, exceptions, MMU, fault report). `-cpu host` (and `max`) abort at startup on QEMU 9.2.1 with an M4 host (`Property 'host-arm-cpu.sme' not found`).
 - Host: `cargo bench-host`. Kernel boot time: every boot prints `boot: <N> us` (kmain entry to end of init, from `CNTVCT_EL0`/`CNTFRQ_EL0`); take min and median of 11 boots.
-- No benchmark framework dependency (criterion etc.): compile time is expensive on this machine. Report min and median of N runs.
+- Host benchmarks use criterion (dev-dependency only) with `benches/thread_time.rs`, which each bench includes by
+  `#[path]`: the thread's CPU time, not wall time (on this loaded host a wall-clock sample counted the time other
+  processes ran, 3-4x the work), and flat sampling. Rows are `<group>/<name>`; one iteration is the whole workload
+  (1000 frames, 400 files), so divide criterion's time by that count for ns/op. Set up outside the timed part with
+  `iter_batched_ref` (`PerIteration` when the input is large), or plain `iter` when the workload leaves its state as
+  it found it; keep results alive with `std::hint::black_box`; add `Throughput::Bytes` to a row that reports MiB/s.
+  `crates/net` and `crates/mogfs2` still print min and median of N runs by hand until they move over. Host rows
+  recorded before the move are those wall-clock min and median of 51 runs; later ones record criterion's estimate.
+- In-guest benchmarks (`test=bench-*`, `scripts/bench.sh <test>`, `scripts/oscompare.sh`) stay on the kernel's timer
+  (`CNTVCT_EL0`): no framework runs in `no_std` under QEMU.
 - Exact instruction counts: under TCG with `-icount shift=0,sleep=off` the virtual counter advances 1 ns per instruction, so a kernel benchmark's `ns/round-trip` reads as instructions per round trip, the same on every run. It finds where a few ns come from; it never gates (hvf does), since a probe or TTBR0 write costs far more under hvf than its one instruction.
 
 ## Workflow
 
 - Kernel comparisons use hvf (`-accel hvf -cpu cortex-a72`): TCG run-to-run noise is about 10%, so TCG numbers are informational only and never gate a change.
-- Compare medians of at least 21 runs, before and after interleaved, on an otherwise idle machine.
+- Kernel: compare medians of at least 21 runs, before and after interleaved, on an otherwise idle machine. Host: 11
+  rounds of `scripts/bench.sh host`.
 - Any change to a hot path includes before/after numbers from the relevant benchmark, run on the same machine and mode.
 - Any slowdown beyond run-to-run noise (hvf median for kernel benchmarks, host median for host benchmarks) is a failing result; a justification does not excuse it. Remove it, or show with numbers that no safe faster form exists. If the before/after spread is wider than the difference, rerun before concluding.
+- Host A/B: `scripts/bench.sh host <rounds> <base commit> <package> [<criterion args>]` checks the base out in a
+  temporary worktree, runs both trees' benches each round, the order alternating, and prints criterion's change estimate and
+  confidence interval per row, then each row's median, min and max change over the rounds. One round's interval
+  covers only that run's noise, not the drift between runs, so it is not a verdict: a row is slower when its median
+  change over 11 or more rounds lies above the A/A spread measured the same way (the host noise floor in Baselines). The base must
+  already have criterion benches.
 - New hot paths (each roadmap step that adds one) get a benchmark when they land, alongside their end-to-end test.
 - Per call, A/B: `scripts/bench.sh <test> <rounds> <new mog_os> [<base mog_os>]` boots each kernel `<rounds>` times
   under hvf, alternating which goes first, each boot on a fresh 1024-block MogFS image, and prints the median and min
@@ -104,10 +120,12 @@ Speed is a primary goal, so performance is tested like behavior: measured, recor
 
 | Benchmark | Mode | Min | Median | Commit |
 | --- | --- | --- | --- | --- |
-| `mm` frames: alloc+free of 1000 frames, 128 MiB allocator (ns/op) | Host, M4 Pro | 4.6 | 5.2 | uncommitted |
-| `mm` frames: `alloc_contiguous(4)` + free, 128 MiB allocator: empty / behind 725 reserved frames (boot's prefix) / behind 4096 frames with every fourth used (ns/op; bit-by-bit base 7.5 / 287 / 1464 min, 8.7 / 290 / 1513 median) | Host, M4 Pro | 7.4 / 12.3 / 46.5 | 7.6 / 12.6 / 47.1 | `mm` word-wise `alloc_contiguous` |
-| `mogfs` create + 100-byte write + commit, 400 files in one directory, in-memory disk (ns/op) | Host, M4 Pro | 1873 | 1956 | phase 4 MogFS unlink and rename |
-| `mogfs` lookup in a 400-entry directory, in-memory disk (ns/op) | Host, M4 Pro | 758 | 784 | phase 4 MogFS unlink and rename |
+| `mm` `frames/alloc+free`: alloc+free of 1000 frames, 128 MiB allocator (ns/op) | Host, M4 Pro | 4.6 | 5.2 | uncommitted |
+| `mm` `frames/contiguous(4)+free, empty` / `, 725 reserved` / `, fragmented`: `alloc_contiguous(4)` + free, 128 MiB allocator: empty / behind 725 reserved frames (boot's prefix) / behind 4096 frames with every fourth used (ns/op; bit-by-bit base 7.5 / 287 / 1464 min, 8.7 / 290 / 1513 median) | Host, M4 Pro | 7.4 / 12.3 / 46.5 | 7.6 / 12.6 / 47.1 | `mm` word-wise `alloc_contiguous` |
+| `mogfs` `mogfs/create+write+commit`: create + 100-byte write + commit, 400 files in one directory, in-memory disk (ns/op) | Host, M4 Pro | 1873 | 1956 | phase 4 MogFS unlink and rename |
+| `mogfs` `mogfs/lookup`: lookup in a 400-entry directory, in-memory disk (ns/op) | Host, M4 Pro | 758 | 784 | phase 4 MogFS unlink and rename |
+| Host noise floor, `scripts/bench.sh host 11 HEAD <crate>` against itself (A/A), criterion on thread CPU time: median change over 11 rounds per row, `mm` four rows (two sessions) / `mogfs` create, lookup (%; single rounds spread -27% to +21%, often flagged significant by criterion, so a verdict takes the median). A host row is slower when its median change exceeds about 0.5% (`mm`) or 3% (`mogfs`); rerun one within twice that | Host, M4 Pro, load 8-84 | - | +0.5 / -0.4 / +0.0 / +0.0 and +0.2 / -0.4 / -0.5 / +0.1; +2.6 / +0.8 | criterion host benches |
+| `mm` frames rows / `mogfs` create, lookup on criterion (thread CPU time, flat sampling), estimate converted to ns/op; the old harness run just before and after gave medians 5.2-5.7 / 8.5 / 12.7 / 47.0-48.5; 1959-1966 / 785 (lookup now repeats on one settled directory, not once right after the creates) | Host, M4 Pro, load 6-11 | - | 5.46 / 7.59 / 12.51 / 48.2; 1991 / 839 | criterion host benches |
 | `net` UDP over the loss-free simulated link: `send_to` on A, `poll` + `recv_from` on B, batches of 16, 64-byte / 1472-byte datagrams (ns/datagram; 17.9 / 7.5 M datagrams/s at the median) | Host, M4 Pro | 53.6 / 130.3 | 55.8 / 133.7 | phase 8 step 46 |
 | `net` UDP receive path: parse, checksum, demux, copy into the socket buffer and out with `recv_from`, 64-byte / 1472-byte datagrams (ns/frame) | Host, M4 Pro | 29.7 / 68.3 | 30.8 / 70.8 | phase 8 step 46 |
 | `net` UDP receive path as above, 1472-byte datagrams, after step 47's second review (ns/frame; a code-placement artifact, not added work: the UDP path did not change, 6 interleaved sessions read 66.3-67.8 against 64.3-65.2 ns for 9c4ca51, and both built with `-C llvm-args=-align-loops=64` read 65.5-67.7 against 65.2-66.1; a workspace-wide alignment flag is queued as its own experiment) | Host, M4 Pro | 66.3 | 68.6 | phase 8 step 47 second review |
@@ -116,6 +134,7 @@ Speed is a primary goal, so performance is tested like behavior: measured, recor
 | `net` TCP receive path per data segment as above, with 63 idle connections in the slots before it (the last-matched-slot hint; the rest is `poll` walking 65 slots per batch of 16) (ns/segment; load 11-12, 6 sessions) | Host, M4 Pro | 87.4 | 92.1 | phase 8 step 47 review |
 | `net` TCP connect + accept + close from each side, through TIME_WAIT, over the loss-free link, 10000 sequential connections (ns/connection; load 19-25, 4 interleaved sessions) | Host, M4 Pro | 398.5 | 407.7 | phase 8 step 47 second review |
 | `net` TCP connect + accept + close as above, every connection through a SYN cookie (no half-open table) (ns/connection; load 19-25, 4 sessions) | Host, M4 Pro | 407.5 | 420.0 | phase 8 step 47 second review |
+| `net` TCP connect + accept + close as above, after step 47's verification fixes and newtypes (ns/connection; load about 10, 6 interleaved sessions; 10f4b2f read 405.1-412.7 in the same sessions: a code-placement artifact, not added work: the handshake takes the same 5 polls and 7 frames per connection, the default build retires 17 more instructions but 38 more cycles per connection, and built with `-C llvm-args=-align-loops=64` the new code retires fewer instructions (2.514 G against 2.534 G for 210k connections) in the same or fewer cycles (360.0-362.2 M against 362.3-364.5 M)) | Host, M4 Pro | 413.3 | 418.0 | phase 8 step 47 verification |
 | `net` `poll` with nothing to do: a listener, 2 slots, a 4 / 64 / 4096-entry half-open table (ns/poll; the table walk ran every poll before: 8.3 / 24.6 / 1196 ns) | Host, M4 Pro | 6.8 / 6.8 / 6.9 | 7.0 / 7.1 / 7.0 | phase 8 step 47 second review |
 | `net` TCP SYN answered with a SYN-ACK while filling a fresh half-open table of 64 / 4096 entries (O(1): a keyed mix picks a run of 8 slots; 3% / 2% of these SYNs overflow to cookies; the linear scan it replaced: 68.4-82.8 / 2004-2300 ns minimums), and with a cookie (ns/SYN; load about 8, 3 interleaved sessions) | Host, M4 Pro | 47.6 / 44.7 / 29.2 | 49.8 / 45.9 / 30.4 | phase 8 step 47 review |
 | `net` TCP simulated goodput (virtual time, deterministic per seed), NewReno, 16 MiB A to B, 1 MiB window, RTO floor 200 ms, 11 seeds: 1% loss at 10 / 50 ms RTT, 5% loss at 10 / 50 ms RTT (MiB/s, higher is better; step 48's SACK baseline, same seeds, window and floor) | Host, simulated | 1.37 / 0.28 / 0.30 / 0.11 | 1.52 / 0.31 / 0.34 / 0.11 | phase 8 step 47 review |
@@ -158,6 +177,8 @@ Speed is a primary goal, so performance is tested like behavior: measured, recor
 | Loopback TCP, `test=bench-sockets` (`nettest bench` against `nettest benchserve`, each its own process): 64-byte send + receive round trip / connect + close / one 4 KiB send of a 16 MiB stream (ns; the stream is 1134 MiB/s at the median; the pipe's round trip is about 390 ns in the same conditions: each TCP round trip also carries two segments, four syscalls a side and the net task's polls) | QEMU hvf (`-cpu cortex-a72`), dev build, 21 boots, load about 9 | 2824 / 2376 / 3371 | 2889 / 2516 / 3446 | phase 8 step 50 |
 | HTTP through QEMU's `hostfwd` (`test=httpd`): host to guest, a GET round trip on a new connection timed by a Python client (us) / guest to host, `fetch` of a 20-byte page from a Python server, 200 GETs, mean per GET (us; 3 boots) / 64 MiB to `httpd`'s echo, both ways at once (MiB/s each way; 3 runs) / 64 MiB fetched from the host (MiB/s; 3 boots). QEMU's user network ends TCP in QEMU, so these measure it more than our stack; recorded as found (min / median columns: best and median of the runs) | QEMU hvf (`-cpu cortex-a72`), dev build, load about 31 | 104 / 195 / 67.5 / 148 | 156 / 212 / 66.3 / 148 | phase 8 step 51 |
 | Phase 8 (steps 49-51) against main `a597dcf`, exact TCG instruction counts (`-icount shift=0`): yield / syscall / pipe round trip, boot without bootargs (instructions; boot in us of 1000) | QEMU TCG, `-icount shift=0`, dev build | 345 / 218 / 2480 / 156 | same; main 345 / 218 / 2480 / 163 | phase 8 step 51 |
+| Kernel boot with a NIC and `net=`, against main `22c07bc` (us; the `rng-seed` read joined the bootargs walk, about 45k instructions removed; the NIC probe and setup, ring memory and stacks, about 60 us under hvf, moved to the net task, which a scenario waits for after `boot:`, so that part is moved, not removed): exact TCG instruction counts (`-icount shift=0`, thousands) with / without a NIC, then hvf median of 31 interleaved boots with a NIC | QEMU TCG `-icount` / hvf, dev build, load 25 to 60 | 164 / 157 (main 264 / 156) | hvf 278 (main 378) | phase 8 follow-ups |
+| Boot to network ready with a NIC and `net=` (`net: ready <N> us`, printed once the net task's setup is done, before any scenario), against main `22c07bc`, which set up inside `boot:` (thousands of TCG instructions, `-icount shift=0`): `boot:` / `net: ready` | QEMU TCG `-icount`, dev build | 164 / 226 | main 264 / (264) | phase 8 follow-ups |
 
 ## Cross-OS comparison
 

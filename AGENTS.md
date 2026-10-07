@@ -44,7 +44,7 @@ Every new `.md` file must be linked from its parent so it stays reachable from t
 - Run in a QEMU window: `cargo window` (mouse stays free; Ctrl+Option+G releases a grab)
 - Quit a hung QEMU: `Ctrl-A` then `X`
 - Test: `cargo test-host` (host tests, `crates/user`'s included, plus the QEMU boot tests in `crates/e2e`; must pass)
-- Benchmarks: `cargo bench-host` (host); kernel boot time is the `boot: <N> us` line; per-call and per-command A/B under hvf: `scripts/bench.sh` (`docs/BENCHMARKS.md`)
+- Benchmarks: `cargo bench-host` (host, criterion); kernel boot time is the `boot: <N> us` line; per-call and per-command A/B under hvf: `scripts/bench.sh` (`docs/BENCHMARKS.md`)
 - Debug: `cargo run -- -s -S`, then attach `lldb` / `gdb` to `localhost:1234`
 - Lint/format: `cargo clippy`, `cargo fmt` (must be clean; `crates/user` is outside the workspace, see `docs/DEVELOPMENT.md`). Settings, rules for agents: `docs/DEVELOPMENT.md`
 - Roadmap and current phase: `docs/ROADMAP.md` (one doc per phase in `docs/phases/`; update "What was done" when a step lands)
@@ -63,7 +63,8 @@ Every new `.md` file must be linked from its parent so it stays reachable from t
 - `crates/e2e` ([CLAUDE.md](crates/e2e/CLAUDE.md)) — host-only QEMU boot tests (`tests/boot.rs`).
 - `c` ([CLAUDE.md](c/CLAUDE.md)) — the C userland: musl with the MogOs syscall layer (`c/musl`), busybox, C test programs; `c/Makefile`, run by the board's `build.rs`, fetches the pinned sources and builds into one cache shared by every worktree (the main checkout's `target/c-cache`, keyed by a hash of the inputs); `target/c` links to it.
 - `.cargo/config.toml` — default target, build/link thread caps, QEMU runners.
-- `scripts/bench.sh` — boots kernels under hvf and prints each `bench` line's median and min, base vs new interleaved.
+- `benches/thread_time.rs` — criterion setup shared by the host benches (`#[path]`-included): thread CPU time, flat sampling.
+- `scripts/bench.sh` — boots kernels under hvf and prints each `bench` line's median and min, base vs new interleaved; `host` mode does the same A/B for a crate's criterion benches.
 
 ## Architecture
 
@@ -85,10 +86,12 @@ Every new `.md` file must be linked from its parent so it stays reachable from t
 - Speed is a feature, so it is measured, not assumed. Details and baselines: `docs/BENCHMARKS.md`.
 - Every hot path gets a benchmark when it lands. Every change to a hot path reports before/after numbers.
 - Speed with complete safety is the moat. A tracked benchmark slowing down (hvf or host medians, never TCG) is a failure: an explanation does not excuse it. Remove it, or show with numbers that no safe faster form exists.
+- Invariants checked at compile time are part of the moat: they cost nothing at run time and their bug class cannot return.
 
 ## Code rules
 
 - `#![no_std]`. Edition 2024: use `#[unsafe(no_mangle)]`, `unsafe extern`.
 - Host-testable crates use `#![cfg_attr(not(test), no_std)]`.
+- Make invalid states unrepresentable: typestate, newtypes and ownership when the state is known at compile time; exhaustive enums when it comes from input (packets, user handles, tables of mixed states). It must cost nothing at run time; a type-level encoding that adds code size or generic bloat on a hot path is measured.
 - `unsafe` only in `crates/arch` and board crates (`crates/board/*`), each block with a one-line `// SAFETY:` reason; user space (`crates/user`) only for its syscall stubs.
 - After editing `linker.ld`, `crates/board/qemu-virt/build.rs` triggers a relink automatically.

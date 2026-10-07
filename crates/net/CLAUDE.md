@@ -13,8 +13,8 @@ time_wait))` adds connection slots (`TcpSocket::new(rx, tx)`, the rings from the
 (`[HalfOpen::EMPTY; N]`), a TIME_WAIT table (`[TimeWait::EMPTY; N]`) and the 128-bit seed every key is derived
 from. Then `listen`, `accept`, `connect(now, local, to)` (local 0 is ephemeral), `send`, `recv` (`Ok(0)` is the end
 of the stream, `WouldBlock` is nothing yet), `shutdown` (half-close), `tcp_close` (release; a RST if data was left
-unread), `abort` and `tcp_info` (state, error, cwnd, ssthresh, send window, RTO, the deadline the next `poll` acts
-on, bytes queued). Segments go out from `poll`.
+unread), `abort` and `tcp_info` (peer address and port, state, error, cwnd, ssthresh, send window, RTO, the deadline
+the next `poll` acts on, bytes queued, whether released, retransmission timeouts taken). Segments go out from `poll`.
 
 The `Nic` trait: `mac`, `mtu`, `transmit(len, |buf| ..)` (the stack writes the frame into the driver's buffer) and
 `receive(|frame| ..)`.
@@ -37,7 +37,7 @@ kernel, step 50), DHCP, DNS or IPv6 (phase 9), or IPv4 fragment reassembly.
   (RFC 3465) and go-back-N after a timeout, a persist timer that probes a zero window as long as the peer answers
   and gives up (`TimedOut`) after 10 unanswered probes. Released (orphan) connections are bounded like Linux's:
   FIN-WAIT-2 ends 60 s after our FIN was acknowledged whatever the peer sends (an open half-closed connection
-  waits as long as it likes), and a zero window gets at most 8 probes even if answered. A FIN (or SYN) owed but not
+  waits as long as it likes), and a zero window gets at most 8 probes in a row without the peer acknowledging new data. A FIN (or SYN) owed but not
   yet sent, say while the next hop does not resolve, runs the retransmission timer like one in flight. TIME_WAIT
   lasts 60 s, restarted only by the retransmitted FIN. Sender silly-window avoidance applies to new data only, receiver avoidance (RFC 9293 3.8.6.2.2) moves the window's edge by min(MSS, ring / 2) or not at
   all, and out-of-window segments get at most one ACK per 500 ms per connection. Out-of-order data is kept in the
@@ -64,8 +64,11 @@ kernel, step 50), DHCP, DNS or IPv6 (phase 9), or IPv4 fragment reassembly.
 - TCP verifies the checksum over the whole segment before reading a field or writing a byte, so a corrupt
   retransmission can never overwrite out-of-order data already kept.
 - Timers: one deadline per connection, derived from its state by `deadline()` from a single start time and cached at
-  the end of every event that can move it (a segment in, a timer firing, an output attempt, which every caller
-  action leads to). No purpose arms or cancels another's. The tests check after every poll that a connection with
+  the end of every event that can move it (a segment in, a timer firing, an output attempt; a call such as `send`,
+  `shutdown` or `tcp_close` only marks it for the next event). One rule in one place (`refresh`): an obligation that
+  appears with no deadline before starts its timer then, so a timeout never counts against a segment owed but not
+  yet sent. No purpose arms or cancels another's. A randomized clean-link test (idle spells, both sides acting at
+  once, polls deferred so the peer's frame lands first) asserts that no timeout is ever taken. The tests check after every poll that a connection with
   work outstanding (anything but idle in ESTABLISHED or CLOSE-WAIT, or an open FIN-WAIT-2; `tcp_info().released`
   tells them apart) has a deadline, and that a silent peer always ends in CLOSED or idle. The link tests also lose
   30% of ARP frames (all of them for a quarter of the silent-peer seeds), so the rule covers neighbours that never
@@ -91,15 +94,19 @@ kernel, step 50), DHCP, DNS or IPv6 (phase 9), or IPv4 fragment reassembly.
   connection (`challenge_acks`), never one global limit (CVE-2016-5696); an ACK above `snd_max` drops the whole
   segment; cwnd grows by bytes acknowledged, so ACK division gains nothing; an ICMP error must quote a sequence
   number in `snd_una..snd_max`, and a hard error aborts only a SYN-SENT connection (RFC 5927); a RST never ends
-  TIME_WAIT (RFC 1337); a full TIME_WAIT table reuses its oldest entry (`time_wait_reused`), and a SYN above an
-  entry's sequence starts a new connection whose ISS is the old `snd_nxt` plus 65537 plus 24 keyed bits, above
+  TIME_WAIT (RFC 1337); a full TIME_WAIT table reuses its oldest entry (`time_wait_reused`), and a SYN (not a SYN-ACK)
+  above an entry's sequence starts a new connection whose ISS is the old `snd_nxt` plus 65537 plus 24 keyed bits, above
   anything the old connection sent and unpredictable, but only with a listener and room in the half-open table for
   that ISS (never a cookie); otherwise TIME_WAIT stays and answers the SYN with an ACK; a window update needs `snd_una <= ack`.
 - ISNs are SipHash-2-4 of the connection plus a 4 us clock (RFC 6528); ephemeral ports are RFC 6056 algorithm 3.
   No key is used twice: `Tcp::new` derives one per use from the caller's seed (SipHash of the seed and a label):
   ISNs, ports, cookies, the TIME_WAIT takeover bits and the half-open mix, so the weak mix's observable collisions
   reveal nothing about the cookie or ISN keys. A cookie's clock and MSS index go into the hashed message, never the
-  key. The kernel's seed comes from the DT seed (step 49).
+  key. Each purpose's key is its own type, `Key<P>`, derived from a `Seed` with `P`'s label, and each purpose's hash
+  is a method of its key type, so a key cannot be used for another purpose. The kernel's seed comes from the DT
+  seed (step 49).
+- Sequence-space values are `Seq(u32)`: ordered and subtracted modulo 2^32 (`lt`, `le`, `gt`, `offset_from`,
+  `Seq - Seq` is a distance), and only a byte count can be added to one; byte counts and windows stay integers.
 - Segments about a connection go to the MAC from its last ARP resolution (each send resolves the next hop; until
   the first, a passive open's SYN source), never to a received frame's source; a pure ACK carries `snd_max`, so a
   go-back-N `snd_nxt` never starts an ACK war. Demux tries the last matched slot first.

@@ -57,6 +57,7 @@ libcalls. Needs: Homebrew `llvm` (clang 19 or later for `-mabi=aapcs-soft`), `gs
 | soft-float C (`-march=armv8-a+nofp -mabi=aapcs-soft`) | `c/Makefile` | The kernel never enables FP/SIMD at EL0 (no `CPACR_EL1` FPEN), so traps and switches never save v-registers; C code follows the Rust programs. |
 | busybox `CONFIG_EXTRA_CFLAGS="-DBB_GLOBAL_CONST="` | `c/busybox.config` | clang 19 hoists the read of busybox's `const` globals pointer above its assignment (hush faulted at `0x140`); busybox's documented switch. |
 | `linked_list_allocator` (no features) | `crates/board/qemu-virt` | Kernel heap with `free` (phase 2 task stacks need it); a bare `Heap` behind an `arch::Lock` (which masks IRQs), not its own spinlock, which could deadlock on one core. In the board crate because it is the binary that owns `#[global_allocator]` and `unsafe` heap init. |
+| `criterion` (no default features), `cpu-time` | `[dev-dependencies]` of `mm`, `mogfs` | Host benchmarks: criterion gives each row a confidence interval and the change against a saved baseline, which `scripts/bench.sh host` turns into an interleaved A/B; `cpu-time` reads the thread's CPU time for `benches/thread_time.rs`, since wall time on this loaded host counts other processes' time. Without default features: no plotters, no rayon. Dev-only, so never in the kernel build; `cargo test-host` compiles them for these crates' tests. |
 | `panic = "abort"` | both profiles | No unwinding in a kernel. |
 | dev `opt-level = 1` | root `Cargo.toml` | Opt-level 0 kernel code has bloated stack frames and slow MMIO loops; measured build cost is zero. Trade-off: some locals show as optimized out in the debugger. |
 | release `lto = true`, `codegen-units = 1` | root `Cargo.toml` | Smallest/fastest release image; release only, so the inner loop does not pay for it. |
@@ -81,7 +82,8 @@ cargo test --manifest-path crates/user/Cargo.toml --target aarch64-apple-darwin 
 cargo build            # dev build
 cargo test-host        # host tests (crates/user's too) + QEMU boot e2e tests (crates/e2e); must pass
 for i in $(seq 50); do cargo test -q --target aarch64-apple-darwin -p e2e --test boot -- handles_enforce_rights_and_generations --exact || break; done  # flake hunt: one test N times; drop `-- <name> --exact` to loop the whole suite (its parallel boots add load)
-cargo bench-host       # host benchmarks (min/median); see docs/BENCHMARKS.md
+cargo bench-host       # host benchmarks (criterion for mm and mogfs, min/median for net and mogfs2); see docs/BENCHMARKS.md
+scripts/bench.sh host 11 main mm  # host criterion A/B, working tree against main, interleaved; see docs/BENCHMARKS.md
 cargo run              # boot in QEMU; prints hello, exceptions, mmu, ram, frames, heap, boot, disk lines and powers off
 cargo run -- -append test=mmu-fault  # reads an unmapped address after MMU on; prints the data abort
 cargo run -- -append test=wx-text    # stores to kernel text (wx-exec: branches to a .data word; wx-guard: core 0's stack overflows into its guard page); prints the fault
@@ -142,15 +144,17 @@ Quit a hung QEMU with `Ctrl-A` then `X`.
 - Leak checks: every scenario that frees frames prints `<test>: free frames <n> before, <n> after` around all it
   spawned, and its e2e test asserts the two match (`assert_no_leak`).
 - Speed: per-call benchmarks run base and new kernels interleaved; any per-call slowdown fails (`docs/BENCHMARKS.md`).
+  Host benchmarks use criterion, in-guest ones the kernel's timer; host A/B is `scripts/bench.sh host`.
 
 ## The HTTP echo server
 
 `cargo httpd` boots MogOs with a NIC on QEMU's user network and runs `httpd` (`crates/user/src/bin/httpd.rs`) on port
 80, which QEMU forwards from the host's `127.0.0.1:8080`. For each request it answers `HTTP/1.1 200 OK` with
 `Content-Type: text/plain` and the request it received (request line, headers, body) as the body, then closes the
-connection; one connection at a time, forever. A head over 8 KiB is `431`, a malformed or repeated
-`Content-Length` `400`, one over 1 GiB `413` (`body_length` in `crates/user/src/lib.rs`, host-tested and fuzzed). So `curl -v http://localhost:8080/anything -d hello` shows its own
-request back. The server holds only the console and a listen-only NetStack. Bootargs: `httpd=<n>` stops after `n`
+connection; one connection at a time, forever. So `curl -v http://localhost:8080/anything -d hello` shows its own
+request back, and the console logs `httpd: <peer ip>:<port>` for each connection (10.0.2.2 through `hostfwd`). A head
+over 8 KiB is `431`, a malformed or repeated `Content-Length` `400`, one over 1 GiB `413` (`body_length` in
+`crates/user/src/lib.rs`, host-tested and fuzzed). The server holds only the console and a listen-only NetStack. Bootargs: `httpd=<n>` stops after `n`
 requests (the power-off follows); `fetch=<ip>:<port>[/<path>][,<times>]` first runs `fetch`, which prints that page's
 body (or, with `<times>`, GETs it that many times and prints `bench http-get: <ns> ns`). Quit with `Ctrl-A` then `X`.
 

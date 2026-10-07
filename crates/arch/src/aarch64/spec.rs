@@ -191,10 +191,12 @@ fn decide(conduit: Option<Conduit>) -> (u32, u32, Table) {
     let sb = || field(sysreg!("id_aa64isar1_el1"), 36) != 0;
     let v2 = if csv2 != 0 || on(V2_SAFE) {
         NOT_AFFECTED
-    } else if workaround(conduit, WORKAROUND_1) == 0 {
-        FIRMWARE_UNCALLED
     } else {
-        VULNERABLE
+        match workaround(conduit, WORKAROUND_1) {
+            0 => FIRMWARE_UNCALLED,
+            1 => NOT_AFFECTED,
+            _ => VULNERABLE,
+        }
     };
     let (bhb, table) = if csv2 == 3 || on(BHB_SAFE) {
         (NOT_AFFECTED, Table::Plain)
