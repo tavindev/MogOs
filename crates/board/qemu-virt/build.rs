@@ -58,6 +58,7 @@ fn main() {
         ("cbench", "cbench"),
         ("oscb", "oscb"),
         ("oscnop", "oscnop"),
+        ("tcpecho", "tcpecho"),
     ];
     for (name, file) in programs {
         files.push((name.into(), fs::read(c_out.join("bin").join(file)).unwrap()));

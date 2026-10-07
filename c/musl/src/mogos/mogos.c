@@ -1,7 +1,8 @@
 /* MogOs: the Linux syscalls musl makes, mapped onto the native calls (crates/kernel/src/syscall.rs); anything
  * unmapped is -ENOSYS. A C program starts with fixed handles: 0-2 stdin, stdout, stderr, 3 the root directory,
- * 4 the boot archive (programs to spawn); an absent one fails with EBADF or EACCES on use. libc keeps the fd table
- * (fd -> open file: handle, offset, path), the current directory (a path below the root) and the pid table. */
+ * 4 the boot archive (programs to spawn), 5 the NetStack (TCP over IPv4 only); an absent one fails with EBADF or
+ * EACCES on use. libc keeps the fd table (fd -> open file: handle, offset, path), the current directory (a path
+ * below the root) and the pid table. */
 #define _GNU_SOURCE
 #include <dirent.h>
 #include <elf.h>
@@ -13,7 +14,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <netinet/in.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
 #include <sys/utsname.h>
@@ -24,10 +27,11 @@
 #include "ksigaction.h"
 
 enum { N_EXIT, N_IO, N_DUP, N_CLOSE, N_MAP, N_OPEN, N_SPAWN, N_PIPE, N_WAIT, N_KILL = 12, N_MKDIR, N_READDIR,
-	N_SYNC, N_UNLINK, N_RENAME };
+	N_SYNC, N_UNLINK, N_RENAME, N_SOCKET = 20, N_BIND, N_LISTEN, N_SUBMIT, N_IO_WAIT, N_SHUTDOWN };
 enum { R_READ = 1, R_WRITE = 2, R_DUP = 8, R_TRANSFER = 16, R_EXEC = 32 };
 enum { N_CREATE = 1, N_TRUNC = 2 };
-enum { H_ROOT = 3, H_ARCHIVE = 4, HANDLES = 5 };
+enum { OP_RECEIVE, OP_SEND, OP_ACCEPT, OP_CONNECT };
+enum { H_ROOT = 3, H_ARCHIVE = 4, H_NET = 5 };
 /* Native limits: largest map, largest spawn argument buffer and count, a killed process's exit code. */
 enum { MAX_MAP = 16 << 12, MAX_ARGS = 32, MAX_ARG_BYTES = 4096, KILLED = 256 };
 /* Frames a spawned C program gets, halved while the parent's budget is short, down to what busybox needs to run
@@ -40,7 +44,7 @@ enum { MAX_MAP = 16 << 12, MAX_ARGS = 32, MAX_ARG_BYTES = 4096, KILLED = 256 };
 #define FDS 32
 #define CHILDREN 8
 
-enum kind { FREE, TTY, NODE, DIRECTORY, PIPE };
+enum kind { FREE, TTY, NODE, DIRECTORY, PIPE, SOCKET };
 
 struct file {
 	long handle;
@@ -220,11 +224,66 @@ static long do_openat(int dirfd, const char *path, int flags)
 	return install(fd, i, flags & O_CLOEXEC);
 }
 
+/* A socket op, waited for at once: with one thread, it is the only one in flight. */
+static long sock_op(long h, long op, long ptr, long len)
+{
+	long r = svc(N_SUBMIT, h, op, ptr, len, 0, 0, 0);
+	return r < 0 ? r : svc(N_IO_WAIT, 0, 0, 0, 0, 0, 0, 0);
+}
+
+static struct file *socket_file(int fd)
+{
+	struct file *f = fd_file(fd);
+	return f && f->kind == SOCKET ? f : 0;
+}
+
+static long do_socket(int domain, int type, int protocol)
+{
+	if (domain != AF_INET) return -EAFNOSUPPORT;
+	if ((type & 0xff) != SOCK_STREAM || protocol && protocol != IPPROTO_TCP) return -EPROTONOSUPPORT;
+	int fd = free_fd(0), i;
+	if (fd < 0) return fd;
+	long h = svc1(N_SOCKET, H_NET);
+	if (h < 0) return h;
+	if ((i = new_file(h, SOCKET, "")) < 0) return nclose(h), i;
+	return install(fd, i, type & SOCK_CLOEXEC);
+}
+
+/* The port of an AF_INET address. */
+static long port_of(const struct sockaddr_in *a, socklen_t len)
+{
+	if (len < sizeof *a || a->sin_family != AF_INET) return -EINVAL;
+	return ntohs(a->sin_port);
+}
+
+static long do_accept(int fd, struct sockaddr_in *addr, socklen_t *len, int flags)
+{
+	struct file *f = socket_file(fd);
+	int new = free_fd(0), i;
+	if (!f) return fd_file(fd) ? -ENOTSOCK : -EBADF;
+	if (new < 0) return new;
+	long h = sock_op(f->handle, OP_ACCEPT, 0, 0);
+	if (h < 0) return h;
+	if ((i = new_file(h, SOCKET, "")) < 0) return nclose(h), i;
+	/* The kernel does not report the peer's address. */
+	if (addr && len && *len >= sizeof *addr) *addr = (struct sockaddr_in){ .sin_family = AF_INET };
+	return install(new, i, flags & SOCK_CLOEXEC);
+}
+
+static long do_connect(int fd, const struct sockaddr_in *a, socklen_t len)
+{
+	struct file *f = socket_file(fd);
+	long port = port_of(a, len);
+	if (!f) return fd_file(fd) ? -ENOTSOCK : -EBADF;
+	return port < 0 ? port : sock_op(f->handle, OP_CONNECT, ntohl(a->sin_addr.s_addr), port);
+}
+
 static long rw(int fd, char *buf, size_t n, int write)
 {
 	struct file *f = fd_file(fd);
 	if (!f) return -EBADF;
 	if (f->kind == DIRECTORY) return -EISDIR;
+	if (f->kind == SOCKET) return sock_op(f->handle, write ? OP_SEND : OP_RECEIVE, (long)buf, n);
 	if (f->kind != NODE) return svc(N_IO, f->handle, write, (long)buf, n, 0, 0, 0);
 	if (write && f->append && (f->off = size_of(f->handle)) < 0) return f->off;
 	long r = svc(N_IO, f->handle, write, (long)buf, n, f->off, 0, 0);
@@ -311,7 +370,8 @@ static long do_fstatat(int dirfd, const char *path, struct kstat *k, int flag)
 	}
 	*k = (struct kstat){ .st_dev = 1, .st_nlink = 1, .st_blksize = 4096 };
 	k->st_ino = hash(p) + (kind == TTY || kind == PIPE ? dirfd : 0);
-	k->st_mode = kind == DIRECTORY ? S_IFDIR | 0755 : kind == NODE ? S_IFREG | 0644 : kind == TTY ? S_IFCHR | 0620 : S_IFIFO | 0600;
+	k->st_mode = kind == DIRECTORY ? S_IFDIR | 0755 : kind == NODE ? S_IFREG | 0644 : kind == TTY ? S_IFCHR | 0620 :
+		kind == SOCKET ? S_IFSOCK | 0777 : S_IFIFO | 0600;
 	if (kind == NODE) k->st_size = size_of(h);
 	if (!f) nclose(h);
 	if (k->st_size < 0) return k->st_size;
@@ -453,7 +513,7 @@ static long spawn(const char *path, char *const argv[], char *const envp[])
 	const char *name = strrchr(path, '/');
 	name = name ? name + 1 : path;
 	if (strcmp(name, "sh") && strcmp(name, "hello") && strcmp(name, "cbench") && strcmp(name, "oscb") &&
-	    strcmp(name, "oscnop"))
+	    strcmp(name, "oscnop") && strcmp(name, "tcpecho"))
 		return -ENOENT;
 	for (int fd = 0; fd < 3; fd++) {
 		struct file *f = fd_file(fd);
@@ -472,9 +532,10 @@ static long spawn(const char *path, char *const argv[], char *const envp[])
 	}
 	long exe = svc(N_OPEN, H_ARCHIVE, (long)name, strlen(name), 0, 0, 0, 0);
 	if (exe < 0) return exe;
-	long handles[HANDLES], p = -ENOMEM;
-	int got = 0;
-	for (; got < HANDLES; got++) {
+	/* Every slot but the NetStack: a child never inherits network access (least privilege). */
+	long handles[H_NET], p = -ENOMEM;
+	int got = 0, n = H_NET;
+	for (; got < n; got++) {
 		struct file *f = got < 3 && !(st.cloexec >> got & 1) ? fd_file(got) : 0;
 		long dup = got < 3 ? (f ? ndup(f->handle) : -EBADF) : ndup(got);
 		/* An absent slot gets a handle with no rights, so the later ones keep their values. */
@@ -485,8 +546,8 @@ static long spawn(const char *path, char *const argv[], char *const envp[])
 		}
 		handles[got] = dup;
 	}
-	for (long budget = CHILD_BUDGET; got == HANDLES && p == -ENOMEM && budget >= MIN_BUDGET; budget /= 2)
-		p = svc(N_SPAWN, exe, (long)handles, HANDLES, budget, -1, (long)args, len);
+	for (long budget = CHILD_BUDGET; got == n && p == -ENOMEM && budget >= MIN_BUDGET; budget /= 2)
+		p = svc(N_SPAWN, exe, (long)handles, n, budget, -1, (long)args, len);
 	if (p < 0)
 		while (got--) nclose(handles[got]);
 	nclose(exe);
@@ -693,6 +754,33 @@ long __mog_syscall(long n, long a, long b, long c, long d, long e, long f)
 	case SYS_mprotect:
 	case SYS_madvise: return 0;
 	case SYS_clock_gettime: return do_clock_gettime((void *)b);
+	case SYS_socket: return do_socket(a, b, c);
+	case SYS_bind: {
+		struct file *file = socket_file(a);
+		long port = port_of((void *)b, c);
+		if (!file) return fd_file(a) ? -ENOTSOCK : -EBADF;
+		/* The kernel takes any (0) or 127.0.0.1, which listens on loopback only. */
+		return port < 0 ? port : svc(N_BIND, file->handle, port, ntohl(((struct sockaddr_in *)b)->sin_addr.s_addr), 0, 0, 0, 0);
+	}
+	case SYS_listen:
+	case SYS_shutdown: {
+		struct file *file = socket_file(a);
+		if (!file) return fd_file(a) ? -ENOTSOCK : -EBADF;
+		/* SHUT_RD alone has nothing to do: received data is simply not read. */
+		if (n == SYS_shutdown && b == SHUT_RD) return 0;
+		return svc1(n == SYS_listen ? N_LISTEN : N_SHUTDOWN, file->handle);
+	}
+	case SYS_accept: return do_accept(a, (void *)b, (void *)c, 0);
+	case SYS_accept4: return do_accept(a, (void *)b, (void *)c, d);
+	case SYS_connect: return do_connect(a, (void *)b, c);
+	case SYS_sendto:
+	case SYS_recvfrom:
+		if (!socket_file(a)) return fd_file(a) ? -ENOTSOCK : -EBADF;
+		return rw(a, (char *)b, c, n == SYS_sendto);
+	case SYS_setsockopt:
+		/* Ports are free to rebind once closed, so SO_REUSEADDR is what the kernel already does. */
+		if (!socket_file(a)) return fd_file(a) ? -ENOTSOCK : -EBADF;
+		return b == SOL_SOCKET && c == SO_REUSEADDR ? 0 : -ENOPROTOOPT;
 	case SYS_uname:
 		*(struct utsname *)a = (struct utsname){ "MogOs", "mogos", "0.4", "", "aarch64" };
 		return 0;

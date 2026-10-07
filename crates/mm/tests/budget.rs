@@ -7,6 +7,16 @@ fn frame(i: u64) -> PhysAddr {
 }
 
 #[test]
+fn a_charge_counts_against_the_budget_until_refunded() {
+    let mut budget = Budget::new(10);
+    assert!(budget.charge(8));
+    assert!(!budget.charge(3));
+    assert_eq!(budget.remaining(), 2);
+    budget.refund(8);
+    assert_eq!(budget.remaining(), 10);
+}
+
+#[test]
 fn out_of_frames_charges_nothing() {
     let mut frames = FrameAllocator::<1>::new(frame(0)..frame(2));
     let mut budget = Budget::new(10);

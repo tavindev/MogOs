@@ -26,6 +26,8 @@ or the policy of who gets how many frames (`crates/kernel`, board `spawn`).
   use, so `empty()` (all bits set) hands out nothing.
 - `free` panics on a frame outside the allocator, misaligned, or not allocated (double free).
 - `Budget::alloc` and `alloc_contiguous` charge only on success: over budget or out of frames charges nothing.
+- `Budget::charge` counts frames the kernel holds outside the allocator (the network's socket pool) and refuses,
+  charging nothing, over budget; `refund` undoes it.
 - `Budget::shrink` panics if fewer than `frames` remain (`"budget overdrawn"`); `grow` returns a child's frames.
 - `alloc` is a hot path (first non-full word, `trailing_ones`).
 - Performance is the moat: a slowdown is never accepted because it has an explanation; it is removed, or shown to

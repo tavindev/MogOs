@@ -8,6 +8,7 @@ use mogfs::Inode;
 
 use crate::Clamp;
 use crate::mutex::Mutex;
+use crate::network::Sock;
 use crate::pipe::End;
 use crate::syscall::{EACCES, EBADF, EMFILE};
 
@@ -26,6 +27,9 @@ pub const TRANSFER: Rights = 1 << 4;
 pub const EXEC: Rights = 1 << 5;
 pub const WAIT: Rights = 1 << 6;
 pub const KILL: Rights = 1 << 7;
+/// A NetStack handle's: open connections, and listen.
+pub const CONNECT: Rights = 1 << 8;
+pub const LISTEN: Rights = 1 << 9;
 
 /// An init's boot archive handle: it spawns from it.
 pub const INIT_ARCHIVE: Rights = READ | EXEC;
@@ -59,6 +63,9 @@ pub enum Object {
     Node(Inode),
     Pipe(End),
     Mutex(Mutex),
+    /// Network access: sockets, with the `CONNECT` and `LISTEN` rights it holds.
+    NetStack,
+    Socket(Sock),
 }
 
 /// A handle table; `C` clamps each user handle's index before its load.

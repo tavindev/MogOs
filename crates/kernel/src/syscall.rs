@@ -5,8 +5,11 @@ use core::ops::Range;
 use mogfs::Inode;
 
 use crate::Clamp;
-use crate::handle::{EXEC, Handles, KILL as KILL_RIGHT, MAX_HANDLES, Object, READ, WRITE};
+use crate::handle::{
+    CONNECT, EXEC, Handles, KILL as KILL_RIGHT, LISTEN, MAX_HANDLES, Object, READ, Rights, WRITE,
+};
 use crate::mutex::Mutex;
+use crate::network::{OP_ACCEPT, OP_CONNECT, OP_RECEIVE, OP_SEND, Sock};
 use crate::pipe::End;
 
 /// `exit(code)`: ends the calling process, every thread; `wait` reports the low 8 bits of `code`.
@@ -87,6 +90,32 @@ const THREAD: u64 = 18;
 /// `thread_exit(code)`: ends the calling thread; its process ends with its last thread, with this code. A join
 /// reports the low 8 bits of `code`.
 const THREAD_EXIT: u64 = 19;
+/// `socket(net)`: returns a handle (read, write, duplicate, transfer) to a new TCP socket on the NetStack `net`, which
+/// needs `CONNECT` or `LISTEN` and passes the socket those of the two it holds. Its buffers are charged to the
+/// caller's budget until the last handle closes (`ENOBUFS`); `ENFILE` when the socket table is full.
+const SOCKET: u64 = 20;
+/// `bind(socket, port, ip)`: sets the local port `listen` and `connect` use (0, the default, picks an ephemeral one
+/// for `connect`; write right) and, for `listen`, the address: 0 listens on every interface, 127.0.0.1 (a big-endian
+/// `u32`) on loopback only, anything else is `EADDRNOTAVAIL`; returns 0. `EINVAL` once listening or connected.
+const BIND: u64 = 21;
+/// `listen(socket)`: listens on the bound port (`EINVAL` without one) on every interface (write right and `LISTEN`, else
+/// `EACCES`; `EADDRINUSE`); returns 0.
+const LISTEN_CALL: u64 = 22;
+/// `io_submit(socket, op, ptr, len, tag)`: starts `op` and returns 0 at once; `io_wait` reports its result with `tag`.
+/// `OP_RECEIVE` reads at most `len` bytes into `ptr` (read right; 0 is the end of the stream), `OP_SEND` queues up to
+/// `len` bytes from `ptr` (write right) and reports how many, `OP_ACCEPT` (read right) reports a handle to the next
+/// connection on a listening socket (its buffers charged to the caller's budget), `OP_CONNECT` (write right and
+/// `CONNECT`) opens a connection to the IPv4 address `ptr` (a big-endian `u32`), port `len`, and reports 0 once it is
+/// established. A buffer must lie in user space and stays the caller's until the result is reported; `len` over
+/// `MAX_BUFFER` moves at most `MAX_BUFFER`. A socket takes one op that receives (receive, accept, connect) and one send
+/// at a time (`EBUSY`). Closing the last handle drops its ops unreported.
+const IO_SUBMIT: u64 = 23;
+/// `io_wait()`: waits until an op the caller submitted finishes; returns its result, and its tag in x1. `EINVAL` if
+/// none is in flight.
+const IO_WAIT: u64 = 24;
+/// `shutdown(socket)`: ends the send side (write right): a FIN follows the queued data; returns 0. `ENOTCONN` unless
+/// connected.
+const SHUTDOWN: u64 = 25;
 
 /// Most arguments a `spawn` passes.
 pub const MAX_ARGS: usize = 32;
@@ -155,6 +184,28 @@ pub const ENAMETOOLONG: i64 = -36;
 const ENOSYS: i64 = -38;
 /// Unlinking a directory that has entries.
 pub const ENOTEMPTY: i64 = -39;
+/// Listening on a port that is taken.
+pub const EADDRINUSE: i64 = -98;
+/// Binding to an address other than any or 127.0.0.1.
+pub const EADDRNOTAVAIL: i64 = -99;
+/// 127.0.0.1, as `bind` takes it.
+const LOCALHOST: u64 = 0x7f00_0001;
+/// Connecting off the loopback network without a NIC, or with no route.
+pub const ENETUNREACH: i64 = -101;
+/// The peer reset the connection.
+pub const ECONNRESET: i64 = -104;
+/// A socket's buffers are over the budget.
+pub const ENOBUFS: i64 = -105;
+/// Connecting a socket that is connected or listening.
+pub const EISCONN: i64 = -106;
+/// Using a socket that is not connected.
+pub const ENOTCONN: i64 = -107;
+/// The peer stopped answering.
+pub const ETIMEDOUT: i64 = -110;
+/// The peer refused the connection.
+pub const ECONNREFUSED: i64 = -111;
+/// An ICMP error answered the connection request.
+pub const EHOSTUNREACH: i64 = -113;
 
 /// User virtual addresses: 4 GiB up to the 39-bit VA limit.
 const USER: Range<u64> = 1 << 32..1 << 39;
@@ -287,6 +338,31 @@ pub enum Call {
         slot: usize,
         generation: u64,
     },
+    /// A socket call: one variant, so the board handles them all out of its hot path.
+    Net(NetCall),
+}
+
+pub enum NetCall {
+    /// Create a socket with these NetStack rights.
+    Socket(Rights),
+    Bind {
+        sock: Sock,
+        port: u16,
+        loopback: bool,
+    },
+    Listen(Sock),
+    /// Submit `op` on `sock`; for a receive or send `ptr..ptr + len` is in `USER` unless empty, but may be unmapped.
+    /// `rights` are the handle's: an accepted connection's handle gets no more.
+    Submit {
+        sock: Sock,
+        op: u8,
+        rights: u16,
+        ptr: u64,
+        len: u32,
+        tag: u64,
+    },
+    IoWait,
+    Shutdown(Sock),
 }
 
 const _: () = assert!(size_of::<Call>() == 56, "every syscall returns a Call");
@@ -294,10 +370,10 @@ const _: () = assert!(size_of::<Call>() == 56, "every syscall returns a Call");
 /// Runs syscall `nr` with arguments `args` (`x0`-`x6`) against the caller's `handles`, leaving the board the parts
 /// that touch hardware or tasks; `Err` holds the result to return.
 pub fn dispatch<C: Clamp>(nr: u64, args: &[u64; 7], handles: &mut Handles<C>) -> Result<Call, i64> {
-    if nr > THREAD_EXIT {
+    if nr > SHUTDOWN {
         return Err(ENOSYS);
     }
-    let nr = C::clamp(nr as usize, THREAD_EXIT as usize + 1) as u64;
+    let nr = C::clamp(nr as usize, SHUTDOWN as usize + 1) as u64;
     match nr {
         EXIT => Ok(Call::Exit(args[0] & 0xff)),
         THREAD_EXIT => Ok(Call::ThreadExit(args[0] & 0xff)),
@@ -440,7 +516,66 @@ pub fn dispatch<C: Clamp>(nr: u64, args: &[u64; 7], handles: &mut Handles<C>) ->
             Object::Dir(_) | Object::Node(_) => Ok(Call::Sync),
             _ => Err(ENOTDIR),
         },
+        SOCKET => match handles.entry(args[0])? {
+            (Object::NetStack, rights) if rights & (CONNECT | LISTEN) != 0 => {
+                Ok(Call::Net(NetCall::Socket(rights)))
+            }
+            _ => Err(EACCES),
+        },
+        BIND => {
+            let sock = socket(handles, args[0], WRITE)?;
+            let port = u16::try_from(args[1]).map_err(|_| EINVAL)?;
+            let loopback = match args[2] {
+                0 => false,
+                LOCALHOST => true,
+                _ => return Err(EADDRNOTAVAIL),
+            };
+            Ok(Call::Net(NetCall::Bind {
+                sock,
+                port,
+                loopback,
+            }))
+        }
+        LISTEN_CALL => Ok(Call::Net(NetCall::Listen(socket(handles, args[0], WRITE)?))),
+        IO_SUBMIT => {
+            let (op, ptr, len, tag) = (args[1], args[2], args[3], args[4]);
+            let need = match op {
+                OP_RECEIVE | OP_ACCEPT => READ,
+                OP_SEND | OP_CONNECT => WRITE,
+                _ => return Err(EINVAL),
+            };
+            let sock = socket(handles, args[0], need)?;
+            let (_, rights) = handles.entry(args[0])?;
+            let len = match op {
+                OP_RECEIVE | OP_SEND => {
+                    let len = len.min(MAX_BUFFER);
+                    user_buffer(ptr, len)?;
+                    len
+                }
+                _ => len.min(u32::MAX.into()),
+            };
+            Ok(Call::Net(NetCall::Submit {
+                sock,
+                op: op as u8,
+                rights: rights as u16,
+                ptr,
+                len: len as u32,
+                tag,
+            }))
+        }
+        IO_WAIT => Ok(Call::Net(NetCall::IoWait)),
+        SHUTDOWN => Ok(Call::Net(NetCall::Shutdown(socket(
+            handles, args[0], WRITE,
+        )?))),
         _ => Err(ENOSYS),
+    }
+}
+
+/// The socket `handle` reaches, if it holds the rights in `need`.
+fn socket<C: Clamp>(handles: &Handles<C>, handle: u64, need: Rights) -> Result<Sock, i64> {
+    match handles.get(handle, need)? {
+        Object::Socket(sock) => Ok(sock),
+        _ => Err(EACCES),
     }
 }
 

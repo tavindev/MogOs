@@ -77,7 +77,7 @@ Speed is a primary goal, so performance is tested like behavior: measured, recor
 | `mutex` | 38.2 | 36.4 |
 | `lock`, uncontended | 36.9 | 33.1 |
 | `unlock`, no waiter | 37.9 | 35.9 |
-| unknown syscall 18, `ENOSYS` (`enosys`) | 32.9 | 30.0 |
+| unknown syscall 64 (18 before phase 8 step 50), `ENOSYS` (`enosys`) | 32.9 | 30.0 |
 
 ## Shell command baselines
 
@@ -110,6 +110,23 @@ Speed is a primary goal, so performance is tested like behavior: measured, recor
 | `mogfs` lookup in a 400-entry directory, in-memory disk (ns/op) | Host, M4 Pro | 758 | 784 | phase 4 MogFS unlink and rename |
 | `net` UDP over the loss-free simulated link: `send_to` on A, `poll` + `recv_from` on B, batches of 16, 64-byte / 1472-byte datagrams (ns/datagram; 17.9 / 7.5 M datagrams/s at the median) | Host, M4 Pro | 53.6 / 130.3 | 55.8 / 133.7 | phase 8 step 46 |
 | `net` UDP receive path: parse, checksum, demux, copy into the socket buffer and out with `recv_from`, 64-byte / 1472-byte datagrams (ns/frame) | Host, M4 Pro | 29.7 / 68.3 | 30.8 / 70.8 | phase 8 step 46 |
+| `net` UDP receive path as above, 1472-byte datagrams, after step 47's second review (ns/frame; a code-placement artifact, not added work: the UDP path did not change, 6 interleaved sessions read 66.3-67.8 against 64.3-65.2 ns for 9c4ca51, and both built with `-C llvm-args=-align-loops=64` read 65.5-67.7 against 65.2-66.1; a workspace-wide alignment flag is queued as its own experiment) | Host, M4 Pro | 66.3 | 68.6 | phase 8 step 47 second review |
+| `net` TCP goodput over the loss-free simulated link (no delay), A sends 64 MiB to B, which reads as it goes; 64 KiB / 1 MiB windows (MiB/s, higher is better; load 11-12, best minimum and median of 6 interleaved sessions' medians) | Host, M4 Pro | 6366 / 5621 | 6448 / 5683 | phase 8 step 47 review |
+| `net` TCP receive path per data segment (nearly all 1460 bytes): checksum, demux, sequence checks, copy into the ring, the ACK built, copy out with `recv`; recorded segments replayed into the same connection (ns/segment; load 11-12, 6 sessions) | Host, M4 Pro | 76.7 | 80.0 | phase 8 step 47 review |
+| `net` TCP receive path per data segment as above, with 63 idle connections in the slots before it (the last-matched-slot hint; the rest is `poll` walking 65 slots per batch of 16) (ns/segment; load 11-12, 6 sessions) | Host, M4 Pro | 87.4 | 92.1 | phase 8 step 47 review |
+| `net` TCP connect + accept + close from each side, through TIME_WAIT, over the loss-free link, 10000 sequential connections (ns/connection; load 19-25, 4 interleaved sessions) | Host, M4 Pro | 398.5 | 407.7 | phase 8 step 47 second review |
+| `net` TCP connect + accept + close as above, every connection through a SYN cookie (no half-open table) (ns/connection; load 19-25, 4 sessions) | Host, M4 Pro | 407.5 | 420.0 | phase 8 step 47 second review |
+| `net` `poll` with nothing to do: a listener, 2 slots, a 4 / 64 / 4096-entry half-open table (ns/poll; the table walk ran every poll before: 8.3 / 24.6 / 1196 ns) | Host, M4 Pro | 6.8 / 6.8 / 6.9 | 7.0 / 7.1 / 7.0 | phase 8 step 47 second review |
+| `net` TCP SYN answered with a SYN-ACK while filling a fresh half-open table of 64 / 4096 entries (O(1): a keyed mix picks a run of 8 slots; 3% / 2% of these SYNs overflow to cookies; the linear scan it replaced: 68.4-82.8 / 2004-2300 ns minimums), and with a cookie (ns/SYN; load about 8, 3 interleaved sessions) | Host, M4 Pro | 47.6 / 44.7 / 29.2 | 49.8 / 45.9 / 30.4 | phase 8 step 47 review |
+| `net` TCP simulated goodput (virtual time, deterministic per seed), NewReno, 16 MiB A to B, 1 MiB window, RTO floor 200 ms, 11 seeds: 1% loss at 10 / 50 ms RTT, 5% loss at 10 / 50 ms RTT (MiB/s, higher is better; step 48's SACK baseline, same seeds, window and floor) | Host, simulated | 1.37 / 0.28 / 0.30 / 0.11 | 1.52 / 0.31 / 0.34 / 0.11 | phase 8 step 47 review |
+| `mogfs` (v1) create + 100-byte write + commit, 400 files, 16384-block (64 MiB) in-memory disk, from a scratch copy of its bench (ns/op) | Host, M4 Pro, 3 runs interleaved with `mogfs2` | 2007 | 2087 | phase 7 step 39 |
+| `mogfs2` create + 100-byte write + commit, 400 files in one directory, 1024-block in-memory disk, 64-slot cache (ns/op; v1 1951-1976 interleaved) | Host, M4 Pro, 6 runs interleaved with v1 | 1807 | 1853-1900 | phase 7 step 39 |
+| `mogfs2` the same on a 16384-block (64 MiB) disk (ns/op; v1 2076-2098 interleaved) | Host, M4 Pro, 3 runs | 1869 | 1934-1951 | phase 7 step 39 |
+| `mogfs2` lookup in a 400-entry directory (ns/op; checks the entry against the inode it names) | Host, M4 Pro | 115 | 121 | phase 7 step 39 |
+| `mogfs2` lookup in a 100k-entry directory, 64-slot cache (ns/op; two leaf reads and checks per lookup) | Host, M4 Pro, 11 runs | 1359 | 1401 | phase 7 step 39 |
+| `mogfs2` 1 GiB file: sequential 1 MiB writes + commit / sequential read, in-memory disk (MiB/s, higher is better) | Host, M4 Pro, 5 runs (busy machine) | 3832 / 5829 | 7413 / 11364 | phase 7 step 39 |
+| `mogfs2` mount after the 1 GiB file (ns; 16 requests: the superblocks, the live bitmap index and pages, the rightmost path, the older slot's index and the pages it does not share) | Host, M4 Pro, 5 runs | 16375 | 17125 | phase 7 step 39 |
+| `mogfs2` 64 MiB file sequential read, fresh / after 16384 random 4 KiB overwrites + commit (fragmentation; MiB/s) | Host, M4 Pro, 11 runs | 8757 / 4335 | 12683 / 4889 | phase 7 step 39 |
 | Kernel boot, kmain to end of init (us) | QEMU TCG, dev build | 2928 | 3140 | uncommitted |
 | Kernel boot, kmain to end of init (us) | QEMU hvf (`-cpu cortex-a72`), dev build, 21 boots | 157 | 178 | phase 3 step 11 |
 | Kernel boot, kmain to end of init, `-smp 1` (us; base 179 / 199 and its A/A copy 178 / 199 in the same run) | QEMU hvf (`-cpu cortex-a72`), dev build, 63 interleaved boots, load about 11 | 181 | 199 | phase 5 step 25a |
@@ -136,6 +153,11 @@ Speed is a primary goal, so performance is tested like behavior: measured, recor
 | Kernel boot, kmain to end of init, `-smp 1`, no disk (us; base 188 / 243 in the same run, held: boot's one `alloc_contiguous` is under the noise) | QEMU hvf (`-cpu cortex-a72`), dev build, 41 interleaved boots, load about 11 | 194 | 243 | `mm` word-wise `alloc_contiguous` |
 | Kernel boot with a MogFS disk mounted, mount in 3 requests (us; 2-block superblock read) | QEMU hvf (`-cpu cortex-a72`), dev build, 42 interleaved boots (busy machine) | 294 | 342 | phase 4 shell commands |
 | `Board::disk` probe, timed in the kernel around the call (us; no disk: one device-ID read; disk: one read plus the setup) | QEMU hvf (`-cpu cortex-a72`), dev build, 21 boots each | 1 / 45 | 2 / 50 | phase 4 step 20 |
+| Network: `test=bench-net` with `net=10.0.2.15/24,gw=10.0.2.2 udp=<port>`, 64-byte UDP datagrams to a host echo (`python3`, on 127.0.0.1) through QEMU's user network: one round trip / one send of a 10000 burst / one datagram each way with 16 in flight (ns; QEMU's user network and the host echo dominate: each send is one queue notify, which QEMU serves in the vCPU thread with a host `sendto`) | QEMU hvf (`-cpu cortex-a72`), dev build, 21 boots, load about 39 | 42820 / 13522 / 16049 | 56683 / 16135 / 20201 | phase 8 step 49 |
+| Kernel boot with a NIC and `net=` (us; the NIC's setup and its 66 frames; without `net=` the NIC is never probed; base without a NIC 198 / 236 in the same run) | QEMU hvf (`-cpu cortex-a72`), dev build, 21 interleaved boots, load about 39 | 260 | 296 | phase 8 step 49 |
+| Loopback TCP, `test=bench-sockets` (`nettest bench` against `nettest benchserve`, each its own process): 64-byte send + receive round trip / connect + close / one 4 KiB send of a 16 MiB stream (ns; the stream is 1134 MiB/s at the median; the pipe's round trip is about 390 ns in the same conditions: each TCP round trip also carries two segments, four syscalls a side and the net task's polls) | QEMU hvf (`-cpu cortex-a72`), dev build, 21 boots, load about 9 | 2824 / 2376 / 3371 | 2889 / 2516 / 3446 | phase 8 step 50 |
+| HTTP through QEMU's `hostfwd` (`test=httpd`): host to guest, a GET round trip on a new connection timed by a Python client (us) / guest to host, `fetch` of a 20-byte page from a Python server, 200 GETs, mean per GET (us; 3 boots) / 64 MiB to `httpd`'s echo, both ways at once (MiB/s each way; 3 runs) / 64 MiB fetched from the host (MiB/s; 3 boots). QEMU's user network ends TCP in QEMU, so these measure it more than our stack; recorded as found (min / median columns: best and median of the runs) | QEMU hvf (`-cpu cortex-a72`), dev build, load about 31 | 104 / 195 / 67.5 / 148 | 156 / 212 / 66.3 / 148 | phase 8 step 51 |
+| Phase 8 (steps 49-51) against main `a597dcf`, exact TCG instruction counts (`-icount shift=0`): yield / syscall / pipe round trip, boot without bootargs (instructions; boot in us of 1000) | QEMU TCG, `-icount shift=0`, dev build | 345 / 218 / 2480 / 156 | same; main 345 / 218 / 2480 / 163 | phase 8 step 51 |
 
 ## Cross-OS comparison
 

@@ -98,6 +98,18 @@ impl<'a> Dtb<'a> {
         })
     }
 
+    /// The first 16 bytes of `/chosen/rng-seed` (QEMU fills it with random bytes on every boot).
+    pub fn rng_seed(&self) -> Option<[u64; 2]> {
+        self.find(|p| {
+            if p.depth != 2 || p.node != b"chosen" || p.name != b"rng-seed" {
+                return None;
+            }
+            let (seed, _) = p.value.split_first_chunk::<16>()?;
+            let (a, b) = seed.split_at(8);
+            Some([a, b].map(|half| u64::from_be_bytes(half.try_into().unwrap())))
+        })
+    }
+
     /// Walks every property in order and returns the first `Some` from `f`.
     fn find<T>(&self, mut f: impl FnMut(&Prop<'a>) -> Option<T>) -> Option<T> {
         let (mut pos, mut depth, mut node, mut node_offset) = (0, 0, &[][..], 0);
