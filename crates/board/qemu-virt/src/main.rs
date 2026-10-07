@@ -749,12 +749,17 @@ impl kernel::Board for QemuVirt {
             count += 1;
             None::<()>
         });
-        // Last first: QEMU `virt` fills the transports from the highest address down.
-        bases[..count].iter().rev().find_map(|&base| {
+        // QEMU `virt` fills the transports from the highest address down with no gaps, so the first empty one ends them.
+        for &base in bases[..count].iter().rev() {
             // SAFETY: the DTB's virtio-mmio transports, in the device-mapped GiB 0, driven only here (`DISK_TAKEN`);
             // frames from the allocator are identity-mapped RAM nobody else uses.
-            unsafe { VirtioBlk::new(base, alloc) }
-        })
+            match unsafe { VirtioBlk::new(base, alloc) } {
+                Ok(disk) => return Some(disk),
+                Err(0) => break,
+                Err(_) => {}
+            }
+        }
+        None
     }
 }
 

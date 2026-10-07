@@ -20,7 +20,8 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
 - `VirtioBlk` (`src/virtio_blk.rs`) implements `kernel::Disk`: modern (version 2) virtio-mmio only, one 4-entry
   queue in one frame, one request in flight, completion polled (no IRQ), DMA straight to the caller's blocks (only
   inside the identity-mapped RAM GiB, else `EFAULT`), requests past the capacity `EIO`. `Board::disk` hands it out
-  once (`DISK_TAKEN`), scanning the DTB's `virtio,mmio` transports last first (QEMU fills them from the top).
+  once (`DISK_TAKEN`), scanning the DTB's `virtio,mmio` transports from the highest down and stopping at the first empty one
+  (QEMU `virt` fills them from the top with no gaps; a board fact like `UART_IRQ`).
 - `build.rs`: nested `cargo build` of `crates/user` into `target/user`, newc `boot.cpio` into `OUT_DIR` (plus a
   non-ELF `bad` entry), `-T linker.ld`. Why it is built this way: `docs/DEVELOPMENT.md` settings table.
 

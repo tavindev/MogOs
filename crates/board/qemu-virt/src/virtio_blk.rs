@@ -106,12 +106,15 @@ pub struct VirtioBlk {
 
 impl VirtioBlk {
     /// Sets up the block device at `base`, if there is one, with its queue in a frame from `alloc`; marks a block
-    /// device it cannot set up as failed.
+    /// device it cannot set up as failed. Otherwise returns the transport's device ID (0: empty).
     ///
     /// # Safety
     /// `base` must be a virtio-mmio transport in device memory that nothing else drives, and `alloc`'s frames
     /// identity-mapped RAM that nothing else uses.
-    pub unsafe fn new(base: PhysAddr, alloc: impl FnOnce() -> Option<PhysAddr>) -> Option<Self> {
+    pub unsafe fn new(
+        base: PhysAddr,
+        alloc: impl FnOnce() -> Option<PhysAddr>,
+    ) -> Result<Self, u32> {
         let mut disk = Self {
             base,
             queue: PhysAddr(0),
@@ -119,16 +122,20 @@ impl VirtioBlk {
             idx: 0,
         };
         // Device ID first, so an empty transport (ID 0) costs one read; the DTB vouches for the magic value.
-        if disk.reg(DEVICE_ID) != BLOCK_DEVICE || disk.reg(VERSION) != 2 {
-            return None;
+        let id = disk.reg(DEVICE_ID);
+        if id != BLOCK_DEVICE || disk.reg(VERSION) != 2 {
+            return Err(id);
         }
-        disk.set(STATUS, 0);
+        // A device that reads status 0 is already reset, and the reset write costs QEMU about 20 us under hvf.
+        if disk.reg(STATUS) != 0 {
+            disk.set(STATUS, 0);
+        }
         disk.set(STATUS, ACKNOWLEDGE | DRIVER);
         if disk.setup(alloc).is_none() {
             disk.set(STATUS, FAILED);
-            return None;
+            return Err(id);
         }
-        Some(disk)
+        Ok(disk)
     }
 
     /// Negotiates features, reads the capacity and sets up the queue, up to `DRIVER_OK`.
