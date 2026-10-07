@@ -223,6 +223,9 @@ const PI_BUDGET: usize = 38;
 /// `threads`' 10 frames, its four threads' stack pages, their map table and 4 kernel stack frames each, a pipe page,
 /// and the 18 it gives `victim`, with 2 to spare.
 const THREADS_BUDGET: usize = 52;
+/// `refund`'s 9 frames, its thread's stack page, map table and 4 kernel stack frames, a pipe page, and the 9 and 14 it
+/// gives `nop` and `refundc`, with 9 to spare.
+const REFUND_BUDGET: usize = 48;
 /// `fuzz`'s own frames, its scratch memory and `map`s, its pipes and its `nop` children: a child whose handle closes
 /// before it exits gives its frames back to the system, not to `fuzz`, so a million calls spend a few thousand.
 const FUZZ_BUDGET: usize = 8192;
@@ -358,6 +361,7 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
                 board.start_timer();
                 run_archived(board, "threads", "threads", (THREADS_BUDGET, INIT_ARCHIVE));
             }
+            "test=refund" => run_archived(board, "refund", "refund", (REFUND_BUDGET, INIT_ARCHIVE)),
             "test=bench-threads" => run_archived(
                 board,
                 "bench-threads",

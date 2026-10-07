@@ -50,9 +50,7 @@ unsafe extern "C" fn board_unlock() {
 /// # Safety
 /// IRQs must be masked (trap context), and `frame` `cpu`'s current trap frame.
 unsafe fn switch(sched: &mut Sched, cpu: usize, frame: usize) -> usize {
-    let from = sched.process(cpu);
-    let next = sched.switch(cpu, frame);
-    let to = sched.process(cpu);
+    let (next, from, to) = sched.switch(cpu, frame);
     if to != from || (to != 0 && next != frame) {
         // SAFETY: `frame` came from the trap path and `next` from the scheduler.
         unsafe { arch::switch_el0_regs(frame, next) };
@@ -207,8 +205,8 @@ unsafe fn block(
     unsafe { switch(&mut kernel.sched, cpu, at) }
 }
 
-/// Drops one handle to `object`: an ended process frees its index and, as `wait` does, moves its budget to `cpu`'s
-/// current process; an ended thread frees its slot; a pipe wakes its waiters and, once no handle reaches it, frees its
+/// Drops one handle to `object` that the process at `holder` held: an ended process frees its index and, as `wait`
+/// does, moves its budget to `holder`; an ended thread frees its slot; a pipe wakes its waiters and, once no handle reaches it, frees its
 /// page, refunding its creator if that still runs; the last handle to a mutex frees it.
 fn release(
     sched: &mut Sched,
@@ -225,11 +223,7 @@ fn release(
         Object::Process { index, generation } => {
             let limit = sched.close(index, generation);
             let held = pipes.charged_to((index, generation));
-            let current = sched.process(cpu);
-            return sched
-                .memory(current)
-                .budget
-                .grow(limit.saturating_sub(held));
+            return sched.memory(holder).budget.grow(limit.saturating_sub(held));
         }
         Object::Thread { slot, generation } => return sched.close_thread(slot, generation),
         _ => return,

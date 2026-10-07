@@ -773,6 +773,8 @@ fn kick(sched: &mut Sched, cpu: usize) {
 }
 
 /// Signals up to `woken` idle cores other than `cpu`.
+#[cold]
+#[inline(never)]
 fn signal(sched: &mut Sched, cpu: usize, woken: usize) {
     for _ in 0..woken {
         let Some(core) = sched.claim_idle(cpu) else {
