@@ -582,21 +582,28 @@ impl<const N: usize, const P: usize> Scheduler<N, P> {
 
     /// A live thread of the process at `index` that no core but `cpu` runs, if it has one.
     pub fn thread_of(&self, index: usize, cpu: usize) -> Option<usize> {
-        let threads = self.processes.threads[index] & !self.elsewhere(cpu);
-        (threads != 0).then(|| threads.trailing_zeros() as usize)
+        self.threads_of(index).find(|&s| !self.elsewhere(s, cpu))
     }
 
     /// The live threads of the process at `index` that cores other than `cpu` run, a bit per slot.
     pub fn threads_elsewhere(&self, index: usize, cpu: usize) -> u64 {
-        self.processes.threads[index] & self.elsewhere(cpu)
+        (self.threads_of(index).filter(|&s| self.elsewhere(s, cpu)))
+            .fold(0, |mask, s| mask | bit(s))
     }
 
-    /// The slots cores other than `cpu` run.
-    fn elsewhere(&self, cpu: usize) -> u64 {
-        let here = self.cores[cpu].current;
-        (0..self.end)
-            .filter(|&s| s != here && self.on_core[s])
-            .fold(0, |mask, s| mask | bit(s))
+    /// The live threads of the process at `index`, in slot order: only its own, not every slot.
+    fn threads_of(&self, index: usize) -> impl Iterator<Item = usize> {
+        let mut threads = self.processes.threads[index];
+        core::iter::from_fn(move || {
+            let slot = (threads != 0).then(|| threads.trailing_zeros() as usize)?;
+            threads &= threads - 1;
+            Some(slot)
+        })
+    }
+
+    /// Whether a core other than `cpu` runs `slot`.
+    fn elsewhere(&self, slot: usize, cpu: usize) -> bool {
+        self.on_core[slot] && slot != self.cores[cpu].current
     }
 
     /// `cpu`'s current task's own priority.
