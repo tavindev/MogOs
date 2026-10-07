@@ -65,7 +65,7 @@ fn boot_with_input(extra: &[&str], mut input: Option<(&str, &[u8])>) -> (ExitSta
         if let Some((ready, bytes)) = input
             && String::from_utf8_lossy(&out.lock().unwrap()).contains(ready)
         {
-            qemu.stdin.as_mut().unwrap().write_all(bytes).unwrap();
+            let _ = qemu.stdin.as_mut().unwrap().write_all(bytes);
             input = None;
         }
         sleep(Duration::from_millis(50));
@@ -427,9 +427,9 @@ fn pipe_bench_reports_round_trip() {
 }
 
 #[test]
-fn console_read_returns_the_edited_line() {
-    // Written once `echo` runs, so the UART receive interrupt is already on.
-    let input = Some(("E: ready", &b"hel\x7flo\r"[..]));
+fn console_reads_edited_lines_typed_ahead() {
+    // Both lines in one write once `E: ready` is out, when the first read is already blocked.
+    let input = Some(("E: ready", &b"hel\x7flo\rbye\r"[..]));
     let (status, lines) = boot_with_input(&["-append", "test=echo"], input);
     assert!(
         !lines.iter().any(|l| l.starts_with("panic:")),
@@ -439,9 +439,17 @@ fn console_read_returns_the_edited_line() {
         .iter()
         .position(|l| l == "E: ready")
         .expect("missing ready line");
-    // The echo erases the `l` with `\b \b`; the program reads the line without it.
-    let console: Vec<_> = lines[start..].iter().take(3).collect();
-    assert_eq!(console, ["E: ready", "hel\u{8} \u{8}lo", "got: helo"]);
+    let console: Vec<_> = lines[start..].iter().take(5).collect();
+    assert_eq!(
+        console,
+        [
+            "E: ready",
+            "hel\u{8} \u{8}lo",
+            "bye",
+            "got: helo",
+            "got: bye"
+        ]
+    );
     assert_no_leak(&lines, "echo");
     assert!(status.success(), "QEMU exited with {status}");
 }

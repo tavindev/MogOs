@@ -53,11 +53,16 @@ fn a_full_line_drops_more_chars_but_still_takes_enter() {
 }
 
 #[test]
-fn input_is_dropped_while_a_line_is_pending() {
+fn lines_typed_ahead_are_read_one_at_a_time() {
     let mut line = Line::new();
-    feed(&mut line, b"a\r");
-    assert_eq!(feed(&mut line, b"b\r"), (Vec::new(), false));
+    let (echo, _) = feed(&mut line, b"a\rb\x7f\x7fc\r");
+    assert_eq!(
+        echo, b"a\nb\x08 \x08c\n",
+        "backspace stops at a completed line"
+    );
     assert_eq!(read(&mut line).as_deref(), Some(&b"a\n"[..]));
+    assert_eq!(read(&mut line).as_deref(), Some(&b"c\n"[..]));
+    assert_eq!(read(&mut line), None);
 }
 
 #[test]

@@ -2,22 +2,18 @@ use mm::PhysAddr;
 
 const GICD_CTLR: u64 = 0x000;
 const GICD_ISENABLER: u64 = 0x100;
-const GICD_ITARGETSR: u64 = 0x800;
-const GICD_ICFGR: u64 = 0xc00;
 const GICC_CTLR: u64 = 0x000;
 const GICC_PMR: u64 = 0x004;
 const GICC_IAR: u64 = 0x00c;
 const GICC_EOIR: u64 = 0x010;
 
-/// Turns on the GICv2 distributor at `dist` and CPU interface at `cpu`, and enables interrupt `irq`.
+/// Turns on the GICv2 distributor at `dist` and CPU interface at `cpu`, letting every priority through.
 ///
 /// # Safety
 ///
 /// `dist` and `cpu` must be a GICv2's distributor and CPU interface, mapped as Device memory.
-pub unsafe fn enable(dist: PhysAddr, cpu: PhysAddr, irq: u32) {
-    let isenabler = dist.0 + GICD_ISENABLER + 4 * (irq / 32) as u64;
+pub unsafe fn enable(dist: PhysAddr, cpu: PhysAddr) {
     let writes = [
-        (isenabler, 1 << (irq % 32)),
         (dist.0 + GICD_CTLR, 1),
         (cpu.0 + GICC_PMR, 0xff),
         (cpu.0 + GICC_CTLR, 1),
@@ -28,21 +24,15 @@ pub unsafe fn enable(dist: PhysAddr, cpu: PhysAddr, irq: u32) {
     }
 }
 
-/// Routes SPI `irq` of the GICv2 distributor at `dist` to CPU 0, edge-triggered if `edge`, else level-sensitive.
+/// Unmasks interrupt `irq` in the GICv2 distributor at `dist`.
 ///
 /// # Safety
 ///
-/// `dist` must be a GICv2 distributor, mapped as Device memory, and `irq` an SPI (32 or above) it implements.
-pub unsafe fn route_spi(dist: PhysAddr, irq: u32, edge: bool) {
-    let target = (dist.0 + GICD_ITARGETSR + irq as u64) as *mut u8;
-    let icfgr = (dist.0 + GICD_ICFGR + 4 * (irq / 16) as u64) as *mut u32;
-    let bit = 2 << (2 * (irq % 16));
-    // SAFETY: the caller guarantees `dist` is a GICv2 distributor implementing `irq`; ITARGETSR is byte-accessible.
-    unsafe { target.write_volatile(1) };
-    // SAFETY: as above.
-    let config = unsafe { icfgr.read_volatile() } & !bit;
-    // SAFETY: as above.
-    unsafe { icfgr.write_volatile(if edge { config | bit } else { config }) };
+/// `dist` must be a GICv2 distributor, mapped as Device memory.
+pub unsafe fn unmask(dist: PhysAddr, irq: u32) {
+    let isenabler = dist.0 + GICD_ISENABLER + 4 * (irq / 32) as u64;
+    // SAFETY: the caller guarantees `dist` is a GICv2 distributor.
+    unsafe { (isenabler as *mut u32).write_volatile(1 << (irq % 32)) };
 }
 
 /// Acknowledges the highest-priority pending interrupt and returns its `GICC_IAR` (1023 if spurious).

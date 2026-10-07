@@ -13,7 +13,7 @@ use core::ops::Range;
 use core::panic::PanicInfo;
 use core::ptr::{self, NonNull};
 use core::slice;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
+use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 use arch::{MemoryType, UserAccess, l1_block, user_page};
 use dtb::Dtb;
@@ -54,12 +54,12 @@ const IMAGE: Range<u64> = USER_BASE..USER_STACK_TOP - PAGE as u64;
 static ARCHIVE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/boot.cpio"));
 /// EL1 virtual timer PPI.
 const TIMER_IRQ: u32 = 27;
+/// PL011 SPI 1 on QEMU `virt`.
+const UART_IRQ: u32 = 33;
 const TICK_US: u64 = 10_000;
 
 /// GIC CPU interface base, set before the first IRQ can be delivered.
 static GIC_CPU: AtomicU64 = AtomicU64::new(0);
-/// The UART's interrupt ID, from the DTB.
-static UART_IRQ: AtomicU32 = AtomicU32::new(0);
 /// Boot context included; a task's slot is its ASID (8 bits).
 const MAX_TASKS: usize = 8;
 const _: () = assert!(MAX_TASKS <= 256);
@@ -626,10 +626,8 @@ impl kernel::Board for QemuVirt {
     }
 
     fn start_timer(&mut self) {
-        let (dist, cpu) = self.gic;
-        GIC_CPU.store(cpu.0, Relaxed);
-        // SAFETY: the DTB's GICv2 registers, in the device-mapped GiB 0.
-        unsafe { arch::gic::enable(dist, cpu, TIMER_IRQ) };
+        // SAFETY: the DTB's GICv2 distributor, in the device-mapped GiB 0.
+        unsafe { arch::gic::unmask(self.gic.0, TIMER_IRQ) };
         arch::timer::arm(TICK_US);
     }
 
@@ -741,14 +739,12 @@ extern "C" fn kmain() -> ! {
     let dtb = Dtb::new(blob).expect("bad DTB");
     let uart = dtb.uart().expect("no PL011 in DTB");
     let gic = dtb.gic().expect("no GICv2 in DTB");
-    let (uart_irq, edge) = dtb.uart_irq().expect("no PL011 interrupt in DTB");
     GIC_CPU.store(gic.1.0, Relaxed);
-    UART_IRQ.store(uart_irq, Relaxed);
-    // SAFETY: the DTB's GICv2 registers and the PL011's SPI, in the device-mapped GiB 0.
-    unsafe { arch::gic::route_spi(gic.0, uart_irq, edge) };
+    // SAFETY: the DTB's GICv2 registers, in the device-mapped GiB 0.
+    unsafe { arch::gic::enable(gic.0, gic.1) };
     // SAFETY: as above.
-    unsafe { arch::gic::enable(gic.0, gic.1, uart_irq) };
-    Uart::new(uart).enable_rx_irq();
+    unsafe { arch::gic::unmask(gic.0, UART_IRQ) };
+    Uart::new(UART0).enable_rx_irq();
 
     kernel::run(
         &mut QemuVirt {
@@ -771,7 +767,7 @@ unsafe extern "C" fn board_irq(frame: usize) -> usize {
     let tick = iar == TIMER_IRQ;
     if tick {
         arch::timer::arm(TICK_US);
-    } else if iar == UART_IRQ.load(Relaxed) {
+    } else if iar == UART_IRQ {
         // SAFETY: the caller masked IRQs on the only core, so this is the sole reference.
         let Kernel { sched, line, .. } = unsafe { &mut *KERNEL.0.get() };
         let mut uart = Uart::new(UART0);
