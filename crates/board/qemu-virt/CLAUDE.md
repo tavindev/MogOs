@@ -14,11 +14,12 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
 
 ## Responsibilities
 
-- `kmain`: turns on the MMU (`arch::enable_mmu`, first), reads the DTB at RAM base, routes `UART_IRQ` to core 0
-  (`GICD_ITARGETSR`, else a GIC with several cores delivers it nowhere), starts the DTB's other cores (at most
-  `MAX_CPUS`) with PSCI `CPU_ON` without waiting for them, builds `QemuVirt`, calls `kernel::run` with the image and DTB
-  reserved. `kmain_secondary`: a started core enables its GIC CPU interface, timer PPI and `RESCHEDULE_SGI` (its banked
-  `ISENABLER0`), prints `cpu <n>: online`, arms its timer and idles in `wfi`; it runs no task yet (step 25b).
+- `kmain`: turns on the MMU (`arch::enable_mmu`, first), reads the DTB at RAM base and its core count (at most
+  `MAX_CPUS`), routes `UART_IRQ` to core 0 (`GICD_ITARGETSR`, else a GIC with several cores delivers it nowhere), builds
+  `QemuVirt`, calls `kernel::run` with the image and DTB reserved. `Board::start_cpus`, the last step of boot, starts the
+  other cores with PSCI `CPU_ON` without waiting for them. `kmain_secondary`: a started core enables its GIC CPU
+  interface, timer PPI and `RESCHEDULE_SGI` (its banked `ISENABLER0`) and idles in `wfi`; only under `test=smp`
+  (`SMP_TEST`) does it print `cpu <n>: online` and arm its timer. It runs no task yet (step 25b).
 - `KERNEL: Lock<Kernel>` (`Scheduler`, `FrameAllocator`, `Pipes`, `Mutexes`, console `Line`, the MogFS `Fs<FsDisk>`
   and whether it is mounted), `HEAP` and `CONSOLE: Lock<Uart>` statics. `Fs::new` is const, so the 48 KiB file system is built in the static with an empty
   `FsDisk(None)` (`Io` until `Board::mount` puts the `VirtioBlk` in through `Fs::disk`). File syscalls run their disk I/O inside the trap under `KERNEL`: a `sync` holds it
@@ -69,7 +70,7 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
 - Locks need the MMU on (exclusives), so `kmain` calls `enable_mmu` first, before any output, trap or secondary core.
 - Only core 0 runs tasks: `board_irq` switches only there, since the scheduler has one `current`. Every core still
   takes `KERNEL` in its trap hooks. IRQs dispatch on `iar & 0x3ff` and EOI the full IAR.
-- `kmain` stores everything a secondary reads (`GIC_DIST`, `GIC_CPU`) before its `CPU_ON`, which `dsb ish` precedes.
+- Everything a secondary reads (`GIC_DIST`, `GIC_CPU`, `SMP_TEST`) is stored before its `CPU_ON`, which `dsb ish` precedes.
 - A process's slot is its ASID (`MAX_TASKS <= 256`, const-asserted); the boot table keeps ASID 0 (`enter`).
 - Every frame a process uses (tables, pages, kernel stack, pipe pages it creates) is charged to its `Budget`;
   `spawn_process` returns every frame on failure, `spawn` moves nothing on failure.

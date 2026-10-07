@@ -537,12 +537,7 @@ fn console_echo(extra: &[&str]) {
         .iter()
         .position(|l| l == "E: ready")
         .expect("missing ready line");
-    // A late secondary's whole `cpu <n>: online` line may land among them.
-    let console: Vec<_> = lines[start..]
-        .iter()
-        .filter(|l| !l.starts_with("cpu "))
-        .take(5)
-        .collect();
+    let console: Vec<_> = lines[start..].iter().take(5).collect();
     assert_eq!(
         console,
         [

@@ -110,8 +110,8 @@ Speed is a primary goal, so performance is tested like behavior: measured, recor
 | `net` UDP receive path: parse, checksum, demux, copy into the socket buffer and out with `recv_from`, 64-byte / 1472-byte datagrams (ns/frame) | Host, M4 Pro | 29.7 / 68.3 | 30.8 / 70.8 | phase 8 step 46 |
 | Kernel boot, kmain to end of init (us) | QEMU TCG, dev build | 2928 | 3140 | uncommitted |
 | Kernel boot, kmain to end of init (us) | QEMU hvf (`-cpu cortex-a72`), dev build, 21 boots | 157 | 178 | phase 3 step 11 |
-| Kernel boot, kmain to end of init, `-smp 1` (us; base 178 / 197 and its A/A copy 180 / 200 in the same run) | QEMU hvf (`-cpu cortex-a72`), dev build, 81 interleaved boots, load about 12 | 186 | 200 | phase 5 step 25a |
-| Kernel boot, kmain to end of init, `-smp 4` (us; base, whose secondaries stay off, 186 / 203; secondaries that only `wfi` cost 310 / 379, see phase 5 step 25a) | QEMU hvf (`-cpu cortex-a72`), dev build, 41 interleaved boots, load about 11 | 466 | 546 | phase 5 step 25a |
+| Kernel boot, kmain to end of init, `-smp 1` (us; base 179 / 196 and its A/A copy 180 / 197 in the same run) | QEMU hvf (`-cpu cortex-a72`), dev build, 63 interleaved boots, load about 10 | 181 | 202 | phase 5 step 25a |
+| Kernel boot, kmain to end of init, `-smp 4` (us; base, whose secondaries stay off, 180 / 201; the rest is the three `CPU_ON` calls, 27-126 us) | QEMU hvf (`-cpu cortex-a72`), dev build, 63 interleaved boots, load about 10 | 215 | 290 | phase 5 step 25a |
 | Yield round trip via `svc`, `test=bench`, 100000 trips (ns) | QEMU TCG, dev build, 11 boots | 1178 | 1218 | uncommitted |
 | Yield round trip via `svc`, `test=bench`, 100000 trips (ns) | QEMU hvf (`-cpu cortex-a72`), dev build, 21 boots | 68 | 70 | phase 3 step 16 |
 | Syscall round trip from EL0, `test=bench-syscall`, 100000 `print(sp, 0)` timed in user space (ns; before `print` became `write`) | QEMU TCG, dev build, 11 boots | 621 | 637 | phase 3 step 11 |

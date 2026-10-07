@@ -81,7 +81,10 @@ pub trait Board {
     fn lock_round_trips(&mut self, n: u64, ticket: bool);
     /// Adds 1 to a counter `n` times, taking a board `Lock` (the kind `KERNEL` is) for each; returns the counter.
     fn add_locked(&mut self, n: u64) -> u64;
-    /// Cores running, this one included; the board started the others at boot.
+    /// Starts the other cores without waiting for them; they idle until given work. Under `smp_test` each prints
+    /// `cpu <n>: online` and runs its timer. Call once, as the last step of boot.
+    fn start_cpus(&mut self, smp_test: bool);
+    /// Cores running, this one included.
     fn cpus(&self) -> usize;
     /// Cores that have taken a timer tick.
     fn ticked_cpus(&self) -> usize;
@@ -183,6 +186,7 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
         .any(|a| a == "test=disk" || a == "test=bench-disk");
     let mounted = disk.take_if(|_| !raw).map(|disk| board.mount(disk));
 
+    board.start_cpus(bootargs.split_whitespace().any(|a| a == "test=smp"));
     let boot_us = board.uptime_us();
     let _ = writeln!(board.console(), "boot: {boot_us} us");
     match blocks {

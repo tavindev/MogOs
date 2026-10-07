@@ -78,6 +78,8 @@ static GIC_DIST: AtomicU64 = AtomicU64::new(0);
 static GIC_CPU: AtomicU64 = AtomicU64::new(0);
 /// Bit `n` is set once core `n` has taken a timer tick.
 static TICKED: AtomicUsize = AtomicUsize::new(0);
+/// `test=smp`: secondaries announce themselves and run their timer; otherwise they sleep until 25b gives them work.
+static SMP_TEST: AtomicBool = AtomicBool::new(false);
 /// Set once `Board::disk` handed out the block device.
 static DISK_TAKEN: AtomicBool = AtomicBool::new(false);
 /// QEMU `virt`'s 32 virtio-mmio transports: the first one's base, and the stride between them.
@@ -177,7 +179,7 @@ struct QemuVirt {
     /// GICv2 distributor and CPU interface.
     gic: (PhysAddr, PhysAddr),
     entry_us: u64,
-    /// Cores running: 0 and those `kmain` started.
+    /// The DTB's cores (at most `MAX_CPUS`) until `start_cpus`, then those running.
     cpus: usize,
 }
 
@@ -355,6 +357,11 @@ impl kernel::Board for QemuVirt {
         *COUNT.lock()
     }
 
+    fn start_cpus(&mut self, smp_test: bool) {
+        SMP_TEST.store(smp_test, Relaxed);
+        self.cpus = 1 + (1..self.cpus).filter(|&cpu| start_cpu(cpu)).count();
+    }
+
     fn cpus(&self) -> usize {
         self.cpus
     }
@@ -405,7 +412,6 @@ extern "C" fn kmain() -> ! {
         // SAFETY: as above.
         unsafe { arch::gic::unmask(gic.0, RESCHEDULE_SGI) };
     }
-    let cpus = 1 + (1..cpus).filter(|&cpu| start_cpu(cpu)).count();
 
     kernel::run(
         &mut QemuVirt {
@@ -424,7 +430,7 @@ extern "C" fn kmain() -> ! {
 fn start_cpu(cpu: usize) -> bool {
     let stack_top = &raw const __stack_top as u64 + cpu as u64 * SECONDARY_STACK;
     let status: i64;
-    // SAFETY: CPU_ON starts an off core on an unused stack; `dsb ish` first completes the stores it reads (GIC bases).
+    // SAFETY: CPU_ON starts an off core on an unused stack; `dsb ish` first completes the stores it reads.
     unsafe {
         core::arch::asm!(
             "dsb ish",
@@ -440,7 +446,7 @@ fn start_cpu(cpu: usize) -> bool {
 }
 
 /// A secondary core's first Rust code, from `arch::secondary_entry`: MMU on, on its own stack, IRQs masked. It turns on
-/// its GIC CPU interface, timer and reschedule SGI, and sleeps; it runs no task yet.
+/// its GIC CPU interface, timer PPI and reschedule SGI, and sleeps; it runs no task yet.
 #[unsafe(no_mangle)]
 extern "C" fn kmain_secondary() -> ! {
     arch::install_vectors();
@@ -451,8 +457,10 @@ extern "C" fn kmain_secondary() -> ! {
         // SAFETY: as above, the distributor; below 32, so this core's banked ISENABLER0.
         unsafe { arch::gic::unmask(dist, irq) };
     }
-    let _ = writeln!(Console, "cpu {}: online", arch::cpu());
-    arch::timer::arm(TICK_US);
+    if SMP_TEST.load(Relaxed) {
+        let _ = writeln!(Console, "cpu {}: online", arch::cpu());
+        arch::timer::arm(TICK_US);
+    }
     loop {
         arch::irq::wait();
     }
