@@ -75,6 +75,8 @@ aarch64_vectors:
     mov x0, sp
     bl aarch64_exception
     mov sp, x0
+    // Only once off the old stack: with the board's kernel lock free, another core may run the task that owns it.
+    bl board_unlock
     ldp x30, x2, [sp, #240]
     msr elr_el1, x2
     ldr x2, [sp, #256]
@@ -118,7 +120,8 @@ const SPSR_EL1H_IRQ_ON: u64 = 0x345;
 const SPSR_EL0T_IRQ_ON: u64 = 0x340;
 
 unsafe extern "C" {
-    /// The board's scheduler: saves the yielding task's frame address and returns the next task's.
+    /// The board's scheduler: saves the yielding task's frame address and returns the next task's; entered and left like
+    /// the hooks below.
     fn task_switch(frame: usize) -> usize;
 }
 
@@ -137,19 +140,24 @@ pub fn install_vectors() {
 }
 
 /// Executes `brk #0`, which the handler skips; returning proves it was caught. Call after `install_vectors`.
-pub fn breakpoint_self_test() {
+///
+/// # Safety
+///
+/// The caller holds the board's kernel lock through a leaked guard: the trap exit releases it, as after every trap.
+pub unsafe fn breakpoint_self_test() {
     // SAFETY: the installed sync handler skips `brk #0` and resumes after it.
     unsafe { asm!("brk #0", clobber_abi("C")) };
 }
 
-// SAFETY: the board defines `board_irq` with this signature.
+// SAFETY: the board defines these with these signatures. Each is entered with IRQs masked and returns holding the board's
+// kernel lock, which the trap exit releases through `board_unlock` once it has moved to the returned frame.
 unsafe extern "C" {
-    /// Handles the pending IRQ; returns the frame to resume, `frame` or the next task's. Requires IRQs masked.
+    /// Handles the pending IRQ; returns the frame to resume, `frame` or the next task's.
     fn board_irq(frame: usize) -> usize;
-    /// Runs the syscall a process made with `svc`; returns the frame to resume. Requires IRQs masked.
+    /// Runs the syscall a process made with `svc`; returns the frame to resume.
     fn board_syscall(frame: &mut TrapFrame) -> usize;
     /// Kills the process whose instruction faulted at EL0 with exception class `ec` at address `far`; returns
-    /// the next task's frame. Requires IRQs masked.
+    /// the next task's frame.
     fn board_user_fault(frame: usize, ec: u64, far: u64) -> usize;
 }
 

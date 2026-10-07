@@ -19,6 +19,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::Write;
 use core::ops::Range;
+use core::sync::atomic::AtomicUsize;
+use core::sync::atomic::Ordering::Relaxed;
 
 use dtb::Dtb;
 use mm::{FrameAllocator, PhysAddr};
@@ -68,6 +70,11 @@ pub trait Board {
     /// Mounts the MogFS on `disk` as the board's file system; once it is mounted, every process spawned from boot
     /// context also gets its root directory (read, write, duplicate, transfer) as handle 3. Never formats.
     fn mount(&mut self, disk: Self::Disk) -> Result<(), mogfs::Error>;
+    /// Makes `n` uncontended acquire + release round trips on a ticket lock like the board's kernel lock (`ticket`),
+    /// or on a test-and-set lock.
+    fn lock_round_trips(&mut self, n: u64, ticket: bool);
+    /// Adds 1 to a counter `n` times, taking a board `Lock` (the kind `KERNEL` is) for each; returns the counter.
+    fn add_locked(&mut self, n: u64) -> u64;
 }
 
 /// Hand-written asm user programs the board provides; newer ones are ELF files in the boot archive.
@@ -91,6 +98,10 @@ pub enum Program {
 
 /// Round trips timed by `test=bench`.
 const BENCH_YIELDS: u64 = 100_000;
+/// Round trips per lock timed by `test=bench-lock`, and the additions each of its two adders makes.
+const BENCH_LOCKS: u64 = 10_000_000;
+/// `test=bench-lock`'s adders that are done.
+static ADDERS_DONE: AtomicUsize = AtomicUsize::new(0);
 /// Round trips the boot archive's `ping` makes with `pong` under `test=bench-pipe`; must equal its `ROUND_TRIPS`.
 const PIPE_ROUND_TRIPS: u64 = 100_000;
 /// Blocks `test=bench-disk` writes and reads (8 MiB); the disk must hold at least this many.
@@ -111,13 +122,14 @@ const PI_BUDGET: usize = 38;
 
 /// `reserved` lists physical ranges in use (kernel image, DTB).
 pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> ! {
+    // First: console writes and traps take locks, whose atomics need the MMU on.
+    board.enable_mmu();
     let el = board.exception_level();
     let _ = writeln!(board.console(), "MogOs: hello from EL{el}");
 
     board.breakpoint_self_test();
     let _ = writeln!(board.console(), "exceptions: ok");
 
-    board.enable_mmu();
     let _ = writeln!(board.console(), "mmu: on");
     let bootargs = dtb.bootargs().unwrap_or_default();
     if bootargs.split_whitespace().any(|a| a == "test=mmu-fault") {
@@ -183,6 +195,7 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
                 run_archived(board, "pi", "pi", PI_BUDGET);
             }
             "test=bench-pipe" => pipe_bench(board),
+            "test=bench-lock" => lock_bench(board),
             "test=budget" => {
                 let before = board.free_frames();
                 run_alone(board, Program::Budget);
@@ -312,6 +325,35 @@ fn pipe_bench<B: Board>(board: &mut B) {
     wait(board);
     let ns = (board.uptime_us() - start) * 1000 / PIPE_ROUND_TRIPS;
     let _ = writeln!(board.console(), "pipe: {ns} ns/round-trip");
+}
+
+/// Times uncontended acquire + release of the ticket and the test-and-set lock; then two tasks, preempted by the timer,
+/// each add `BENCH_LOCKS` to a counter under the board's lock, and the total must be exact.
+fn lock_bench<B: Board>(board: &mut B) {
+    for (name, ticket) in [("ticket", true), ("test-and-set", false)] {
+        let start = board.uptime_us();
+        board.lock_round_trips(BENCH_LOCKS, ticket);
+        let tenths = (board.uptime_us() - start) * 10_000 / BENCH_LOCKS;
+        let (ns, tenth) = (tenths / 10, tenths % 10);
+        let _ = writeln!(board.console(), "lock: {name} {ns}.{tenth} ns/round-trip");
+    }
+    board.spawn(add_and_yield, 0).expect("spawn");
+    board.spawn(add_and_yield, 0).expect("spawn");
+    board.start_timer();
+    while ADDERS_DONE.load(Relaxed) < 2 {
+        board.idle();
+    }
+    let count = board.add_locked(0);
+    let _ = writeln!(board.console(), "lock: count {count}");
+}
+
+fn add_and_yield<B: Board>(board: &mut B, _: usize) -> ! {
+    let count = board.add_locked(BENCH_LOCKS);
+    let _ = writeln!(board.console(), "lock: adder done at {count}");
+    ADDERS_DONE.fetch_add(1, Relaxed);
+    loop {
+        board.yield_now();
+    }
 }
 
 fn yield_forever<B: Board>(board: &mut B, _: usize) -> ! {
