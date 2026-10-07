@@ -1,7 +1,9 @@
 use std::hint::black_box;
 use std::net::{Ipv4Addr, SocketAddrV4};
-use std::time::Instant;
+use std::time::Duration;
 
+use cpu_time::ThreadTime;
+use criterion::{Criterion, Throughput, criterion_group};
 use net::{
     Config, HalfOpen, Mac, Neighbor, Nic, Proto, Socket, Stack, State, Tcp, TcpId, TcpSocket,
     TimeWait,
@@ -9,9 +11,12 @@ use net::{
 
 #[path = "../tests/sim/mod.rs"]
 mod sim;
+#[path = "../../../benches/thread_time.rs"]
+mod thread_time;
 
-const RUNS: usize = 21;
 const DATAGRAMS: usize = 100_000;
+const POLLS: u64 = 100_000;
+const CONNECTIONS: usize = 10_000;
 const BATCH: usize = 16;
 const MAC_A: Mac = [2, 0, 0, 0, 0, 1];
 const MAC_B: Mac = [2, 0, 0, 0, 0, 2];
@@ -24,15 +29,6 @@ fn config(ip: Ipv4Addr) -> Config {
         netmask: Ipv4Addr::new(255, 255, 255, 0),
         gateway: None,
     }
-}
-
-fn report(name: &str, mut ns: Vec<f64>) {
-    ns.sort_by(f64::total_cmp);
-    let (min, median) = (ns[0], ns[RUNS / 2]);
-    println!(
-        "{name}: min {min:.1} ns, median {median:.1} ns, {:.2} M/s at the median ({RUNS} runs)",
-        1e3 / median
-    );
 }
 
 /// Hands out the same frame `left` more times.
@@ -64,8 +60,8 @@ impl Nic for Repeat<'_> {
     }
 }
 
-/// A sends `size`-byte UDP datagrams to B over the loss-free simulated link, B receives each one; ns per datagram.
-fn udp_link(size: usize) -> f64 {
+/// A sends `DATAGRAMS` `size`-byte UDP datagrams to B over the loss-free simulated link, B receives each one.
+fn udp_link(size: usize) -> Duration {
     let mut link = sim::Link::new(1, sim::Faults::default(), [MAC_A, MAC_B]);
     let (mut na, mut nb) = ([Neighbor::EMPTY; 4], [Neighbor::EMPTY; 4]);
     let (mut bufa, mut bufb) = (vec![0u8; 1 << 16], vec![0u8; 1 << 16]);
@@ -81,7 +77,7 @@ fn udp_link(size: usize) -> f64 {
     let _ = a.send_to(&mut link.end(0), 0, client, to, &data);
     b.poll(&mut link.end(1), 0);
     a.poll(&mut link.end(0), 0);
-    let start = Instant::now();
+    let start = ThreadTime::now();
     let mut got = 0;
     while got < DATAGRAMS {
         for _ in 0..BATCH {
@@ -94,11 +90,11 @@ fn udp_link(size: usize) -> f64 {
         }
     }
     assert_eq!(got, DATAGRAMS);
-    start.elapsed().as_nanos() as f64 / DATAGRAMS as f64
+    start.elapsed()
 }
 
-/// B's receive path for one UDP frame (parse, checksum, demux, copy into the socket and out again), in ns.
-fn receive_path(size: usize) -> f64 {
+/// B's receive path for `DATAGRAMS` UDP frames (parse, checksum, demux, copy into the socket and out again).
+fn receive_path(size: usize) -> Duration {
     let mut link = sim::Link::new(1, sim::Faults::default(), [MAC_A, MAC_B]);
     let (mut na, mut nb) = ([Neighbor::EMPTY; 1], [Neighbor::EMPTY; 1]);
     let (mut bufa, mut bufb) = (vec![0u8; 4096], vec![0u8; 1 << 16]);
@@ -118,7 +114,7 @@ fn receive_path(size: usize) -> f64 {
     let frame = link.record.take().unwrap().pop().unwrap();
     let mut buf = [0u8; 2048];
     let rounds = DATAGRAMS / BATCH;
-    let start = Instant::now();
+    let start = ThreadTime::now();
     for _ in 0..rounds {
         b.poll(
             &mut Repeat {
@@ -133,7 +129,7 @@ fn receive_path(size: usize) -> f64 {
         }
     }
     assert_eq!(b.counters.rx, (rounds * BATCH) as u64 + 1);
-    start.elapsed().as_nanos() as f64 / (rounds * BATCH) as f64
+    start.elapsed()
 }
 
 /// Binds `$stack` to a TCP stack at `$ip` with `$slots` connections of `$ring`-byte rings and `$half_open` entries.
@@ -190,15 +186,15 @@ fn connect(link: &mut sim::Link, a: &mut Stack, b: &mut Stack, listener: TcpId) 
     (ca, cb.unwrap())
 }
 
-/// A sends `bytes` to B, which reads as it goes; returns the wall time in ns and the virtual time it took.
-fn tcp_transfer(faults: sim::Faults, seed: u64, ring: usize, bytes: usize) -> (f64, u64) {
+/// A sends `bytes` to B, which reads as it goes; returns the thread CPU time and the virtual time it took.
+fn tcp_transfer(faults: sim::Faults, seed: u64, ring: usize, bytes: usize) -> (Duration, u64) {
     let mut link = sim::Link::new(seed, faults, [MAC_A, MAC_B]);
     host!(a, IP_A, [seed, 1], 1, ring, 4);
     host!(b, IP_B, [seed, 2], 2, ring, 4);
     let listener = b.listen(80).unwrap();
     let (ca, cb) = connect(&mut link, &mut a, &mut b, listener);
     let (data, mut buf) = (vec![0x5a; 1 << 16], vec![0u8; 1 << 16]);
-    let (mut sent, mut got, start, at) = (0, 0, Instant::now(), link.now);
+    let (mut sent, mut got, start, at) = (0, 0, ThreadTime::now(), link.now);
     drive(&mut link, &mut a, &mut b, |a, b| {
         let mut progress = false;
         while sent < bytes
@@ -212,7 +208,7 @@ fn tcp_transfer(faults: sim::Faults, seed: u64, ring: usize, bytes: usize) -> (f
         }
         (progress, got == bytes)
     });
-    (start.elapsed().as_nanos() as f64, link.now - at)
+    (start.elapsed(), link.now - at)
 }
 
 /// Hands out recorded frames in turn; transmitted frames are built and dropped.
@@ -247,9 +243,9 @@ impl Nic for Replay<'_> {
     }
 }
 
-/// B's receive path per TCP data segment (nearly all 1460 bytes) (checksum, demux, sequence checks, copy into the ring, the ACK, and the
+/// B's receive path for TCP data segments (nearly all 1460 bytes) (checksum, demux, sequence checks, copy into the ring, the ACK, and the
 /// copy out with `recv`): A's segments recorded from a transfer, replayed into the same connection.
-fn tcp_receive_path(frames: &[Vec<u8>], idle: usize) -> f64 {
+fn tcp_receive_path(frames: &[Vec<u8>], idle: usize) -> Duration {
     let mut link = sim::Link::new(1, sim::Faults::default(), [MAC_A, MAC_B]);
     host!(a, IP_A, [1, 1], idle + 1, 1 << 16, 4);
     host!(b, IP_B, [1, 2], idle + 2, 1 << 16, 4);
@@ -262,7 +258,7 @@ fn tcp_receive_path(frames: &[Vec<u8>], idle: usize) -> f64 {
         scratch: vec![0; 2048],
     };
     let taken = b.counters.tcp;
-    let start = Instant::now();
+    let start = ThreadTime::now();
     for batch in frames.chunks(BATCH) {
         (nic.frames, nic.next) = (batch, 0);
         b.poll(&mut nic, link.now);
@@ -270,13 +266,13 @@ fn tcp_receive_path(frames: &[Vec<u8>], idle: usize) -> f64 {
             black_box(&buf[..n]);
         }
     }
-    let ns = start.elapsed().as_nanos() as f64 / frames.len() as f64;
+    let time = start.elapsed();
     assert_eq!(
         b.counters.tcp - taken,
         frames.len() as u64,
         "every segment taken"
     );
-    ns
+    time
 }
 
 /// A connects to B `idle` times, leaving those connections idle in the earlier slots, then once more.
@@ -345,9 +341,9 @@ fn record_syns(n: usize) -> Vec<Vec<u8>> {
 }
 
 /// B answering SYNs with SYN-ACKs until a fresh `table`-entry half-open table is full, or 64 per batch with cookies
-/// when `table` is 0; ns per SYN, and the share of SYNs answered with a cookie.
-fn syn_answer(syns: &[Vec<u8>], table: usize) -> (f64, f64) {
-    let (mut ns, mut cookies) = (0, 0);
+/// when `table` is 0.
+fn syn_answer(syns: &[Vec<u8>], table: usize) -> Duration {
+    let mut time = Duration::ZERO;
     for batch in syns.chunks(table.max(64)) {
         host!(b, IP_B, [1, 2], 2, 4096, table);
         b.listen(80).unwrap();
@@ -356,20 +352,16 @@ fn syn_answer(syns: &[Vec<u8>], table: usize) -> (f64, f64) {
             next: 0,
             scratch: vec![0; 2048],
         };
-        let start = Instant::now();
+        let start = ThreadTime::now();
         b.poll(&mut nic, 0);
-        ns += start.elapsed().as_nanos();
+        time += start.elapsed();
         assert_eq!(b.counters.tcp, batch.len() as u64);
-        cookies += b.counters.syn_cookies;
     }
-    (
-        ns as f64 / syns.len() as f64,
-        cookies as f64 / syns.len() as f64,
-    )
+    time
 }
 
-/// One `poll` with nothing to do on a listener with a `half_open`-entry table and 2 slots; ns per poll.
-fn idle_poll(half_open: usize) -> f64 {
+/// `POLLS` `poll`s with nothing to do on a listener with a `half_open`-entry table and 2 slots.
+fn idle_poll(half_open: usize) -> Duration {
     host!(b, IP_B, [1, 2], 2, 4096, half_open);
     b.listen(80).unwrap();
     let mut nic = Replay {
@@ -377,26 +369,24 @@ fn idle_poll(half_open: usize) -> f64 {
         next: 0,
         scratch: vec![0; 2048],
     };
-    let n = 100_000;
-    let start = Instant::now();
-    for i in 0..n {
+    let start = ThreadTime::now();
+    for i in 0..POLLS {
         black_box(b.poll(&mut nic, i));
     }
-    start.elapsed().as_nanos() as f64 / n as f64
+    start.elapsed()
 }
 
-/// Connect, accept, a close from each side and the TIME_WAIT entry, over the loss-free link; ns per connection.
-fn handshake_and_close(half_open: usize) -> f64 {
+/// `CONNECTIONS` rounds of connect, accept, a close from each side and the TIME_WAIT entry, over the loss-free link.
+fn handshake_and_close(half_open: usize) -> Duration {
     let mut link = sim::Link::new(1, sim::Faults::default(), [MAC_A, MAC_B]);
     host!(a, IP_A, [1, 1], 1, 4096, 4);
     host!(b, IP_B, [1, 2], 2, 4096, half_open);
     let listener = b.listen(80).unwrap();
-    let n = 10_000;
-    let mut start = Instant::now();
-    for i in 0..=n {
+    let mut start = ThreadTime::now();
+    for i in 0..=CONNECTIONS {
         // The first connection also resolves ARP, so it is not timed.
         if i == 1 {
-            start = Instant::now();
+            start = ThreadTime::now();
         }
         let (ca, cb) = connect(&mut link, &mut a, &mut b, listener);
         a.tcp_close(ca);
@@ -408,63 +398,78 @@ fn handshake_and_close(half_open: usize) -> f64 {
             (false, closed(a, ca) && closed(b, cb))
         });
     }
-    start.elapsed().as_nanos() as f64 / n as f64
+    start.elapsed()
 }
 
-fn main() {
-    for ring in [64 << 10, 1 << 20] {
-        let bytes = 64 << 20;
-        let mut mibs: Vec<f64> = (0..RUNS)
-            .map(|_| {
-                bytes as f64
-                    / (1 << 20) as f64
-                    / (tcp_transfer(sim::Faults::default(), 1, ring, bytes).0 / 1e9)
-            })
-            .collect();
-        mibs.sort_by(f64::total_cmp);
-        println!(
-            "tcp goodput over the loss-free link, {} KiB window: min {:.0}, median {:.0} MiB/s ({RUNS} runs)",
-            ring >> 10,
-            mibs[0],
-            mibs[RUNS / 2]
-        );
+/// Sums `iters` runs of `run`, for `iter_custom`.
+fn sum(iters: u64, mut run: impl FnMut() -> Duration) -> Duration {
+    (0..iters).map(|_| run()).sum()
+}
+
+/// Each iteration is a whole workload: 64 MiB, the 2880 recorded segments, `CONNECTIONS` connections, `POLLS` polls,
+/// 4096 SYNs; divide its time by that count for ns per op.
+fn tcp(c: &mut Criterion<thread_time::ThreadTime>) {
+    let mut g = thread_time::group(c, "tcp");
+    for (name, idle) in [
+        ("receive path", 0),
+        ("receive path, 63 idle connections in earlier slots", 63),
+    ] {
+        let frames = record_segments(idle);
+        g.bench_function(name, |b| {
+            b.iter_custom(|iters| sum(iters, || tcp_receive_path(&frames, idle)))
+        });
     }
-    let frames = record_segments(0);
-    report(
-        "tcp receive path per data segment",
-        (0..RUNS).map(|_| tcp_receive_path(&frames, 0)).collect(),
-    );
-    let frames = record_segments(63);
-    report(
-        "tcp receive path per data segment, 63 idle connections in earlier slots",
-        (0..RUNS).map(|_| tcp_receive_path(&frames, 63)).collect(),
-    );
-    report(
-        "tcp connect + accept + close both ways",
-        (0..RUNS).map(|_| handshake_and_close(4)).collect(),
-    );
-    report(
-        "tcp connect + accept + close both ways through a SYN cookie",
-        (0..RUNS).map(|_| handshake_and_close(0)).collect(),
-    );
+    for (name, half_open) in [
+        ("connect+accept+close", 4),
+        ("connect+accept+close through a SYN cookie", 0),
+    ] {
+        g.bench_function(name, |b| {
+            b.iter_custom(|iters| sum(iters, || handshake_and_close(half_open)))
+        });
+    }
     for h in [4, 64, 4096] {
-        report(
-            &format!("tcp idle poll, {h}-entry half-open table"),
-            (0..RUNS).map(|_| idle_poll(h)).collect(),
-        );
+        g.bench_function(format!("idle poll, {h}-entry half-open table"), |b| {
+            b.iter_custom(|iters| sum(iters, || idle_poll(h)))
+        });
     }
     let syns = record_syns(4096);
     for table in [64, 4096, 0] {
-        let runs: Vec<_> = (0..RUNS).map(|_| syn_answer(&syns, table)).collect();
         let name = match table {
-            0 => "tcp SYN answered with a cookie".to_string(),
-            n => format!(
-                "tcp SYN answered while filling a {n}-entry half-open table ({:.0}% cookies)",
-                runs[0].1 * 100.0
-            ),
+            0 => "SYN answered with a cookie".to_string(),
+            n => format!("SYN answered, {n}-entry half-open table"),
         };
-        report(&name, runs.iter().map(|r| r.0).collect());
+        g.bench_function(name, |b| {
+            b.iter_custom(|iters| sum(iters, || syn_answer(&syns, table)))
+        });
     }
+    let bytes = 64 << 20;
+    g.throughput(Throughput::Bytes(bytes as u64));
+    for ring in [64 << 10, 1 << 20] {
+        g.bench_function(format!("goodput, {} KiB window", ring >> 10), |b| {
+            b.iter_custom(|iters| {
+                sum(iters, || {
+                    tcp_transfer(sim::Faults::default(), 1, ring, bytes).0
+                })
+            })
+        });
+    }
+}
+
+/// Each iteration is `DATAGRAMS` datagrams; divide its time by that count for ns per datagram.
+fn udp(c: &mut Criterion<thread_time::ThreadTime>) {
+    let mut g = thread_time::group(c, "udp");
+    for size in [64, 1472] {
+        g.bench_function(format!("simulated link, {size}-byte datagrams"), |b| {
+            b.iter_custom(|iters| sum(iters, || udp_link(size)))
+        });
+        g.bench_function(format!("receive path, {size}-byte datagrams"), |b| {
+            b.iter_custom(|iters| sum(iters, || receive_path(size)))
+        });
+    }
+}
+
+/// Simulated goodput is virtual time, deterministic per seed: printed, not measured.
+fn simulated_goodput() {
     for (loss, delay) in [(10, 5), (10, 25), (50, 5), (50, 25)] {
         let faults = sim::Faults {
             loss,
@@ -488,14 +493,16 @@ fn main() {
             mibs[5]
         );
     }
-    for size in [64, 1472] {
-        report(
-            &format!("udp over the simulated link, {size}-byte datagrams"),
-            (0..RUNS).map(|_| udp_link(size)).collect(),
-        );
-        report(
-            &format!("udp receive path, {size}-byte datagrams"),
-            (0..RUNS).map(|_| receive_path(size)).collect(),
-        );
-    }
+}
+
+criterion_group! {
+    name = benches;
+    config = thread_time::config();
+    targets = tcp, udp
+}
+
+fn main() {
+    simulated_goodput();
+    benches();
+    Criterion::default().configure_from_args().final_summary();
 }
