@@ -5,7 +5,7 @@
 The on-disk format (described at the top of `src/lib.rs`) and `Fs<D: Disk>`: `new` (const), in-place `format` and
 `mount`, `disk` (replace only before `mount`), `lookup`, `readdir` (from an entry index, with each kind, stops when
 its callback returns true), `kind`, `mkdir`, `create` (opens an existing name), `read`, `write`, `truncate`,
-`unlink`, `rename`, `commit`. It also defines the `Disk` trait (with `clamp`, the Spectre v1 port) and `BLOCK_SIZE` that the kernel re-exports and the
+`unlink`, `rename`, `commit`. It also defines the `Disk` trait and `BLOCK_SIZE` that the kernel re-exports and the
 board's `VirtioBlk` implements. All in `src/lib.rs`.
 
 It is **NOT** paths, handles or `..` handling (`crates/kernel`, step 22), a block cache beyond its one data buffer, or
@@ -30,9 +30,9 @@ a device driver.
 
 ## Invariants & rules
 
-- `read`, `write` (through `write_data`) and `scan` index a record's block pointers through `D::clamp`, since their
-  positions come from a user's offset or `readdir` start and a mispredicted loop bound runs one index past the end.
-  Every `Disk` implements it: the board's with `arch::clamp` (`csdb`), host disks with `min`.
+- Spectre v1: `read`, `write` (through `write_data`) and `scan` index a record's block pointers `% PTRS`, in bounds
+  by construction, since a position from a user's offset or `readdir` start, on a mispredicted loop bound, runs one
+  block past the end; the kernel clamps the offset and start themselves at `dispatch`.
 
 - No block reachable from either superblock slot is written; blocks allocated since the last commit are rewritten in
   place. `commit` writes the dirty table blocks, flushes, writes the other slot, flushes; nothing changed, no I/O.

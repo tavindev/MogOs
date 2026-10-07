@@ -10,10 +10,6 @@ use crate::virtio_blk::VirtioBlk;
 pub(crate) struct FsDisk(pub(crate) Option<VirtioBlk>);
 
 impl Disk for FsDisk {
-    fn clamp(index: usize, len: usize) -> usize {
-        arch::clamp(index, len)
-    }
-
     fn read(&mut self, block: u64, bufs: &mut [[u8; BLOCK_SIZE]]) -> Result<(), Error> {
         self.0.as_mut().ok_or(Error::Io)?.read(block, bufs)
     }

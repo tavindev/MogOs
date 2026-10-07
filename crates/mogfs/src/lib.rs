@@ -73,9 +73,6 @@ pub trait Disk {
     /// Returns once every completed write is durable.
     fn flush(&mut self) -> Result<(), Error>;
     fn blocks(&self) -> u64;
-    /// `index` if below `len`, else a value below `len`, also on a mispredicted path (a `csdb` barrier on the
-    /// board, `min` on the host); indexes into a record's block pointers derived from a user's offset go through it.
-    fn clamp(index: usize, len: usize) -> usize;
 }
 
 /// A file or directory, stable across writes and commits.
@@ -277,7 +274,7 @@ impl<D: Disk> Fs<D> {
             );
             let n = min(PAYLOAD - at, (end - pos) as usize);
             let out = &mut buf[(pos - offset) as usize..][..n];
-            match r.ptrs[D::clamp(i, PTRS)] {
+            match r.ptrs[i % PTRS] {
                 0 => out.fill(0),
                 p => {
                     self.load(p, false)?;
@@ -300,9 +297,7 @@ impl<D: Disk> Fs<D> {
             return Ok(());
         }
         let span = (offset / PAYLOAD as u64) as usize..=((end - 1) / PAYLOAD as u64) as usize;
-        let need = span
-            .filter(|&i| !self.fresh(r.ptrs[D::clamp(i, PTRS)]))
-            .count();
+        let need = span.filter(|&i| !self.fresh(r.ptrs[i % PTRS])).count();
         self.reserve(need, &[file])?;
         self.write_data(&mut r, offset, data)?;
         self.set(file, r)
@@ -720,7 +715,8 @@ impl<D: Disk> Fs<D> {
                 (pos % PAYLOAD as u64) as usize,
             );
             let n = min(PAYLOAD - at, (end - pos) as usize);
-            let i = D::clamp(i, PTRS);
+            // In bounds by construction, also on a mispredicted path: a user's offset reaches `i`.
+            let i = i % PTRS;
             let old = r.ptrs[i];
             if old != 0
                 && n < PAYLOAD
@@ -757,7 +753,7 @@ impl<D: Disk> Fs<D> {
         for e in start..r.size as usize / DIRENT {
             let at = e % PER_DIR_BLOCK * DIRENT;
             if at == 0 || e == start {
-                match r.ptrs[D::clamp(e / PER_DIR_BLOCK, PTRS)] {
+                match r.ptrs[e / PER_DIR_BLOCK % PTRS] {
                     0 => return Err(Error::Corrupt),
                     p => self.load(p, false)?,
                 }

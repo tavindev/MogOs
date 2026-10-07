@@ -327,7 +327,8 @@ unsafe extern "C" fn board_syscall(frame: &mut arch::TrapFrame) -> usize {
     } = kernel;
     let args = frame.x.first_chunk().unwrap();
     let ok = |result: Result<(), i64>| result.map_or_else(|error| error as u64, |()| 0);
-    frame.x[0] = match kernel::syscall::dispatch(frame.x[8], args, sched.handles()) {
+    frame.x[0] = match kernel::syscall::dispatch::<crate::Nospec>(frame.x[8], args, sched.handles())
+    {
         Ok(Call::Exit(code)) => {
             // SAFETY: the caller masked IRQs, and `frame` is the current process's.
             return unsafe { exit_process(kernel, frame as *mut arch::TrapFrame as usize, code) };

@@ -9,10 +9,6 @@ const FILES: usize = 400;
 struct MemDisk(Vec<[u8; BLOCK_SIZE]>);
 
 impl Disk for &mut MemDisk {
-    fn clamp(index: usize, len: usize) -> usize {
-        index.min(len - 1)
-    }
-
     fn read(&mut self, block: u64, bufs: &mut [[u8; BLOCK_SIZE]]) -> Result<(), Error> {
         bufs.copy_from_slice(&self.0[block as usize..][..bufs.len()]);
         Ok(())

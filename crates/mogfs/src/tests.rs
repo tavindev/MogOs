@@ -44,10 +44,6 @@ impl Guarded {
 }
 
 impl Disk for Guarded {
-    fn clamp(index: usize, len: usize) -> usize {
-        index.min(len - 1)
-    }
-
     fn read(&mut self, block: u64, bufs: &mut [[u8; BLOCK_SIZE]]) -> Result<(), Error> {
         bufs.copy_from_slice(&self.blocks[block as usize..][..bufs.len()]);
         Ok(())

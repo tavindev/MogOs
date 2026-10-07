@@ -119,7 +119,7 @@ fn spawn_process(
     frames: &mut FrameAllocator<FRAME_WORDS>,
     (file, segments, entry): (&[u8], impl Iterator<Item = Segment>, u64),
     mut budget: Budget,
-    (process, slot, handles, priority): ((usize, u64), (usize, u64), Handles<Nospec>, u8),
+    (process, slot, handles, priority): ((usize, u64), (usize, u64), Handles, u8),
     (args, argc): (&[u8], usize),
 ) -> Result<(), i64> {
     let l1 = zeroed(frames, &mut budget).ok_or(ENOMEM)?;
@@ -249,7 +249,7 @@ pub(crate) fn spawn(
     for (handle, bytes) in list.iter_mut().zip(bytes.as_chunks::<8>().0) {
         *handle = u64::from_le_bytes(*bytes);
     }
-    let (mut parent, child) = sched.handles().split(&list[..len])?;
+    let (mut parent, child) = sched.handles().split::<Nospec>(&list[..len])?;
     let current = sched.process();
     if budget > sched.memory(current).budget.remaining() {
         return Err(ENOMEM);

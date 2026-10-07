@@ -21,8 +21,7 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
   with PSCI `CPU_ON` without waiting, and core 1 starts the rest (a refused `CPU_ON` panics). `kmain_secondary`: a started core installs its own vectors and records them, enables its GIC CPU
   interface, timer PPI and `RESCHEDULE_SGI` (its banked `ISENABLER0`) and idles in `wfi`; only under `test=smp`
   (`SMP_TEST`) does it print `cpu <n>: online` and arm its timer. It runs no task yet (step 25b).
-- `Nospec`, the `kernel::Clamp` the scheduler's handle tables use (`arch::clamp`); `FsDisk` and `VirtioBlk` clamp
-  with it too.
+- `Nospec`, the `kernel::Clamp` `dispatch` and `split` use (`arch::clamp`).
 - `KERNEL: Lock<Kernel>` (`Scheduler` with its process table, `FrameAllocator`, `Pipes`, `Mutexes`, console `Line`,
   the MogFS `Fs<FsDisk>` and whether it is mounted, and `buf`, the 8 KiB a syscall copies user inputs into), `HEAP` and
   `CONSOLE: Lock<Uart>` statics. `Fs::new` is const, so the 48 KiB file system is built in the static with an empty
@@ -108,8 +107,8 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
 - Every new `Process` or `Thread` handle is counted (`Scheduler::held`): the one `spawn_process` hands out (the
   spawner's, or init's own), `thread`'s, and each `dup`; `release` uncounts each closed one.
 - A blocking call rewinds its `svc` (`block` calls `TrapFrame::restart`) and reruns when woken.
-- User memory is reached only through `UserIn` / `UserOut` (`src/usermem.rs`), which mask the pointer once
-  (`arch::mask_user`: null outside user space, also under speculation), then probe every page with
+- User memory is reached only through `UserIn` / `UserOut` (`src/usermem.rs`), which take pointers `dispatch`
+  clamped into user space, then probe every page with
   `arch::user_readable` / `user_writable` once and then move bytes by raw copy, in the same trap, before any switch;
   never through a reference, since a sibling thread may write the memory meanwhile. Inputs the kernel parses (paths,
   spawn arguments and handle lists) are copied into `buf` (`copy_in`) once and validated there; bulk data goes straight

@@ -62,10 +62,6 @@ impl MemDisk {
 }
 
 impl Disk for &mut MemDisk {
-    fn clamp(index: usize, len: usize) -> usize {
-        index.min(len - 1)
-    }
-
     fn read(&mut self, block: u64, bufs: &mut [Block]) -> Result<(), Error> {
         for (i, buf) in bufs.iter_mut().enumerate() {
             let b = block as usize + i;
@@ -600,10 +596,6 @@ fn older_slot_past_the_newest_block_count_is_ignored() {
 struct FailReads<'a>(&'a mut MemDisk, u64, usize);
 
 impl Disk for FailReads<'_> {
-    fn clamp(index: usize, len: usize) -> usize {
-        index.min(len - 1)
-    }
-
     fn read(&mut self, block: u64, bufs: &mut [Block]) -> Result<(), Error> {
         if block == self.1 && self.2 > 0 {
             self.2 -= 1;
@@ -629,10 +621,6 @@ impl Disk for FailReads<'_> {
 struct FlipRead<'a>(&'a mut MemDisk, u64, usize);
 
 impl Disk for FlipRead<'_> {
-    fn clamp(index: usize, len: usize) -> usize {
-        index.min(len - 1)
-    }
-
     fn read(&mut self, block: u64, bufs: &mut [Block]) -> Result<(), Error> {
         (&mut *self.0).read(block, bufs)?;
         if block == self.1 {
@@ -875,10 +863,6 @@ impl Counted<'_> {
 }
 
 impl Disk for Counted<'_> {
-    fn clamp(index: usize, len: usize) -> usize {
-        index.min(len - 1)
-    }
-
     fn read(&mut self, block: u64, bufs: &mut [Block]) -> Result<(), Error> {
         self.bump(0, 1);
         (&mut *self.0).read(block, bufs)

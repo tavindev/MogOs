@@ -1,6 +1,5 @@
 use mm::{Budget, PhysAddr};
 
-use crate::Clamp;
 use crate::handle::{Handles, Object};
 use crate::syscall::EBADF;
 
@@ -145,9 +144,9 @@ impl<const M: usize> Entries<M> {
 
 /// The process table: per index, an address space (its level-1 table; `PhysAddr(0)` is the boot table), handles,
 /// memory and live threads. Index 0 is the kernel: the boot context and kernel tasks, in the boot table.
-pub struct Processes<const P: usize, C> {
+pub struct Processes<const P: usize> {
     space: [PhysAddr; P],
-    handles: [Handles<C>; P],
+    handles: [Handles; P],
     /// An ended process's budget stays here until `reap`.
     memory: [Memory; P],
     /// A bit per slot of its live threads.
@@ -157,8 +156,8 @@ pub struct Processes<const P: usize, C> {
 
 /// Run queue of up to `N` threads of up to `P` processes, each thread known by its saved trap frame address, process,
 /// kernel stack and priority. The highest-priority ready thread runs, round robin within a level; blocked ones are
-/// skipped; with none ready, the boot context (slot 0) runs. `C` clamps user handle indexes (`Handles`).
-pub struct Scheduler<const N: usize, const P: usize, C> {
+/// skipped; with none ready, the boot context (slot 0) runs.
+pub struct Scheduler<const N: usize, const P: usize> {
     frame: [usize; N],
     process: [usize; N],
     /// First frame of the kernel stack, charged to the thread's process.
@@ -173,10 +172,10 @@ pub struct Scheduler<const N: usize, const P: usize, C> {
     current: usize,
     /// `process[current]`, cached: the syscall, switch and exit paths read it on every call.
     current_process: usize,
-    processes: Processes<P, C>,
+    processes: Processes<P>,
 }
 
-impl<const N: usize, const P: usize, C: Clamp> Scheduler<N, P, C> {
+impl<const N: usize, const P: usize> Scheduler<N, P> {
     /// Slot 0 is the boot context, the kernel process's first thread; its frame is recorded on its first switch.
     pub const fn new() -> Self {
         let mut threads = [0; P];
@@ -208,7 +207,7 @@ impl<const N: usize, const P: usize, C: Clamp> Scheduler<N, P, C> {
         (index, generation): (usize, u64),
         space: PhysAddr,
         memory: Memory,
-        handles: Handles<C>,
+        handles: Handles,
     ) {
         let p = &mut self.processes;
         p.space[index] = space;
@@ -438,12 +437,12 @@ impl<const N: usize, const P: usize, C: Clamp> Scheduler<N, P, C> {
     }
 
     /// The current process's handles.
-    pub fn handles(&mut self) -> &mut Handles<C> {
+    pub fn handles(&mut self) -> &mut Handles {
         &mut self.processes.handles[self.current_process]
     }
 
     /// Empties the handle table of the process at `index`; returns what it held.
-    pub fn take_handles(&mut self, index: usize) -> Handles<C> {
+    pub fn take_handles(&mut self, index: usize) -> Handles {
         core::mem::take(&mut self.processes.handles[index])
     }
 
@@ -472,7 +471,7 @@ impl<const N: usize, const P: usize, C: Clamp> Scheduler<N, P, C> {
     }
 }
 
-impl<const N: usize, const P: usize, C: Clamp> Default for Scheduler<N, P, C> {
+impl<const N: usize, const P: usize> Default for Scheduler<N, P> {
     fn default() -> Self {
         Self::new()
     }

@@ -693,10 +693,6 @@ fn disk_bench_reports_throughput() {
 struct FileDisk(std::fs::File, u64);
 
 impl mogfs::Disk for FileDisk {
-    fn clamp(index: usize, len: usize) -> usize {
-        index.min(len - 1)
-    }
-
     fn read(&mut self, block: u64, bufs: &mut [[u8; 4096]]) -> Result<(), mogfs::Error> {
         self.0
             .read_exact_at(bufs.as_flattened_mut(), block * 4096)

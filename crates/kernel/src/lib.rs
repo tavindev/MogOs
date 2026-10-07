@@ -112,8 +112,9 @@ pub trait Board {
 
 /// Bounds a user-derived index under speculation; the board's ends in a barrier (`csdb`), host tests use `min`.
 pub trait Clamp {
-    /// `index` if below `len`, else a value below `len`, also on a mispredicted path; the caller still bounds-checks.
-    fn clamp(index: usize, len: usize) -> usize;
+    /// Each of `values` if below its limit, else the limit minus 1, also on a mispredicted path, behind one barrier;
+    /// the caller still checks each value.
+    fn clamp<const N: usize>(values: [u64; N], limits: [u64; N]) -> [u64; N];
 }
 
 /// Hand-written asm user programs the board provides; newer ones are ELF files in the boot archive.

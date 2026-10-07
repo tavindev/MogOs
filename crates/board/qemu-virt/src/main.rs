@@ -99,14 +99,15 @@ const MAX_TASKS: usize = 8;
 /// The kernel included; a process's index is its ASID (8 bits).
 const MAX_PROCESSES: usize = 8;
 const _: () = assert!(MAX_PROCESSES <= 256);
-type Sched = Scheduler<MAX_TASKS, MAX_PROCESSES, Nospec>;
+type Sched = Scheduler<MAX_TASKS, MAX_PROCESSES>;
 
-/// `kernel::Clamp` over `arch::clamp`, so a user handle index is bounded under speculation.
+/// `kernel::Clamp` over `arch::clamp`: user values that index kernel memory, bounded behind one `csdb`.
 struct Nospec;
 
 impl kernel::Clamp for Nospec {
-    fn clamp(index: usize, len: usize) -> usize {
-        arch::clamp(index, len)
+    #[inline(always)]
+    fn clamp<const N: usize>(values: [u64; N], limits: [u64; N]) -> [u64; N] {
+        arch::clamp(values, limits)
     }
 }
 /// Kernel stack per task: 16 KiB.

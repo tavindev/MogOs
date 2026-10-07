@@ -19,16 +19,16 @@ touches memory through raw addresses: the board reads user buffers, copies pages
   `lookup` per `/`-separated component), `open` (`CREATE`, `TRUNC`), `mkdir`, `unlink`, `rename`, `readdir` (one pass
   writing whole `name\n` / `name/\n` entries, at most 64 per call), `list_archive`, and `errno` (mogfs error to musl
   errno; `Io` and `Corrupt` are `EIO`).
-- `Scheduler<N, P, C>` (`src/sched.rs`; `C: Clamp` is its handle tables'): thread slots (frame, process, kernel stack, state, priorities) and the process
+- `Scheduler<N, P>` (`src/sched.rs`): thread slots (frame, process, kernel stack, state, priorities) and the process
   table `Processes<P>` (address space, `Handles`, `Memory` with the budget and map cursor, live threads (a slot bitmask),
   generation); states (`Ready`, `Blocked`, `Exited`, `Zombie`) for both; `end` (a thread, and its process with its last
   thread), `reap` (a process), `join` (a thread).
-- `Handles<C>` (`src/handle.rs`): per-process handle tables, rights, `dup`, `split` for `spawn`; every lookup bounds
-  the user's index, then clamps it with `C` before the load (`lookup`, which `close` reuses).
+- `Handles` (`src/handle.rs`): per-process handle tables, rights, `dup`, `split` for `spawn`; lookups take a `Handle`, a
+  user value with its index clamped (by `dispatch`, or `Handle::new` / `split` with their own barrier).
 - `Pipes<N>` (`src/pipe.rs`), `Mutexes<N>` (`src/mutex.rs`): fixed tables of kernel objects. `Pipe::read` and
   `Pipe::write` hand the caller each chunk of the ring through a closure, so the board copies straight between user
   memory and the pipe page; `read_waits` lets it skip probing the user buffer when the read would wait.
-- `syscall::dispatch` (`src/syscall.rs`): returns `ENOSYS` above the last syscall, then clamps `x8` with `C`, decodes `x8`/`x0`-`x5`, checks handles and rights, returns a `Call` for the
+- `syscall::dispatch` (`src/syscall.rs`): returns `ENOSYS` above the last syscall, then clamps every user value that indexes kernel memory behind one `Clamp` barrier, decodes `x8`/`x0`-`x5`, checks handles and rights, returns a `Call` for the
   board to execute. Syscall numbers and error constants are defined here.
 - `cpio::find`, `cpio::entries`, `elf::Elf::parse` (`src/cpio.rs`, `src/elf.rs`).
 - `network` (`src/network.rs`, design notes at its top): `Network`, up to three `net::Stack`s (`ETH` on the NIC,
@@ -79,10 +79,13 @@ touches memory through raw addresses: the board reads user buffers, copies pages
 
 ## Invariants & rules
 
-- Spectre v1: a user-derived index the kernel loads through goes through `Clamp` where it is used: the handle index
-  (`Handles::lookup`) and the syscall number (`dispatch`). Objects a handle reaches (pipe, mutex, process, thread,
-  inode) are kernel-written, so their indexes need none. The board's `Clamp` ends in `csdb` (`arch::clamp`); host
-  tests use `min`. A new user-indexed table joins the list in `docs/phases/phase-10-hardening.md` (60b).
+- Spectre v1: `dispatch` clamps, before any use and behind one barrier (`Clamp::clamp`, `csel`s then one `csdb` on the
+  board, `min` on the host), every argument that may index kernel memory, each to the capacity of what it indexes:
+  the number, the handles in x0 and x3, each user buffer (pointer and length), the file offset and the `readdir`
+  start; only the clamped values go on. An index derived from them is bounded by construction (MogFS's `% PTRS`). A
+  value that only appears later keeps its own clamp: `spawn`'s handle list (`split`), `Handle::new`. Objects a handle
+  reaches are kernel-written. A new syscall's indexing arguments join the batch (`docs/phases/phase-10-hardening.md`,
+  60b).
 
 - Handle value is `generation << 32 | index`; `close` bumps the entry's generation; an entry retires at `1 << 31`, so
   values stay positive and never wrap (`src/handle.rs` header, `RETIRED`).

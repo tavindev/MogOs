@@ -302,52 +302,28 @@ fn smccc(conduit: Conduit, function: u32, arg: u32) -> i64 {
     result as i32 as i64
 }
 
-/// `index` if below `len`, else 0, also under speculation (`cmp`, `csel`, `csdb`); the caller still bounds-checks
-/// `index`, since 0 is in range.
+/// Each of `values` if below its limit, else the limit minus 1, by `cmp` and `csel`, then one `csdb`: no later
+/// instruction uses a value a mispredicted check let through.
 #[inline(always)]
-pub fn clamp(index: usize, len: usize) -> usize {
-    let clamped: usize;
-    // SAFETY: arithmetic and `csdb` only.
-    unsafe {
-        asm!(
-            "cmp {i}, {n}",
-            "csel {c}, {i}, xzr, lo",
-            "hint #20", // csdb
-            i = in(reg) index,
-            n = in(reg) len,
-            c = lateout(reg) clamped,
-            options(pure, nomem, nostack),
-        )
-    };
-    clamped
-}
-
-/// `ptr` if `ptr..ptr + len` lies in user space (4 GiB up to the 39-bit VA limit), else 0, also under speculation
-/// (`cmp`, `ccmp`, `csel`, `csdb`).
-#[inline(always)]
-pub fn mask_user(ptr: u64, len: u64) -> u64 {
-    let masked: u64;
-    // SAFETY: arithmetic and `csdb` only.
-    unsafe {
-        asm!(
-            "movz {lo}, #1, lsl #32",
-            "movz {hi}, #0x80, lsl #32",
-            "sub {room}, {hi}, {p}",
-            "cmp {p}, {lo}",
-            "ccmp {hi}, {p}, #0, hs",
-            "ccmp {room}, {len}, #0, hs",
-            "csel {m}, {p}, xzr, hs",
-            "hint #20", // csdb
-            p = in(reg) ptr,
-            len = in(reg) len,
-            lo = out(reg) _,
-            hi = out(reg) _,
-            room = out(reg) _,
-            m = lateout(reg) masked,
-            options(pure, nomem, nostack),
-        )
-    };
-    masked
+pub fn clamp<const N: usize>(values: [u64; N], limits: [u64; N]) -> [u64; N] {
+    let mut out = values;
+    for i in 0..N {
+        // SAFETY: arithmetic only; not `pure`, so it stays before the `csdb` below.
+        unsafe {
+            asm!(
+                "sub {m}, {n}, #1",
+                "cmp {v}, {n}",
+                "csel {v}, {v}, {m}, lo",
+                v = inout(reg) out[i],
+                n = in(reg) limits[i],
+                m = out(reg) _,
+                options(nomem, nostack),
+            )
+        };
+    }
+    // SAFETY: `csdb` only; no `nomem`, so no load the compiler emits moves above it.
+    unsafe { asm!("hint #20", options(nostack, preserves_flags)) };
+    out
 }
 
 fn vectors() -> u64 {

@@ -5,8 +5,8 @@ use kernel::syscall::{E2BIG, EFAULT, EINVAL, MAX_ARGS, argc, dispatch};
 struct Min;
 
 impl kernel::Clamp for Min {
-    fn clamp(index: usize, len: usize) -> usize {
-        index.min(len - 1)
+    fn clamp<const N: usize>(values: [u64; N], limits: [u64; N]) -> [u64; N] {
+        core::array::from_fn(|i| values[i].min(limits[i] - 1))
     }
 }
 
@@ -30,13 +30,13 @@ fn argc_counts_nul_terminated_strings_up_to_the_limit() {
 #[test]
 fn spawn_checks_the_argument_buffer() {
     const SPAWN: u64 = 6;
-    let mut handles = Handles::<Min>::new();
+    let mut handles = Handles::new();
     let exe = handles
         .insert(Object::File { start: 0, end: 0 }, EXEC)
         .unwrap();
     let user = 1 << 32;
-    let spawn = |handles: &mut Handles<Min>, ptr: u64, len: u64| {
-        dispatch(SPAWN, &[exe, 0, 0, 0, 0, ptr, len], handles).err()
+    let spawn = |handles: &mut Handles, ptr: u64, len: u64| {
+        dispatch::<Min>(SPAWN, &[exe, 0, 0, 0, 0, ptr, len], handles).err()
     };
     assert_eq!(spawn(&mut handles, user, 4096), None);
     assert_eq!(spawn(&mut handles, user, 4097), Some(E2BIG));

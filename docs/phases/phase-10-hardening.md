@@ -43,12 +43,17 @@ QEMU 9.2.1 `target/arm/hvf/hvf.c`). So e2e proves the decision per model, and hv
 - **60b.** Invariants:
   - Every user-derived array index goes through the clamp. The list in the step is exhaustive, and the reviewer checks
     it on every step that adds a syscall or a user-indexed table.
-  - The clamp runs where the index is used, not only where it enters.
+  - Clamped at one choke point behind one `csdb`, bounded by array capacity (changed during implementation, see What
+    was done: a `csdb` costs about 9 ns on the M4). `dispatch` clamps every argument that may index kernel memory,
+    each with a `csel` to the capacity of what it indexes (never a run-time size such as a file's length), then runs
+    one `csdb`, and passes on only the clamped values. An index derived from them later is bounded by that capacity
+    by construction, with no `csel`. A value that only appears after `dispatch` and indexes memory keeps its own
+    clamp and barrier.
 
   Avoids Linux's scattered `array_index_nospec` call sites; here the choke points already exist.
 
   Linux masks user pointers with one `bic` of bit 55, possible because its kernel lives in TTBR1. After phase 6's
-  higher-half move, `mask_user` becomes that one instruction and its cost is re-measured.
+  higher-half move, the pointer clamp can become that one instruction and its cost is re-measured.
 - **60c.** Invariants:
   - No kernel mapping is both writable and executable.
   - Each kernel stack built at boot has a guard page.
@@ -173,3 +178,35 @@ Filled in as each step lands.
   after the `boot:` line. TCG instructions (`-icount shift=0`, exact): `cortex-a76` syscall 218 -> 293 (+75: `mov`,
   24 x 3, `dsb`, `isb`), pipe 2480 -> 2930 (six traps); `cortex-a72` picks the plain table, so 218 -> 218; the hvf
   k = 8 table runs 27 more instructions per EL0 trap.
+- Step 60b, Spectre v1: built first as the step says, a clamp where each index is used (`arch::clamp`, `cmp`/`csel`/
+  `csdb`, through a `Clamp` port on `Handles` and `Disk`, and `arch::mask_user` in `UserIn`/`UserOut`; commit
+  "Step 60b (per-site clamps)"). Measured against 60a (hvf, 63 boots, load about 10): `enosys` +11 ns, a null console
+  write +23, a pipe write +34, a file read +43, the pipe round trip +191, about 10 ns per `csdb`, not the 1 ns
+  pre-declared. A `csdb` alone costs 8.8 ns on the M4 (a host loop of `cmp; csel; csdb` against 0.3 ns without it),
+  so the cost is the barrier, which hvf runs natively; an A72's is unknown until phase 11. The orchestrating session
+  then approved the cheaper form, one barrier per syscall, and the invariant changed (above). `dispatch` (generic over the
+  kernel's `Clamp` port, the board's `Nospec` over `arch::clamp`: one `cmp`/`csel` per value, then one `csdb`) now
+  clamps, before the jump on the number, 13 values: the number (below 26), the handle indexes in x0 and x3 (below
+  16), the user buffers at x1, x2, x4 and x5 with the lengths after them (each pointer's offset in user space below
+  its room, `2^39 - 2^32 - (len & 0x1fff) + 1`, so a clamped buffer ends in user space or, for a length a mispredicted
+  check let through, at most 4 KiB past its top, where nothing translates; each length below `MAX_BUFFER + 1`), the
+  file offset in x4 (below `MAX_FILE_SIZE + 2`) and the `readdir` start in x3 (below `MAX_FILE_SIZE + 1`). Each limit
+  keeps every architecturally valid value unchanged, so the architectural checks decide the result as before; only
+  the clamped values reach `Call`. Handle lookups take a `Handle` (value and clamped index); `split` (`spawn`'s
+  handle list, read from user memory after `dispatch`) clamps each with `Handle::new` and its own barrier. MogFS indexes
+  a record's block pointers `% PTRS` in `read`, `write_data`, `write`'s block count and `scan`: in bounds by
+  construction on a mispredicted loop bound, which runs one block past the end (`Disk` has no clamp). The socket calls
+  (20-25) take x0's clamped handle, and a receive or send the x2/x3 buffer. MogFS v2 (`crates/mogfs2`) is not wired
+  into the kernel yet; it joins the list when it is. `fsbench` now checks that reads at and past a file's end and a
+  `readdir` from past the last entry return 0 (green before and after: regression guards), and both pinned `spec:`
+  lines read `v1 mitigated`. Benchmarks (hvf, base: main `22c07bc` with 60a, 63 interleaved boots, load 50 to 78, so
+  min is the steadier number; median/min before -> after): `-smp 1` syscall 61/45 -> 78/60 ns, `mutex` (no index
+  but the number) 60.1/52.7 -> 75.7/64.9, `dup` 61.0/51.3 -> 75.1/65.4, `close` 58.8/49.9 -> 74.6/62.8, pipe write
+  84.5/74.5 -> 101.6/87.9, file read 106.7/90.6 -> 120.3/103.3, `open` 116.7/101.2 -> 136.4/115.6, `readdir`
+  122.4/104.6 -> 141.4/120.9, `enosys` (rejected before the batch) 55.6/46.7 -> 55.2/47.3, yield and boot hold;
+  `-smp 4` syscall 61/48 -> 77/60, pipe write 93.4/75.8 -> 113.0/95.5, file read 110.6/90.7 -> 126.9/109.7, pipe
+  round trip 605/482 -> 708/544. So about 13-17 ns per syscall, one `csdb` and the batch's 13 selects, against
+  23-43 ns for the per-site form. TCG instructions (`-icount`, `cortex-a72`): 84-98 per syscall (the batch), `enosys`
+  +2, yield 0. At `opt-level = 1` the generic `dispatch` is instantiated in the board crate, so the handle lookups and
+  `path`/`socket` are `#[inline(always)]` (without it each returned its `Object` through `memcpy`, 200 more
+  instructions for `dup` and `close`).

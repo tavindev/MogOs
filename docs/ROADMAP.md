@@ -13,7 +13,7 @@ Ordered by dependency: each phase builds on the previous one.
 | 7 | Storage that scales: MogFS v2 (extents, snapshots, scrub), async block path, multi-queue NVMe | [phase-7-storage.md](phases/phase-7-storage.md) | |
 | 8 | Networking: safe TCP/IP, sockets as handles, virtio-net | [phase-8-networking.md](phases/phase-8-networking.md) | In progress (steps 46, 49, 50, 51 done) |
 | 9 | POSIX completeness and Linux binary compatibility; native ABI frozen | not written | |
-| 10 | Observability, debugging, security hardening; early hardening baseline (Spectre-BHB, v1 masking, kernel W^X: steps 60a-60c) runs beside phase 5 | [phase-10-hardening.md](phases/phase-10-hardening.md) | Step 60a done; 60b-60c planned; 60-66 not written |
+| 10 | Observability, debugging, security hardening; early hardening baseline (Spectre-BHB, v1 masking, kernel W^X: steps 60a-60c) runs beside phase 5 | [phase-10-hardening.md](phases/phase-10-hardening.md) | Steps 60a-60b done; 60c planned; 60-66 not written |
 | 11 | Real hardware, boot, power | not written | |
 | 12 | Graphics, desktop, virtualization | not written | |
 

@@ -104,7 +104,7 @@ pub trait Budgets {
     fn alive(&mut self, owner: Owner) -> bool;
 }
 
-impl<const N: usize, const P: usize, C: crate::Clamp> Budgets for Scheduler<N, P, C> {
+impl<const N: usize, const P: usize> Budgets for Scheduler<N, P> {
     fn charge(&mut self, (slot, generation): Owner, frames: usize) -> bool {
         self.budget(slot, generation)
             .is_some_and(|b| b.charge(frames))
