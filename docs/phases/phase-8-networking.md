@@ -49,4 +49,13 @@ Decision: write `crates/net` fresh. smoltcp is a host-only dev-dependency of `cr
 
 ## What was done
 
-Filled in as each step lands.
+- **46.** `crates/net` ([CLAUDE.md](../../crates/net/CLAUDE.md)): `Stack` over the `Nic` trait as in Notes, with
+  the ARP cache, socket table and socket buffers from the caller and `now` passed in. UDP sockets and ICMP echo
+  sockets (Linux ping-socket shape) share one table; an unresolved next hop returns `Unresolved` after sending the
+  ARP request (no datagram queue), and `poll` retries ARP every second, three times, returning the next deadline.
+  ARP also requires the sender MAC to equal the Ethernet source, which keeps a corrupted frame from poisoning the
+  cache. Replies (ARP, echo) are built in one stack-owned frame buffer while the received frame is borrowed, then
+  sent. Tests (`tests/stack.rs`, simulated link in `tests/sim/mod.rs`): 200 seeds of ping and UDP echo under loss,
+  reordering, duplication and corruption; 100k seeded mutations of recorded frames; ARP spoof, flood, LRU and retry;
+  named socket errors; fragments. Checksum: copy then sum in 32-bit words measured faster than a fused copy-and-sum
+  loop on the host, so the copy is a plain `memcpy`. Benchmarks in `docs/BENCHMARKS.md`.
