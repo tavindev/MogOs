@@ -3,8 +3,8 @@ use core::cell::{RefCell, UnsafeCell};
 use core::hint::spin_loop;
 use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::AtomicU16;
 use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+use core::sync::atomic::{AtomicU16, AtomicU32};
 
 use super::irq;
 
@@ -51,6 +51,8 @@ pub unsafe fn enter_percpu(index: usize, area: usize) {
 pub struct Lock<T> {
     next: AtomicU16,
     owner: AtomicU16,
+    /// Acquisitions that had to wait (wrapping); in the padding before an 8-byte aligned `data`.
+    contended: AtomicU32,
     data: UnsafeCell<T>,
 }
 
@@ -62,6 +64,7 @@ impl<T> Lock<T> {
         Self {
             next: AtomicU16::new(0),
             owner: AtomicU16::new(0),
+            contended: AtomicU32::new(0),
             data: UnsafeCell::new(data),
         }
     }
@@ -77,14 +80,22 @@ impl<T> Lock<T> {
     /// Acquires without touching DAIF, for code entered with IRQs masked (trap hooks).
     pub fn lock_masked(&self) -> Guard<'_, T> {
         let ticket = self.next.fetch_add(1, Relaxed);
-        while self.owner.load(Acquire) != ticket {
-            spin_loop();
+        if self.owner.load(Acquire) != ticket {
+            self.contended.fetch_add(1, Relaxed);
+            while self.owner.load(Acquire) != ticket {
+                spin_loop();
+            }
         }
         Guard {
             lock: self,
             irq: None,
             _data: PhantomData,
         }
+    }
+
+    /// Acquisitions so far that had to wait for another holder (wrapping).
+    pub fn contended(&self) -> u32 {
+        self.contended.load(Relaxed)
     }
 
     /// Releases the lock a leaked guard held.

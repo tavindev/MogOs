@@ -469,6 +469,10 @@ impl kernel::Board for QemuVirt {
     fn online_cpus(&self) -> usize {
         ONLINE.load(Acquire)
     }
+
+    fn contended(&self) -> u32 {
+        KERNEL.contended()
+    }
 }
 
 unsafe extern "C" {

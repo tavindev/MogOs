@@ -114,6 +114,8 @@ pub trait Board {
     fn ticked_cpus(&self) -> usize;
     /// Cores whose interrupt controller is set up, this one included, once `start_cpus` ran.
     fn online_cpus(&self) -> usize;
+    /// Acquisitions of the board's kernel lock that had to wait, so far (wrapping).
+    fn contended(&self) -> u32;
 }
 
 /// What `Board::round_trips` times.
@@ -155,6 +157,15 @@ pub enum Program {
 const BENCH_YIELDS: u64 = 100_000;
 /// Round trips per lock timed by `test=bench-lock`.
 const BENCH_LOCKS: u64 = 10_000_000;
+/// Per `smpwork` worker of `test=bench-smp`: syscalls, pipe round trips, spawns; must equal its `SYSCALLS`,
+/// `ROUND_TRIPS` and `SPAWNS`.
+const SMP_SYSCALLS: u64 = 20_000;
+const SMP_ROUND_TRIPS: u64 = 2_000;
+const SMP_SPAWNS: u64 = 200;
+/// `smpwork`'s 9 frames, two pipe pages and `pong`'s 9, or `nop`'s 9, with 4 to spare.
+const SMP_WORK_BUDGET: usize = 24;
+/// `test=bench-smp`'s worker counts, those up to the core count.
+const SMP_WORKERS: [usize; 5] = [1, 2, 4, 8, 12];
 /// SGI round trips `test=bench-ipi` times.
 const IPI_ROUND_TRIPS: u64 = 1000;
 /// The additions each of `test=bench-lock`'s adders makes, one adder per core (at least two), the boot context one.
@@ -328,6 +339,7 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
             ),
             "test=bench-pipe" => pipe_bench(board),
             "test=bench-lock" => lock_bench(board),
+            "test=bench-smp" => smp_bench(board),
             "test=bench-ipi" if board.cpus() > 1 => {
                 let start = board.uptime_us();
                 board.ipi_round_trips(IPI_ROUND_TRIPS);
@@ -608,6 +620,38 @@ fn pipe_bench<B: Board>(board: &mut B) {
     wait(board);
     let ns = (board.uptime_us() - start) * 1000 / PIPE_ROUND_TRIPS;
     let _ = writeln!(board.console(), "pipe: {ns} ns/round-trip");
+}
+
+/// `test=bench-smp`: k `smpwork` processes at once for each mode, timed from their spawn until all exited; prints the
+/// aggregate operations per second and the kernel lock's contended acquisitions over the run.
+fn smp_bench<B: Board>(board: &mut B) {
+    run_checked(board, "bench-smp", |board| {
+        let modes = [
+            ("syscall", SMP_SYSCALLS),
+            ("pipe", SMP_ROUND_TRIPS),
+            ("spawn", SMP_SPAWNS),
+        ];
+        let cpus = board.cpus();
+        for (mode, ops) in modes {
+            let args = [b"smpwork\0", mode.as_bytes(), b"\0"].concat();
+            for k in SMP_WORKERS.into_iter().filter(|&k| k <= cpus) {
+                let (start, contended) = (board.uptime_us(), board.contended());
+                for _ in 0..k {
+                    board
+                        .spawn_archived("smpwork", SMP_WORK_BUDGET, INIT_ARCHIVE, &args)
+                        .expect("spawn");
+                }
+                wait(board);
+                let us = (board.uptime_us() - start).max(1);
+                let rate = k as u64 * ops * 1_000_000 / us;
+                let contended = board.contended().wrapping_sub(contended);
+                let _ = writeln!(
+                    board.console(),
+                    "bench-smp {mode} {k}: {rate} ops/s, {contended} contended"
+                );
+            }
+        }
+    });
 }
 
 /// Times uncontended acquire + release of the ticket and the test-and-set lock, reading the core index and a per-CPU

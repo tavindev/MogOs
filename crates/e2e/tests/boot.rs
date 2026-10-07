@@ -576,6 +576,35 @@ fn lock_bench(cpus: usize, secs: u64) {
 }
 
 #[test]
+fn smp_bench_reports_throughput_and_contention_for_each_worker_count() {
+    let (status, lines) = boot(&["-append", "test=bench-smp"]);
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.starts_with("panic:") || l.starts_with("fault:")),
+        "kernel panicked or a worker faulted"
+    );
+    for mode in ["syscall", "pipe", "spawn"] {
+        for k in [1, 2, 4] {
+            let line = format!("bench-smp {mode} {k}: ");
+            let rest = lines
+                .iter()
+                .find_map(|l| l.strip_prefix(&line))
+                .unwrap_or_else(|| panic!("missing line: {line}"));
+            let (rate, contended) = rest.split_once(" ops/s, ").unwrap();
+            assert!(rate.parse::<u64>().unwrap() > 0);
+            contended
+                .strip_suffix(" contended")
+                .unwrap()
+                .parse::<u32>()
+                .unwrap();
+        }
+    }
+    assert_no_leak(&lines, "bench-smp");
+    assert!(status.success(), "QEMU exited with {status}");
+}
+
+#[test]
 fn ipi_bench_reports_an_sgi_round_trip_between_cores() {
     let (status, lines) = boot(&["-append", "test=bench-ipi"]);
     assert!(
