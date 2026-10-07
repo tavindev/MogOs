@@ -4,10 +4,46 @@
 # prints the median and min of every `bench <name>: <ns> ns` line. With a base kernel, each round boots both, the order
 # alternating, and prints the base, the new and the delta of each; `SLOWER` marks a call whose median and min both rose.
 # <test> may carry more bootargs; QEMU_ARGS adds QEMU arguments (a NIC: `-netdev user,id=n0 -device virtio-net-device,netdev=n0`).
+# Usage: scripts/bench.sh host <rounds> <base commit> <package> [<criterion args>]
+# Host criterion benches of <package>, the working tree against <base commit> (checked out under target/): each round
+# runs both, the order alternating, then prints criterion's change estimate and confidence interval for every row.
 set -eu
-[ $# -ge 3 ] || { sed -n '2,6s/^# //p' "$0"; exit 2; }
-test=$1 rounds=$2 new=$3 base=${4:-}
+[ $# -ge 3 ] || { sed -n '2,9s/^# //p' "$0"; exit 2; }
 root=$(cd "$(dirname "$0")/.." && pwd)
+
+if [ "$1" = host ]; then
+    [ $# -ge 4 ] || { sed -n '2,9s/^# //p' "$0"; exit 2; }
+    rounds=$2 base=$3 package=$4
+    shift 4
+    src="$root/target/bench-base-src"
+    git -C "$root" worktree remove --force "$src" 2>/dev/null || true
+    git -C "$root" worktree add -q --detach "$src" "$base"
+    trap 'git -C "$root" worktree remove --force "$src"' EXIT
+    # One baseline directory for both trees, so the compare step sees both.
+    export CRITERION_HOME="$root/target/criterion"
+    # bench <tree> <target dir> <criterion args>; runs in <tree> so its .cargo/config.toml applies.
+    bench() {
+        tree=$1 dir=$2
+        shift 2
+        (cd "$tree" && CARGO_TARGET_DIR=$dir cargo bench -q --target aarch64-apple-darwin -p "$package" --bench '*' -- "$@")
+    }
+    i=0
+    while [ "$i" -lt "$rounds" ]; do
+        if [ $((i % 2)) -eq 0 ]; then
+            bench "$src" "$root/target/bench-base" --save-baseline base "$@" >/dev/null
+            bench "$root" "$root/target" --save-baseline new "$@" >/dev/null
+        else
+            bench "$root" "$root/target" --save-baseline new "$@" >/dev/null
+            bench "$src" "$root/target/bench-base" --save-baseline base "$@" >/dev/null
+        fi
+        i=$((i + 1))
+        echo "round $i, load $(sysctl -n vm.loadavg | cut -d' ' -f2):"
+        bench "$root" "$root/target" --load-baseline new --baseline base "$@" | grep -vE '^(Benchmarking|Found|  [0-9])|^$'
+    done
+    exit
+fi
+
+test=$1 rounds=$2 new=$3 base=${4:-}
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 cargo run -q --manifest-path "$root/Cargo.toml" -p mogfs --example mkfs --target aarch64-apple-darwin -- \
