@@ -1,14 +1,14 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use mogfs2::{BLOCK_SIZE, Block, Disk, Error, Fs, ROOT, bitmap_words, cache_blocks};
+use mogfs2::{BLOCK_SIZE, Buf, Disk, Error, Fs, ROOT, bitmap_words, cache_blocks};
 
 const RUNS: usize = 51;
 const FILES: usize = 400;
 const POOL: usize = 64;
 
 struct MemDisk {
-    blocks: Vec<Block>,
+    blocks: Vec<Buf>,
     requests: usize,
 }
 
@@ -22,13 +22,13 @@ impl MemDisk {
 }
 
 impl Disk for &mut MemDisk {
-    fn read(&mut self, block: u64, bufs: &mut [Block]) -> Result<(), Error> {
+    fn read(&mut self, block: u64, bufs: &mut [Buf]) -> Result<(), Error> {
         self.requests += 1;
         bufs.copy_from_slice(&self.blocks[block as usize..][..bufs.len()]);
         Ok(())
     }
 
-    fn write(&mut self, block: u64, bufs: &[Block]) -> Result<(), Error> {
+    fn write(&mut self, block: u64, bufs: &[Buf]) -> Result<(), Error> {
         self.requests += 1;
         self.blocks[block as usize..][..bufs.len()].copy_from_slice(bufs);
         Ok(())
@@ -45,7 +45,7 @@ impl Disk for &mut MemDisk {
 }
 
 struct Mem {
-    cache: Vec<Block>,
+    cache: Vec<Buf>,
     bits: Vec<u64>,
 }
 
