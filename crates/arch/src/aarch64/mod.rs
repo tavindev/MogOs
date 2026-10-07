@@ -13,6 +13,16 @@ pub use trap::*;
 
 global_asm!(include_str!("boot.s"));
 
+unsafe extern "C" {
+    fn aarch64_secondary() -> !;
+}
+
+/// PSCI `CPU_ON`'s entry point for a secondary core, with its 16-byte aligned stack top as the context id. The core turns
+/// on its MMU with the boot table, sets `cpu()` to its MPIDR Aff0 and calls the board's `kmain_secondary`, IRQs masked.
+pub fn secondary_entry() -> u64 {
+    aarch64_secondary as *const () as u64
+}
+
 /// Microseconds since the virtual counter started.
 pub fn uptime_us() -> u64 {
     let (ticks, freq): (u64, u64);

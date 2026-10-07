@@ -499,9 +499,36 @@ fn lock_bench_reports_round_trips_and_an_exact_count() {
 
 #[test]
 fn console_reads_edited_lines_typed_ahead() {
+    console_echo(&[]);
+}
+
+#[test]
+fn console_input_reaches_core_0_on_four_cores() {
+    console_echo(&["-smp", "4"]);
+}
+
+#[test]
+fn every_core_comes_online_and_takes_a_timer_tick() {
+    let (status, lines) = boot(&["-smp", "4", "-append", "test=smp"]);
+    assert!(
+        !lines.iter().any(|l| l.starts_with("panic:")),
+        "kernel panicked"
+    );
+    for cpu in 0..4 {
+        let online = format!("cpu {cpu}: online");
+        assert!(lines.contains(&online), "missing line: {online}");
+    }
+    assert!(
+        lines.iter().any(|l| l == "smp: 4 cpus ticked"),
+        "missing line: smp: 4 cpus ticked"
+    );
+    assert!(status.success(), "QEMU exited with {status}");
+}
+
+fn console_echo(extra: &[&str]) {
     // Both lines in one write once `E: ready` is out, when the first read is already blocked.
     let input = Some(("E: ready", &[&b"hel\x7flo\rbye\r"[..]][..]));
-    let (status, lines) = boot_with_input(&["-append", "test=echo"], input);
+    let (status, lines) = boot_with_input(&[extra, &["-append", "test=echo"]].concat(), input);
     assert!(
         !lines.iter().any(|l| l.starts_with("panic:")),
         "kernel panicked"

@@ -14,15 +14,21 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
 
 ## Responsibilities
 
-- `kmain`: reads the DTB at RAM base, builds `QemuVirt`, calls `kernel::run` with the image and DTB reserved.
+- `kmain`: turns on the MMU (`arch::enable_mmu`, first), reads the DTB at RAM base and its core count (at most
+  `MAX_CPUS`), routes `UART_IRQ` to core 0 (`GICD_ITARGETSR`, else a GIC with several cores delivers it nowhere), builds
+  `QemuVirt`, calls `kernel::run` with the image and DTB reserved. `Board::start_cpus`, the last step of boot, starts core 1
+  with PSCI `CPU_ON` without waiting, and core 1 starts the rest (a refused `CPU_ON` panics). `kmain_secondary`: a started core enables its GIC CPU
+  interface, timer PPI and `RESCHEDULE_SGI` (its banked `ISENABLER0`) and idles in `wfi`; only under `test=smp`
+  (`SMP_TEST`) does it print `cpu <n>: online` and arm its timer. It runs no task yet (step 25b).
 - `KERNEL: Lock<Kernel>` (`Scheduler`, `FrameAllocator`, `Pipes`, `Mutexes`, console `Line`, the MogFS `Fs<FsDisk>`
   and whether it is mounted), `HEAP` and `CONSOLE: Lock<Uart>` statics. `Fs::new` is const, so the 48 KiB file system is built in the static with an empty
   `FsDisk(None)` (`Io` until `Board::mount` puts the `VirtioBlk` in through `Fs::disk`). File syscalls run their disk I/O inside the trap under `KERNEL`: a `sync` holds it
   for its writes and two flushes. Boot-spawned processes get the root directory as handle 3 once mounted (`spawn_init`).
 - Trap hooks `task_switch`, `board_irq`, `board_syscall`, `board_user_fault`: execute the `kernel::syscall::Call`
   that `dispatch` returns (user buffers, pages, frames, wake/block). `board_unlock`, called by the trap exit, releases `KERNEL`.
-- `Board::console` writes (`Console`) hold `CONSOLE` for a whole `write_fmt`, so a line is never split; it is the PL011
-  at `UART0`, like every other UART access. `test=bench-lock`'s `lock_round_trips` (ticket vs test-and-set) and `add_locked`.
+- `Board::console` writes (`Console`) hold `CONSOLE` for a whole `write_fmt`, so no other `Console` line splits it (the unlocked writers below can); it is the PL011
+  at `UART0`, like every other UART access. `test=bench-lock`'s `lock_round_trips` (ticket vs test-and-set) and `add_locked`;
+  `test=smp`'s `cpus` and `ticked_cpus` (`TICKED`, a bit per core set on each tick).
 - Processes: `spawn_process`, `spawn`, `task_exit`, `kill`, `map`, `release`, `enter` (TTBR0/ASID switch).
 - `VirtioBlk` (`src/virtio_blk.rs`) implements `kernel::Disk` (`mogfs::Disk`): modern (version 2) virtio-mmio only,
   one 4-entry queue in one frame, one request in flight, completion polled (no IRQ), DMA straight to the caller's
@@ -41,7 +47,7 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
   `// SAFETY:` and every `unsafe fn` a `# Safety` section.
 - Depends on `kernel`, never the reverse. GIC and RAM come from the DTB; board constants fix the rest:
   `UART0` (the PL011 at `0x0900_0000`: all console output and input, never read from the DTB), `DTB` (RAM base), `KERNEL_L1` (GiB 0 device, GiB 1 RAM),
-  `UNMAPPED`, `TIMER_IRQ` (27), `VIRTIO`, `VIRTIO_STRIDE`, `VIRTIO_COUNT` (32 virtio-mmio transports from `0x0a00_0000`, `0x200` apart), the PSCI call. QEMU runs with
+  `UNMAPPED`, `TIMER_IRQ` (27), `UART_IRQ` (33), `RESCHEDULE_SGI` (0), core `n`'s MPIDR (`n`), `SECONDARY_STACK` (16 KiB), `VIRTIO`, `VIRTIO_STRIDE`, `VIRTIO_COUNT` (32 virtio-mmio transports from `0x0a00_0000`, `0x200` apart), the PSCI calls (`SYSTEM_OFF`, `CPU_ON`, by HVC). QEMU runs with
   `-global virtio-mmio.force-legacy=false` (the driver rejects legacy) and `-global virtio-mmio.ioeventfd=off`
   (`docs/DEVELOPMENT.md` settings table).
 - Bare-metal only: excluded from `cargo test-host`.
@@ -61,7 +67,10 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
   task whose kernel stack another core still runs on. `breakpoint_self_test` takes it before its `brk`. `Board`
   methods take `lock()` guards and never hold one across a switch (`run_others` drops it before `yield_now`). Panic,
   fault, echo and user `write` output use `UART0` directly, never `CONSOLE`.
-- Locks need the MMU on (exclusives), so `kernel::run` calls `enable_mmu` first, before any output or trap.
+- Locks need the MMU on (exclusives), so `kmain` calls `enable_mmu` first, before any output, trap or secondary core.
+- Only core 0 runs tasks: `board_irq` switches only there, since the scheduler has one `current`. Every core still
+  takes `KERNEL` in its trap hooks. IRQs dispatch on `iar & 0x3ff` and EOI the full IAR.
+- Everything a secondary reads (`GIC_DIST`, `GIC_CPU`, `CPUS`, `SMP_TEST`) is stored before its `CPU_ON`, which `dsb ish` precedes.
 - A process's slot is its ASID (`MAX_TASKS <= 256`, const-asserted); the boot table keeps ASID 0 (`enter`).
 - Every frame a process uses (tables, pages, kernel stack, pipe pages it creates) is charged to its `Budget`;
   `spawn_process` returns every frame on failure, `spawn` moves nothing on failure.
@@ -75,7 +84,8 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
   (both charged to the child), and the child starts with x0-x2 = count, address, length,
   `map` from `MAP_BASE` upward. Kernel blocks (`KERNEL_L1`) are EL1-only in every address space.
 - `MAX_MUTEXES = MAX_TASKS * MAX_HANDLES`: every live mutex holds a handle, so the handle tables are the quota.
-- `linker.ld` provides `__stack_top`, `__bss_start`, `__bss_end`, `__kernel_start`, `__kernel_end`; its load address
+- `linker.ld` provides `__stack_top`, `__bss_start`, `__bss_end`, `__kernel_start`, `__kernel_end`, and above
+  `__stack_top` the secondaries' stacks (core `n`'s ends at `__stack_top + n * 0x4000`), inside the reserved image; its load address
   is explained in `docs/DEVELOPMENT.md`.
 - Performance is the moat: a slowdown is never accepted because it has an explanation; it is removed, or shown to
   be unavoidable with before/after numbers (`docs/BENCHMARKS.md`).

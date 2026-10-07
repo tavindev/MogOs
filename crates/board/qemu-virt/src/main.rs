@@ -18,7 +18,7 @@ use core::panic::PanicInfo;
 use core::ptr::{self, NonNull};
 use core::slice;
 use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
-use core::sync::atomic::{AtomicBool, AtomicU64};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 
 use arch::{Guard, Lock, MemoryType, l1_block};
 use dtb::Dtb;
@@ -67,8 +67,21 @@ const TIMER_IRQ: u32 = 27;
 const UART_IRQ: u32 = 33;
 const TICK_US: u64 = 10_000;
 
-/// GIC CPU interface base, set before the first IRQ can be delivered.
+/// The SGI that will wake a core to reschedule (step 25b); enabled on every core.
+const RESCHEDULE_SGI: u32 = 0;
+const PSCI_CPU_ON: u64 = 0xc400_0003;
+/// Each secondary core's stack, reserved in `linker.ld` above `__stack_top`.
+const SECONDARY_STACK: u64 = 0x4000;
+
+/// GIC distributor and CPU interface bases, set before the first IRQ can be delivered and before any secondary starts.
+static GIC_DIST: AtomicU64 = AtomicU64::new(0);
 static GIC_CPU: AtomicU64 = AtomicU64::new(0);
+/// Bit `n` is set once core `n` has taken a timer tick.
+static TICKED: AtomicUsize = AtomicUsize::new(0);
+/// `test=smp`: secondaries announce themselves and run their timer; otherwise they sleep until 25b gives them work.
+static SMP_TEST: AtomicBool = AtomicBool::new(false);
+/// The DTB's cores, at most `MAX_CPUS`; `start_cpus` starts them all or panics.
+static CPUS: AtomicUsize = AtomicUsize::new(1);
 /// Set once `Board::disk` handed out the block device.
 static DISK_TAKEN: AtomicBool = AtomicBool::new(false);
 /// QEMU `virt`'s 32 virtio-mmio transports: the first one's base, and the stride between them.
@@ -189,11 +202,6 @@ impl kernel::Board for QemuVirt {
         let _ = Guard::leak(KERNEL.lock());
         // SAFETY: `KERNEL` is held through the guard leaked above, which the trap exit releases.
         unsafe { arch::breakpoint_self_test() }
-    }
-
-    fn enable_mmu(&mut self) {
-        // SAFETY: called at boot with the MMU off, before any atomic RMW; MMIO is in GiB 0, and the image, stack and DTB are in RAM in GiB 1.
-        unsafe { arch::enable_mmu(&KERNEL_L1, arch::MAIR) }
     }
 
     fn read_unmapped(&mut self) {
@@ -348,16 +356,35 @@ impl kernel::Board for QemuVirt {
         }
         *COUNT.lock()
     }
+
+    fn start_cpus(&mut self, smp_test: bool) {
+        SMP_TEST.store(smp_test, Relaxed);
+        // Core 1 starts the rest, so boot pays one call.
+        if CPUS.load(Relaxed) > 1 {
+            start_cpu(1);
+        }
+    }
+
+    fn cpus(&self) -> usize {
+        CPUS.load(Relaxed)
+    }
+
+    fn ticked_cpus(&self) -> usize {
+        TICKED.load(Relaxed).count_ones() as usize
+    }
 }
 
 unsafe extern "C" {
     static __kernel_start: u8;
     static __kernel_end: u8;
+    static __stack_top: u8;
 }
 
 #[unsafe(no_mangle)]
 extern "C" fn kmain() -> ! {
     let entry_us = arch::uptime_us();
+    // SAFETY: core 0, MMU off, before any atomic RMW; MMIO is in GiB 0, the image, stacks and DTB in RAM in GiB 1.
+    unsafe { arch::enable_mmu(&KERNEL_L1) };
     arch::install_vectors();
     arch::timer::allow_user_counter();
 
@@ -373,12 +400,22 @@ extern "C" fn kmain() -> ! {
 
     let dtb = Dtb::new(blob).expect("bad DTB");
     let gic = dtb.gic().expect("no GICv2 in DTB");
+    GIC_DIST.store(gic.0.0, Relaxed);
     GIC_CPU.store(gic.1.0, Relaxed);
     // SAFETY: the DTB's GICv2 registers, in the device-mapped GiB 0.
     unsafe { arch::gic::enable(gic.0, gic.1) };
     // SAFETY: as above.
     unsafe { arch::gic::unmask(gic.0, UART_IRQ) };
     Uart::new(UART0).enable_rx_irq();
+    let cpus = dtb.cpus().min(arch::MAX_CPUS);
+    CPUS.store(cpus, Relaxed);
+    // A one-core GIC delivers every interrupt to that core (ITARGETSR is RAZ/WI), and no other core sends it an SGI.
+    if cpus > 1 {
+        // SAFETY: as above; UART_IRQ is an SPI and core 0's CPU interface is 0.
+        unsafe { arch::gic::route(gic.0, UART_IRQ, 0) };
+        // SAFETY: as above.
+        unsafe { arch::gic::unmask(gic.0, RESCHEDULE_SGI) };
+    }
 
     kernel::run(
         &mut QemuVirt {
@@ -389,6 +426,49 @@ extern "C" fn kmain() -> ! {
         dtb,
         &[image, dtb_range],
     )
+}
+
+/// Starts core `cpu` (MPIDR `cpu` on QEMU `virt`) at `arch::secondary_entry` on its stack, without waiting for it.
+fn start_cpu(cpu: usize) {
+    let stack_top = &raw const __stack_top as u64 + cpu as u64 * SECONDARY_STACK;
+    let status: i64;
+    // SAFETY: CPU_ON starts an off core on an unused stack; `dsb ish` first completes the stores it reads.
+    unsafe {
+        core::arch::asm!(
+            "dsb ish",
+            "hvc #0",
+            inlateout("x0") PSCI_CPU_ON => status,
+            in("x1") cpu,
+            in("x2") arch::secondary_entry(),
+            in("x3") stack_top,
+            clobber_abi("C"),
+        )
+    };
+    assert_eq!(status, 0, "PSCI CPU_ON {cpu}");
+}
+
+/// A secondary core's first Rust code, from `arch::secondary_entry`: MMU on, on its own stack, IRQs masked. It turns on
+/// its GIC CPU interface, timer PPI and reschedule SGI, and sleeps; it runs no task yet.
+#[unsafe(no_mangle)]
+extern "C" fn kmain_secondary() -> ! {
+    arch::install_vectors();
+    if arch::cpu() == 1 {
+        (2..CPUS.load(Relaxed)).for_each(start_cpu);
+    }
+    let dist = PhysAddr(GIC_DIST.load(Relaxed));
+    // SAFETY: the DTB's GICv2 CPU interface, stored by `kmain` before it started this core, in device-mapped GiB 0.
+    unsafe { arch::gic::enable_cpu(PhysAddr(GIC_CPU.load(Relaxed))) };
+    for irq in [TIMER_IRQ, RESCHEDULE_SGI] {
+        // SAFETY: as above, the distributor; below 32, so this core's banked ISENABLER0.
+        unsafe { arch::gic::unmask(dist, irq) };
+    }
+    if SMP_TEST.load(Relaxed) {
+        let _ = writeln!(Console, "cpu {}: online", arch::cpu());
+        arch::timer::arm(TICK_US);
+    }
+    loop {
+        arch::irq::wait();
+    }
 }
 
 fn shutdown() -> ! {

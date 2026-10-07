@@ -99,6 +99,7 @@ cargo run -- -append test=echo       # readlines prints E: ready, reads two line
 cargo run -- -append test=bench-spawn # spawnbench spawns nop, waits and closes it 1000 times without and then with two arguments; prints each round trip in ns
 cargo run -- -append test=bench-pipe # ping and pong echo one byte over two pipes 100000 times; prints the round trip in ns
 cargo run -- -append test=bench-lock # uncontended acquire + release of the ticket and a test-and-set lock in ns; two timer-preempted tasks add 10^7 each under the lock (lock: count 20000000)
+cargo run -- -smp 4 -append test=smp  # cores 1-3 start (PSCI CPU_ON) and print cpu <n>: online; once every core took a timer tick, smp: 4 cpus ticked
 cargo run -p mogfs --example mkfs --target aarch64-apple-darwin -- b.img 1024; cargo run -- -drive file=b.img,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0 -append test=bench-syscalls  # fresh image; prints `bench <call>: <ns> ns` for every syscall's fast path
 cargo run -p mogfs --example mkfs --target aarch64-apple-darwin -- b.img 1024; cargo run -- -drive file=b.img,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0 -append test=bench-shell  # fresh image; shellsetup makes fixtures, msh times 11 commands 5 times (`bench <command>: <ns> ns`)
 scripts/bench.sh bench-syscalls 21 new_mog_os base_mog_os  # hvf A/B, interleaved; see docs/BENCHMARKS.md

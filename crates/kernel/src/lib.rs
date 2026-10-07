@@ -35,8 +35,6 @@ pub trait Board {
     fn exception_level(&self) -> u8;
     /// Raises a breakpoint; returns once it was caught and resumed.
     fn breakpoint_self_test(&mut self);
-    /// Identity-maps device memory and RAM and turns on the MMU and caches.
-    fn enable_mmu(&mut self);
     /// Reads an address the MMU leaves unmapped; the data abort panics.
     fn read_unmapped(&mut self);
     /// Hands `region` (identity-mapped RAM, owned by nobody else) to the global allocator; call once.
@@ -83,6 +81,13 @@ pub trait Board {
     fn lock_round_trips(&mut self, n: u64, ticket: bool);
     /// Adds 1 to a counter `n` times, taking a board `Lock` (the kind `KERNEL` is) for each; returns the counter.
     fn add_locked(&mut self, n: u64) -> u64;
+    /// Starts the other cores without waiting for them; they idle until given work. Under `smp_test` each prints
+    /// `cpu <n>: online` and runs its timer. Call once, as the last step of boot.
+    fn start_cpus(&mut self, smp_test: bool);
+    /// Cores `start_cpus` starts, this one included.
+    fn cpus(&self) -> usize;
+    /// Cores that have taken a timer tick.
+    fn ticked_cpus(&self) -> usize;
 }
 
 /// Hand-written asm user programs the board provides; newer ones are ELF files in the boot archive.
@@ -141,8 +146,6 @@ const SHELL_BENCH: &[u8] = b"msh\0ls d1\0ls d100\0ls d390\0cat small\0cat big\0w
 
 /// `reserved` lists physical ranges in use (kernel image, DTB).
 pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> ! {
-    // First: console writes and traps take locks, whose atomics need the MMU on.
-    board.enable_mmu();
     let el = board.exception_level();
     let _ = writeln!(board.console(), "MogOs: hello from EL{el}");
 
@@ -183,6 +186,7 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
         .any(|a| a == "test=disk" || a == "test=bench-disk");
     let mounted = disk.take_if(|_| !raw).map(|disk| board.mount(disk));
 
+    board.start_cpus(bootargs.split_whitespace().any(|a| a == "test=smp"));
     let boot_us = board.uptime_us();
     let _ = writeln!(board.console(), "boot: {boot_us} us");
     match blocks {
@@ -222,6 +226,7 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
             }
             "test=bench-pipe" => pipe_bench(board),
             "test=bench-lock" => lock_bench(board),
+            "test=smp" => smp_test(board),
             "test=fuzz" => fuzz(board, bootargs),
             "test=bench-shell" => shell_bench(board),
             "test=bench-syscalls" => run_archived(
@@ -246,6 +251,17 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
     }
 
     board.power_off()
+}
+
+/// Core 0 joins the secondaries' `cpu <n>: online` lines, then waits until every core has taken a timer tick.
+fn smp_test<B: Board>(board: &mut B) {
+    let _ = writeln!(board.console(), "cpu 0: online");
+    let cpus = board.cpus();
+    board.start_timer();
+    while board.ticked_cpus() < cpus {
+        board.idle();
+    }
+    let _ = writeln!(board.console(), "smp: {cpus} cpus ticked");
 }
 
 /// Tasks a and b print in turn; the boot task's third yield returns after both printed 2.

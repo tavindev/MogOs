@@ -1,4 +1,4 @@
-use core::arch::asm;
+use core::arch::{asm, global_asm};
 
 use mm::PhysAddr;
 
@@ -9,7 +9,7 @@ pub enum MemoryType {
 }
 
 /// `MAIR_EL1` matching `MemoryType`: Device-nGnRE, Normal write-back cacheable.
-pub const MAIR: u64 = 0x04 | 0xff << 8;
+const MAIR: u64 = 0x04 | 0xff << 8;
 
 const VALID_BLOCK: u64 = 0b01;
 const VALID_TABLE_OR_PAGE: u64 = 0b11;
@@ -74,50 +74,66 @@ struct Table([u64; 512]);
 
 static mut L1: Table = Table([0; 512]);
 
-/// Loads `l1` as the level-1 table for TTBR0 (4 KiB granule, 39-bit VA, attributes per `mair`) and turns on the MMU and caches.
+/// TCR_EL1 but for the PA size, which `aarch64_mmu_on` reads from ID_AA64MMFR0_EL1.
+const TCR: u64 = 25 // T0SZ: 39-bit VA
+    | 0b01 << 8 | 0b01 << 10 | 0b11 << 12 // walks: write-back, inner shareable
+    | 1 << 23 // EPD1: no TTBR1 walks
+    | 0b10 << 30; // TG1 4 KiB, only to avoid the reserved encoding
+const SCTLR: u64 = 1 << 0 | 1 << 2 | 1 << 12 // M, C, I: MMU, data and instruction caches on
+    | 1 << 3 | 1 << 4 // SA, SA0: SP alignment checks at EL1 and EL0
+    | 1 << 16 | 1 << 18 // nTWI, nTWE: EL0 wfi/wfe not trapped; EL0 cannot mask IRQs (UMA = 0), so a tick ends them
+    | 1 << 23 // SPAN: PAN untouched on exception entry (the kernel reads checked user pages directly)
+    | 1 << 11 | 1 << 20 | 1 << 22 | 1 << 28 | 1 << 29; // RES1 on ARMv8.0
+// UMA, DZE, UCT, UCI = 0: EL0 cannot mask interrupts, zero or query caches, or maintain them; E0E, EE = 0: little endian.
+const _: () = assert!(MAIR < 1 << 16 && TCR < 1 << 32 && SCTLR < 1 << 32);
+
+// Every core's MMU-on, run with the MMU off, so no load, store or atomic before SCTLR is set; clobbers x9 and x10.
+global_asm!(
+    r#"
+.text
+.global aarch64_mmu_on
+aarch64_mmu_on:
+    dsb ish
+    mov x9, #{mair}
+    msr mair_el1, x9
+    movz x9, #({tcr} & 0xffff)
+    movk x9, #({tcr} >> 16), lsl #16
+    mrs x10, id_aa64mmfr0_el1
+    bfi x9, x10, #32, #3
+    msr tcr_el1, x9
+    adrp x9, {l1}
+    add x9, x9, :lo12:{l1}
+    msr ttbr0_el1, x9
+    isb
+    tlbi vmalle1
+    dsb ish
+    isb
+    movz x9, #({sctlr} & 0xffff)
+    movk x9, #({sctlr} >> 16), lsl #16
+    msr sctlr_el1, x9
+    isb
+    ret
+"#,
+    mair = const MAIR,
+    tcr = const TCR,
+    sctlr = const SCTLR,
+    l1 = sym L1,
+);
+
+/// Fills the boot table from `l1` (4 KiB granule, 39-bit VA, attributes per `MAIR`) and turns on the MMU and caches
+/// with it; other cores turn theirs on with the same table from `aarch64_secondary`.
 ///
 /// # Safety
 ///
-/// Call with the MMU off (the table is overwritten in place, no break-before-make) and before any
-/// atomic read-modify-write (exclusives need Normal memory). The entries must map, at their current physical addresses, all code, data,
-/// stack and MMIO the program uses.
-pub unsafe fn enable_mmu(l1: &[u64], mair: u64) {
+/// Call once, on core 0, with the MMU off (the table is overwritten in place, no break-before-make) and before any
+/// atomic read-modify-write (exclusives need Normal memory). The entries must map, at their current physical addresses,
+/// all code, data, stack and MMIO the program uses.
+pub unsafe fn enable_mmu(l1: &[u64]) {
     let table = &raw mut L1;
-    // SAFETY: single core with the MMU off; nothing else references L1.
+    // SAFETY: core 0 alone with the MMU off; nothing else references L1.
     unsafe { (&mut (*table).0)[..l1.len()].copy_from_slice(l1) };
-    let pa_range: u64;
-    // SAFETY: reading ID_AA64MMFR0_EL1 has no side effects.
-    unsafe { asm!("mrs {}, id_aa64mmfr0_el1", out(reg) pa_range) };
-    let tcr = 25 // T0SZ: 39-bit VA
-        | 0b01 << 8 | 0b01 << 10 | 0b11 << 12 // walks: write-back, inner shareable
-        | 1 << 23 // EPD1: no TTBR1 walks
-        | 0b10 << 30 // TG1 4 KiB, only to avoid the reserved encoding
-        | (pa_range & 0x7) << 32;
-    let sctlr: u64 = 1 << 0 | 1 << 2 | 1 << 12 // M, C, I: MMU, data and instruction caches on
-        | 1 << 3 | 1 << 4 // SA, SA0: SP alignment checks at EL1 and EL0
-        | 1 << 16 | 1 << 18 // nTWI, nTWE: EL0 wfi/wfe not trapped; EL0 cannot mask IRQs (UMA = 0), so a tick ends them
-        | 1 << 23 // SPAN: PAN untouched on exception entry (the kernel reads checked user pages directly)
-        | 1 << 11 | 1 << 20 | 1 << 22 | 1 << 28 | 1 << 29; // RES1 on ARMv8.0
-    // UMA, DZE, UCT, UCI = 0: EL0 cannot mask interrupts, zero or query caches, or maintain them; E0E, EE = 0: little endian.
     // SAFETY: the table is written and the caller guarantees it maps everything in use.
-    unsafe {
-        asm!(
-            "dsb ish",
-            "msr mair_el1, {mair}",
-            "msr tcr_el1, {tcr}",
-            "msr ttbr0_el1, {ttbr}",
-            "isb",
-            "tlbi vmalle1",
-            "dsb ish",
-            "isb",
-            "msr sctlr_el1, {sctlr}",
-            "isb",
-            mair = in(reg) mair,
-            tcr = in(reg) tcr,
-            ttbr = in(reg) &raw const L1,
-            sctlr = in(reg) sctlr,
-        )
-    }
+    unsafe { asm!("bl aarch64_mmu_on", out("x9") _, out("x10") _, out("x30") _) }
 }
 
 /// The boot level-1 table that `enable_mmu` loaded, with ASID 0.
@@ -238,12 +254,12 @@ pub unsafe fn set_ttbr0(table: PhysAddr, asid: usize) {
     };
 }
 
-/// Drops every non-global TLB entry tagged with `asid`.
+/// Drops every non-global TLB entry tagged with `asid`, on every core.
 pub fn flush_asid(asid: usize) {
     // SAFETY: invalidating TLB entries only forces later walks.
     unsafe {
         asm!(
-            "tlbi aside1, {}",
+            "tlbi aside1is, {}",
             "dsb ish",
             "isb",
             in(reg) (asid as u64) << 48,
@@ -303,13 +319,13 @@ pub unsafe fn clean_dcache(start: usize, len: usize) {
     }
 }
 
-/// Waits for the cleans before it, then discards every stale instruction in the I-cache.
+/// Waits for the cleans before it, then discards every stale instruction in every core's I-cache.
 pub fn invalidate_icache() {
     // SAFETY: barriers and an I-cache invalidate only discard stale instructions.
     unsafe {
         asm!(
             "dsb ish",
-            "ic iallu",
+            "ic ialluis",
             "dsb ish",
             "isb",
             options(nostack, preserves_flags)
