@@ -3,9 +3,11 @@ use core::ops::Range;
 use core::ptr;
 use core::sync::atomic::{Ordering::SeqCst, fence};
 
-use kernel::syscall::EIO;
+use kernel::syscall::{EFAULT, EIO};
 use kernel::{BLOCK, Disk};
 use mm::PhysAddr;
+
+use crate::GIB;
 
 /// "virt", little-endian.
 const MAGIC: u32 = 0x7472_6976;
@@ -93,29 +95,24 @@ struct Queue {
 const _: () = assert!(size_of::<Queue>() <= PAGE);
 
 /// A virtio-blk device on a modern (version 2) virtio-mmio transport: one queue, one request at a time, completion
-/// polled (no interrupt). Data moves through its own frame, so callers' buffers need not be physical memory.
+/// polled (no interrupt). The device moves data straight to and from the caller's blocks.
 pub struct VirtioBlk {
     base: PhysAddr,
     queue: PhysAddr,
-    data: PhysAddr,
     /// Requests submitted so far, wrapping: the available ring's next index.
     idx: u16,
 }
 
 impl VirtioBlk {
-    /// Sets up the block device at `base`, if there is one, with two frames from `alloc` (queue, data).
+    /// Sets up the block device at `base`, if there is one, with its queue in a frame from `alloc`.
     ///
     /// # Safety
     /// `base` must be a virtio-mmio transport in device memory that nothing else drives, and `alloc`'s frames
     /// identity-mapped RAM that nothing else uses.
-    pub unsafe fn new(
-        base: PhysAddr,
-        alloc: impl FnOnce() -> Option<Range<PhysAddr>>,
-    ) -> Option<Self> {
+    pub unsafe fn new(base: PhysAddr, alloc: impl FnOnce() -> Option<PhysAddr>) -> Option<Self> {
         let mut disk = Self {
             base,
             queue: PhysAddr(0),
-            data: PhysAddr(0),
             idx: 0,
         };
         if disk.reg(MAGIC_VALUE) != MAGIC
@@ -140,11 +137,9 @@ impl VirtioBlk {
         if disk.reg(STATUS) & FEATURES_OK == 0 || disk.reg(QUEUE_NUM_MAX) < QUEUE_SIZE as u32 {
             return None;
         }
-        let frames = alloc()?;
-        (disk.queue, disk.data) = (frames.start, PhysAddr(frames.start.0 + PAGE as u64));
+        disk.queue = alloc()?;
         // SAFETY: the caller hands over the queue frame, which no reference aliases.
         unsafe { ptr::write_bytes(disk.queue.0 as *mut u8, 0, PAGE) };
-        let data = disk.data.0;
         let queue = disk.queue();
         queue.avail.flags = AVAIL_NO_INTERRUPT;
         // Every request is this chain at descriptor 0, which the zeroed ring already names.
@@ -154,12 +149,7 @@ impl VirtioBlk {
             flags: DESC_NEXT,
             next: 1,
         };
-        queue.desc[1] = Desc {
-            addr: data,
-            len: BLOCK as u32,
-            flags: DESC_NEXT,
-            next: 2,
-        };
+        queue.desc[1].next = 2;
         queue.desc[2] = Desc {
             addr: &raw const queue.status as u64,
             len: 1,
@@ -197,16 +187,16 @@ impl VirtioBlk {
         unsafe { &mut *(self.queue.0 as *mut Queue) }
     }
 
-    /// The data frame; the device reads or writes it only inside `request`.
-    fn data(&mut self) -> &mut [u8; BLOCK] {
-        // SAFETY: as in `queue`.
-        unsafe { &mut *(self.data.0 as *mut [u8; BLOCK]) }
-    }
-
-    /// Submits a `kind` request for `block` (with the data frame, unless a flush) and polls until the device completes
-    /// it.
-    fn request(&mut self, kind: u32, block: u64) -> Result<(), i64> {
+    /// Submits a `kind` request for the blocks from `block` on at the addresses `data` (empty for a flush, which has no
+    /// data) and polls until the device completes it. An empty read or write does nothing (QEMU fails it); `EFAULT`
+    /// unless `data` is in the identity-mapped RAM GiB, where every kernel buffer lives at its physical address.
+    fn request(&mut self, kind: u32, block: u64, data: Range<u64>) -> Result<(), i64> {
         let sector = block.checked_mul(BLOCK as u64 / SECTOR).ok_or(EIO)?;
+        match data.is_empty() {
+            true if kind != T_FLUSH => return Ok(()),
+            false if !(GIB <= data.start && data.end <= 2 * GIB) => return Err(EFAULT),
+            _ => {}
+        }
         let idx = self.idx.wrapping_add(1);
         let queue = self.queue();
         queue.header = Header {
@@ -215,7 +205,9 @@ impl VirtioBlk {
             sector,
         };
         queue.status = u8::MAX;
-        queue.desc[0].next = if kind == T_FLUSH { 2 } else { 1 };
+        queue.desc[0].next = if data.is_empty() { 2 } else { 1 };
+        queue.desc[1].addr = data.start;
+        queue.desc[1].len = (data.end - data.start) as u32;
         queue.desc[1].flags = if kind == T_IN {
             DESC_NEXT | DESC_WRITE
         } else {
@@ -242,18 +234,17 @@ impl VirtioBlk {
 }
 
 impl Disk for VirtioBlk {
-    fn read(&mut self, block: u64, data: &mut [u8; BLOCK]) -> Result<(), i64> {
-        self.request(T_IN, block)?;
-        *data = *self.data();
-        Ok(())
+    fn read(&mut self, block: u64, data: &mut [[u8; BLOCK]]) -> Result<(), i64> {
+        let start = data.as_mut_ptr() as u64;
+        self.request(T_IN, block, start..start + size_of_val(data) as u64)
     }
 
-    fn write(&mut self, block: u64, data: &[u8; BLOCK]) -> Result<(), i64> {
-        *self.data() = *data;
-        self.request(T_OUT, block)
+    fn write(&mut self, block: u64, data: &[[u8; BLOCK]]) -> Result<(), i64> {
+        let start = data.as_ptr() as u64;
+        self.request(T_OUT, block, start..start + size_of_val(data) as u64)
     }
 
     fn flush(&mut self) -> Result<(), i64> {
-        self.request(T_FLUSH, 0)
+        self.request(T_FLUSH, 0, 0..0)
     }
 }

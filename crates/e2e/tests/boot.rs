@@ -24,6 +24,8 @@ fn boot(extra: &[&str]) -> (ExitStatus, Vec<String>) {
             "128M",
             "-global",
             "virtio-mmio.force-legacy=false",
+            "-global",
+            "virtio-mmio.ioeventfd=off",
             "-nographic",
             "-kernel",
         ])
@@ -434,12 +436,12 @@ fn a_flushed_block_survives_a_reboot() {
     assert!(status.success(), "QEMU exited with {status}");
     let disk: Vec<_> = lines.iter().filter(|l| l.starts_with("disk: ")).collect();
     assert_eq!(disk, ["disk: found", "disk: wrote"]);
-    // Block 1 is bytes 4096..8192: a driver addressing 512-byte sectors by block number would miss it.
+    // Blocks 1 and 2 are bytes 4096..12288: a driver addressing 512-byte sectors by block number would miss them.
     let bytes = std::fs::read(&image).unwrap();
-    let expected: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+    let expected: Vec<u8> = (0..8192).map(|i| (i % 251) as u8).collect();
     assert!(
-        bytes[4096..8192] == expected[..],
-        "block 1 not on the image"
+        bytes[4096..12288] == expected[..],
+        "blocks 1 and 2 not on the image"
     );
 
     let (status, lines) = boot_with_disk(&image, "test=disk");
@@ -458,7 +460,12 @@ fn disk_bench_reports_throughput() {
         !lines.iter().any(|l| l.starts_with("panic:")),
         "kernel panicked"
     );
-    for op in ["write+flush", "read"] {
+    for op in [
+        "4 KiB write+flush",
+        "4 KiB read",
+        "256 KiB write+flush",
+        "256 KiB read",
+    ] {
         lines
             .iter()
             .find_map(|l| {

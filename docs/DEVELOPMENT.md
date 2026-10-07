@@ -20,6 +20,7 @@
 | `-T link.ld`, `-zmax-page-size=4096` | `crates/user/build.rs` | User programs: one RX `PT_LOAD` (text, rodata) and one RW (data, bss), page-aligned from 4 GiB; lld's 64 KiB default page size padded each program to 64 KiB. |
 | load address `0x4020_0000` | `crates/board/qemu-virt/linker.ld` | QEMU only places its 1 MiB DTB at RAM base (`0x4000_0000`) if it fits below the ELF image. |
 | `-global virtio-mmio.force-legacy=false` | runners in `.cargo/config.toml`, `crates/e2e` | QEMU 9.2 defaults virtio-mmio to legacy (version 1); the driver speaks modern (version 2), which takes three 64-bit queue addresses instead of legacy's page-size register and one page-aligned ring block. |
+| `-global virtio-mmio.ioeventfd=off` | same | QEMU handles a queue notify in the vCPU thread instead of handing it to the main loop: hvf 4 KiB requests +9% write+flush, +19% read (21 interleaved boots); 256 KiB unchanged. |
 | `test-host` alias | `.cargo/config.toml` | Runs tests for the host target, excluding the bare-metal-only `qemu-virt` and `arch`. A string, not an array, so a nested worktree's copy overrides it instead of concatenating. |
 | `bench-host` alias | `.cargo/config.toml` | Runs the host `benches/*.rs` targets (`--bench '*'`) for the same crates as `test-host`. |
 | `linked_list_allocator` (no features) | `crates/board/qemu-virt` | Kernel heap with `free` (phase 2 task stacks need it); a bare `Heap` with IRQs masked around each call (`arch::irq`), not its spinlock, which could deadlock on one core. In the board crate because it is the binary that owns `#[global_allocator]` and `unsafe` heap init. |
@@ -46,7 +47,7 @@ cargo fmt --manifest-path crates/user/Cargo.toml
 cargo build            # dev build
 cargo test-host        # host tests + QEMU boot e2e tests (crates/e2e); must pass
 cargo bench-host       # host benchmarks (min/median); see docs/BENCHMARKS.md
-cargo run              # boot in QEMU; prints hello, exceptions, mmu, ram, frames, heap, boot lines and powers off
+cargo run              # boot in QEMU; prints hello, exceptions, mmu, ram, frames, heap, boot, disk lines and powers off
 cargo run -- -append test=mmu-fault  # reads an unmapped address after MMU on; prints the data abort
 cargo run -- -append test=yield      # tasks a and b print 0..2 in turn via `svc` yield
 cargo run -- -append test=bench      # prints the yield round trip in ns
@@ -60,8 +61,8 @@ cargo run -- -append test=pipe       # reader blocks on an empty pipe until its 
 cargo run -- -append test=wait       # waiter's child A exits before child B is spawned; wait still returns both codes and budgets; closing a third, exited child's handle returns its budget too (P: and C: lines); free frames before/after match
 cargo run -- -append test=pi         # timer on: L (priority 1) holds a mutex H (3) blocks on while Mid (2) is ready to spin forever; H acquires only through priority inheritance, then init kills Mid (L:, H:, P: lines; no M: line); free frames before/after match
 cargo run -- -append test=bench-pipe # ping and pong echo one byte over two pipes 100000 times; prints the round trip in ns
-cargo run -- -drive file=disk.img,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0 -append test=disk  # attach a raw image (`truncate -s 1M disk.img`); first boot writes block 1 and flushes (disk: wrote), the next reads it back (disk: read ok); without a disk every boot prints disk: none
-cargo run -- -drive file=disk.img,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0 -append test=bench-disk  # image of at least 8 MiB; sequential 4 KiB write+flush and read throughput in MiB/s
+cargo run -- -drive file=disk.img,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0 -append test=disk  # attach a raw image (`truncate -s 1M disk.img`); first boot writes blocks 1-2 and flushes (disk: wrote), the next reads it back (disk: read ok); without a disk every boot prints disk: none
+cargo run -- -drive file=disk.img,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0 -append test=bench-disk  # image of at least 8 MiB; sequential write+flush and read throughput in MiB/s, 4 KiB and 256 KiB per request
 cargo run -- -s -S     # boot halted, gdbstub on localhost:1234; attach lldb/gdb
 cargo build --release  # LTO release image
 ```

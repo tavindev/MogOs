@@ -716,9 +716,9 @@ impl kernel::Board for QemuVirt {
         let alloc = || {
             let irq = arch::irq::disable();
             // SAFETY: IRQs are masked on the only core, so this is the sole reference.
-            let frames = unsafe { &mut (*KERNEL.0.get()).frames }.alloc_contiguous(2);
+            let frame = unsafe { &mut (*KERNEL.0.get()).frames }.alloc();
             arch::irq::restore(irq);
-            frames
+            frame
         };
         // SAFETY: the DTB's virtio-mmio transports, in the device-mapped GiB 0, driven only here; frames from the
         // allocator are identity-mapped RAM nobody else uses.

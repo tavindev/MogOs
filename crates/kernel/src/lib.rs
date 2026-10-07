@@ -12,6 +12,7 @@ pub mod syscall;
 
 pub use sched::{Event, Full, Memory, PRIORITIES, Scheduler};
 
+use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::Write;
 use core::ops::Range;
@@ -66,10 +67,13 @@ pub trait Board {
 /// Bytes per disk block.
 pub const BLOCK: usize = 4096;
 
-/// A block device of `BLOCK`-byte blocks; each call returns once the device completed it. A failed request is `EIO`.
+/// A block device of `BLOCK`-byte blocks; each call is one request, returning once the device completed it. A failed
+/// request is `EIO`; buffers must be kernel memory (identity-mapped RAM), else `EFAULT`.
 pub trait Disk {
-    fn read(&mut self, block: u64, data: &mut [u8; BLOCK]) -> Result<(), i64>;
-    fn write(&mut self, block: u64, data: &[u8; BLOCK]) -> Result<(), i64>;
+    /// Reads `data.len()` consecutive blocks from `block` on.
+    fn read(&mut self, block: u64, data: &mut [[u8; BLOCK]]) -> Result<(), i64>;
+    /// Writes `data.len()` consecutive blocks from `block` on.
+    fn write(&mut self, block: u64, data: &[[u8; BLOCK]]) -> Result<(), i64>;
     /// Makes every completed write durable.
     fn flush(&mut self) -> Result<(), i64>;
 }
@@ -99,6 +103,8 @@ const BENCH_YIELDS: u64 = 100_000;
 const PIPE_ROUND_TRIPS: u64 = 100_000;
 /// Blocks `test=bench-disk` writes and reads (8 MiB); the disk must hold at least this many.
 const DISK_BENCH_BLOCKS: u64 = 2048;
+/// Blocks per request in `test=bench-disk`'s batched pass (256 KiB of heap).
+const DISK_BATCH: usize = 64;
 
 /// Bitmap capacity in 64-frame words: 512 words cover 128 MiB.
 pub const FRAME_WORDS: usize = 512;
@@ -306,11 +312,15 @@ fn yield_forever<B: Board>(board: &mut B, _: usize) -> ! {
     }
 }
 
-/// Reads block 1 and prints `disk: read ok` if it holds the test pattern; otherwise writes the pattern, flushes and
-/// prints `disk: wrote`. So the first boot on a zeroed image writes, and the next one reads it back.
+/// Reads blocks 1 and 2 in one request and prints `disk: read ok` if they hold the test pattern (byte `i` of the two
+/// is `i % 251`); otherwise writes it in one request, flushes and prints `disk: wrote`. So the first boot on a zeroed
+/// image writes, and the next one reads it back. Empty reads and writes must succeed.
 fn disk_test<B: Board>(board: &mut B, disk: &mut B::Disk) {
-    let pattern: [u8; BLOCK] = core::array::from_fn(|i| (i % 251) as u8);
-    let mut block = [0; BLOCK];
+    let pattern: [[u8; BLOCK]; 2] =
+        core::array::from_fn(|b| core::array::from_fn(|i| ((b * BLOCK + i) % 251) as u8));
+    let mut block = [[0; BLOCK]; 2];
+    disk.read(0, &mut []).expect("empty read");
+    disk.write(0, &[]).expect("empty write");
     disk.read(1, &mut block).expect("read");
     let done = if block == pattern {
         "read ok"
@@ -322,25 +332,25 @@ fn disk_test<B: Board>(board: &mut B, disk: &mut B::Disk) {
     let _ = writeln!(board.console(), "disk: {done}");
 }
 
-/// Writes `DISK_BENCH_BLOCKS` blocks in order and flushes, then reads them back; prints each throughput in MiB/s.
+/// Writes `DISK_BENCH_BLOCKS` blocks in order and flushes, then reads them back, one block and then `DISK_BATCH`
+/// blocks per request; prints each throughput in MiB/s.
 fn disk_bench<B: Board>(board: &mut B, disk: &mut B::Disk) {
-    let mut block = [0x5a; BLOCK];
-    let start = board.uptime_us();
-    for n in 0..DISK_BENCH_BLOCKS {
-        disk.write(n, &block).expect("write");
-    }
-    disk.flush().expect("flush");
-    let write_us = board.uptime_us() - start;
-    let start = board.uptime_us();
-    for n in 0..DISK_BENCH_BLOCKS {
-        disk.read(n, &mut block).expect("read");
-    }
-    let read_us = board.uptime_us() - start;
+    let mut blocks = vec![[0x5a; BLOCK]; DISK_BATCH];
     let mib_s = |us: u64| ((DISK_BENCH_BLOCKS * BLOCK as u64) >> 20) * 1_000_000 / us;
-    let _ = writeln!(
-        board.console(),
-        "disk: write+flush {} MiB/s",
-        mib_s(write_us)
-    );
-    let _ = writeln!(board.console(), "disk: read {} MiB/s", mib_s(read_us));
+    for batch in [1, DISK_BATCH] {
+        let kib = batch * BLOCK / 1024;
+        let start = board.uptime_us();
+        for n in (0..DISK_BENCH_BLOCKS).step_by(batch) {
+            disk.write(n, &blocks[..batch]).expect("write");
+        }
+        disk.flush().expect("flush");
+        let write = mib_s(board.uptime_us() - start);
+        let start = board.uptime_us();
+        for n in (0..DISK_BENCH_BLOCKS).step_by(batch) {
+            disk.read(n, &mut blocks[..batch]).expect("read");
+        }
+        let read = mib_s(board.uptime_us() - start);
+        let _ = writeln!(board.console(), "disk: {kib} KiB write+flush {write} MiB/s");
+        let _ = writeln!(board.console(), "disk: {kib} KiB read {read} MiB/s");
+    }
 }
