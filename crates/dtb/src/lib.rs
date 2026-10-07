@@ -52,6 +52,16 @@ impl<'a> Dtb<'a> {
         Some((PhysAddr(reg.reg(0)?.0), PhysAddr(reg.reg(1)?.0)))
     }
 
+    /// Number of second-level nodes (the `/cpus` children) whose `device_type` is `cpu`.
+    pub fn cpus(&self) -> usize {
+        let mut count = 0;
+        self.find(|p| {
+            count += (p.depth == 3 && p.name == b"device_type" && p.value == b"cpu\0") as usize;
+            None::<()>
+        });
+        count
+    }
+
     /// `reg` property of the first top-level node compatible with `compatible`.
     fn reg_of(&self, compatible: &[u8]) -> Option<Prop<'a>> {
         let (mut node, mut reg, mut found) = (0, None, false);

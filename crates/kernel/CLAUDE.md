@@ -10,7 +10,7 @@ touches memory through raw addresses: the board reads user buffers, copies pages
 
 ## Responsibilities
 
-- `Board` trait and `Program` enum (`src/lib.rs`); `run` drives boot and the `test=*` bootargs scenarios, enabling the MMU first (the board's locks need it). The crate has no lock: its tables are plain data the board keeps under its big lock.
+- `Board` trait and `Program` enum (`src/lib.rs`); `run` drives boot and the `test=*` bootargs scenarios; the board turns on the MMU before calling it (its locks need the MMU), and `run` starts the other cores (`Board::start_cpus`) as the last step of boot, inside the `boot:` time. The crate has no lock: its tables are plain data the board keeps under its big lock.
 - `Disk` and `BLOCK_SIZE` (4096) are `mogfs`'s, re-exported (`src/lib.rs`): synchronous `read`/`write` of
   consecutive blocks, `flush`, `blocks`; every failure is `mogfs::Error::Io`. `Board::disk` is called once in `run`,
   then `Board::mount` (except under `test=disk` and `test=bench-disk`, which keep the raw device), both before the
@@ -102,9 +102,9 @@ touches memory through raw addresses: the board reads user buffers, copies pages
   once), and about 7000, about 150 ms, on a crafted one (504 directories of 14 blocks each).
 - `Elf::parse` accepts only page-aligned, address-ordered, in-region `PT_LOAD`s, never W+X, entry in an executable one.
 - init's handles (`Handles::init`): 0 console (read, write, duplicate, transfer), 1 itself (kill), 2 the boot archive
-  with `INIT_ARCHIVE` (read, exec); only `test=shell`'s msh gets `SHELL_ARCHIVE` (also duplicate, transfer), since it
+  with `INIT_ARCHIVE` (read, exec); only msh (`test=shell`, `test=bench-shell`) gets `SHELL_ARCHIVE` (also duplicate, transfer), since it
   hands the archive to `sh`, which spawns from it. Every other init can neither copy nor pass it on.
-- `BOOT_BUDGET`, `SHELL_BUDGET` (`test=shell`: msh's 25 frames and the 2048 it gives `sh`), `WAITER_BUDGET`, `PI_BUDGET`, `THREADS_BUDGET` are sized to the user programs' frame needs: too small and `run`'s
+- `BOOT_BUDGET`, `SHELL_BUDGET` (msh under `test=shell` and `test=bench-shell`: its 25 frames and the 2048 it gives `sh`), `WAITER_BUDGET`, `PI_BUDGET`, `FUZZ_BUDGET`, `SYSBENCH_BUDGET`, `THREADS_BUDGET` are sized to the user programs' frame needs: too small and `run`'s
   `expect("spawn")` panics. `PIPE_ROUND_TRIPS` must equal `ROUND_TRIPS` in `crates/user/src/bin/ping.rs`; a mismatch
   only prints a wrong `pipe:` number, nothing fails.
 - Performance is the moat: a slowdown is never accepted because it has an explanation; it is removed, or shown to

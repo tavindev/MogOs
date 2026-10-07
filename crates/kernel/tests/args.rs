@@ -11,6 +11,11 @@ fn argc_counts_nul_terminated_strings_up_to_the_limit() {
     let most = [*b"x\0"; MAX_ARGS].concat();
     assert_eq!(argc(&most), Ok(MAX_ARGS));
     assert_eq!(argc(&[most, b"x\0".to_vec()].concat()), Err(E2BIG));
+    let mut long = vec![b'x'; 4096];
+    long[4095] = 0;
+    assert_eq!(argc(&long), Ok(1));
+    long.push(0);
+    assert_eq!(argc(&long), Err(E2BIG));
 }
 
 #[test]

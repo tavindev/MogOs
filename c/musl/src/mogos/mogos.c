@@ -440,8 +440,8 @@ static size_t put(char *buf, size_t at, const char *s)
 	return at + n;
 }
 
-/* Spawns the boot archive's C program (`sh`, `hello`, `cbench`; the native ones expect other handles) named by
- * `path`'s last component with the stdio fds, the root and the archive. The arguments start with
+/* Spawns the boot archive's C program (`sh`, `hello`, `cbench`, `oscb`, `oscnop`; the native ones expect other
+ * handles) named by `path`'s last component with the stdio fds, the root and the archive. The arguments start with
  * "<argc> <stdin> <stdout> <stderr> /<cwd>", each stdio fd `t` (console), `p` (pipe), `d`, or `f<offset>` (`a` if
  * appending) for a file, then argv, then as much of envp as fits. */
 static long spawn(const char *path, char *const argv[], char *const envp[])
@@ -452,7 +452,9 @@ static long spawn(const char *path, char *const argv[], char *const envp[])
 	if (argc + 1 > MAX_ARGS) return -E2BIG;
 	const char *name = strrchr(path, '/');
 	name = name ? name + 1 : path;
-	if (strcmp(name, "sh") && strcmp(name, "hello") && strcmp(name, "cbench")) return -ENOENT;
+	if (strcmp(name, "sh") && strcmp(name, "hello") && strcmp(name, "cbench") && strcmp(name, "oscb") &&
+	    strcmp(name, "oscnop"))
+		return -ENOENT;
 	for (int fd = 0; fd < 3; fd++) {
 		struct file *f = fd_file(fd);
 		int kind = f ? f->kind : TTY;
