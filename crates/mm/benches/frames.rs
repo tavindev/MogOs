@@ -8,6 +8,8 @@ mod thread_time;
 use thread_time::ThreadTime;
 
 const FRAMES: usize = 1000;
+/// A full prefix about as long as the kernel image's frames (two 2 MiB blocks and its data and bss).
+const BOOT_RESERVED: u64 = 1559;
 const RAM: core::ops::Range<PhysAddr> = PhysAddr(0x4000_0000)..PhysAddr(0x4800_0000);
 
 /// Times `FRAMES` rounds of `alloc_contiguous(4)` then freeing the 4 frames, on the bitmap `setup` leaves.
@@ -30,9 +32,9 @@ fn contiguous(
     });
 }
 
-/// Allocates then frees `FRAMES` frames from a fresh 128 MiB allocator; then `alloc_contiguous(4)` + free on an
-/// empty bitmap, behind the kernel's reserved prefix (725 frames, as at boot), and behind 4096 frames where every
-/// fourth is used. Each iteration is `FRAMES` ops, so its time in us reads as ns per op, and leaves the bitmap as it
+/// Allocates then frees `FRAMES` frames from a fresh 128 MiB allocator, then one frame at a time behind an image-sized
+/// reserved prefix; then `alloc_contiguous(4)` + free on an empty bitmap, behind a 725-frame reserved prefix, and
+/// behind 4096 frames where every fourth is used. Each iteration is `FRAMES` ops, so its time in us reads as ns per op, and leaves the bitmap as it
 /// found it.
 fn frames(c: &mut Criterion<ThreadTime>) {
     let mut g = thread_time::group(c, "frames");
@@ -44,6 +46,16 @@ fn frames(c: &mut Criterion<ThreadTime>) {
                 held.push(black_box(&mut frames).alloc().unwrap());
             }
             for frame in held.drain(..) {
+                black_box(&mut frames).free(frame);
+            }
+        })
+    });
+    let mut frames = FrameAllocator::<512>::new(RAM);
+    frames.reserve(RAM.start..PhysAddr(RAM.start.0 + BOOT_RESERVED * 4096));
+    g.bench_function("alloc+free, boot reserved", |b| {
+        b.iter(|| {
+            for _ in 0..FRAMES {
+                let frame = black_box(&mut frames).alloc().unwrap();
                 black_box(&mut frames).free(frame);
             }
         })
