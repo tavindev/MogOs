@@ -729,10 +729,9 @@ fn enable_gic_cpu() {
     );
     // SAFETY: as above, and `affinity` showed it is this core's; `kmain` enabled the distributor first.
     unsafe { arch::gic::enable_cpu(redist) };
-    for irq in [TIMER_IRQ, RESCHEDULE_SGI, PING_SGI] {
-        // SAFETY: as above.
-        unsafe { arch::gic::unmask_local(redist, irq) };
-    }
+    let irqs = 1 << TIMER_IRQ | 1 << RESCHEDULE_SGI | 1 << PING_SGI;
+    // SAFETY: as above.
+    unsafe { arch::gic::unmask_local(redist, irqs) };
 }
 
 /// A core's idle context: sleeps until an IRQ, whose handler switches to a ready task, if any.

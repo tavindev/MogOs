@@ -10,18 +10,15 @@ const GICD_IROUTER: u64 = 0x6000;
 /// Affinity routing, then Group 1 delivery (one security state: QEMU `virt` runs the GIC with `DS` set).
 const CTLR_ARE: u32 = 1 << 4;
 const CTLR_ENABLE_GRP1: u32 = 1 << 1;
-/// Register write pending, in `GICD_CTLR` and `GICR_CTLR`.
+/// `GICD_CTLR`'s register write pending.
 const RWP: u32 = 1 << 31;
-const GICR_CTLR: u64 = 0x0000;
 const GICR_TYPER: u64 = 0x0008;
 const GICR_WAKER: u64 = 0x0014;
-const WAKER_PROCESSOR_SLEEP: u32 = 1 << 1;
 const WAKER_CHILDREN_ASLEEP: u32 = 1 << 2;
 /// The SGI and PPI frame follows each redistributor's control frame.
 const GICR_SGI: u64 = 0x1_0000;
 const GICR_IGROUPR0: u64 = GICR_SGI + 0x0080;
 const GICR_ISENABLER0: u64 = GICR_SGI + 0x0100;
-const GICR_RWP: u32 = 1 << 3;
 
 /// # Safety
 ///
@@ -41,26 +38,25 @@ unsafe fn write(addr: u64, value: u32) {
 
 /// # Safety
 ///
-/// `ctlr` must be a `GICD_CTLR` or `GICR_CTLR`, mapped as Device memory, and `rwp` its register-write-pending bit.
-unsafe fn wait_rwp(ctlr: u64, rwp: u32) {
+/// `ctlr` must be a `GICD_CTLR`, mapped as Device memory.
+unsafe fn wait_rwp(ctlr: u64) {
     // SAFETY: the caller's contract.
-    while unsafe { read(ctlr) } & rwp != 0 {
+    while unsafe { read(ctlr) } & RWP != 0 {
         spin_loop();
     }
 }
 
-/// Turns on the GICv3 distributor at `dist`: affinity routing, then Group 1.
+/// Turns on the GICv3 distributor at `dist`: affinity routing and Group 1 in one write, as Linux does (each register
+/// access is a VM exit under hvf).
 ///
 /// # Safety
 ///
 /// `dist` must be a GICv3 distributor, mapped as Device memory; call once, before any core enables its interface.
 pub unsafe fn enable(dist: PhysAddr) {
-    for ctlr in [CTLR_ARE, CTLR_ARE | CTLR_ENABLE_GRP1] {
-        // SAFETY: the caller guarantees `dist` is a GICv3 distributor.
-        unsafe { write(dist.0 + GICD_CTLR, ctlr) };
-        // SAFETY: as above.
-        unsafe { wait_rwp(dist.0 + GICD_CTLR, RWP) };
-    }
+    // SAFETY: the caller guarantees `dist` is a GICv3 distributor.
+    unsafe { write(dist.0 + GICD_CTLR, CTLR_ARE | CTLR_ENABLE_GRP1) };
+    // SAFETY: as above.
+    unsafe { wait_rwp(dist.0 + GICD_CTLR) };
 }
 
 /// The affinity (Aff3.Aff2.Aff1.Aff0, a byte each) of the redistributor at `redist`, as `GICR_TYPER` reports it.
@@ -81,18 +77,15 @@ pub unsafe fn affinity(redist: PhysAddr) -> u32 {
 /// `redist` must be this core's GICv3 redistributor (`affinity` matches its MPIDR), mapped as Device memory, after
 /// `enable`.
 pub unsafe fn enable_cpu(redist: PhysAddr) {
-    // SAFETY: the caller guarantees `redist` is this core's redistributor.
-    let waker = unsafe { read(redist.0 + GICR_WAKER) };
-    // SAFETY: as above.
-    unsafe { write(redist.0 + GICR_WAKER, waker & !WAKER_PROCESSOR_SLEEP) };
+    // SAFETY: the caller guarantees `redist` is this core's redistributor; `GICR_WAKER`'s other writable bit is
+    // implementation defined and 0 at reset.
+    unsafe { write(redist.0 + GICR_WAKER, 0) };
     // SAFETY: as above.
     while unsafe { read(redist.0 + GICR_WAKER) } & WAKER_CHILDREN_ASLEEP != 0 {
         spin_loop();
     }
     // SAFETY: as above.
     unsafe { write(redist.0 + GICR_IGROUPR0, u32::MAX) };
-    // SAFETY: as above.
-    unsafe { wait_rwp(redist.0 + GICR_CTLR, GICR_RWP) };
     // SAFETY: ICC_SRE_EL1.SRE, ICC_PMR_EL1 and ICC_IGRPEN1_EL1 only configure this core's CPU interface; each `isb`
     // completes the write before the next use.
     unsafe {
@@ -111,7 +104,8 @@ pub unsafe fn enable_cpu(redist: PhysAddr) {
     };
 }
 
-/// Puts shared peripheral interrupt `irq` in Group 1 and delivers it to the core with affinity `mpidr` only.
+/// Puts shared peripheral interrupt `irq`, with the other 31 SPIs of its `GICD_IGROUPR` word, in Group 1 (every
+/// interrupt the kernel uses is), and delivers it to the core with affinity `mpidr` only.
 ///
 /// # Safety
 ///
@@ -119,9 +113,7 @@ pub unsafe fn enable_cpu(redist: PhysAddr) {
 pub unsafe fn route(dist: PhysAddr, irq: u32, mpidr: u64) {
     let group = dist.0 + GICD_IGROUPR + 4 * (irq / 32) as u64;
     // SAFETY: the caller guarantees `dist` is a GICv3 distributor.
-    let groups = unsafe { read(group) };
-    // SAFETY: as above.
-    unsafe { write(group, groups | 1 << (irq % 32)) };
+    unsafe { write(group, u32::MAX) };
     let affinity = mpidr & 0xff_00ff_ffff;
     // SAFETY: as above; IRM (bit 31) clear routes to that one core.
     unsafe { ((dist.0 + GICD_IROUTER + 8 * irq as u64) as *mut u64).write_volatile(affinity) };
@@ -142,14 +134,15 @@ pub unsafe fn unmask(dist: PhysAddr, irq: u32) {
     };
 }
 
-/// Unmasks SGI or PPI `irq` (below 32) in this core's redistributor at `redist`.
+/// Unmasks the SGIs and PPIs whose bits `irqs` sets (bit `n` for interrupt `n`, below 32) in this core's
+/// redistributor at `redist`.
 ///
 /// # Safety
 ///
 /// `redist` must be this core's GICv3 redistributor, mapped as Device memory.
-pub unsafe fn unmask_local(redist: PhysAddr, irq: u32) {
+pub unsafe fn unmask_local(redist: PhysAddr, irqs: u32) {
     // SAFETY: the caller guarantees `redist` is this core's redistributor.
-    unsafe { write(redist.0 + GICR_ISENABLER0, 1 << irq) };
+    unsafe { write(redist.0 + GICR_ISENABLER0, irqs) };
 }
 
 /// Sends SGI `sgi` (below 16) to the core with affinity `mpidr`, once the stores before it are visible to that core.
