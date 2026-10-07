@@ -30,6 +30,14 @@ Speed is a primary goal, so performance is tested like behavior: measured, recor
 | `mm` frames: alloc+free of 1000 frames, 128 MiB allocator (ns/op) | Host, M4 Pro | 4.6 | 5.2 | uncommitted |
 | `mogfs` create + 100-byte write + commit, 400 files in one directory, in-memory disk (ns/op) | Host, M4 Pro | 1873 | 1956 | phase 4 MogFS unlink and rename |
 | `mogfs` lookup in a 400-entry directory, in-memory disk (ns/op) | Host, M4 Pro | 758 | 784 | phase 4 MogFS unlink and rename |
+| `mogfs` (v1) create + 100-byte write + commit, 400 files, 16384-block (64 MiB) in-memory disk, from a scratch copy of its bench (ns/op) | Host, M4 Pro, 3 runs interleaved with `mogfs2` | 2007 | 2087 | phase 7 step 39 |
+| `mogfs2` create + 100-byte write + commit, 400 files in one directory, 1024-block in-memory disk, 64-slot cache (ns/op; v1 1951-1976 interleaved) | Host, M4 Pro, 6 runs interleaved with v1 | 1807 | 1853-1900 | phase 7 step 39 |
+| `mogfs2` the same on a 16384-block (64 MiB) disk (ns/op; v1 2076-2098 interleaved) | Host, M4 Pro, 3 runs | 1869 | 1934-1951 | phase 7 step 39 |
+| `mogfs2` lookup in a 400-entry directory (ns/op; checks the entry against the inode it names) | Host, M4 Pro | 115 | 121 | phase 7 step 39 |
+| `mogfs2` lookup in a 100k-entry directory, 64-slot cache (ns/op; two leaf reads and checks per lookup) | Host, M4 Pro, 11 runs | 1359 | 1401 | phase 7 step 39 |
+| `mogfs2` 1 GiB file: sequential 1 MiB writes + commit / sequential read, in-memory disk (MiB/s, higher is better) | Host, M4 Pro, 5 runs (busy machine) | 3832 / 5829 | 7413 / 11364 | phase 7 step 39 |
+| `mogfs2` mount after the 1 GiB file (ns; 16 requests: the superblocks, the live bitmap index and pages, the rightmost path, the older slot's index and the pages it does not share) | Host, M4 Pro, 5 runs | 16375 | 17125 | phase 7 step 39 |
+| `mogfs2` 64 MiB file sequential read, fresh / after 16384 random 4 KiB overwrites + commit (fragmentation; MiB/s) | Host, M4 Pro, 11 runs | 8757 / 4335 | 12683 / 4889 | phase 7 step 39 |
 | Kernel boot, kmain to end of init (us) | QEMU TCG, dev build | 2928 | 3140 | uncommitted |
 | Kernel boot, kmain to end of init (us) | QEMU hvf (`-cpu cortex-a72`), dev build, 21 boots | 157 | 178 | phase 3 step 11 |
 | Yield round trip via `svc`, `test=bench`, 100000 trips (ns) | QEMU TCG, dev build, 11 boots | 1178 | 1218 | uncommitted |
