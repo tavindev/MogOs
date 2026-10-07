@@ -518,6 +518,7 @@ pub fn dispatch(nr: u64, args: &[u64; 7], handles: &mut Handles) -> Result<Call,
             _ => Err(EACCES),
         },
         BIND => {
+            let sock = socket(handles, args[0], WRITE)?;
             let port = u16::try_from(args[1]).map_err(|_| EINVAL)?;
             let loopback = match args[2] {
                 0 => false,
@@ -525,7 +526,7 @@ pub fn dispatch(nr: u64, args: &[u64; 7], handles: &mut Handles) -> Result<Call,
                 _ => return Err(EADDRNOTAVAIL),
             };
             Ok(Call::Net(NetCall::Bind {
-                sock: socket(handles, args[0], WRITE)?,
+                sock,
                 port,
                 loopback,
             }))
