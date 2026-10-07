@@ -12,6 +12,7 @@ pub const WRITE: u64 = 1 << 1;
 pub const DUPLICATE: u64 = 1 << 3;
 pub const TRANSFER: u64 = 1 << 4;
 pub const EXEC: u64 = 1 << 5;
+pub const WAIT: u64 = 1 << 6;
 
 /// `open` flags: create a missing file; empty the file.
 pub const CREATE: u64 = 1 << 0;
@@ -77,6 +78,7 @@ pub unsafe fn raw(nr: u64, args: [u64; 7]) -> (i64, u64) {
     (x0, x1)
 }
 
+/// Ends the whole process, every thread.
 pub fn exit(code: u64) -> ! {
     syscall(0, [code, 0, 0, 0]);
     loop {
@@ -226,9 +228,9 @@ pub fn pipe() -> (i64, u64) {
     (read, write)
 }
 
-/// Blocks until `process` exits; returns its exit code.
-pub fn wait(process: u64) -> i64 {
-    syscall(8, [process, 0, 0, 0])
+/// Blocks until `handle`'s process exits, or its thread (a join); returns the exit code.
+pub fn wait(handle: u64) -> i64 {
+    syscall(8, [handle, 0, 0, 0])
 }
 
 pub fn mutex() -> i64 {
@@ -244,8 +246,31 @@ pub fn unlock(mutex: u64) -> i64 {
     syscall(11, [mutex, 0, 0, 0])
 }
 
-pub fn kill(process: u64) -> i64 {
-    syscall(12, [process, 0, 0, 0])
+/// Ends a process, or a thread (its process ends with its last thread); `wait` then reports `KILLED`.
+pub fn kill(handle: u64) -> i64 {
+    syscall(12, [handle, 0, 0, 0])
+}
+
+/// Starts a thread of this process at `entry(arg)` with SP = `stack` and TPIDR_EL0 = `tls`, at the caller's
+/// priority; returns a handle to it (wait joins it, kill, duplicate, transfer).
+pub fn thread(entry: extern "C" fn(u64) -> !, stack: u64, tls: u64, arg: u64) -> i64 {
+    syscall(18, [entry as usize as u64, stack, tls, arg])
+}
+
+/// Ends the calling thread; its process ends with its last thread. A join reports the low 8 bits of `code`.
+pub fn thread_exit(code: u64) -> ! {
+    syscall(19, [code, 0, 0, 0]);
+    loop {
+        core::hint::spin_loop()
+    }
+}
+
+/// This thread's TPIDR_EL0, as `thread` set it.
+pub fn tls() -> u64 {
+    let tls;
+    // SAFETY: reading TPIDR_EL0 has no side effects.
+    unsafe { asm!("mrs {}, tpidr_el0", out(reg) tls, options(nomem, nostack)) };
+    tls
 }
 
 pub fn mkdir(dir: u64, path: &[u8]) -> i64 {

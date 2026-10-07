@@ -109,38 +109,54 @@ impl<const N: usize> Default for Pipes<N> {
 }
 
 impl Pipe {
-    /// Moves up to `out.len()` bytes from the buffer in `page` to `out`; returns the count, 0 at end of file (empty,
-    /// no write end left), or `None` while it is empty and a write end is open.
-    pub fn read(&mut self, page: &[u8; SIZE], out: &mut [u8]) -> Option<i64> {
-        if self.len == 0 && self.writers > 0 && !out.is_empty() {
+    /// Whether a read of `len` bytes waits: the buffer is empty and a write end is open.
+    pub fn read_waits(&self, len: usize) -> bool {
+        self.len == 0 && self.writers > 0 && len != 0
+    }
+
+    /// Moves up to `len` bytes out of the buffer in `page`: `out(chunk, at)` takes each chunk of `page` as the bytes at
+    /// offset `at` of the read; returns the count, 0 at end of file (empty, no write end left), or `None` while it
+    /// waits (`read_waits`).
+    pub fn read(
+        &mut self,
+        page: &[u8; SIZE],
+        len: usize,
+        mut out: impl FnMut(&[u8], usize),
+    ) -> Option<i64> {
+        if self.read_waits(len) {
             return None;
         }
-        let n = out.len().min(self.len);
+        let n = len.min(self.len);
         let first = n.min(SIZE - self.head);
-        out[..first].copy_from_slice(&page[self.head..self.head + first]);
-        out[first..n].copy_from_slice(&page[..n - first]);
+        out(&page[self.head..self.head + first], 0);
+        out(&page[..n - first], first);
         self.head = (self.head + n) % SIZE;
         self.len -= n;
         Some(n as i64)
     }
 
-    /// Moves all of `data` (at most `SIZE` bytes) into the buffer in `page`, never part of it; returns the count,
-    /// `EPIPE` once no read end is left, or `None` until it fits. Empty `data` returns 0, as on Linux.
-    pub fn write(&mut self, page: &mut [u8; SIZE], data: &[u8]) -> Option<i64> {
-        if data.is_empty() {
+    /// Moves all of `n` bytes (at most `SIZE`) into the buffer in `page`, never part of them: `data(chunk, at)` fills
+    /// each chunk of `page` with the bytes at offset `at` of the data; returns the count, `EPIPE` once no read end is
+    /// left, or `None` until they fit. Zero bytes return 0, as on Linux.
+    pub fn write(
+        &mut self,
+        page: &mut [u8; SIZE],
+        n: usize,
+        mut data: impl FnMut(&mut [u8], usize),
+    ) -> Option<i64> {
+        if n == 0 {
             return Some(0);
         }
         if self.readers == 0 {
             return Some(EPIPE);
         }
-        if SIZE - self.len < data.len() {
+        if SIZE - self.len < n {
             return None;
         }
-        let n = data.len();
         let tail = (self.head + self.len) % SIZE;
         let first = n.min(SIZE - tail);
-        page[tail..tail + first].copy_from_slice(&data[..first]);
-        page[..n - first].copy_from_slice(&data[first..n]);
+        data(&mut page[tail..tail + first], 0);
+        data(&mut page[..n - first], first);
         self.len += n;
         Some(n as i64)
     }

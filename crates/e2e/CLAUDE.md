@@ -30,7 +30,7 @@ lines and the exit status. `tests/user.rs` runs `crates/user`'s host tests (outs
 - Console input (`boot_with_input`) writes chunk `i` once the output holds the ready marker `i + 1` times, so `shell`
   types one command per `msh> ` prompt and no echo interleaves with msh's output.
 - `assert_no_leak` checks that a scenario's `<test>: free frames <n> before, <n> after` counts match; every scenario
-  of `budget`, `spawn`, `pipe`, `wait`, `pi`, `echo`, `shell`, `bench-fs`, `bench-spawn`, `fuzz`, `bench-syscalls` and `bench-shell` uses it; a new scenario that frees frames should too.
+  of `budget`, `spawn`, `pipe`, `wait`, `pi`, `echo`, `shell`, `bench-fs`, `bench-spawn`, `fuzz`, `bench-syscalls`, `bench-shell`, `threads` and `bench-threads` uses it; a new scenario that frees frames should too.
 - A new kernel behavior gets its failing scenario here first (`docs/WORKFLOW.md`, step 2).
 - Performance is the moat: a slowdown is never accepted because it has an explanation; it is removed, or shown to
   be unavoidable with before/after numbers (`docs/BENCHMARKS.md`).

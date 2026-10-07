@@ -2,8 +2,8 @@
 
 ## What this crate is
 
-The hardware-free core: the boot sequence (`run`), the `Board` port each board implements, the scheduler, handle
-tables, pipes, mutexes, syscall decoding, and the boot archive's cpio and ELF parsers.
+The hardware-free core: the boot sequence (`run`), the `Board` port each board implements, the scheduler and its
+process table, handle tables, pipes, mutexes, syscall decoding, and the boot archive's cpio and ELF parsers.
 
 It is **NOT** where registers, page tables, trap entry or MMIO live (`crates/arch`, `crates/board/*`), and it never
 touches memory through raw addresses: the board reads user buffers, copies pages and frees frames.
@@ -19,9 +19,14 @@ touches memory through raw addresses: the board reads user buffers, copies pages
   `lookup` per `/`-separated component), `open` (`CREATE`, `TRUNC`), `mkdir`, `unlink`, `rename`, `readdir` (one pass
   writing whole `name\n` / `name/\n` entries, at most 64 per call), `list_archive`, and `errno` (mogfs error to musl
   errno; `Io` and `Corrupt` are `EIO`).
-- `Scheduler<N>` (`src/sched.rs`): slots, states (`Ready`, `Blocked`, `Exited`, `Zombie`), priorities, `reap`, `kill`.
+- `Scheduler<N, P>` (`src/sched.rs`): thread slots (frame, process, kernel stack, state, priorities) and the process
+  table `Processes<P>` (address space, `Handles`, `Memory` with the budget and map cursor, live threads (a slot bitmask),
+  generation); states (`Ready`, `Blocked`, `Exited`, `Zombie`) for both; `end` (a thread, and its process with its last
+  thread), `reap` (a process), `join` (a thread).
 - `Handles` (`src/handle.rs`): per-process handle tables, rights, `dup`, `split` for `spawn`.
-- `Pipes<N>` (`src/pipe.rs`), `Mutexes<N>` (`src/mutex.rs`): fixed tables of kernel objects.
+- `Pipes<N>` (`src/pipe.rs`), `Mutexes<N>` (`src/mutex.rs`): fixed tables of kernel objects. `Pipe::read` and
+  `Pipe::write` hand the caller each chunk of the ring through a closure, so the board copies straight between user
+  memory and the pipe page; `read_waits` lets it skip probing the user buffer when the read would wait.
 - `syscall::dispatch` (`src/syscall.rs`): decodes `x8`/`x0`-`x5`, checks handles and rights, returns a `Call` for the
   board to execute. Syscall numbers and error constants are defined here.
 - `cpio::find`, `cpio::entries`, `elf::Elf::parse` (`src/cpio.rs`, `src/elf.rs`).
@@ -36,10 +41,15 @@ touches memory through raw addresses: the board reads user buffers, copies pages
 
 ## Vocabulary
 
-- **Slot**: a scheduler index; slot 0 is the **boot context**. A process's slot is also its ASID (board side).
-- **Generation**: per-slot (and per pipe/mutex entry) counter that tells a live object from a later one in the same place.
-- **Zombie**: an exited process whose slot is kept because some handle table still holds a `Process` handle to it.
-- **Budget**: frames a process may hold (`mm::Budget`); `spawn` moves part of the parent's to the child.
+- **Slot**: a scheduler index, one thread; slot 0 is the **boot context**. A thread handle (`Object::Thread`) names a
+  slot and its generation.
+- **Process index**: an entry of the process table, also its ASID (board side); index 0 is the kernel (boot context
+  and kernel tasks, boot table, ASID 0). A process handle (`Object::Process`) names an index and its generation.
+- **Generation**: per-slot, per-process (and per pipe/mutex entry) counter that tells a live object from a later one
+  in the same place.
+- **Zombie**: an ended thread or process whose slot or index is kept because a handle to it is still open.
+- **Budget**: frames a process may hold (`mm::Budget`), its threads' kernel stacks included; `spawn` moves part of
+  the parent's to the child.
 - **Boot archive**: the cpio of `crates/user` programs; `Object::Archive` / `Object::File` reach it, read-only.
 - **File system**: the mounted MogFS; `Object::Dir(Inode)` / `Object::Node(Inode)` (a file) reach it. Inode numbers
   stay fixed while a file lives.
@@ -50,13 +60,19 @@ touches memory through raw addresses: the board reads user buffers, copies pages
   values stay positive and never wrap (`src/handle.rs` header, `RETIRED`).
 - `dup` needs `DUPLICATE` and only narrows rights; `split` moves only `TRANSFER` handles and works on a copy, so a
   failed `spawn` changes nothing (`Handles::split`).
-- `Scheduler::add` takes the generation from `free_slot` (old + 1); `reap`, `kill`, `budget` return `EBADF`/`None`
-  for a stale generation. Slot 0 never exits (`assert!` in `Scheduler::exit`).
-- `end` decides `Zombie` vs `Exited` by whether any table holds a handle to the process; `reap` hands out the budget
-  limit once (later calls get 0); `close` on a zombie's handle frees its slot like `reap` (`src/sched.rs`).
+- `Scheduler::add` and `add_process` take the generation from `free_slot` / `free_process` (old + 1); `reap`,
+  `join`, `process_live`, `thread_live` return `EBADF` for a stale generation, `budget` `None`. Slot 0 never ends
+  (`assert!` in `Scheduler::end`), nor does process 0.
+- Thread slots and process indices share one lifecycle (`Entries`): state, generation, a count of open handles
+  (`held` on each new `Process` or `Thread` handle, `close` / `close_thread` on each closed one, ignored for an older
+  generation) and a bitmask of free entries, so `end` and `free_slot` / `free_process` are O(1) (at most 64 entries,
+  const-asserted). `end` makes a thread, and with its last thread the process, a zombie while its count is above 0;
+  the caller first takes and releases the process's own handles (`take_handles`), so its handle to itself does not
+  keep it. `reap` hands out the budget limit once (later calls get 0); the last `close` / `close_thread` of a zombie
+  frees its index or slot like `reap` / `join` (`src/sched.rs`).
 - `advance` runs the highest effective priority, round robin within a level, boot context when none is ready.
   Priority inheritance is one level only (`unboost` doc). The board calls `unboost(slot, ..)` when an owner loses a
-  waiter (an unlock that woke one, or a kill of a task blocked on `Lock`); after such an unlock it switches at once if
+  waiter (an unlock that woke one, or the end of a thread blocked on `Lock`); after such an unlock it switches at once if
   `outranked()` (any ready task beats the caller).
 - Pipes and mutexes: entry reached by `index` + `generation`, counted handles, freed when the count hits zero.
   `End::index` and `Mutex::index` are `u32` so copying an `Object` stays a plain move on the syscall path.
@@ -64,14 +80,17 @@ touches memory through raw addresses: the board reads user buffers, copies pages
 - `MAX_BUFFER` (4 KiB) and `MAX_MAP` (16 pages) bound the work a syscall does under the board's big lock (IRQs masked); `user_buffer` checks
   every user range lies in `USER` (4 GiB..512 GiB).
 - Errors are negated musl errno values; `KILLED` (256) sits outside `exit`'s 0..=255.
-- Syscalls 0-17 (`src/syscall.rs` docs): exit, io_submit_wait, dup, close, map, open, spawn, pipe, wait, mutex, lock,
-  unlock, kill, mkdir, readdir, sync, unlink, rename. `io_submit_wait` takes a file offset in x4 (files need it, the console and pipes
+- Syscalls 0-19 (`src/syscall.rs` docs): exit, io_submit_wait, dup, close, map, open, spawn, pipe, wait, mutex, lock,
+  unlock, kill, mkdir, readdir, sync, unlink, rename, thread, thread_exit. `exit` ends the whole process; `thread_exit`
+  ends the caller, and its process with its last thread; `wait` and `kill` take a process or a thread handle (`wait`
+  on a thread is a join). Both exit codes keep the low 8 bits, so `KILLED` stays distinct. `MAX_BUFFER` is public: the
+  board sizes its copy-in buffer with it. `io_submit_wait` takes a file offset in x4 (files need it, the console and pipes
   ignore it; offsets live in libc, not in handles, so `Object` stays `Copy`). `open` takes flags in x3; the opened
   object gets the directory handle's rights, so a child never has more. `spawn` takes arguments in x5/x6 (NUL-ended
   strings, at most `MAX_ARGS` (32) and `MAX_BUFFER` bytes, `E2BIG`; checked by `syscall::argc`); `dispatch` reads
   x0-x6. `Call` stays 56 bytes (const-asserted), so `Spawn`'s small fields are `u8`/`u16`. Changing the archive is `EROFS`.
 - An inode a handle reaches is never freed: `unlink` is `EBUSY` while any table holds a `Dir` or `Node` handle to it
-  (`Scheduler::holds`, at most `MAX_TASKS * MAX_HANDLES` entries), since `create` reuses freed inodes. The scan sees
+  (`Scheduler::holds`, at most `MAX_PROCESSES * MAX_HANDLES` entries), since `create` reuses freed inodes. The scan sees
   every handle: `spawn` moves handles within one syscall, and an exiting process's table is emptied as it releases.
 - Paths resolve only below a directory handle: each component goes through `mogfs::lookup`, which rejects `.`, `..`
   and empty names, so `../x` and `/x` are `EINVAL`. Trust note: a crafted image can point an entry at `ROOT` or an
@@ -87,7 +106,7 @@ touches memory through raw addresses: the board reads user buffers, copies pages
 - init's handles (`Handles::init`): 0 console (read, write, duplicate, transfer), 1 itself (kill), 2 the boot archive
   with `INIT_ARCHIVE` (read, exec); only msh (`test=shell`, `test=bench-shell`) gets `SHELL_ARCHIVE` (also duplicate, transfer), since it
   hands the archive to `sh`, which spawns from it. Every other init can neither copy nor pass it on.
-- `BOOT_BUDGET`, `SHELL_BUDGET` (msh under `test=shell` and `test=bench-shell`: its 25 frames and the 2048 it gives `sh`), `WAITER_BUDGET`, `PI_BUDGET`, `FUZZ_BUDGET`, `SYSBENCH_BUDGET` are sized to the user programs' frame needs: too small and `run`'s
+- `BOOT_BUDGET`, `SHELL_BUDGET` (msh under `test=shell` and `test=bench-shell`: its 25 frames and the 2048 it gives `sh`), `WAITER_BUDGET`, `PI_BUDGET`, `FUZZ_BUDGET`, `SYSBENCH_BUDGET`, `THREADS_BUDGET` are sized to the user programs' frame needs: too small and `run`'s
   `expect("spawn")` panics. `PIPE_ROUND_TRIPS` must equal `ROUND_TRIPS` in `crates/user/src/bin/ping.rs`; a mismatch
   only prints a wrong `pipe:` number, nothing fails.
 - Performance is the moat: a slowdown is never accepted because it has an explanation; it is removed, or shown to
@@ -95,7 +114,8 @@ touches memory through raw addresses: the board reads user buffers, copies pages
 
 ## How it's tested
 
-- Host: `cargo test --target aarch64-apple-darwin -p kernel` runs `tests/sched.rs`, `tests/handle.rs`,
+- Host: `cargo test --target aarch64-apple-darwin -p kernel` runs `tests/sched.rs` (slot and process generations,
+  zombies, last-thread exit, joins, priorities), `tests/handle.rs`,
   `tests/pipe.rs`, `tests/exec.rs` (cpio, ELF, archive listing), `tests/args.rs` (`spawn`'s argument checks), `tests/dispatch.rs` (`unlink`, `rename`, `sync` handle checks), `tests/file.rs` (path walk limits, `readdir` at
   tight buffer sizes, over an in-memory disk); `file` also end to end (`test=shell`, `test=bench-fs`).
 - End to end: every scenario in `crates/e2e/tests/boot.rs`; `run`'s `test=*` arms are listed in

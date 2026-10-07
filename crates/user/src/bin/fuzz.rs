@@ -1,9 +1,9 @@
 //! `test=fuzz`'s init: makes seeded random syscalls (every number, unknown ones too) with boundary and random
 //! arguments, live, closed and narrowed handles, and bad spawns; exits 1 at the first result that is neither a count nor
 //! a known errno, printing the call. Arguments: seed, calls, and the call from which to print each one before making
-//! it. Skips only the calls that would end it (`exit`, `kill` of itself), block it forever (a read of an empty pipe, a
-//! write that does not fit, a spawn of anything but `nop`), or write over its own image and stack; a console write that
-//! would print is cut to 0 bytes. Prints `fuzz: seed <seed>: <calls> calls ok, <n> skipped`.
+//! it. Skips only the calls that would end it (`exit`, `thread`, `thread_exit`, `kill` of itself), block it forever
+//! (a read of an empty pipe, a write that does not fit, a spawn of anything but `nop`), or write over its own image and
+//! stack; a console write that would print is cut to 0 bytes. Prints `fuzz: seed <seed>: <calls> calls ok, <n> skipped`.
 #![no_std]
 #![no_main]
 
@@ -24,7 +24,7 @@ const MAX_BUFFER: u64 = 4096;
 const MAX_MAP: u64 = 16 * PAGE;
 /// Bytes mapped above `STACK_TOP`, the scratch memory included, after which `map` gets only bad lengths.
 const MAPS: u64 = 32 * PAGE;
-const LAST_SYSCALL: u64 = 17;
+const LAST_SYSCALL: u64 = 19;
 const POOL: usize = 48;
 
 const ERRNOS: [i64; 25] = [
@@ -384,7 +384,7 @@ impl Fuzzer {
             18 | 19 => {
                 let any = self.rng.next();
                 self.rng
-                    .pick(&[18, 19, 64, 255, 1 << 32 | 1, 1 << 32 | 6, u64::MAX, any])
+                    .pick(&[20, 21, 64, 255, 1 << 32 | 1, 1 << 32 | 6, u64::MAX, any])
             }
             nr => nr.max(1),
         };
@@ -490,7 +490,8 @@ impl Fuzzer {
             len == 0 || ptr >= STACK_TOP || ptr.saturating_add(len) <= USER_BASE
         };
         match nr {
-            0 => false,
+            // `exit`, `thread_exit` of its only thread, and a `thread` at a random entry, which faults, end it.
+            0 | 18 | 19 => false,
             1 => {
                 let len = a[3].min(MAX_BUFFER);
                 match (self.kind(a[0]), a[1]) {

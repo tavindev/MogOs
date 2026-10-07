@@ -10,20 +10,25 @@ use kernel::elf::{Elf, Segment};
 use kernel::handle::{
     DUPLICATE, Handles, KILL, MAX_HANDLES, Object, READ, Rights, TRANSFER, WAIT, WRITE,
 };
-use kernel::syscall::{EAGAIN, EFAULT, ENOEXEC, ENOMEM};
-use kernel::{FRAME_WORDS, Memory, Program, Scheduler};
+use kernel::syscall::{EAGAIN, EFAULT, ENOEXEC, ENOMEM, MAX_BUFFER};
+use kernel::{FRAME_WORDS, Memory, Program};
 use mm::{Budget, FrameAllocator, PhysAddr};
 use mogfs::ROOT;
 
-use crate::usermem::user_bytes;
+use crate::usermem::copy_in;
 use crate::{
-    ARCHIVE, IMAGE, KERNEL, KERNEL_L1, Kernel, MAP_BASE, MAX_TASKS, PAGE, TASK_STACK_FRAMES,
-    USER_BASE, USER_STACK_TOP,
+    ARCHIVE, IMAGE, KERNEL, KERNEL_L1, Kernel, MAP_BASE, PAGE, Sched, TASK_STACK_FRAMES, USER_BASE,
+    USER_STACK_TOP,
 };
 
-pub(crate) fn free_stack(frames: &mut FrameAllocator<FRAME_WORDS>, stack: PhysAddr) {
+/// Returns a thread's kernel stack at `stack` to `frames`, refunding `budget`.
+pub(crate) fn free_stack(
+    frames: &mut FrameAllocator<FRAME_WORDS>,
+    budget: &mut Budget,
+    stack: PhysAddr,
+) {
     for i in 0..TASK_STACK_FRAMES {
-        frames.free(PhysAddr(stack.0 + (i * PAGE) as u64));
+        budget.free(frames, PhysAddr(stack.0 + (i * PAGE) as u64));
     }
 }
 
@@ -60,7 +65,7 @@ fn map_filled(
     let end = at + bytes.len();
     // SAFETY: a fresh frame from the allocator: identity-mapped RAM that nothing else uses, and `end <= PAGE`.
     unsafe { ptr::write_bytes(base, 0, at) };
-    // SAFETY: as above; `bytes` is kernel or user memory, never this frame.
+    // SAFETY: as above; `bytes` is kernel memory, never this frame.
     unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), base.wrapping_add(at), bytes.len()) };
     // SAFETY: as above.
     unsafe { ptr::write_bytes(base.wrapping_add(end), 0, PAGE - end) };
@@ -77,12 +82,13 @@ fn map_filled(
 /// Maps `pages` zeroed read-write pages at the current process's next map address, charged to its budget; returns
 /// their address, or `None` with nothing mapped if the budget or the frames run out.
 pub(crate) fn map(
-    sched: &mut Scheduler<MAX_TASKS>,
+    sched: &mut Sched,
     frames: &mut FrameAllocator<FRAME_WORDS>,
     pages: usize,
 ) -> Option<u64> {
-    let (asid, l1) = sched.current();
-    let memory = sched.memory();
+    let asid = sched.process();
+    let l1 = sched.space(asid);
+    let memory = sched.memory(asid);
     if pages > memory.budget.remaining() {
         return None;
     }
@@ -103,33 +109,16 @@ pub(crate) fn map(
     Some(start)
 }
 
-/// Moves SP_EL0, TPIDR_EL0 and TTBR0 from the task that saved `frame` to the scheduler's current task, whose frame is
-/// `next`: the boot table keeps ASID 0, a process's level-1 table has ASID = its slot.
-///
-/// # Safety
-/// `frame` and `next` must be trap frames.
-pub(crate) unsafe fn enter(sched: &Scheduler<MAX_TASKS>, frame: usize, next: usize) {
-    let (slot, space) = sched.current();
-    // SAFETY: the caller guarantees both are trap frames.
-    unsafe { arch::switch_el0_regs(frame, next) };
-    let (table, asid) = match space {
-        PhysAddr(0) => (arch::boot_table(), 0),
-        table => (table, slot),
-    };
-    // SAFETY: every space's table holds the kernel blocks, and ASID `slot` is used only by the task in that slot.
-    unsafe { arch::set_ttbr0(table, asid) }
-}
-
-/// Builds a process from `file`'s `segments` (entered at `entry`): address space, pages and kernel stack, all charged
-/// to `budget`, and queues it in the free `slot` with `handles` at `priority`; on failure (`ENOMEM`) returns every
-/// frame it took. With `args` (`argc` of them, at most a page), the top stack page holds them and the stack gets a
-/// page below it.
+/// Builds a process from `file`'s `segments` (entered at `entry`): address space, pages and its first thread's kernel
+/// stack, all charged to `budget`, and queues it at the free index `process`, its thread in the free `slot`, with
+/// `handles` at `priority`; on failure (`ENOMEM`) returns every frame it took. With `args` (`argc` of them, at most a
+/// page), the top stack page holds them and the stack gets a page below it.
 fn spawn_process(
-    sched: &mut Scheduler<MAX_TASKS>,
+    sched: &mut Sched,
     frames: &mut FrameAllocator<FRAME_WORDS>,
     (file, segments, entry): (&[u8], impl Iterator<Item = Segment>, u64),
     mut budget: Budget,
-    (slot, handles, priority): ((usize, u64), Handles, u8),
+    (process, slot, handles, priority): ((usize, u64), (usize, u64), Handles, u8),
     (args, argc): (&[u8], usize),
 ) -> Result<(), i64> {
     let l1 = zeroed(frames, &mut budget).ok_or(ENOMEM)?;
@@ -177,13 +166,16 @@ fn spawn_process(
     let at = USER_STACK_TOP - args.len() as u64;
     let x = [argc as u64, at, args.len() as u64];
     // SAFETY: the kernel stack below `stack.end` is fresh and owned by the new process.
-    let frame = unsafe { arch::new_user_task(stack.end.0 as usize, entry, at & !15, x) };
+    let frame = unsafe { arch::new_user_task(stack.end.0 as usize, entry, (at & !15, 0), x) };
     let memory = Memory {
-        stack: stack.start,
         budget,
         next: MAP_BASE,
     };
-    sched.add(slot, frame, l1, memory, handles, priority);
+    sched.add_process(process, l1, memory, handles);
+    sched.add(slot, process.0, (frame, stack.start), priority);
+    // Its one handle: the spawner's, or init's own.
+    let (index, generation) = process;
+    sched.held(Object::Process { index, generation });
     Ok(())
 }
 
@@ -213,12 +205,13 @@ pub(crate) fn spawn_init(
         mounted,
         ..
     } = &mut *kernel;
-    sched.free_slot().ok_or(EAGAIN).and_then(|slot| {
-        let mut handles = Handles::init(slot.0, slot.1, archive);
+    let ids = sched.free_process().zip(sched.free_slot()).ok_or(EAGAIN);
+    ids.and_then(|(process, slot)| {
+        let mut handles = Handles::init(process.0, process.1, archive);
         if *mounted {
             handles.insert(Object::Dir(ROOT), READ | WRITE | DUPLICATE | TRANSFER)?;
         }
-        let init = (slot, handles, priority);
+        let init = (process, slot, handles, priority);
         spawn_process(
             sched,
             frames,
@@ -232,31 +225,35 @@ pub(crate) fn spawn_init(
 
 /// Spawns the boot archive's executable at `file` with the `len` handles at user address `ptr` and `budget` frames
 /// moved from the current process, which gets a handle to the child, at `priority` capped at the current process's
-/// own, with the arguments at user address `args`; on failure nothing moves.
+/// own, with the arguments at user address `args`, both copied in through `buf`; on failure nothing moves.
 pub(crate) fn spawn(
-    sched: &mut Scheduler<MAX_TASKS>,
+    sched: &mut Sched,
     frames: &mut FrameAllocator<FRAME_WORDS>,
+    buf: &mut [u8],
     file: Range<usize>,
     (ptr, len): (u64, usize),
     (budget, priority): (usize, u8),
     args: (u64, usize),
 ) -> Result<u64, i64> {
     let executable = executable(file)?;
-    let args = user_bytes(args.0, args.1).ok_or(EFAULT)?;
+    let (args_buf, list_buf) = buf.split_at_mut(MAX_BUFFER as usize);
+    let args = copy_in(args.0, args.1, args_buf).ok_or(EFAULT)?;
     let argc = kernel::syscall::argc(args)?;
-    let bytes = user_bytes(ptr, len * 8).ok_or(EFAULT)?;
+    let bytes = copy_in(ptr, len * 8, list_buf).ok_or(EFAULT)?;
     let mut list = [0; MAX_HANDLES];
     for (handle, bytes) in list.iter_mut().zip(bytes.as_chunks::<8>().0) {
         *handle = u64::from_le_bytes(*bytes);
     }
     let (mut parent, child) = sched.handles().split(&list[..len])?;
-    if budget > sched.memory().budget.remaining() {
+    let current = sched.process();
+    if budget > sched.memory(current).budget.remaining() {
         return Err(ENOMEM);
     }
-    let (slot, generation) = sched.free_slot().ok_or(EAGAIN)?;
-    let process = parent.insert(Object::Process { slot, generation }, WAIT | KILL)?;
+    let (process, slot) = sched.free_process().zip(sched.free_slot()).ok_or(EAGAIN)?;
+    let (index, generation) = process;
+    let handle = parent.insert(Object::Process { index, generation }, WAIT | KILL)?;
     let priority = priority.min(sched.priority());
-    let child = ((slot, generation), child, priority);
+    let child = (process, slot, child, priority);
     spawn_process(
         sched,
         frames,
@@ -265,9 +262,37 @@ pub(crate) fn spawn(
         child,
         (args, argc),
     )?;
-    sched.memory().budget.shrink(budget);
+    sched.memory(current).budget.shrink(budget);
     *sched.handles() = parent;
-    Ok(process)
+    Ok(handle)
+}
+
+/// Starts a thread of the current process at user address `entry` with SP_EL0 = `sp`, TPIDR_EL0 = `tls` and x0 =
+/// `arg`, at the caller's priority, its kernel stack charged to the process's budget; returns a handle to it (wait,
+/// kill, duplicate, transfer). On failure nothing changes.
+pub(crate) fn thread(
+    sched: &mut Sched,
+    frames: &mut FrameAllocator<FRAME_WORDS>,
+    entry: u64,
+    (sp, tls): (u64, u64),
+    arg: u64,
+) -> Result<u64, i64> {
+    let (slot, generation) = sched.free_slot().ok_or(EAGAIN)?;
+    let mut handles = *sched.handles();
+    let thread = Object::Thread { slot, generation };
+    let handle = handles.insert(thread, WAIT | KILL | DUPLICATE | TRANSFER)?;
+    let index = sched.process();
+    let budget = &mut sched.memory(index).budget;
+    let stack = budget
+        .alloc_contiguous(frames, TASK_STACK_FRAMES)
+        .ok_or(ENOMEM)?;
+    // SAFETY: the kernel stack below `stack.end` is fresh and owned by the new thread.
+    let frame = unsafe { arch::new_user_task(stack.end.0 as usize, entry, (sp, tls), [arg, 0, 0]) };
+    let priority = sched.priority();
+    sched.add((slot, generation), index, (frame, stack.start), priority);
+    sched.held(thread);
+    *sched.handles() = handles;
+    Ok(handle)
 }
 
 global_asm!(include_str!("user.s"), USER_BASE = const USER_BASE);
