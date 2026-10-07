@@ -1013,7 +1013,10 @@ unsafe extern "C" fn board_syscall(frame: &mut arch::TrapFrame) -> usize {
             .map_or_else(|error| error as u64, |n| n as u64),
         Ok(Call::Unlink { dir, ptr, len }) => user_bytes(ptr, len)
             .ok_or(EFAULT)
-            .and_then(|path| file::unlink(fs, dir, path))
+            .and_then(|path| {
+                let held = |i| sched.holds(|o| o == Object::Dir(i) || o == Object::Node(i));
+                file::unlink(fs, dir, path, held)
+            })
             .map_or_else(|error| error as u64, |()| 0),
         Ok(Call::Rename { from, to }) => user_bytes(from.1, from.2)
             .zip(user_bytes(to.1, to.2))

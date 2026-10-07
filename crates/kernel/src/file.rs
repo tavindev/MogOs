@@ -8,8 +8,8 @@ use mogfs::{Disk, Error, Fs, Inode, Kind};
 use crate::cpio;
 use crate::handle::Object;
 use crate::syscall::{
-    CREATE, EEXIST, EFBIG, EINVAL, EIO, EISDIR, ENAMETOOLONG, ENOENT, ENOSPC, ENOTDIR, ENOTEMPTY,
-    TRUNC,
+    CREATE, EBUSY, EEXIST, EFBIG, EINVAL, EIO, EISDIR, ENAMETOOLONG, ENOENT, ENOSPC, ENOTDIR,
+    ENOTEMPTY, TRUNC,
 };
 
 /// Entries one `readdir` call lists at most.
@@ -74,9 +74,18 @@ pub fn mkdir<D: Disk>(fs: &mut Fs<D>, dir: Inode, path: &[u8]) -> Result<(), i64
     fs.mkdir(dir, name).map(|_| ()).map_err(errno)
 }
 
-/// Removes the file or empty directory at `path` under `dir`.
-pub fn unlink<D: Disk>(fs: &mut Fs<D>, dir: Inode, path: &[u8]) -> Result<(), i64> {
+/// Removes the file or empty directory at `path` under `dir`; `EBUSY` if `held` says a handle reaches it, since its
+/// inode would be reused.
+pub fn unlink<D: Disk>(
+    fs: &mut Fs<D>,
+    dir: Inode,
+    path: &[u8],
+    held: impl Fn(Inode) -> bool,
+) -> Result<(), i64> {
     let (dir, name) = parent(fs, dir, path)?;
+    if held(fs.lookup(dir, name).map_err(errno)?) {
+        return Err(EBUSY);
+    }
     fs.unlink(dir, name).map_err(errno)
 }
 

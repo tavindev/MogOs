@@ -1,6 +1,8 @@
 use kernel::file::{mkdir, open, readdir, rename, unlink};
 use kernel::handle::Object;
-use kernel::syscall::{CREATE, EEXIST, EINVAL, EISDIR, ENAMETOOLONG, ENOENT, ENOTEMPTY, TRUNC};
+use kernel::syscall::{
+    CREATE, EBUSY, EEXIST, EINVAL, EISDIR, ENAMETOOLONG, ENOENT, ENOTEMPTY, TRUNC,
+};
 use mogfs::{BLOCK_SIZE, Disk, Error, Fs, ROOT};
 
 struct MemDisk(Vec<[u8; BLOCK_SIZE]>);
@@ -115,7 +117,7 @@ fn unlink_and_rename_walk_paths_like_open() {
     let mut fs = fs();
     mkdir(&mut fs, ROOT, b"d").unwrap();
     open(&mut fs, ROOT, b"d/a", CREATE).unwrap();
-    assert_eq!(unlink(&mut fs, ROOT, b"d"), Err(ENOTEMPTY));
+    assert_eq!(unlink(&mut fs, ROOT, b"d", |_| false), Err(ENOTEMPTY));
     assert_eq!(
         rename(&mut fs, (ROOT, b"d/a"), (ROOT, b"d/../b")),
         Err(EINVAL)
@@ -123,14 +125,28 @@ fn unlink_and_rename_walk_paths_like_open() {
     rename(&mut fs, (ROOT, b"d/a"), (ROOT, b"b")).unwrap();
     open(&mut fs, ROOT, b"d/c", CREATE).unwrap();
     assert_eq!(rename(&mut fs, (ROOT, b"b"), (ROOT, b"d/c")), Err(EEXIST));
-    assert_eq!(unlink(&mut fs, ROOT, b"d/a"), Err(ENOENT));
-    unlink(&mut fs, ROOT, b"d/c").unwrap();
-    unlink(&mut fs, ROOT, b"d").unwrap();
+    assert_eq!(unlink(&mut fs, ROOT, b"d/a", |_| false), Err(ENOENT));
+    unlink(&mut fs, ROOT, b"d/c", |_| false).unwrap();
+    unlink(&mut fs, ROOT, b"d", |_| false).unwrap();
     assert_eq!(list(&mut fs, 0, 64).as_deref(), Ok("b\n"));
     let deep = [&b"x/"[..]; 16].concat();
-    assert_eq!(unlink(&mut fs, ROOT, &deep), Err(ENAMETOOLONG));
+    assert_eq!(unlink(&mut fs, ROOT, &deep, |_| false), Err(ENAMETOOLONG));
     assert_eq!(
         rename(&mut fs, (ROOT, b"b"), (ROOT, &deep)),
         Err(ENAMETOOLONG)
     );
+}
+
+#[test]
+fn unlink_refuses_an_inode_a_handle_reaches() {
+    let mut fs = fs();
+    let Ok(Object::Node(file)) = open(&mut fs, ROOT, b"f", CREATE) else {
+        panic!()
+    };
+    fs.write(file, 0, b"mine").unwrap();
+    assert_eq!(unlink(&mut fs, ROOT, b"f", |i| i == file), Err(EBUSY));
+    open(&mut fs, ROOT, b"g", CREATE).unwrap();
+    let mut buf = [0; 8];
+    assert_eq!(fs.read(file, 0, &mut buf), Ok(4));
+    assert_eq!(&buf[..4], b"mine");
 }

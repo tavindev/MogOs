@@ -41,9 +41,8 @@ touches memory through raw addresses: the board reads user buffers, copies pages
 - **Zombie**: an exited process whose slot is kept because some handle table still holds a `Process` handle to it.
 - **Budget**: frames a process may hold (`mm::Budget`); `spawn` moves part of the parent's to the child.
 - **Boot archive**: the cpio of `crates/user` programs; `Object::Archive` / `Object::File` reach it, read-only.
-- **File system**: the mounted MogFS; `Object::Dir(Inode)` / `Object::Node(Inode)` (a file) reach it. An inode
-  number stays fixed while the file lives, but `unlink` frees it for the next `create`: a handle held across an
-  unlink reaches whatever reuses the inode.
+- **File system**: the mounted MogFS; `Object::Dir(Inode)` / `Object::Node(Inode)` (a file) reach it. Inode numbers
+  stay fixed while a file lives.
 
 ## Invariants & rules
 
@@ -69,6 +68,9 @@ touches memory through raw addresses: the board reads user buffers, copies pages
   unlock, kill, mkdir, readdir, sync, unlink, rename. `io_submit_wait` takes a file offset in x4 (files need it, the console and pipes
   ignore it; offsets live in libc, not in handles, so `Object` stays `Copy`). `open` takes flags in x3; the opened
   object gets the directory handle's rights, so a child never has more. Changing the archive is `EROFS`.
+- An inode a handle reaches is never freed: `unlink` is `EBUSY` while any table holds a `Dir` or `Node` handle to it
+  (`Scheduler::holds`, at most `MAX_TASKS * MAX_HANDLES` entries), since `create` reuses freed inodes. The scan sees
+  every handle: `spawn` moves handles within one syscall, and an exiting process's table is emptied as it releases.
 - Paths resolve only below a directory handle: each component goes through `mogfs::lookup`, which rejects `.`, `..`
   and empty names, so `../x` and `/x` are `EINVAL`. Trust note: a crafted image can point an entry at `ROOT` or an
   ancestor, so a subdirectory handle may reach the root and the tree may cycle; nothing in the kernel recurses over

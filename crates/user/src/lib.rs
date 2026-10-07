@@ -21,6 +21,7 @@ pub const ENOEXEC: i64 = -8;
 pub const EBADF: i64 = -9;
 pub const ENOMEM: i64 = -12;
 pub const EACCES: i64 = -13;
+pub const EBUSY: i64 = -16;
 pub const EEXIST: i64 = -17;
 pub const ENOTDIR: i64 = -20;
 pub const EISDIR: i64 = -21;

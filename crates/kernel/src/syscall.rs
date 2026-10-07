@@ -66,7 +66,8 @@ const READDIR: u64 = 14;
 /// for its writes and two flushes. `EIO` means unknown: the changes may or may not be durable.
 const SYNC: u64 = 15;
 /// `unlink(dir, path_ptr, path_len)`: removes the file or empty directory (`ENOTEMPTY` otherwise) at `path` under `dir`
-/// (write right), resolved as by `open`; returns 0. `EROFS` on the boot archive.
+/// (write right), resolved as by `open`; returns 0. `EBUSY` while any process holds a handle to it, so a freed inode
+/// is never reached through an old handle. `EROFS` on the boot archive.
 const UNLINK: u64 = 16;
 /// `rename(from_dir, from_ptr, from_len, to_dir, to_ptr, to_len)`: moves the entry at the path `from` under `from_dir`
 /// to the path `to` under `to_dir` (both write right), resolved as by `open`; returns 0. `EEXIST` if `to` exists,
@@ -104,6 +105,8 @@ pub const ENOMEM: i64 = -12;
 pub const EACCES: i64 = -13;
 /// Bad address: outside user space, unmapped, or (except for `io_submit_wait`) longer than `MAX_BUFFER`.
 pub const EFAULT: i64 = -14;
+/// Unlinking a file or directory that a handle reaches.
+pub const EBUSY: i64 = -16;
 /// The name exists.
 pub const EEXIST: i64 = -17;
 /// A path component, or a handle a call needs to be a directory, is a file.
