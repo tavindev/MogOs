@@ -42,11 +42,10 @@ const PAGE: usize = 4096;
 /// What a socket charges its creator's budget: its two rings.
 pub const SOCKET_FRAMES: usize = 2 * RING / PAGE;
 const SOCKETS: usize = 32;
-/// Connections a listener holds before they are accepted; one past it is reset. Each is charged to the listener's
 /// A listener's most connections waiting for accept; `listen` charges each holder for its backlog up front, so peers
 /// queue nothing nobody paid for and charge no budget themselves.
 pub const BACKLOG: usize = 8;
-/// Processes the holder bitmask covers: process indices are below it.
+/// Processes the holder bitmask covers: process indices must be below it (the board const-asserts it).
 pub const MAX_HOLDERS: usize = 64;
 /// Frames each direction of the loopback wire holds: more than every slot's window in flight at once.
 const WIRE: usize = 128;
@@ -336,18 +335,11 @@ impl Network {
         self.entry(sock).map_or(0, |e| e.cost())
     }
 
-    /// Records process `holder` holding `sock`; the caller charged it `cost` unless it held it already (true).
-    pub fn hold(&mut self, sock: Sock, holder: usize) -> bool {
-        assert!(
-            holder < MAX_HOLDERS,
-            "process index past the holder bitmask"
-        );
-        let Ok(entry) = self.entry(sock) else {
-            return true;
-        };
-        let held = entry.holders & 1 << holder != 0;
-        entry.holders |= 1 << holder;
-        held
+    /// Records process `holder` (below `MAX_HOLDERS`) holding `sock`; the caller charged it `cost`.
+    pub fn hold(&mut self, sock: Sock, holder: usize) {
+        if let Ok(entry) = self.entry(sock) {
+            entry.holders |= 1 << holder;
+        }
     }
 
     /// Process `holder` no longer holds `sock`: refunds it, once.
@@ -406,7 +398,7 @@ impl Network {
     }
 
     /// Listens on the bound port on `LO` and, unless bound to loopback, `ETH` (if up), holding up to `backlog`
-    /// (1..=`BACKLOG`) connections for accept; each holder is charged for them now (`ENOBUFS`, nothing charged).
+    /// (1..=`BACKLOG`, as `dispatch` clamps it) connections for accept; each holder is charged for them now (`ENOBUFS`, nothing charged).
     /// `EADDRINUSE` if a stack has the port.
     pub fn listen(
         &mut self,
@@ -437,7 +429,6 @@ impl Network {
                 }
             }
         }
-        let backlog = backlog.clamp(1, BACKLOG);
         let frames = backlog * SOCKET_FRAMES;
         let holders = (0..MAX_HOLDERS).filter(|&h| entry.holders & 1 << h != 0);
         for (n, holder) in holders.clone().enumerate() {
@@ -651,10 +642,6 @@ impl Network {
         conn: Conn,
         budgets: &mut impl Budgets,
     ) -> Result<Sock, i64> {
-        assert!(
-            holder < MAX_HOLDERS,
-            "process index past the holder bitmask"
-        );
         if !budgets.charge(holder, SOCKET_FRAMES) {
             return Err(ENOBUFS);
         }

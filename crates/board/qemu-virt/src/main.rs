@@ -339,6 +339,10 @@ impl kernel::Board for QemuVirt {
         mounted
     }
 
+    fn has_nic(&self) -> bool {
+        net::present()
+    }
+
     fn start_net(&mut self, config: Option<::net::Config>, key: [u64; 2]) {
         net::start(self, config, key)
     }

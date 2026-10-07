@@ -78,8 +78,10 @@ pub trait Board {
     /// Mounts the MogFS on `disk` as the board's file system; once it is mounted, every process spawned from boot
     /// context also gets its root directory (read, write, duplicate, transfer) as handle 3. Never formats.
     fn mount(&mut self, disk: Self::Disk) -> Result<(), mogfs::Error>;
-    /// Spawns the net task, which, off the boot path, sets up the NIC (only with `config`, as its address; it prints
-    /// `net: no nic` without one), the `network::Network` (`key` seeds TCP) and the timer, then polls the network
+    /// Whether the board has a NIC; reads only device IDs, sets up nothing.
+    fn has_nic(&self) -> bool;
+    /// Spawns the net task, which, off the boot path, sets up the NIC (only with `config`, its address; `has_nic`
+    /// found it), the `network::Network` (`key` seeds TCP) and the timer, then polls the network
     /// whenever the NIC's interrupt, the tick past the next deadline, a socket call or `with_net` wakes it. Every
     /// process spawned from boot context from then on also gets a NetStack handle (connect, listen, duplicate,
     /// transfer) after its other handles. Call once, after `init_frames`.
@@ -222,7 +224,10 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
             }
         }
     }
-    // The NIC is probed only for a network address; loopback alone starts only for the socket tests.
+    // The NIC is looked for only with a network address; without one nothing starts, as before, except loopback for
+    // the socket tests.
+    let no_nic = config.is_some() && !board.has_nic();
+    let config = config.filter(|_| !no_nic);
     let net = config.is_some() || loopback;
     if net {
         board.start_net(config, seed.expect("no rng-seed in DTB"));
@@ -239,8 +244,11 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
     if let Some(Err(error)) = mounted {
         let _ = writeln!(board.console(), "fs: {error:?}");
     }
+    if no_nic {
+        let _ = writeln!(board.console(), "net: no nic");
+    }
     if net {
-        // Scenarios count free frames, so the net task's setup ends before the first.
+        // Scenarios count free frames, so the net task's setup ends before the first (after `boot:`, so not in it).
         board.with_net(|_, _, _| ());
     }
 

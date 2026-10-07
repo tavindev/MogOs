@@ -4,10 +4,7 @@ use core::sync::atomic::Ordering::Relaxed;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 
 use arch::Lock;
-use core::fmt::Write;
-use kernel::handle::{DUPLICATE, Object, READ, TRANSFER, WRITE};
-
-use kernel::handle::{Handles, MAX_HANDLES};
+use kernel::handle::{DUPLICATE, Handles, MAX_HANDLES, Object, READ, TRANSFER, WRITE};
 use kernel::network::{self, Network, Sock, UserMemory};
 use kernel::syscall::{EINVAL, ENOBUFS, NetCall};
 use kernel::{Board, Event};
@@ -15,8 +12,12 @@ use mm::PhysAddr;
 use net::Config;
 
 use crate::usermem::{UserIn, UserOut};
-use crate::virtio_net::{POOL_FRAMES, VirtioNet};
-use crate::{CPUS, GIC_DIST, KERNEL, QemuVirt, Sched, VIRTIO, VIRTIO_COUNT, VIRTIO_STRIDE};
+use crate::virtio_net::{NET_DEVICE, POOL_FRAMES, VirtioNet};
+use crate::{
+    CPUS, GIC_DIST, KERNEL, MAX_PROCESSES, QemuVirt, Sched, VIRTIO, VIRTIO_COUNT, VIRTIO_STRIDE,
+};
+
+const _: () = assert!(MAX_PROCESSES <= network::MAX_HOLDERS);
 
 /// QEMU `virt` wires virtio-mmio transport `i` to SPI `16 + i`.
 const VIRTIO_IRQ: u32 = 48;
@@ -45,8 +46,8 @@ fn nic() -> Option<VirtioNet> {
     // QEMU `virt` fills the transports from the highest address down with no gaps, as `Board::disk` relies on.
     let (nic, index) = (0..VIRTIO_COUNT).rev().find_map(|i| {
         let base = PhysAddr(VIRTIO.0 + i * VIRTIO_STRIDE);
-        // SAFETY: QEMU `virt`'s virtio-mmio transports, in the device-mapped GiB 0; `Board::nic` runs once, so nothing
-        // else drives a net device; frames from the allocator are identity-mapped RAM nobody else uses.
+        // SAFETY: QEMU `virt`'s virtio-mmio transports, in the device-mapped GiB 0; the net task's setup runs once, so
+        // nothing else drives a net device; frames from the allocator are identity-mapped RAM nobody else uses.
         match unsafe { VirtioNet::new(base, alloc, pool) } {
             Ok(nic) => Some(Some((nic, i))),
             Err(0) => Some(None),
@@ -55,6 +56,21 @@ fn nic() -> Option<VirtioNet> {
     })??;
     IRQ.store(VIRTIO_IRQ + index as u32, Relaxed);
     Some(nic)
+}
+
+/// `Board::has_nic`: one device-ID read per transport, down to the first empty one.
+pub fn present() -> bool {
+    let id = |i| {
+        let base = VIRTIO.0 + i * VIRTIO_STRIDE;
+        // SAFETY: QEMU `virt`'s virtio-mmio transports, in the device-mapped GiB 0; reading the device ID changes nothing.
+        unsafe { ((base + 8) as *const u32).read_volatile() }
+    };
+    // QEMU `virt` fills the transports from the highest address down with no gaps, as `Board::disk` relies on.
+    (0..VIRTIO_COUNT)
+        .rev()
+        .map(id)
+        .take_while(|&id| id != 0)
+        .any(|id| id == NET_DEVICE)
 }
 
 /// `Board::start_net`: only spawns the net task, which does the setup.
@@ -66,12 +82,8 @@ pub fn start(board: &mut QemuVirt, config: Option<Config>, key: [u64; 2]) {
 
 /// Sets up the NIC (with an address), routing its interrupt to core 0, and the network, and starts the timer.
 fn setup(board: &mut QemuVirt) {
-    let (config, key) = SETUP.lock().take().expect("net setup");
-    let nic = config.and_then(|_| nic());
-    if config.is_some() && nic.is_none() {
-        let _ = writeln!(board.console(), "net: no nic");
-    }
-    let eth = config.filter(|_| nic.is_some());
+    let (eth, key) = SETUP.lock().take().expect("net setup");
+    let nic = eth.map(|_| nic().expect("a net device, as `present` found"));
     let frames = network::frames(eth.is_some());
     let range = KERNEL
         .lock()
@@ -84,9 +96,8 @@ fn setup(board: &mut QemuVirt) {
     let network = Network::new(eth, key, memory)
         .and_then(network::leak_one)
         .expect("net heap");
-    let irq = nic.is_some().then(|| IRQ.load(Relaxed));
-    *NET.lock() = Some((nic, network));
-    if let Some(irq) = irq {
+    if nic.is_some() {
+        let irq = IRQ.load(Relaxed);
         let dist = PhysAddr(GIC_DIST.load(Relaxed));
         if CPUS.load(Relaxed) > 1 {
             // SAFETY: the DTB's GICv2 distributor, in the device-mapped GiB 0; `irq` is an SPI, core 0's interface is 0.
@@ -96,12 +107,20 @@ fn setup(board: &mut QemuVirt) {
         unsafe { arch::gic::unmask(dist, irq) };
     }
     board.start_timer();
+    // Last, so `with` returns only once everything is up.
+    let _kernel = KERNEL.lock();
+    *NET.lock() = Some((nic, network));
 }
 
 /// `Board::with_net`: first lets the net task finish its setup (boot context only).
 pub fn with<R>(f: impl FnOnce(&mut Network, Option<&mut VirtioNet>, u64) -> R) -> R {
-    while NET.lock().is_none() {
-        KERNEL.lock().sched.block(Event::Idle);
+    loop {
+        let mut kernel = KERNEL.lock();
+        if NET.lock().is_some() {
+            break;
+        }
+        kernel.sched.block(Event::Idle);
+        drop(kernel);
         arch::yield_now();
     }
     let mut kernel = KERNEL.lock();
@@ -244,7 +263,6 @@ pub fn open(sock: Sock) {
     }
 }
 
-/// Drops a handle to `sock`; the last one refunds its owner, if it still runs.
 /// Drops a handle of process `holder` to `sock`; refunds `holder` once it has no other handle to it.
 pub fn close(sched: &mut Sched, sock: Sock, holder: usize) {
     // A process other than the current one is ending, its table already emptied.
@@ -256,9 +274,8 @@ pub fn close(sched: &mut Sched, sock: Sock, holder: usize) {
     wake(sched);
 }
 
-/// Moves the charge for the sockets `spawn` moves from the current process to its child at `index` (`child`, the
-/// child's table, and `parent`, the current one's after the move): the child's `budget` pays for each before the
-/// spawn (`ENOBUFS`); `spawned` records it after.
+/// Before a `spawn`: the child's `budget` pays for each socket its table `child` reaches (`ENOBUFS`); `spawned`
+/// records it after.
 pub fn spawn_charge(child: &Handles, budget: &mut mm::Budget) -> Result<(), i64> {
     if !STARTED.load(Relaxed) {
         return Ok(());

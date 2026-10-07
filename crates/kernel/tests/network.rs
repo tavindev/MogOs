@@ -290,7 +290,7 @@ fn a_listen_its_holders_cannot_all_pay_for_charges_nobody() {
     // OTHER holds it too (a spawn moved it a handle, OTHER paid); a backlog of 2 fits ME but not OTHER after it.
     let cost = w.network.cost(listener);
     assert!(w.processes.charge(OTHER.0, cost));
-    assert!(!w.network.hold(listener, OTHER.0));
+    w.network.hold(listener, OTHER.0);
     w.processes.charge(OTHER.0, SOCKET_FRAMES * 2);
     assert_eq!(w.listen(listener, 2), Err(ENOBUFS));
     assert_eq!(w.used(ME), SOCKET_FRAMES, "ME's backlog charge was undone");
@@ -306,7 +306,7 @@ fn a_socket_is_charged_to_every_process_holding_it_until_its_last_handle_there_c
     // A spawn moves ME's handle to OTHER: OTHER pays first, holds, then ME, holding none, is refunded.
     let cost = w.network.cost(sock);
     assert!(w.processes.charge(OTHER.0, cost));
-    assert!(!w.network.hold(sock, OTHER.0));
+    w.network.hold(sock, OTHER.0);
     w.network.unhold(sock, ME.0, &mut w.processes);
     assert_eq!((w.used(ME), w.used(OTHER)), (0, SOCKET_FRAMES));
     // A refund happens once, whatever releases ME's handles.
