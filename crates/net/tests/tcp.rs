@@ -184,12 +184,15 @@ fn wrap_start(key: [u64; 2], before: u32) -> u64 {
     0u32.wrapping_sub(before).wrapping_sub(isn) as u64 * 4000
 }
 
-/// Liveness, after a poll: a connection with work outstanding (anything but idle in ESTABLISHED or CLOSE-WAIT)
-/// has a deadline.
+/// Liveness, after a poll: a connection with work outstanding (anything but idle in ESTABLISHED, CLOSE-WAIT or an
+/// open FIN-WAIT-2; the released FIN-WAIT-2 timeout has its own tests) has a deadline.
 fn live(s: &Stack, id: TcpId) {
     let i = s.tcp_info(id).unwrap();
     let idle = matches!(i.state, State::Closed | State::Listen)
-        || (matches!(i.state, State::Established | State::CloseWait) && i.queued == 0);
+        || (matches!(
+            i.state,
+            State::Established | State::CloseWait | State::FinWait2
+        ) && i.queued == 0);
     assert!(
         idle || i.deadline.is_some(),
         "work outstanding and no deadline: {i:?}"
@@ -1657,5 +1660,47 @@ fn a_time_wait_takeover_iss_is_unpredictable() {
     assert_ne!(
         gaps[0], gaps[1],
         "the new ISS is keyed, not old snd_nxt + a constant"
+    );
+}
+
+#[test]
+fn an_open_half_closed_connection_waits_for_a_slow_peer() {
+    let mut m = Mem::new(2, 4096, 4096, 4, 4);
+    host!(a, m, IP_A, [1, 1]);
+    let mut tap = Tap::new(MAC_A);
+    let (c, mut p) = accepted(&mut a, &mut tap);
+    a.shutdown(c);
+    assert_eq!(feed(&mut a, &mut tap, 0, [])[0].flags, FIN | ACK);
+    p.ack += 1;
+    feed(&mut a, &mut tap, 0, [p.now(ACK, &[])]);
+    assert_eq!(state(&a, c), State::FinWait2);
+    timers(&mut a, &mut tap, 0, 120 * SEC);
+    feed(&mut a, &mut tap, 120 * SEC, [p.now(FIN | ACK, b"late")]);
+    let mut buf = [0u8; 8];
+    assert_eq!(
+        a.recv(c, &mut buf),
+        Ok(4),
+        "the answer arrives after two minutes"
+    );
+    assert_eq!(a.recv(c, &mut buf), Ok(0));
+}
+
+#[test]
+fn closing_a_connection_already_in_fin_wait_2_starts_its_timeout() {
+    let mut m = Mem::new(2, 4096, 4096, 4, 4);
+    host!(a, m, IP_A, [1, 1]);
+    let mut tap = Tap::new(MAC_A);
+    let (c, mut p) = accepted(&mut a, &mut tap);
+    a.shutdown(c);
+    feed(&mut a, &mut tap, 0, []);
+    p.ack += 1;
+    feed(&mut a, &mut tap, 0, [p.now(ACK, &[])]);
+    timers(&mut a, &mut tap, 0, 100 * SEC);
+    a.tcp_close(c);
+    timers(&mut a, &mut tap, 100 * SEC, 3600 * SEC);
+    assert!(
+        a.connect(3600 * SEC, 0, SocketAddrV4::new(IP_B, PEER_PORT))
+            .is_ok(),
+        "released and freed"
     );
 }

@@ -35,8 +35,9 @@ kernel, step 50), DHCP, DNS or IPv6 (phase 9), or IPv4 fragment reassembly.
 - TCP: RFC 9293 with MSS and window scaling, RFC 6298 RTO (initial 1 s, floor 200 ms, max 60 s; SYN given up
   after 6 retransmissions, data after 10, a SYN-ACK after 5), NewReno (RFC 5681, RFC 6582) with byte counting
   (RFC 3465) and go-back-N after a timeout, a persist timer that probes a zero window as long as the peer answers
-  and gives up (`TimedOut`) after 10 unanswered probes, FIN-WAIT-2 ended 60 s after the peer's last segment (open
-  or released), and a 60 s TIME_WAIT restarted only by the retransmitted FIN. Sender silly-window avoidance applies
+  and gives up (`TimedOut`) after 10 unanswered probes, FIN-WAIT-2 ended 60 s after the peer's last segment once
+  the caller has released the connection (Linux's rule; an open half-closed connection waits as long as it
+  likes), and a 60 s TIME_WAIT restarted only by the retransmitted FIN. Sender silly-window avoidance applies
   to new data only, receiver avoidance (RFC 9293 3.8.6.2.2) moves the window's edge by min(MSS, ring / 2) or not at
   all, and out-of-window segments get at most one ACK per 500 ms per connection. Out-of-order data is kept in the
   receive ring (4 ranges). No timestamps: RFC 7323 timestamps with PAWS were built and measured, and cost 3-5% of
@@ -64,8 +65,8 @@ kernel, step 50), DHCP, DNS or IPv6 (phase 9), or IPv4 fragment reassembly.
 - Timers: one deadline per connection, derived from its state by `deadline()` from a single start time and cached at
   the end of every event that can move it (a segment in, a timer firing, an output attempt, which every caller
   action leads to). No purpose arms or cancels another's. The tests check after every poll that a connection with
-  work outstanding (anything but idle in ESTABLISHED or CLOSE-WAIT) has a deadline, and that a silent peer always
-  ends in CLOSED.
+  work outstanding (anything but idle in ESTABLISHED, CLOSE-WAIT or FIN-WAIT-2) has a deadline, and that a silent
+  peer always ends in CLOSED or idle; released FIN-WAIT-2 timing out has its own tests.
 - TCP's attack surface, each with a test: a SYN flood fills only the half-open table and answers to the frame's
   source, so it never touches the ARP cache or a slot; a full table answers with SYN cookies (user-approved,
   replacing oldest-first eviction; `syn_cookies`): the ISS holds one clock bit (16 s periods, this one or the last),

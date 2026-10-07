@@ -10,7 +10,8 @@
 //!   and a SYN above the entry's sequence number starts a new connection whose ISS is 65537 plus 24 keyed bits above
 //!   the old one (RFC 9293 3.10.7.4 note, RFC 1122 4.2.2.13).
 //! - Each connection has one deadline, derived from its state (`deadline`) and cached at the end of every event that
-//!   can move it: retransmission, persist (given up after 10 unanswered probes), or FIN-WAIT-2's idle limit.
+//!   can move it: retransmission, persist (given up after 10 unanswered probes), or a released connection's
+//!   FIN-WAIT-2 idle limit.
 //! - ISNs (RFC 6528) and ephemeral ports (RFC 6056, algorithm 3) come from SipHash-2-4 keyed by the caller.
 //! - RFC 5961: an inexact in-window RST, any SYN on a synchronized connection and an ACK outside the sent range get
 //!   a challenge ACK, at most `CHALLENGES` per second per connection. RFC 5927: an ICMP error must name a sequence
@@ -627,7 +628,8 @@ impl<'a> TcpSocket<'a> {
     fn deadline(&self) -> Option<u64> {
         let wait = match self.state {
             State::Closed | State::Listen | State::TimeWait => return None,
-            State::FinWait2 => FIN_WAIT_2,
+            // Linux's rule: only a released connection times out waiting for the peer's FIN.
+            State::FinWait2 if !self.open => FIN_WAIT_2,
             _ if self.persisting() => (self.rto << self.probes.min(16)).min(MAX_RTO),
             _ if self.snd_una != self.snd_max || !self.synchronized() => self.rto,
             _ => return None,
@@ -1056,6 +1058,7 @@ impl<'a> Stack<'a> {
         }
         s.open = false;
         s.parent = None;
+        s.due = s.deadline();
         self.shutdown(id);
     }
 

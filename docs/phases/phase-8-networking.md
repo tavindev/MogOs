@@ -98,4 +98,5 @@ Decision: write `crates/net` fresh. smoltcp is a host-only dev-dependency of `cr
   receive path did not move, but loss-free goodput fell 3-5% (64 KiB window medians 6025-6223 against 6403-6470
   MiB/s) and connect + close rose 7% (minimums 443-466 against 418-423 ns), so they were dropped and the ISS rule is
   the wrapped-sequence protection. smoltcp 0.12 also drops its retransmission timer on ESTABLISHED + FIN ->
-  CLOSE-WAIT; the interop test works around both of its cases.
+  CLOSE-WAIT; the interop test works around both of its cases. FIN-WAIT-2 times out only once the caller releases
+  the connection (Linux's rule, the coordinator's decision): an open half-closed connection waits for a slow peer.
