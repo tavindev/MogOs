@@ -5,7 +5,8 @@
 Host-only integration tests: `tests/boot.rs` builds `qemu-virt`, boots `mog_os` in `qemu-system-aarch64`
 (`virt`, `cortex-a72`, 128 MiB, `-global virtio-mmio.force-legacy=false`, `-global virtio-mmio.ioeventfd=off`;
 `-append test=<name>` for every scenario but plain boot), and asserts on the serial
-lines and the exit status.
+lines and the exit status. `tests/user.rs` runs `crates/user`'s host tests (outside the workspace) through a nested
+`cargo test`, so `cargo test-host` covers them.
 `src/lib.rs` is an empty placeholder (`[lib] test = false`). It is the main test of the project, not a library.
 
 ## Boundaries (hard)
@@ -19,20 +20,24 @@ lines and the exit status.
 
 - Assertions are on exact serial lines the kernel or user programs print; when boot output changes, extend `tests/boot.rs`
   in the same change (`docs/DEVELOPMENT.md`, rules for agents).
-- Each boot has a 30 s deadline, then QEMU is killed and the test fails.
+- Each boot has a 30 s deadline, then QEMU is killed and the test fails. Every boot prints QEMU's exit status,
+  stderr and stdout (captured: shown when the test fails).
+- The kernel is built once per test run (`Once` in `boot_with_input`): even a fresh `cargo build` replaces `mog_os`
+  (a new inode), so a build beside a booting test made QEMU fail with `Couldn't load elf` and no output.
 - Disk scenarios make a zeroed raw image in the temp dir per test (`disk_image`), or a formatted MogFS one
   (`mogfs_image`), and remove it; the flush checks (`test=disk`, and msh's `sync` in `sync_reports_a_failed_flush`) boot through a `blkdebug` blockdev that fails every host flush with EIO (`flush_fails`).
 - Console input (`boot_with_input`) writes chunk `i` once the output holds the ready marker `i + 1` times, so `shell`
   types one command per `msh> ` prompt and no echo interleaves with msh's output.
 - `assert_no_leak` checks that a scenario's `<test>: free frames <n> before, <n> after` counts match; every scenario
-  of `budget`, `spawn`, `pipe`, `wait`, `pi`, `echo`, `shell`, `bench-fs` and `bench-spawn` uses it; a new scenario that frees frames should too.
+  of `budget`, `spawn`, `pipe`, `wait`, `pi`, `echo`, `shell`, `bench-fs`, `bench-spawn`, `fuzz`, `bench-syscalls` and `bench-shell` uses it; a new scenario that frees frames should too.
 - A new kernel behavior gets its failing scenario here first (`docs/WORKFLOW.md`, step 2).
 - Performance is the moat: a slowdown is never accepted because it has an explanation; it is removed, or shown to
   be unavoidable with before/after numbers (`docs/BENCHMARKS.md`).
 
 ## How it's tested
 
-- All: `cargo test-host`. One scenario: `cargo test --target aarch64-apple-darwin -p e2e -- <test name filter>`.
+- All: `cargo test-host`. One scenario: `cargo test --target aarch64-apple-darwin -p e2e -- <test name filter>`. Flake
+  hunting: the loop in `docs/DEVELOPMENT.md` (inner loop).
 
 ---
 

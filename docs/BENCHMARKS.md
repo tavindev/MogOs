@@ -21,7 +21,83 @@ Speed is a primary goal, so performance is tested like behavior: measured, recor
 - Any change to a hot path includes before/after numbers from the relevant benchmark, run on the same machine and mode.
 - Any slowdown beyond run-to-run noise (hvf median for kernel benchmarks, host median for host benchmarks) is a failing result; a justification does not excuse it. Remove it, or show with numbers that no safe faster form exists. If the before/after spread is wider than the difference, rerun before concluding.
 - New hot paths (each roadmap step that adds one) get a benchmark when they land, alongside their end-to-end test.
+- Per call, A/B: `scripts/bench.sh <test> <rounds> <new mog_os> [<base mog_os>]` boots each kernel `<rounds>` times
+  under hvf, alternating which goes first, each boot on a fresh 1024-block MogFS image, and prints the median and min
+  of every `bench <name>: <ns> ns` line, base vs new with deltas. `SLOWER` marks a call whose median and min both rose:
+  rerun it with more rounds; if it holds, it is a failure under the rule above. A/A noise at 21 rounds (one kernel
+  against itself, load about 25): medians within 1% for calls under 1 us and within 7% for disk-bound calls, and
+  `SLOWER` showed on 3 of 27 calls, so one flag alone is not a verdict.
+- Build the base kernel from the base commit (a worktree, `cargo build`, copy
+  `target/aarch64-unknown-none-softfloat/debug/mog_os`), then the new one; the script takes the two files.
+- `test=bench-syscalls` (`crates/user/src/bin/sysbench.rs`): one table entry per call, each its fast path. A batch
+  makes the call many times in groups of up to 8 between two `CNTVCT_EL0` reads (raw ticks, converted once per batch,
+  so the counter read costs under 1 ns per call), setup and undo outside the timed part; the line is the median of
+  11 batches. A new syscall gets a table entry. The older single benches (`test=bench-syscall`, `bench-fs`,
+  `bench-spawn`, `bench-pipe`, `bench`) stay as they are: folding them in would change their loops and their numbers.
+- `test=bench-shell`: `shellsetup` makes the fixtures, then msh, given command lines as arguments, runs them 5 times,
+  timing each from just before its `spawn` to after `wait` reaps the child (`bench <command>: <ns> ns`).
+- Cycle and instruction counts: not available under QEMU. Probed at EL1 (PMCR_EL0 enable, PMCNTENSET_EL0, PMEVTYPER0
+  INST_RETIRED 0x08, PMUSERENR_EL0): under hvf, writing PMEVTYPER0_EL0 or PMXEVTYPER_EL0 traps as undefined (EC 0);
+  the cycle counter alone works but is QEMU's virtual clock (15.0 M "cycles" for 15.0 ms of CNTVCT, in steps of
+  1000), not CPU cycles. Under TCG the cycle counter is the same clock and the event counter reads 0. Cycle and
+  instruction counts wait for real hardware (phase 11).
 - Record the current numbers in the Baselines table below whenever they change.
+
+## Per-call baselines
+
+`scripts/bench.sh bench-syscalls 21`, QEMU hvf (`-cpu cortex-a72`), dev build, M4 Pro, load about 30, commit
+"e2e: build the kernel once per run" (ns per call; the `bench` line names in brackets).
+
+| Call | Median | Min |
+| --- | --- | --- |
+| `io_submit_wait` console write, 0 bytes (`console-write`) | 36.6 | 32.5 |
+| `io_submit_wait` console read, 0 bytes (`console-read`) | 37.1 | 34.3 |
+| `io_submit_wait` pipe write, 64 bytes (`pipe-write`) | 59.8 | 55.2 |
+| `io_submit_wait` pipe read, 64 bytes (`pipe-read`) | 62.6 | 58.3 |
+| `io_submit_wait` file write, 64 bytes at offset 0 (`file-write`; a block write) | 15366 | 13691 |
+| `io_submit_wait` file read, 64 bytes at offset 0 (`file-read`) | 73.6 | 69.4 |
+| `dup` | 38.1 | 35.5 |
+| `close` | 38.4 | 34.7 |
+| `open`, existing file in the root (`open`) | 81.4 | 76.9 |
+| `open(CREATE)`, new file (`open-create`) | 16018 | 11159 |
+| `open(TRUNC)`, existing empty file (`open-trunc`) | 86.8 | 83.1 |
+| `mkdir` | 16038 | 14007 |
+| `readdir`, root of 3 entries into 512 bytes | 89.4 | 84.7 |
+| `unlink` of an empty file | 8278 | 7495 |
+| `rename` within the root | 16025 | 14398 |
+| `sync`, nothing changed (`sync`) | 36.8 | 32.4 |
+| `sync` after a 64-byte file write (`sync-change`) | 98268 | 88908 |
+| `map`, one page | 552 | 522 |
+| `pipe` | 99.0 | 86.2 |
+| `spawn` of `nop`, no arguments (`spawn`) | 2441 | 2347 |
+| `spawn` of `nop`, two arguments (`spawn-args`) | 2661 | 2531 |
+| `wait` on a killed child (`wait`) | 54.0 | 48.8 |
+| `kill` of a ready child that never ran (`kill`) | 1074 | 909 |
+| `mutex` | 38.2 | 36.4 |
+| `lock`, uncontended | 36.9 | 33.1 |
+| `unlock`, no waiter | 37.9 | 35.9 |
+| unknown syscall 18, `ENOSYS` (`enosys`) | 32.9 | 30.0 |
+
+## Shell command baselines
+
+`scripts/bench.sh bench-shell 21`, as above: 105 samples per command (21 boots of 5 rounds), each from msh's
+`spawn` of the program to reaping it, output to the PL011 included (us).
+
+| Command | Median | Min |
+| --- | --- | --- |
+| `ls d1` (1 entry) | 37.6 | 26.1 |
+| `ls d100` (100 entries) | 914 | 843 |
+| `ls d390` (390 entries; 1000 does not fit: MogFS v1 has 504 inodes, the root and fixtures included) | 3552 | 3298 |
+| `cat small` (4 KiB) | 6161 | 5818 |
+| `cat big` (57232 bytes, the largest MogFS v1 file) | 86283 | 82076 |
+| `write w hello` | 115 | 75.7 |
+| `mkdir m` | 41.4 | 29.3 |
+| `rm m` | 5.6 | 5.1 |
+| `mv a b` / `mv b a` | 24.2 / 22.7 | 18.8 / 16.5 |
+| `echo hi` | 11.9 | 10.5 |
+
+`ls` and `cat` are bound by the console: each byte is a PL011 write, a VM exit under hvf (about 1.5 us per byte), so
+`cat big` is about 57232 of them.
 
 ## Baselines
 

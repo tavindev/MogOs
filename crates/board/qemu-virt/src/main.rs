@@ -278,12 +278,19 @@ impl kernel::Board for QemuVirt {
             budget,
             0,
             INIT_ARCHIVE,
+            &[],
         )
     }
 
-    fn spawn_archived(&mut self, name: &str, budget: usize, archive: Rights) -> Result<(), i64> {
+    fn spawn_archived(
+        &mut self,
+        name: &str,
+        budget: usize,
+        archive: Rights,
+        args: &[u8],
+    ) -> Result<(), i64> {
         let file = kernel::cpio::find(ARCHIVE, name.as_bytes()).ok_or(ENOENT)?;
-        spawn_init(executable(file)?, budget, PRIORITIES - 1, archive)
+        spawn_init(executable(file)?, budget, PRIORITIES - 1, archive, args)
     }
 
     fn tasks(&self) -> usize {

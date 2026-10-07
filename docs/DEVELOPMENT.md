@@ -50,7 +50,7 @@ libcalls. Needs: Homebrew `llvm` (clang 19 or later for `-mabi=aapcs-soft`), `gs
 | load address `0x4020_0000` | `crates/board/qemu-virt/linker.ld` | QEMU only places its 1 MiB DTB at RAM base (`0x4000_0000`) if it fits below the ELF image. |
 | `-global virtio-mmio.force-legacy=false` | runners in `.cargo/config.toml`, `crates/e2e` | QEMU 9.2 defaults virtio-mmio to legacy (version 1); the driver speaks modern (version 2), which takes three 64-bit queue addresses instead of legacy's page-size register and one page-aligned ring block. |
 | `-global virtio-mmio.ioeventfd=off` | same | QEMU handles a queue notify in the vCPU thread instead of handing it to the main loop: hvf 4 KiB requests +9% write+flush, +19% read (21 interleaved boots); 256 KiB unchanged. |
-| `test-host` alias | `.cargo/config.toml` | Runs tests for the host target, excluding the bare-metal-only `qemu-virt` and `arch`. A string, not an array, so a nested worktree's copy overrides it instead of concatenating. |
+| `test-host` alias | `.cargo/config.toml` | Runs tests for the host target, excluding the bare-metal-only `qemu-virt` and `arch`. A string, not an array, so a nested worktree's copy overrides it instead of concatenating. A cargo alias cannot chain a second command, so `crates/user`'s host tests run from `crates/e2e/tests/user.rs`, a nested `cargo test` like the boot tests' nested build. |
 | `bench-host` alias | `.cargo/config.toml` | Runs the host `benches/*.rs` targets (`--bench '*'`) for the same crates as `test-host`. |
 | `mkfs`, `shell` aliases | `.cargo/config.toml` | `cargo mkfs` writes an empty 64 MiB MogFS `disk.img` in the current directory; `cargo shell` boots into msh with it attached (`-drive`/`-device` after the runner's `-kernel <path>`). Strings, so a worktree's copy overrides them. |
 | `make -C c` in the board's `build.rs` | `crates/board/qemu-virt/build.rs`, `c/Makefile` | busybox and the C programs join the boot archive in the same one-command build; the build is cached across worktrees by a hash of `c/` (about 0.4 s to check when it is built). |
@@ -79,7 +79,8 @@ cargo clippy --manifest-path crates/user/Cargo.toml --target-dir target/user  # 
 cargo fmt --manifest-path crates/user/Cargo.toml
 cargo test --manifest-path crates/user/Cargo.toml --target aarch64-apple-darwin --target-dir target/user --lib  # msh's command table
 cargo build            # dev build
-cargo test-host        # host tests + QEMU boot e2e tests (crates/e2e); must pass
+cargo test-host        # host tests (crates/user's too) + QEMU boot e2e tests (crates/e2e); must pass
+for i in $(seq 50); do cargo test -q --target aarch64-apple-darwin -p e2e --test boot -- handles_enforce_rights_and_generations --exact || break; done  # flake hunt: one test N times; drop `-- <name> --exact` to loop the whole suite (its parallel boots add load)
 cargo bench-host       # host benchmarks (min/median); see docs/BENCHMARKS.md
 cargo run              # boot in QEMU; prints hello, exceptions, mmu, ram, frames, heap, boot, disk lines and powers off
 cargo run -- -append test=mmu-fault  # reads an unmapped address after MMU on; prints the data abort
@@ -98,6 +99,10 @@ cargo run -- -append test=echo       # readlines prints E: ready, reads two line
 cargo run -- -append test=bench-spawn # spawnbench spawns nop, waits and closes it 1000 times without and then with two arguments; prints each round trip in ns
 cargo run -- -append test=bench-pipe # ping and pong echo one byte over two pipes 100000 times; prints the round trip in ns
 cargo run -- -append test=bench-lock # uncontended acquire + release of the ticket and a test-and-set lock in ns; two timer-preempted tasks add 10^7 each under the lock (lock: count 20000000)
+cargo run -p mogfs --example mkfs --target aarch64-apple-darwin -- b.img 1024; cargo run -- -drive file=b.img,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0 -append test=bench-syscalls  # fresh image; prints `bench <call>: <ns> ns` for every syscall's fast path
+cargo run -p mogfs --example mkfs --target aarch64-apple-darwin -- b.img 1024; cargo run -- -drive file=b.img,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0 -append test=bench-shell  # fresh image; shellsetup makes fixtures, msh times 11 commands 5 times (`bench <command>: <ns> ns`)
+scripts/bench.sh bench-syscalls 21 new_mog_os base_mog_os  # hvf A/B, interleaved; see docs/BENCHMARKS.md
+cargo run -p mogfs --example mkfs --target aarch64-apple-darwin -- fuzz.img 1024; cargo run -- -drive file=fuzz.img,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0 -append "test=fuzz fuzz=7,1000000"  # syscall fuzzer on a fresh image: seed 7, a million calls ("Testing strategy")
 cargo run -- -drive file=disk.img,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0 -append test=disk  # attach a raw image (`truncate -s 1M disk.img`); every boot prints `disk: <n> blocks` (`disk: none` without a disk); the first writes blocks 1-2 and flushes (disk: wrote), the next reads them back (disk: read ok); a failed flush prints disk: flush failed
 cargo run -- -drive file=disk.img,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0 -append test=bench-disk  # image of at least 8 MiB; sequential write+flush and read throughput in MiB/s, 4 KiB and 256 KiB per request
 cargo run -p mogfs --example mkfs --target aarch64-apple-darwin -- disk.img 16384  # empty 64 MiB MogFS image
@@ -110,6 +115,23 @@ cargo build --release  # LTO release image
 ```
 
 Quit a hung QEMU with `Ctrl-A` then `X`.
+
+## Testing strategy
+
+- End to end first: a behavior is proven by a QEMU boot scenario in `crates/e2e/tests/boot.rs` that asserts exact
+  serial lines. Host tests (a crate's public API, `cargo test-host`) cover the edge cases a boot reaches only slowly or
+  not at all: corrupt and crafted images, power cuts, table limits, argument checks.
+- Fuzzing: `test=fuzz` boots `crates/user/src/bin/fuzz.rs`, which makes seeded random syscalls (every number, unknown
+  ones too) with boundary and random arguments and handles, and fails on any result that is not a count or a known
+  errno. `fuzzer_never_crashes_the_kernel_or_leaks_frames` runs seeds 1-3, 20000 calls each, each on a fresh
+  1024-block image, and asserts no `panic:`, no `fault:`, the `fuzz: seed <s>: <n> calls ok` line and no leak.
+  Longer runs by hand: the `fuzz=<seed>,<calls>[,<from>]` bootarg (inner loop above); `<from>` prints every call from
+  that one on with its result, before making it, so a crash's last `fuzz: call` line is the culprit. The same seed and
+  calls on a fresh image of the same size replay the same calls. A kernel bug the fuzzer finds is fixed with a
+  failing scenario first, never skipped in the fuzzer.
+- Leak checks: every scenario that frees frames prints `<test>: free frames <n> before, <n> after` around all it
+  spawned, and its e2e test asserts the two match (`assert_no_leak`).
+- Speed: per-call benchmarks run base and new kernels interleaved; any per-call slowdown fails (`docs/BENCHMARKS.md`).
 
 ## Using the shell
 

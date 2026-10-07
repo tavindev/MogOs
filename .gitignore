@@ -1,4 +1,4 @@
 /target
 /.claude/worktrees
-/disk.img
+/*.img
 /third_party
