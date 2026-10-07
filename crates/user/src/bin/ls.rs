@@ -6,17 +6,20 @@ use user::*;
 
 #[unsafe(no_mangle)]
 extern "C" fn _start(argc: usize, _: usize, len: usize) -> ! {
-    start(argc, len, |_| {
-        let mut buf = [0; 512];
-        let mut start = 0;
-        loop {
-            let n = readdir(1, &mut buf, start);
-            if n <= 0 {
-                return status(n);
-            }
-            let entries = &buf[..n as usize];
-            write(CONSOLE, entries);
-            start += entries.iter().filter(|&&b| b == b'\n').count() as u64;
+    // SAFETY: `argc` and `len` are the x0 and x2 this process started with.
+    unsafe { start(argc, len, main) }
+}
+
+fn main(_: &[&[u8]]) -> u64 {
+    let mut buf = [0; 512];
+    let mut start = 0;
+    loop {
+        let n = readdir(1, &mut buf, start);
+        if n <= 0 {
+            return status(n);
         }
-    })
+        let entries = &buf[..n as usize];
+        write(CONSOLE, entries);
+        start += entries.iter().filter(|&&b| b == b'\n').count() as u64;
+    }
 }

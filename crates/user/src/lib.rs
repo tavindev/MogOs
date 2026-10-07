@@ -1,8 +1,8 @@
-//! Native syscalls (`x8` = number, `x0`-`x5` = arguments, `x0` = result, negative = error) and the panic handler.
-#![no_std]
+//! Native syscalls (`x8` = number, `x0`-`x6` = arguments, `x0` = result, negative = error), msh's command table and
+//! the panic handler.
+#![cfg_attr(not(test), no_std)]
 
 use core::arch::asm;
-use core::panic::PanicInfo;
 
 /// Handle 0: the console, for every program spawned with it first.
 pub const CONSOLE: u64 = 0;
@@ -151,9 +151,14 @@ pub fn spawn_at(exe: u64, handles: &[u64], budget: usize, priority: u64, args: &
 
 /// Runs `main` with the arguments `spawn` passed and exits with its result: `_start` receives x0 = their count, x1 =
 /// their address, x2 = their length (0, none, for a process spawned at boot), and passes the count and length here.
-pub fn start(argc: usize, len: usize, main: fn(&[&[u8]]) -> u64) -> ! {
+///
+/// # Safety
+///
+/// `argc` and `len` must be the x0 and x2 the kernel started this process with: the `len` bytes below `STACK_TOP` are
+/// then its arguments, and nothing else references them.
+pub unsafe fn start(argc: usize, len: usize, main: fn(&[&[u8]]) -> u64) -> ! {
     let len = len.min(4096);
-    // SAFETY: the kernel copies the arguments to the end of the top stack page, which stays mapped; `len` fits in it.
+    // SAFETY: the kernel copied the arguments to the end of the top stack page, which stays mapped (caller contract).
     let bytes = unsafe { core::slice::from_raw_parts((STACK_TOP - len) as *const u8, len) };
     let mut args: [&[u8]; MAX_ARGS] = [&[]; MAX_ARGS];
     for (arg, bytes) in args.iter_mut().zip(bytes.split(|&b| b == 0)) {
@@ -262,7 +267,68 @@ pub fn now_ns() -> u64 {
     (count as u128 * 1_000_000_000 / freq as u128) as u64
 }
 
+/// A panic exits 255, outside the errno range a shell program's exit code uses.
+#[cfg(not(test))]
 #[panic_handler]
-fn panic(_: &PanicInfo) -> ! {
-    exit(1)
+fn panic(_: &core::panic::PanicInfo) -> ! {
+    exit(255)
+}
+
+/// What msh hands a command besides the console (write only), each handle narrowed to these rights (and transfer).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Grant {
+    /// Nothing more.
+    Console,
+    /// The root directory.
+    Root(u64),
+    /// What the first argument names (the current directory if none).
+    Target(u64),
+    /// The parent directory of each of the first `n` arguments, which go to the program as their last components.
+    Parents(u64, usize),
+}
+
+/// The programs msh runs, each with only what its job needs (least privilege, `crates/user/CLAUDE.md`).
+pub const COMMANDS: [(&[u8], Grant); 9] = [
+    (b"cat", Grant::Target(READ)),
+    (b"ls", Grant::Target(READ)),
+    (b"echo", Grant::Console),
+    (b"sync", Grant::Root(0)),
+    (b"mkdir", Grant::Parents(WRITE, 1)),
+    (b"rm", Grant::Parents(WRITE, 1)),
+    (b"touch", Grant::Parents(READ | WRITE, 1)),
+    (b"write", Grant::Parents(READ | WRITE, 1)),
+    (b"mv", Grant::Parents(WRITE, 2)),
+];
+
+/// What msh grants the command `name`; `None` if msh does not run it.
+pub fn grant(name: &[u8]) -> Option<Grant> {
+    COMMANDS.iter().find(|c| c.0 == name).map(|c| c.1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_command_gets_only_what_its_job_needs() {
+        let reader = Grant::Target(READ);
+        let expected = [
+            ("cat", Some(reader)),
+            ("ls", Some(reader)),
+            ("echo", Some(Grant::Console)),
+            ("sync", Some(Grant::Root(0))),
+            ("mkdir", Some(Grant::Parents(WRITE, 1))),
+            ("rm", Some(Grant::Parents(WRITE, 1))),
+            ("touch", Some(Grant::Parents(READ | WRITE, 1))),
+            ("write", Some(Grant::Parents(READ | WRITE, 1))),
+            ("mv", Some(Grant::Parents(WRITE, 2))),
+            ("msh", None),
+            ("mid", None),
+            ("child", None),
+        ];
+        for (name, grant_) in expected {
+            assert_eq!(grant(name.as_bytes()), grant_, "{name}");
+        }
+        assert_eq!(COMMANDS.len(), 9);
+    }
 }

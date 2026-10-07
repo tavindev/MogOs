@@ -92,7 +92,7 @@ touches memory through raw addresses: the board reads user buffers, copies pages
 ## How it's tested
 
 - Host: `cargo test --target aarch64-apple-darwin -p kernel` runs `tests/sched.rs`, `tests/handle.rs`,
-  `tests/pipe.rs`, `tests/exec.rs` (cpio, ELF, archive listing), `tests/args.rs` (`spawn`'s argument checks), `tests/file.rs` (path walk limits, `readdir` at
+  `tests/pipe.rs`, `tests/exec.rs` (cpio, ELF, archive listing), `tests/args.rs` (`spawn`'s argument checks), `tests/dispatch.rs` (`unlink`, `rename`, `sync` handle checks), `tests/file.rs` (path walk limits, `readdir` at
   tight buffer sizes, over an in-memory disk); `file` also end to end (`test=shell`, `test=bench-fs`).
 - End to end: every scenario in `crates/e2e/tests/boot.rs`; `run`'s `test=*` arms are listed in
   `docs/DEVELOPMENT.md` (inner loop). Full gate: `cargo test-host`.

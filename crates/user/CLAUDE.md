@@ -11,12 +11,14 @@ board crate).
 ## Boundaries (hard)
 
 - Outside the workspace (own `Cargo.lock`): lint and format with the `--manifest-path` commands in
-  `docs/DEVELOPMENT.md`. `cargo test-host` does not build it.
-- `#![no_std]`, `#![no_main]`, no dependencies. `unsafe` blocks only in `src/lib.rs` for `svc`, `map`'s slice and `start`'s argument slice
-  (bins only use `#[unsafe(no_mangle)]`), each with a `// SAFETY:`.
-- A program that takes arguments defines `_start(argc, _, len)` and calls `start(argc, len, main)`, which hands `main`
-  the arguments as `&[&[u8]]` (the kernel puts them at the end of the top stack page, `STACK_TOP`) and exits with its
-  result; boot-spawned programs get none.
+  `docs/DEVELOPMENT.md`. `cargo test-host` does not build it; its lib's host test (the command table) runs with the
+  `cargo test --manifest-path` command there.
+- `#![no_std]` (the lib `cfg_attr(not(test))`), `#![no_main]`, no dependencies. `unsafe` only in `src/lib.rs` for
+  `svc`, `map`'s slice and `start`'s argument slice, and in bins for `#[unsafe(no_mangle)]` and the one call to the
+  `unsafe fn start`; each block with a `// SAFETY:`.
+- A program that takes arguments defines `_start(argc, _, len)` and calls `unsafe { start(argc, len, main) }` with
+  its x0 and x2, which hands `main` the arguments as `&[&[u8]]` (the kernel puts them at the end of the top stack page,
+  `STACK_TOP`) and exits with its result; boot-spawned programs get none.
 - Talks to the kernel only through `svc #0`; handles arrive at values 0, 1, ... as the spawner passed them
   (init: 0 console, 1 itself, 2 boot archive, 3 the MogFS root directory when a disk is mounted).
 - `read`/`write` are `read_at`/`write_at` at offset 0: `io_submit_wait` takes the file offset in x4, which the console
@@ -32,15 +34,16 @@ board crate).
 - Child budgets (`CHILD_BUDGET`, `A_BUDGET`, `PONG_BUDGET`, ...) are sized deliberately, some exact, some with slack,
   as their comments say; they must fit in the kernel's `BOOT_BUDGET`, `WAITER_BUDGET`, `PI_BUDGET`. `ROUND_TRIPS` in
   `ping.rs` must equal the kernel's `PIPE_ROUND_TRIPS`.
-- Least privilege (security rule): msh resolves every path argument itself, against its root handle and current
-  directory, and passes a program only the console (write) and a handle to what its job needs, narrowed by `dup` to
-  the rights it uses plus transfer: `cat` a read-only file, `ls` a read-only directory, `mkdir` and `rm` the parent
-  directory with write, `touch` and `write` the parent with read and write, `mv` both parents with write, `sync` the
-  root with write, `echo` and any other program nothing. The leaf name goes as an argument. A program never gets the
-  root unless its job needs it (`sync`), nor a right it does not use. A shell program exits with the errno of its
-  failure (`status`), which msh prints by name.
+- Least privilege (security rule): msh runs only the programs in `COMMANDS` (`src/lib.rs`; anything else, even in
+  the archive, is `command not found`), resolves every path argument itself, against its root handle and current
+  directory, and passes a program only the console (write, never read) and the handles its `Grant` names, narrowed
+  by `dup` to those rights plus transfer: `cat` a read-only file, `ls` a read-only directory, `mkdir` and `rm` the
+  parent directory with write, `touch` and `write` the parent with read and write, `mv` both parents with write,
+  `sync` the root with no right, `echo` nothing. The leaf name goes as an argument. A program never gets the root
+  unless its job needs it (`sync`), nor a right it does not use; the lib's host test pins the table. A shell program
+  exits with the errno of its failure (`status`), which msh prints by name.
 - A failed check exits instead of printing, so a wrong result shows as a missing line in the e2e test; panic is
-  `exit(1)`.
+  `exit(255)`, outside the errno codes shell programs exit with.
 - Performance is the moat: a slowdown is never accepted because it has an explanation; it is removed, or shown to
   be unavoidable with before/after numbers (`docs/BENCHMARKS.md`).
 

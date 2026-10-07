@@ -7,7 +7,10 @@ use user::*;
 
 #[unsafe(no_mangle)]
 extern "C" fn _start(argc: usize, _: usize, len: usize) -> ! {
-    start(argc, len, |args| {
-        status(rename(1, arg(args, 1), 2, arg(args, 2)))
-    })
+    // SAFETY: `argc` and `len` are the x0 and x2 this process started with.
+    unsafe { start(argc, len, main) }
+}
+
+fn main(args: &[&[u8]]) -> u64 {
+    status(rename(1, arg(args, 1), 2, arg(args, 2)))
 }

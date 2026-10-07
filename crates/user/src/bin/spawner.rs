@@ -8,6 +8,8 @@ use user::*;
 /// init's boot-archive directory handle.
 const DIR: u64 = 2;
 const CHILD_BUDGET: usize = 12;
+/// `child`'s 10 frames, one short once its arguments need their own stack page.
+const WITHOUT_ARGS_PAGE: usize = 10;
 /// One short of `child`'s 10 frames (3 tables, text, data, stack, 4 kernel stack): fails at the last, the kernel stack.
 const ONE_FRAME_SHORT: usize = 9;
 
@@ -68,6 +70,12 @@ extern "C" fn _start() -> ! {
         console,
         spawned == EINVAL,
         b"S: spawn args without a NUL: EINVAL\n",
+    );
+    let spawned = spawn_at(child, &[CONSOLE], WITHOUT_ARGS_PAGE, u64::MAX, b"child\0");
+    check(
+        console,
+        spawned == ENOMEM,
+        b"S: spawn with args one frame short: ENOMEM\n",
     );
     write(CONSOLE, b"S: console not moved\n");
     let spawned = spawn_at(child, &[CONSOLE], CHILD_BUDGET, u64::MAX, &args[..4096]);

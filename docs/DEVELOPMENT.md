@@ -45,6 +45,7 @@ cargo clippy           # lints; must be clean
 cargo fmt              # format (CI-style check: cargo fmt --check)
 cargo clippy --manifest-path crates/user/Cargo.toml --target-dir target/user  # user programs (outside the workspace)
 cargo fmt --manifest-path crates/user/Cargo.toml
+cargo test --manifest-path crates/user/Cargo.toml --target aarch64-apple-darwin --target-dir target/user --lib  # msh's command table
 cargo build            # dev build
 cargo test-host        # host tests + QEMU boot e2e tests (crates/e2e); must pass
 cargo bench-host       # host benchmarks (min/median); see docs/BENCHMARKS.md
@@ -83,7 +84,7 @@ current directory and stay below the root: `..` (except `cd ..`), `.` and a lead
 | Command | Does |
 | --- | --- |
 | `cd [dir]`, `pwd` | builtins: change the current directory (`cd ..` up one, `cd` alone to the root), print it |
-| `help`, `exit` | builtins: list the builtins and the boot archive's programs; leave (the boot powers off) |
+| `help`, `exit` | builtins: list the builtins and the commands; leave (the boot powers off) |
 | `ls [dir]` | list a directory (`name/` for a directory) |
 | `mkdir <dir>`, `touch <file>` | make a directory; make an empty file if missing |
 | `write <file> <text>` | replace a file with `text` and a newline |
@@ -92,8 +93,8 @@ current directory and stay below the root: `..` (except `cd ..`), `.` and a lead
 | `echo <text>` | print `text` |
 | `sync` | make every change durable; nothing written since the last `sync` survives a reboot |
 
-Every command but the builtins is a program from the boot archive (`crates/user/src/bin`), never from disk; msh
-passes it only the handles its job needs. A failure prints `msh: <command>: <errno>`, an unknown command
+Every command but the builtins is a program from the boot archive (`crates/user/src/bin`), never from disk, listed
+in msh's table (`COMMANDS` in `crates/user/src/lib.rs`); msh passes it only the handles its job needs. A failure prints `msh: <command>: <errno>`, an unknown command
 `msh: <name>: command not found`.
 
 ## Rules for agents

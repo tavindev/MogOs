@@ -65,8 +65,8 @@ const MKDIR: u64 = 13;
 /// newlines it got; an unlink between calls moves an entry, so a resumed listing can skip or repeat one. `EINVAL` if
 /// the first entry does not fit in `len`.
 const READDIR: u64 = 14;
-/// `sync(handle)`: makes every change to the file system the directory or file `handle` (write right) is on durable, atomically; it holds the core
-/// for its writes and two flushes. `EIO` means unknown: the changes may or may not be durable.
+/// `sync(handle)`: makes every change to the file system the directory or file `handle` (no right needed: it changes
+/// nothing a handle reaches) is on durable, atomically; it holds the core for its writes and two flushes. `EIO` means unknown: the changes may or may not be durable.
 const SYNC: u64 = 15;
 /// `unlink(dir, path_ptr, path_len)`: removes the file or empty directory (`ENOTEMPTY` otherwise) at `path` under `dir`
 /// (write right), resolved as by `open`; returns 0. `EBUSY` while any process holds a handle to it, so a freed inode
@@ -393,7 +393,7 @@ pub fn dispatch(nr: u64, args: &[u64; 7], handles: &mut Handles) -> Result<Call,
                 start: args[3],
             })
         }
-        SYNC => match handles.get(args[0], WRITE)? {
+        SYNC => match handles.get(args[0], 0)? {
             Object::Dir(_) | Object::Node(_) => Ok(Call::Sync),
             _ => Err(ENOTDIR),
         },
