@@ -4,7 +4,8 @@
 //! - A connection slot owns a receive and a send ring from the caller. Out-of-order data is written into the
 //!   receive ring at its offset and tracked as up to `OOO` ranges; each segment is acknowledged at once.
 //! - A passive open lives in the half-open table until the handshake completes, so a SYN flood never takes a slot.
-//!   A full table answers with SYN cookies (the ISS encodes the MSS and a keyed hash; no window scaling), accepted
+//!   A keyed hash of the connection picks its run of `PROBES` slots, so lookups are O(1) at any table size.
+//!   A full run answers with SYN cookies (the ISS encodes the MSS and a keyed hash; no window scaling), accepted
 //!   only while the stack has sent cookies recently.
 //! - A connection entering TIME_WAIT leaves its slot for a compact entry; a full TIME_WAIT table reuses its oldest,
 //!   and a SYN above the entry's sequence number starts a new connection whose ISS is 65537 plus 24 keyed bits above
@@ -48,6 +49,8 @@ const TIME_WAIT: u64 = 60 * SEC;
 /// How long a closed connection waits in FIN-WAIT-2 for the peer's FIN.
 const FIN_WAIT_2: u64 = 60 * SEC;
 const CHALLENGES: u8 = 10;
+/// A half-open entry lives in one of this many slots in a row, from a keyed hash of its connection.
+const PROBES: usize = 8;
 /// At most one ACK per connection per this long answers out-of-window segments (as Linux).
 const OOW_ACK: u64 = 500 * MS;
 /// A SYN cookie's clock: a cookie is accepted for one to two periods.
@@ -1157,16 +1160,15 @@ impl<'a> Stack<'a> {
                 return Ok(());
             }
         }
-        if let Some(h) = self
-            .tcp
-            .half_open
-            .iter()
-            .position(|h| h.remote.port() != 0 && h.local == s.port && h.remote == s.from)
-        {
+        let slots = self.slots(s.port, s.from);
+        let table = &self.tcp.half_open;
+        if let Some(h) = slots.clone().find(|&h| {
+            table[h].remote.port() != 0 && table[h].local == s.port && table[h].remote == s.from
+        }) {
             return self.half_open_in(h, s, ours, now, mss);
         }
         if let Some(l) = self.listener(s.port) {
-            return self.listen_in(l, s, (mac, ours), now, mss, iss);
+            return self.listen_in(l, s, (mac, ours), now, mss, (iss, slots));
         }
         if s.flags & RST == 0 {
             self.reply_tcp((mac, ours), s.from, s.port, &rst_for(s));
@@ -1195,7 +1197,7 @@ impl<'a> Stack<'a> {
         macs: (Mac, Mac),
         now: u64,
         mss: u16,
-        iss: Option<u32>,
+        (iss, mut slots): (Option<u32>, impl Iterator<Item = usize>),
     ) -> Result<(), Reason> {
         if s.flags & RST != 0 {
             return Err(Reason::Unacceptable);
@@ -1215,7 +1217,7 @@ impl<'a> Stack<'a> {
         let rx = self.free_slot().unwrap_or(l);
         let rx = self.tcp.sockets[rx].rx.len();
         let win = rx.min(0xffff) as u16;
-        let Some(h) = self.tcp.half_open.iter().position(|h| h.remote.port() == 0) else {
+        let Some(h) = slots.find(|&h| self.tcp.half_open[h].remote.port() == 0) else {
             // A full table answers statelessly: the ISS encodes the MSS and is checked when the ACK returns.
             self.counters.syn_cookies += 1;
             self.tcp.cookie_at = Some(now);
@@ -1518,6 +1520,18 @@ impl<'a> Stack<'a> {
             |_| {},
         );
         self.reply_len = len;
+    }
+
+    /// The half-open slots a connection may occupy: `PROBES` in a row from a keyed hash, so a lookup is O(1).
+    fn slots(&self, local: u16, from: SocketAddrV4) -> impl Iterator<Item = usize> + Clone + use<> {
+        let n = self.tcp.half_open.len();
+        let ips = (u32::from(self.config.ip) as u64) << 32 | u32::from(*from.ip()) as u64;
+        let ports = 3 << 32 | (local as u64) << 16 | from.port() as u64;
+        // A keyed mix, not SipHash: steering SYNs into one run only sends them to cookies.
+        let k = self.tcp.key;
+        let x = (ips ^ k[0]).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ (ports ^ k[1]);
+        let h = (x.wrapping_mul(0xbf58_476d_1ce4_e5b9) >> 32) as usize;
+        (0..PROBES.min(n)).map(move |i| (h + i) % n)
     }
 
     fn listener(&self, port: u16) -> Option<usize> {

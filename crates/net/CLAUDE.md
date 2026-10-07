@@ -67,6 +67,12 @@ kernel, step 50), DHCP, DNS or IPv6 (phase 9), or IPv4 fragment reassembly.
   action leads to). No purpose arms or cancels another's. The tests check after every poll that a connection with
   work outstanding (anything but idle in ESTABLISHED, CLOSE-WAIT or FIN-WAIT-2) has a deadline, and that a silent
   peer always ends in CLOSED or idle; released FIN-WAIT-2 timing out has its own tests.
+- The half-open table is found in O(1) at any size: a keyed multiply-xorshift mix of the connection picks a run of 8
+  slots, every lookup checks the whole run (so freeing is just clearing), and a SYN whose run is full gets a cookie.
+  The mix is not SipHash on purpose: SipHash cost 20 ns per handshake, and steering SYNs into one run only sends them
+  to cookies. Filling a table to the last slot sends about 3% (random connections: up to about 11%) to cookies.
+  Still linear per `poll`: the SYN-ACK retransmission walk over the half-open table, the connection slots, and the
+  TIME_WAIT lookup.
 - TCP's attack surface, each with a test: a SYN flood fills only the half-open table and answers to the frame's
   source, so it never touches the ARP cache or a slot; a full table answers with SYN cookies (user-approved,
   replacing oldest-first eviction; `syn_cookies`): the ISS holds one clock bit (16 s periods, this one or the last),

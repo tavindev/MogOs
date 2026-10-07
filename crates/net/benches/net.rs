@@ -344,11 +344,12 @@ fn record_syns(n: usize) -> Vec<Vec<u8>> {
     syns
 }
 
-/// B answering 64 SYNs with SYN-ACKs, into a fresh 64-entry half-open table or (cookies) none; ns per SYN.
-fn syn_answer(syns: &[Vec<u8>], cookies: bool) -> f64 {
-    let mut ns = 0;
-    for batch in syns.chunks(64) {
-        host!(b, IP_B, [1, 2], 2, 4096, if cookies { 0 } else { 64 });
+/// B answering SYNs with SYN-ACKs until a fresh `table`-entry half-open table is full, or 64 per batch with cookies
+/// when `table` is 0; ns per SYN, and the share of SYNs answered with a cookie.
+fn syn_answer(syns: &[Vec<u8>], table: usize) -> (f64, f64) {
+    let (mut ns, mut cookies) = (0, 0);
+    for batch in syns.chunks(table.max(64)) {
+        host!(b, IP_B, [1, 2], 2, 4096, table);
         b.listen(80).unwrap();
         let mut nic = Replay {
             frames: batch,
@@ -358,10 +359,13 @@ fn syn_answer(syns: &[Vec<u8>], cookies: bool) -> f64 {
         let start = Instant::now();
         b.poll(&mut nic, 0);
         ns += start.elapsed().as_nanos();
-        assert_eq!(b.counters.tcp, 64);
-        assert_eq!(b.counters.syn_cookies, if cookies { 64 } else { 0 });
+        assert_eq!(b.counters.tcp, batch.len() as u64);
+        cookies += b.counters.syn_cookies;
     }
-    ns as f64 / syns.len() as f64
+    (
+        ns as f64 / syns.len() as f64,
+        cookies as f64 / syns.len() as f64,
+    )
 }
 
 /// Connect, accept, a close from each side and the TIME_WAIT entry, over the loss-free link; ns per connection.
@@ -427,14 +431,17 @@ fn main() {
         (0..RUNS).map(|_| handshake_and_close(0)).collect(),
     );
     let syns = record_syns(4096);
-    report(
-        "tcp SYN answered from a 64-entry half-open table",
-        (0..RUNS).map(|_| syn_answer(&syns, false)).collect(),
-    );
-    report(
-        "tcp SYN answered with a cookie",
-        (0..RUNS).map(|_| syn_answer(&syns, true)).collect(),
-    );
+    for table in [64, 4096, 0] {
+        let runs: Vec<_> = (0..RUNS).map(|_| syn_answer(&syns, table)).collect();
+        let name = match table {
+            0 => "tcp SYN answered with a cookie".to_string(),
+            n => format!(
+                "tcp SYN answered while filling a {n}-entry half-open table ({:.0}% cookies)",
+                runs[0].1 * 100.0
+            ),
+        };
+        report(&name, runs.iter().map(|r| r.0).collect());
+    }
     for (loss, delay) in [(10, 5), (10, 25), (50, 5), (50, 25)] {
         let faults = sim::Faults {
             loss,

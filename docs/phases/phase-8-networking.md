@@ -100,3 +100,6 @@ Decision: write `crates/net` fresh. smoltcp is a host-only dev-dependency of `cr
   the wrapped-sequence protection. smoltcp 0.12 also drops its retransmission timer on ESTABLISHED + FIN ->
   CLOSE-WAIT; the interop test works around both of its cases. FIN-WAIT-2 times out only once the caller releases
   the connection (Linux's rule, the coordinator's decision): an open half-closed connection waits for a slow peer.
+  The half-open table is found in O(1) (a keyed mix picks a run of 8 slots; a full run means a cookie), for tables
+  sized from RAM: filling 4096 entries costs 45 ns per SYN, down from 2.0 us for the linear scan, and 64 entries 48 ns
+  against 68. Still linear: the per-`poll` walks over the half-open table and the slots, and the TIME_WAIT lookup.
