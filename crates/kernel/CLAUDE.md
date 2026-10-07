@@ -85,7 +85,8 @@ touches memory through raw addresses: the board reads user buffers, copies pages
   once), and about 7000, about 150 ms, on a crafted one (504 directories of 14 blocks each).
 - `Elf::parse` accepts only page-aligned, address-ordered, in-region `PT_LOAD`s, never W+X, entry in an executable one.
 - init's handles (`Handles::init`): 0 console (read, write, duplicate, transfer), 1 itself (kill), 2 the boot archive
-  (read, exec, duplicate, transfer: msh hands it to `sh`, which spawns from it).
+  with `INIT_ARCHIVE` (read, exec); only `test=shell`'s msh gets `SHELL_ARCHIVE` (also duplicate, transfer), since it
+  hands the archive to `sh`, which spawns from it. Every other init can neither copy nor pass it on.
 - `BOOT_BUDGET`, `SHELL_BUDGET` (`test=shell`: msh's 25 frames and the 2048 it gives `sh`), `WAITER_BUDGET`, `PI_BUDGET` are sized to the user programs' frame needs: too small and `run`'s
   `expect("spawn")` panics. `PIPE_ROUND_TRIPS` must equal `ROUND_TRIPS` in `crates/user/src/bin/ping.rs`; a mismatch
   only prints a wrong `pipe:` number, nothing fails.
