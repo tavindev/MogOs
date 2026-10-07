@@ -1,5 +1,6 @@
 use kernel::handle::{Handles, Object, READ, WRITE};
-use kernel::syscall::{Call, EACCES, EADDRNOTAVAIL, ENOTDIR, EROFS, dispatch};
+use kernel::network::OP_CONNECT;
+use kernel::syscall::{Call, EACCES, EADDRNOTAVAIL, EINVAL, ENOTDIR, EROFS, NetCall, dispatch};
 use mogfs::ROOT;
 
 /// The host's clamp: no speculation to bound.
@@ -20,6 +21,7 @@ const UNLINK: u64 = 16;
 const RENAME: u64 = 17;
 const BIND: u64 = 21;
 const LISTEN: u64 = 22;
+const IO_SUBMIT: u64 = 23;
 const USER: u64 = 1 << 32;
 
 #[test]
@@ -78,4 +80,33 @@ fn sync_takes_any_mogfs_handle_without_a_right() {
     }
     let sync = dispatch::<Min>(SYNC, &[console, 0, 0, 0, 0, 0, 0], &mut handles);
     assert_eq!(sync.err(), Some(ENOTDIR));
+}
+
+#[test]
+fn connect_takes_an_address_and_port_that_fit() {
+    let mut handles = Handles::new();
+    let sock = Object::Socket(kernel::network::Sock {
+        index: 0,
+        generation: 1,
+    });
+    let sock = handles.insert(sock, READ | WRITE).unwrap();
+    let mut connect = |ip, port| {
+        dispatch::<Min>(
+            IO_SUBMIT,
+            &[sock, OP_CONNECT, ip, port, 7, 0, 0],
+            &mut handles,
+        )
+    };
+    assert_eq!(connect(1 << 32, 80).err(), Some(EINVAL));
+    assert_eq!(connect(0x7f00_0001, 1 << 16).err(), Some(EINVAL));
+    let ok = connect(0x7f00_0001, 80);
+    assert!(matches!(
+        ok,
+        Ok(Call::Net(NetCall::Submit {
+            peer: (0x7f00_0001, 80),
+            ..
+        }))
+    ));
+    let op = dispatch::<Min>(IO_SUBMIT, &[sock, 4, USER, 1, 0, 0, 0], &mut handles);
+    assert_eq!(op.err(), Some(EINVAL));
 }

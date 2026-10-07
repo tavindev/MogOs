@@ -289,9 +289,14 @@ Filled in as each step lands.
     nearly all of it is the barrier Linux prescribes when FEAT_SB is absent (the hvf guest's ISAR1 shows no SB, so
     `sb` would be undefined). TCG `cortex-a76`: syscall 218 (main) -> 320 (the 75-instruction loop and 27 for the
     clamps).
-  - `io_submit`: a connect's address and port now travel in their own `NetCall::Submit` field (`peer`, checked to
+  - `io_submit`: its op no longer selects the right it needs through a table LLVM built from the `match`, indexed
+    by the raw op past one branch (a bit test now); a connect's address and port now travel in their own
+    `NetCall::Submit` field (`peer`, checked to
     fit `u32` and `u16` in `dispatch`), and the buffer fields always carry the clamped buffer, so no misprediction
     on the op reads them as a buffer; `Network::submit` takes `peer`. `linker.ld` puts `.data.rel.ro` in the
     read-only block (the current build has none).
+  - Stack overflow: the nested faults now run the report in the 4 KiB below the guard, which for core 0 is the top of
+    core 1's stack (live once core 1 is up), for cores 1 and 2 the next core's, and for core 3 a frame below
+    `__stacks` that the frame allocator may have handed out; still only on a path that powers off.
   - Against main overall (hvf min at `-smp 1`): syscall 30 -> 55 ns (BHB 13-15, one `csdb` 9), `enosys` 32.5 ->
     46.8 (BHB only), pipe round trip 352 -> 519, yield and median boot hold.

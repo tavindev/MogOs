@@ -459,7 +459,6 @@ unsafe extern "C" {
     static __boot_guard: u8;
     static __stacks: u8;
     static __kernel_end: u8;
-    static __stack_top: u8;
 }
 
 #[unsafe(no_mangle)]

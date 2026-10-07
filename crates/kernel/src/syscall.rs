@@ -10,7 +10,7 @@ use crate::handle::{
     WRITE,
 };
 use crate::mutex::Mutex;
-use crate::network::{BACKLOG, OP_ACCEPT, OP_CONNECT, OP_RECEIVE, OP_SEND, Sock};
+use crate::network::{BACKLOG, OP_CONNECT, OP_RECEIVE, OP_SEND, Sock};
 use crate::pipe::End;
 
 /// `exit(code)`: ends the calling process, every thread; `wait` reports the low 8 bits of `code`.
@@ -594,11 +594,11 @@ pub fn dispatch<C: Clamp>(nr: u64, args: &[u64; 7], handles: &mut Handles) -> Re
         })),
         IO_SUBMIT => {
             let (op, tag) = (args[1], args[4]);
-            let need = match op {
-                OP_RECEIVE | OP_ACCEPT => READ,
-                OP_SEND | OP_CONNECT => WRITE,
-                _ => return Err(EINVAL),
-            };
+            if op > OP_CONNECT {
+                return Err(EINVAL);
+            }
+            // Receive and accept read, send and connect write: a bit test, so no table is indexed by `op`.
+            let need = if op & 1 == 0 { READ } else { WRITE };
             let io_len = args[3].min(MAX_BUFFER);
             let (h0, ptr, len) = handle_buffer::<C>(args[0], args[2], io_len);
             let sock = socket(handles, h0, need)?;
