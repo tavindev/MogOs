@@ -9,19 +9,25 @@
 
 ### C (musl, busybox)
 
-Nothing is installed system-wide; the first `cargo build` needs the network. The board's `build.rs` runs
-`make -j3 -C c OUT=<repo>/target/c` (`c/Makefile`, ownership in [c/CLAUDE.md](../c/CLAUDE.md)), which:
+Nothing is installed system-wide; the first build on a machine needs the network. The board's `build.rs` runs
+`make -j3 -C c` (`c/Makefile`, ownership in [c/CLAUDE.md](../c/CLAUDE.md)). One cache serves every worktree: the
+main checkout's `target/c-cache/` (found through the repository's common git directory), with the downloads in
+`dl/` and each build in `<key>/`, the key a hash of every file in `c/` the build reads and `rustc --version`. A
+worktree with the same `c/` reuses the build (about 0.4 s to check); changing any of those files builds a new key
+(about 75 s on a loaded machine) and leaves the old one. `lockf` on `target/c-cache/.lock` runs one C build at a time
+across worktrees. `target/c` in each worktree links to its key's directory. `rm -rf target/c-cache` in the main
+checkout clears it (`cargo clean` there does too). Inside the key's directory (`$OUT`) the Makefile:
 
-1. downloads `musl-1.2.5.tar.gz` and `busybox-1.36.1.tar.bz2` into `third_party/` (gitignored) and checks their
-   SHA-256 (in the Makefile);
-2. links `target/c/host/ld.lld` to the pinned toolchain's `rust-lld` and `target/c/host/sed` to Homebrew `gsed`;
-3. unpacks musl into `target/c/musl`, deletes its FP/SIMD assembly, copies `c/musl/` over it, and runs
-   `./configure --target=aarch64-linux-musl --disable-shared` and `make install` into `target/c/sysroot` with
+1. downloads `musl-1.2.5.tar.gz` and `busybox-1.36.1.tar.bz2` into `dl/` and checks their SHA-256 (in the
+   Makefile);
+2. links `$OUT/host/ld.lld` to the pinned toolchain's `rust-lld` and `$OUT/host/sed` to Homebrew `gsed`;
+3. unpacks musl into `$OUT/musl`, deletes its FP/SIMD assembly, copies `c/musl/` over it, and runs
+   `./configure --target=aarch64-linux-musl --disable-shared` and `make install` into `$OUT/sysroot` with
    `/opt/homebrew/opt/llvm/bin/clang` (Homebrew LLVM 19) and `llvm-ar`;
-4. unpacks busybox into `target/c/busybox` with `c/busybox.config`, `make oldconfig` and `make busybox_unstripped`
+4. unpacks busybox into `$OUT/busybox` with `c/busybox.config`, `make oldconfig` and `make busybox_unstripped`
    with `CC=c/mog-cc` (host tools with the system `cc`, GNU `sed` first in `PATH`), and strips it into
-   `target/c/bin/busybox`;
-5. builds `c/hello.c` and `c/cbench.c` with `c/mog-cc` into `target/c/bin`.
+   `$OUT/bin/busybox`;
+5. builds `c/hello.c` and `c/cbench.c` with `c/mog-cc` into `$OUT/bin`.
 
 `c/mog-cc` is clang with `--target=aarch64-linux-musl -march=armv8-a+nofp -mabi=aapcs-soft -mno-outline-atomics`,
 the sysroot's headers, and for a link `rust-lld` (through `-fuse-ld=lld --ld-path`, with
@@ -47,7 +53,7 @@ libcalls. Needs: Homebrew `llvm` (clang 19 or later for `-mabi=aapcs-soft`), `gs
 | `test-host` alias | `.cargo/config.toml` | Runs tests for the host target, excluding the bare-metal-only `qemu-virt` and `arch`. A string, not an array, so a nested worktree's copy overrides it instead of concatenating. |
 | `bench-host` alias | `.cargo/config.toml` | Runs the host `benches/*.rs` targets (`--bench '*'`) for the same crates as `test-host`. |
 | `mkfs`, `shell` aliases | `.cargo/config.toml` | `cargo mkfs` writes an empty 64 MiB MogFS `disk.img` in the current directory; `cargo shell` boots into msh with it attached (`-drive`/`-device` after the runner's `-kernel <path>`). Strings, so a worktree's copy overrides them. |
-| `make -C c` in the board's `build.rs` | `crates/board/qemu-virt/build.rs`, `c/Makefile` | busybox and the C programs join the boot archive in the same one-command build; the Makefile's file dependencies make it a no-op (about 60 ms) when nothing in `c/` changed. |
+| `make -C c` in the board's `build.rs` | `crates/board/qemu-virt/build.rs`, `c/Makefile` | busybox and the C programs join the boot archive in the same one-command build; the build is cached across worktrees by a hash of `c/` (about 0.4 s to check when it is built). |
 | soft-float C (`-march=armv8-a+nofp -mabi=aapcs-soft`) | `c/Makefile` | The kernel never enables FP/SIMD at EL0 (no `CPACR_EL1` FPEN), so traps and switches never save v-registers; C code follows the Rust programs. |
 | busybox `CONFIG_EXTRA_CFLAGS="-DBB_GLOBAL_CONST="` | `c/busybox.config` | clang 19 hoists the read of busybox's `const` globals pointer above its assignment (hush faulted at `0x140`); busybox's documented switch. |
 | `linked_list_allocator` (no features) | `crates/board/qemu-virt` | Kernel heap with `free` (phase 2 task stacks need it); a bare `Heap` behind an `arch::Lock` (which masks IRQs), not its own spinlock, which could deadlock on one core. In the board crate because it is the binary that owns `#[global_allocator]` and `unsafe` heap init. |

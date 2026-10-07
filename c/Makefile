@@ -1,10 +1,16 @@
 # C userland for MogOs: musl with the MogOs syscall layer (`musl/` is copied over the release), busybox, and the C
-# test programs. Sources are fetched into `third_party/` and checked against SHA-256; everything builds into $(OUT).
-# The board's build.rs runs `make -C c OUT=<repo>/target/c`; when nothing changed it does nothing.
+# test programs. One cache serves every worktree, in the main checkout's `target/c-cache`: sources are fetched into
+# `dl/` and checked against SHA-256, and everything builds into `<key>/`, where the key hashes every input below and
+# the toolchain, so a worktree with the same inputs reuses the build and a changed input gets its own.
+# `$(ROOT)/target/c` links to that directory. The board's build.rs runs `make -C c`; with a built key it does nothing.
 
 ROOT := $(abspath $(CURDIR)/..)
-OUT ?= $(ROOT)/target/c
-DL := $(ROOT)/third_party
+MAIN := $(abspath $(dir $(shell git -C $(CURDIR) rev-parse --path-format=absolute --git-common-dir)))
+INPUTS := Makefile mog-cc link.ld busybox.config hello.c cbench.c $(sort $(shell find musl -type f))
+KEY := $(shell { cat $(INPUTS); rustc --version; } | shasum -a 256 | cut -c1-16)
+CACHE := $(MAIN)/target/c-cache
+OUT := $(CACHE)/$(KEY)
+DL := $(CACHE)/dl
 
 MUSL := musl-1.2.5
 MUSL_SHA := a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4
@@ -36,7 +42,14 @@ BUSYBOX_VARS := HOSTCC=cc CC=$(CC) AR=$(LLVM)/llvm-ar NM=$(LLVM)/llvm-nm STRIP=$
 PROGRAMS := hello cbench
 BINS := $(OUT)/bin/busybox $(PROGRAMS:%=$(OUT)/bin/%)
 
-all: $(BINS)
+# One C build at a time across worktrees (lockf), so two agents never build into the same key.
+all:
+	mkdir -p $(CACHE)
+	lockf -k $(CACHE)/.lock $(MAKE) build
+	@[ -L $(ROOT)/target/c ] || rm -rf $(ROOT)/target/c
+	ln -sfn $(OUT) $(ROOT)/target/c
+
+build: $(BINS)
 
 $(DL)/$(MUSL).tar.gz:
 	mkdir -p $(DL)
@@ -59,28 +72,29 @@ $(OUT)/host/sed:
 	mkdir -p $(OUT)/host
 	ln -sf "$$(command -v gsed)" $@
 
-MUSL_OVERLAY := $(shell find musl -type f)
+# Outputs depend on the tarballs only: the key already changes with every input, and a fresh checkout's newer mtimes
+# must not rebuild a key that is built.
 
 # The release minus its FP/SIMD assembly (the generic C versions take over), plus the overlay.
-$(SYSROOT)/lib/libc.a: $(DL)/$(MUSL).tar.gz $(MUSL_OVERLAY) | $(OUT)/host/ld.lld
+$(SYSROOT)/lib/libc.a: | $(DL)/$(MUSL).tar.gz $(OUT)/host/ld.lld
 	rm -rf $(OUT)/musl && mkdir -p $(OUT)/musl
-	tar xzf $< -C $(OUT)/musl --strip-components 1
+	tar xzf $(DL)/$(MUSL).tar.gz -C $(OUT)/musl --strip-components 1
 	cd $(OUT)/musl && rm -r src/math/aarch64 src/fenv/aarch64 src/string/aarch64
 	cp -R musl/. $(OUT)/musl/
 	cd $(OUT)/musl && ./configure --target=aarch64-linux-musl --prefix=$(SYSROOT) --disable-shared \
 		CC="$(MOG_CLANG)" CFLAGS="$(CFLAGS)" AR=$(LLVM)/llvm-ar RANLIB=$(LLVM)/llvm-ranlib >/dev/null
 	$(MAKE) -C $(OUT)/musl install >/dev/null
 
-$(OUT)/bin/%: %.c $(SYSROOT)/lib/libc.a mog-cc link.ld
+$(OUT)/bin/%: | $(SYSROOT)/lib/libc.a
 	mkdir -p $(OUT)/bin
-	$(CC) -s -o $@ $<
+	$(CC) -s -o $@ $*.c
 
-$(OUT)/bin/busybox: $(DL)/$(BUSYBOX).tar.bz2 busybox.config $(SYSROOT)/lib/libc.a mog-cc link.ld | $(OUT)/host/sed
+$(OUT)/bin/busybox: | $(DL)/$(BUSYBOX).tar.bz2 $(SYSROOT)/lib/libc.a $(OUT)/host/sed
 	rm -rf $(OUT)/busybox && mkdir -p $(OUT)/busybox $(OUT)/bin
-	tar xjf $< -C $(OUT)/busybox --strip-components 1
+	tar xjf $(DL)/$(BUSYBOX).tar.bz2 -C $(OUT)/busybox --strip-components 1
 	cp busybox.config $(OUT)/busybox/.config
 	PATH=$(HOSTPATH) $(MAKE) -C $(OUT)/busybox $(BUSYBOX_VARS) oldconfig </dev/null >/dev/null
 	PATH=$(HOSTPATH) $(MAKE) -C $(OUT)/busybox $(BUSYBOX_VARS) busybox_unstripped >/dev/null
 	$(LLVM)/llvm-strip -o $@ $(OUT)/busybox/busybox_unstripped
 
-.PHONY: all
+.PHONY: all build

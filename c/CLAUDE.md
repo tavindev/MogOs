@@ -2,9 +2,11 @@
 
 ## What this is
 
-The C userland: `Makefile` fetches musl 1.2.5 and busybox 1.36.1 (pinned SHA-256) into `third_party/` and builds
-them into `target/c/` with Homebrew clang and the pinned toolchain's `rust-lld`; `crates/board/qemu-virt/build.rs`
-runs it and bundles `target/c/bin/busybox` (as `sh`), `hello` and `cbench` into the boot archive. `musl/` is copied
+The C userland: `Makefile` fetches musl 1.2.5 and busybox 1.36.1 (pinned SHA-256) and builds them with Homebrew
+clang and the pinned toolchain's `rust-lld` into one cache shared by every worktree, the main checkout's
+`target/c-cache/<key>`, the key a hash of the inputs and the toolchain (`docs/DEVELOPMENT.md`); `target/c` links to
+it. `crates/board/qemu-virt/build.rs` runs it and bundles `target/c/bin/busybox` (as `sh`), `hello` and `cbench`
+into the boot archive. `musl/` is copied
 over the musl release before it builds; `src/mogos/mogos.c` there is the MogOs syscall layer.
 
 It is **NOT** a Linux compatibility layer for unmodified binaries (phase 9), and **NOT** a kernel interface: the
@@ -58,7 +60,8 @@ kernel's ABI is `crates/kernel/src/syscall.rs`, mirrored here by hand (numbers, 
 
 - End to end in `crates/e2e/tests/boot.rs`: `a_c_program_on_musl_prints_gets_enosys_and_exits_with_its_code`,
   `busybox_sh_changes_files_that_survive_a_reboot_once_synced`, `musl_bench_reports_round_trips` (`cbench`).
-- `make -C c OUT=$PWD/target/c` alone builds everything; it is a no-op when nothing changed.
+- `make -C c` alone builds everything; it is a no-op once the key is built. A new input file in `c/` must join
+  `INPUTS` in the Makefile, or a change to it reuses a stale build.
 
 ---
 

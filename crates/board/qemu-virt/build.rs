@@ -30,13 +30,12 @@ fn main() {
         .unwrap();
     assert!(status.success(), "user programs failed to build");
 
-    // musl, busybox and the C programs (`c/Makefile`); a no-op when nothing changed.
+    // musl, busybox and the C programs (`c/Makefile`, a cache shared by every worktree); `target/c` links to them.
     println!("cargo:rerun-if-changed={}", root.join("c").display());
     let c_out = root.join("target/c");
     let status = Command::new("make")
         .args(["-j3", "-C"])
         .arg(root.join("c"))
-        .arg(format!("OUT={}", c_out.display()))
         .status()
         .unwrap();
     assert!(status.success(), "C programs failed to build");
