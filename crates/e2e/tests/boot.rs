@@ -900,6 +900,35 @@ fn musl_bench_reports_round_trips() {
 }
 
 #[test]
+fn oscb_runs_the_cross_os_benchmarks() {
+    let image = mogfs_image("oscb", 1024);
+    let script = "sh -c 'oscb syscalls / oscnop; oscb pipe / oscnop; oscb spawn / oscnop; oscb files / oscnop'";
+    let (status, got) = shell(&image, &[script, "exit"]);
+    std::fs::remove_file(&image).unwrap();
+    assert!(status.success(), "QEMU exited with {status}");
+    let names: Vec<&str> = got[0]
+        .1
+        .iter()
+        .map(|l| {
+            l.strip_prefix("oscb: ")
+                .and_then(|l| l.split(' ').next())
+                .unwrap_or(l)
+        })
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "getppid",
+            "write0",
+            "pipe",
+            "spawn",
+            "create+write+fsync",
+            "open+close"
+        ]
+    );
+}
+
+#[test]
 fn sync_reports_a_failed_flush() {
     let image = mogfs_image("shell-flush", 1024);
     let blockdev = flush_fails(&image);

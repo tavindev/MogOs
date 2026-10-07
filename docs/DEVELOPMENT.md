@@ -27,7 +27,7 @@ checkout clears it (`cargo clean` there does too). Inside the key's directory (`
 4. unpacks busybox into `$OUT/busybox` with `c/busybox.config`, `make oldconfig` and `make busybox_unstripped`
    with `CC=c/mog-cc` (host tools with the system `cc`, GNU `sed` first in `PATH`), and strips it into
    `$OUT/bin/busybox`;
-5. builds `c/hello.c` and `c/cbench.c` with `c/mog-cc` into `$OUT/bin`.
+5. builds `c/hello.c`, `c/cbench.c`, `c/oscb.c` and `c/oscnop.c` with `c/mog-cc` into `$OUT/bin`.
 
 `c/mog-cc` is clang with `--target=aarch64-linux-musl -march=armv8-a+nofp -mabi=aapcs-soft -mno-outline-atomics`,
 the sysroot's headers, and for a link `rust-lld` (through `-fuse-ld=lld --ld-path`, with
@@ -104,6 +104,7 @@ cargo run -p mogfs --example mkfs --target aarch64-apple-darwin -- disk.img 1638
 [ -f disk.img ] || cargo mkfs; cargo shell  # formats disk.img if missing, boots into msh with it; files survive a reboot once synced (see "Using the shell")
 cargo run -- -drive file=disk.img,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0 -append test=bench-fs  # MogFS image; open(CREATE|TRUNC)+write+sync and open+close round trips in ns
 [ -f disk.img ] || cargo mkfs; cargo shell, then: sh -c cbench  # musl syscall round trip and busybox spawn in ns
+scripts/oscompare.sh [runs]  # same C benchmarks (c/oscb.c) on MogOs, Linux and macOS, interleaved; docs/BENCHMARKS.md "Cross-OS comparison"
 cargo run -- -s -S     # boot halted, gdbstub on localhost:1234; attach lldb/gdb
 cargo build --release  # LTO release image
 ```
