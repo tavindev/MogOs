@@ -21,7 +21,7 @@ lines and the exit status. `tests/user.rs` runs `crates/user`'s host tests (outs
 
 - Assertions are on exact serial lines the kernel or user programs print; when boot output changes, extend `tests/boot.rs`
   in the same change (`docs/DEVELOPMENT.md`, rules for agents).
-- Each boot has a 30 s deadline, then QEMU is killed and the test fails. Every boot prints QEMU's exit status,
+- A boot is killed, failing its test, once QEMU prints nothing for `SILENCE` (30 s) or at `CAP` (300 s), so a slow scenario passes under load while it prints and a hang fails fast; every scenario prints well within it (the captured output reports the longest silence). Every boot prints QEMU's exit status,
   stderr and stdout (captured: shown when the test fails).
 - The kernel is built once per test run (`Once` in `boot_with_input`): even a fresh `cargo build` replaces `mog_os`
   (a new inode), so a build beside a booting test made QEMU fail with `Couldn't load elf` and no output.
