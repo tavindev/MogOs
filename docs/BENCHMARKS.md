@@ -16,9 +16,10 @@ Speed is a primary goal, so performance is tested like behavior: measured, recor
   `#[path]`: the thread's CPU time, not wall time (on this loaded host a wall-clock sample counted the time other
   processes ran, 3-4x the work), and flat sampling. Rows are `<group>/<name>`; one iteration is the whole workload
   (1000 frames, 400 files), so divide criterion's time by that count for ns/op. Set up outside the timed part with
-  `iter_batched_ref` (`PerIteration` when the input is large), keep results alive with `std::hint::black_box`, and
-  add `Throughput::Bytes` to a row that reports MiB/s. `crates/net` and `crates/mogfs2` still print min and median
-  of N runs by hand until they move over.
+  `iter_batched_ref` (`PerIteration` when the input is large), or plain `iter` when the workload leaves its state as
+  it found it; keep results alive with `std::hint::black_box`; add `Throughput::Bytes` to a row that reports MiB/s.
+  `crates/net` and `crates/mogfs2` still print min and median of N runs by hand until they move over. Host rows
+  recorded before the move are those wall-clock min and median of 51 runs; later ones record criterion's estimate.
 - In-guest benchmarks (`test=bench-*`, `scripts/bench.sh <test>`, `scripts/oscompare.sh`) stay on the kernel's timer
   (`CNTVCT_EL0`): no framework runs in `no_std` under QEMU.
 - Exact instruction counts: under TCG with `-icount shift=0,sleep=off` the virtual counter advances 1 ns per instruction, so a kernel benchmark's `ns/round-trip` reads as instructions per round trip, the same on every run. It finds where a few ns come from; it never gates (hvf does), since a probe or TTBR0 write costs far more under hvf than its one instruction.
@@ -26,14 +27,15 @@ Speed is a primary goal, so performance is tested like behavior: measured, recor
 ## Workflow
 
 - Kernel comparisons use hvf (`-accel hvf -cpu cortex-a72`): TCG run-to-run noise is about 10%, so TCG numbers are informational only and never gate a change.
-- Compare medians of at least 21 runs, before and after interleaved, on an otherwise idle machine.
+- Kernel: compare medians of at least 21 runs, before and after interleaved, on an otherwise idle machine. Host: 11
+  rounds of `scripts/bench.sh host`.
 - Any change to a hot path includes before/after numbers from the relevant benchmark, run on the same machine and mode.
 - Any slowdown beyond run-to-run noise (hvf median for kernel benchmarks, host median for host benchmarks) is a failing result; a justification does not excuse it. Remove it, or show with numbers that no safe faster form exists. If the before/after spread is wider than the difference, rerun before concluding.
-- Host A/B: `scripts/bench.sh host <rounds> <base commit> <package> [<criterion args>]` checks the base out under
-  `target/`, runs both trees' benches each round, the order alternating, and prints criterion's change estimate and
+- Host A/B: `scripts/bench.sh host <rounds> <base commit> <package> [<criterion args>]` checks the base out in a
+  temporary worktree, runs both trees' benches each round, the order alternating, and prints criterion's change estimate and
   confidence interval per row, then each row's median, min and max change over the rounds. One round's interval
   covers only that run's noise, not the drift between runs, so it is not a verdict: a row is slower when its median
-  change over 11 or more rounds lies above the A/A spread measured the same way (noise floor below). The base must
+  change over 11 or more rounds lies above the A/A spread measured the same way (the host noise floor in Baselines). The base must
   already have criterion benches.
 - New hot paths (each roadmap step that adds one) get a benchmark when they land, alongside their end-to-end test.
 - Per call, A/B: `scripts/bench.sh <test> <rounds> <new mog_os> [<base mog_os>]` boots each kernel `<rounds>` times

@@ -1,6 +1,6 @@
 use std::hint::black_box;
 
-use criterion::{BatchSize, BenchmarkGroup, Criterion, criterion_group, criterion_main};
+use criterion::{BenchmarkGroup, Criterion, criterion_group, criterion_main};
 use mm::{FrameAllocator, PhysAddr};
 
 #[path = "../../../benches/thread_time.rs"]
@@ -16,44 +16,37 @@ fn contiguous(
     name: &str,
     setup: impl Fn(&mut FrameAllocator<512>),
 ) {
+    let mut frames = FrameAllocator::<512>::new(RAM);
+    setup(&mut frames);
     g.bench_function(name, |b| {
-        b.iter_batched_ref(
-            || {
-                let mut frames = FrameAllocator::<512>::new(RAM);
-                setup(&mut frames);
-                frames
-            },
-            |frames| {
-                for _ in 0..FRAMES {
-                    let run = black_box(&mut *frames).alloc_contiguous(4).unwrap();
-                    for i in 0..4 {
-                        black_box(&mut *frames).free(PhysAddr(run.start.0 + i * 4096));
-                    }
+        b.iter(|| {
+            for _ in 0..FRAMES {
+                let run = black_box(&mut frames).alloc_contiguous(4).unwrap();
+                for i in 0..4 {
+                    black_box(&mut frames).free(PhysAddr(run.start.0 + i * 4096));
                 }
-            },
-            BatchSize::SmallInput,
-        )
+            }
+        })
     });
 }
 
 /// Allocates then frees `FRAMES` frames from a fresh 128 MiB allocator; then `alloc_contiguous(4)` + free on an
 /// empty bitmap, behind the kernel's reserved prefix (725 frames, as at boot), and behind 4096 frames where every
-/// fourth is used. Each iteration is `FRAMES` ops, so its time in us reads as ns per op.
+/// fourth is used. Each iteration is `FRAMES` ops, so its time in us reads as ns per op, and leaves the bitmap as it
+/// found it.
 fn frames(c: &mut Criterion<ThreadTime>) {
     let mut g = thread_time::group(c, "frames");
+    let mut frames = FrameAllocator::<512>::new(RAM);
+    let mut held = Vec::with_capacity(FRAMES);
     g.bench_function("alloc+free", |b| {
-        b.iter_batched_ref(
-            || (FrameAllocator::<512>::new(RAM), Vec::with_capacity(FRAMES)),
-            |(frames, held)| {
-                for _ in 0..FRAMES {
-                    held.push(black_box(&mut *frames).alloc().unwrap());
-                }
-                for &frame in held.iter() {
-                    black_box(&mut *frames).free(frame);
-                }
-            },
-            BatchSize::SmallInput,
-        )
+        b.iter(|| {
+            for _ in 0..FRAMES {
+                held.push(black_box(&mut frames).alloc().unwrap());
+            }
+            for frame in held.drain(..) {
+                black_box(&mut frames).free(frame);
+            }
+        })
     });
     contiguous(&mut g, "contiguous(4)+free, empty", |_| {});
     contiguous(&mut g, "contiguous(4)+free, 725 reserved", |f| {

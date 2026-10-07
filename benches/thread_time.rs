@@ -1,5 +1,5 @@
 //! Criterion setup shared by the host benches (`#[path]`-included): the benchmark thread's CPU time instead of wall
-//! time, so time the loaded host gives other processes is not counted, and flat sampling in short samples.
+//! time, so time the loaded host gives other processes is not counted, and flat sampling.
 
 use std::time::Duration;
 

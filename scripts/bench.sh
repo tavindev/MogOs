@@ -5,7 +5,7 @@
 # alternating, and prints the base, the new and the delta of each; `SLOWER` marks a call whose median and min both rose.
 # <test> may carry more bootargs; QEMU_ARGS adds QEMU arguments (a NIC: `-netdev user,id=n0 -device virtio-net-device,netdev=n0`).
 # Usage: scripts/bench.sh host <rounds> <base commit> <package> [<criterion args>]
-# Host criterion benches of <package>, the working tree against <base commit> (checked out under target/): each round
+# Host criterion benches of <package>, the working tree against <base commit> (a temporary worktree): each round
 # runs both, the order alternating, then prints criterion's change estimate and confidence interval for every row; the
 # end prints each row's median, min and max change over the rounds.
 set -eu
@@ -16,13 +16,15 @@ if [ "$1" = host ]; then
     [ $# -ge 4 ] || { sed -n '2,10s/^# //p' "$0"; exit 2; }
     rounds=$2 base=$3 package=$4
     shift 4
-    src="$root/target/bench-base-src" log="$root/target/bench-host.log" changes="$root/target/bench-host.changes"
+    # The base outside $root, so it does not also load $root's .cargo/config.toml.
+    tmp=$(mktemp -d)
+    src="$tmp/base" log="$tmp/log" changes="$tmp/changes"
     : >"$changes"
-    git -C "$root" worktree remove --force "$src" 2>/dev/null || true
+    git -C "$root" worktree prune
     git -C "$root" worktree add -q --detach "$src" "$base"
-    trap 'git -C "$root" worktree remove --force "$src"' EXIT
-    # One baseline directory for both trees, so the compare step sees both.
-    export CRITERION_HOME="$root/target/criterion"
+    trap 'git -C "$root" worktree remove --force "$src"; rm -rf "$tmp"' EXIT
+    # Fresh and shared by both trees: the compare step sees both and no row from an earlier run.
+    export CRITERION_HOME="$tmp/criterion"
     # bench <tree> <target dir> <criterion args>: output to $log, shown on failure; runs in <tree> for its config.
     bench() {
         tree=$1 dir=$2
@@ -44,10 +46,13 @@ if [ "$1" = host ]; then
         echo "round $i, load $(sysctl -n vm.loadavg | cut -d' ' -f2):"
         bench "$root" "$root/target" --load-baseline after --baseline before "$@"
         grep -vE '^(Benchmarking|Found|  [0-9])|^$' "$log"
-        # `<row> <tab> <change %>`; a long row name stands on its own line above `time:`.
+        # `<row> <tab> <change %>`; a long row name stands on its own line above `time:`, and with a throughput
+        # `change:` stands alone above its `time:` estimates.
         sed 's/−/-/g' "$log" | awk '/^[^ ]/ { name = $0; sub(/ *time:.*/, "", name) }
-            /change:/ { gsub(/[][%]/, ""); print name "\t" $3 }' >>"$changes"
+            /change:/ && NF == 1 { pending = 1; next }
+            /change:/ || (pending && /time:/) { gsub(/[][%]/, ""); print name "\t" $3; pending = 0 }' >>"$changes"
     done
+    [ -s "$changes" ] || { echo "bench.sh: no criterion rows in $package" >&2; exit 1; }
     awk -F'\t' '
     {
         if (!(($1) in count)) names[++names_len] = $1
