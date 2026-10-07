@@ -10,8 +10,8 @@ Ordered by dependency: each phase builds on the previous one.
 | 4 | Shell, async I/O, MogFS | [phase-4-io-storage.md](phases/phase-4-io-storage.md) | Milestone done (step 22); step 23 next |
 | 5 | SMP, threads, fair scheduling, resource groups; the locking model fixed first | [phase-5-smp-threads.md](phases/phase-5-smp-threads.md) | Next |
 | 6 | Virtual memory: demand paging under no-overcommit, page cache, file mmap, CoW fork in libc, kernel W^X/KASLR | not written | |
-| 7 | Storage that scales: MogFS v2 (extents, snapshots, scrub), async block path, multi-queue NVMe | not written | |
-| 8 | Networking: safe TCP/IP, sockets as handles, virtio-net | not written | |
+| 7 | Storage that scales: MogFS v2 (extents, snapshots, scrub), async block path, multi-queue NVMe | [phase-7-storage.md](phases/phase-7-storage.md) | |
+| 8 | Networking: safe TCP/IP, sockets as handles, virtio-net | [phase-8-networking.md](phases/phase-8-networking.md) | |
 | 9 | POSIX completeness and Linux binary compatibility; native ABI frozen | not written | |
 | 10 | Observability, debugging, security hardening | not written | |
 | 11 | Real hardware, boot, power | not written | |
