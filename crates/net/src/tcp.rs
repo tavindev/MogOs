@@ -4,16 +4,20 @@
 //! - A connection slot owns a receive and a send ring from the caller. Out-of-order data is written into the
 //!   receive ring at its offset and tracked as up to `OOO` ranges; each segment is acknowledged at once.
 //! - A passive open lives in the half-open table until the handshake completes, so a SYN flood never takes a slot.
-//!   A full table evicts its oldest entry: simpler than SYN cookies (no options to encode), and a real SYN keeps its
-//!   entry for a round trip unless a table's worth of SYNs arrives inside it.
+//!   A full table answers with SYN cookies (the ISS encodes the MSS and a keyed hash; no window scaling), accepted
+//!   only while the listener has sent cookies recently.
 //! - A connection entering TIME_WAIT leaves its slot for a compact entry; a full TIME_WAIT table reuses its oldest,
-//!   and a SYN above the entry's sequence number starts a new connection (RFC 9293 3.10.7.4 note).
+//!   and a SYN above the entry's sequence number starts a new connection whose ISS is 65537 plus 24 keyed bits above
+//!   the old one (RFC 9293 3.10.7.4 note, RFC 1122 4.2.2.13).
+//! - Each connection has one deadline, derived from its state (`deadline`) and cached at the end of every event that
+//!   can move it: retransmission, persist (given up after 10 unanswered probes), or FIN-WAIT-2's idle limit.
 //! - ISNs (RFC 6528) and ephemeral ports (RFC 6056, algorithm 3) come from SipHash-2-4 keyed by the caller.
 //! - RFC 5961: an inexact in-window RST, any SYN on a synchronized connection and an ACK outside the sent range get
 //!   a challenge ACK, at most `CHALLENGES` per second per connection. RFC 5927: an ICMP error must name a sequence
 //!   number in flight, and a hard error aborts only a connection still in SYN-SENT.
-//! - Segments about a connection go to the MAC it resolved by ARP (or, for a passive open, the SYN's source), never
-//!   to a received frame's source; only a RST for an unknown connection and a SYN-ACK answer the frame's source.
+//! - Segments about a connection go to the MAC it last resolved by ARP (until its first send, a passive open's SYN
+//!   source), never to a received frame's source; only a RST for an unknown connection and a SYN-ACK answer the
+//!   frame's source.
 //! - Congestion control is NewReno as plain code, with go-back-N after a timeout.
 use core::net::{Ipv4Addr, SocketAddrV4};
 

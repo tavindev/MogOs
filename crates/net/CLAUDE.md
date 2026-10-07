@@ -13,7 +13,8 @@ time_wait))` adds connection slots (`TcpSocket::new(rx, tx)`, the rings from the
 (`[HalfOpen::EMPTY; N]`), a TIME_WAIT table (`[TimeWait::EMPTY; N]`) and the 128-bit key for ISNs and ephemeral
 ports. Then `listen`, `accept`, `connect(now, local, to)` (local 0 is ephemeral), `send`, `recv` (`Ok(0)` is the end
 of the stream, `WouldBlock` is nothing yet), `shutdown` (half-close), `tcp_close` (release; a RST if data was left
-unread), `abort` and `tcp_info` (state, error, cwnd, ssthresh, send window, RTO). Segments go out from `poll`.
+unread), `abort` and `tcp_info` (state, error, cwnd, ssthresh, send window, RTO, the deadline the next `poll` acts
+on, bytes queued). Segments go out from `poll`.
 
 The `Nic` trait: `mac`, `mtu`, `transmit(len, |buf| ..)` (the stack writes the frame into the driver's buffer) and
 `receive(|frame| ..)`.
@@ -33,8 +34,14 @@ kernel, step 50), DHCP, DNS or IPv6 (phase 9), or IPv4 fragment reassembly.
 
 - TCP: RFC 9293 with MSS and window scaling, RFC 6298 RTO (initial 1 s, floor 200 ms, max 60 s; SYN given up
   after 6 retransmissions, data after 10, a SYN-ACK after 5), NewReno (RFC 5681, RFC 6582) with byte counting
-  (RFC 3465) and go-back-N after a timeout, a persist timer that probes a zero window forever, a FIN-WAIT-2 timeout
-  (60 s once released) and a 60 s TIME_WAIT. Out-of-order data is kept in the receive ring (4 ranges).
+  (RFC 3465) and go-back-N after a timeout, a persist timer that probes a zero window as long as the peer answers
+  and gives up (`TimedOut`) after 10 unanswered probes, FIN-WAIT-2 ended 60 s after the peer's last segment (open
+  or released), and a 60 s TIME_WAIT restarted only by the retransmitted FIN. Sender silly-window avoidance applies
+  to new data only, receiver avoidance (RFC 9293 3.8.6.2.2) moves the window's edge by min(MSS, ring / 2) or not at
+  all, and out-of-window segments get at most one ACK per 500 ms per connection. Out-of-order data is kept in the
+  receive ring (4 ranges). No timestamps: RFC 7323 timestamps with PAWS were built and measured, and cost 3-5% of
+  loss-free goodput and 7% of connect + close beyond noise, so the ISS rule below is the only wrapped-sequence
+  protection.
 
 ## Boundaries (hard)
 
@@ -54,18 +61,29 @@ kernel, step 50), DHCP, DNS or IPv6 (phase 9), or IPv4 fragment reassembly.
   takes is counted in `tcp`.
 - TCP verifies the checksum over the whole segment before reading a field or writing a byte, so a corrupt
   retransmission can never overwrite out-of-order data already kept.
-- TCP's attack surface, each with a test: a SYN flood fills only the half-open table, which evicts its oldest entry
-  (`syn_evicted`) and answers to the frame's source, so it never touches the ARP cache or a slot; RFC 5961 challenge
+- Timers: one deadline per connection, derived from its state by `deadline()` from a single start time and cached at
+  the end of every event that can move it (a segment in, a timer firing, an output attempt, which every caller
+  action leads to). No purpose arms or cancels another's. The tests check after every poll that a connection with
+  work outstanding (anything but idle in ESTABLISHED or CLOSE-WAIT) has a deadline, and that a silent peer always
+  ends in CLOSED.
+- TCP's attack surface, each with a test: a SYN flood fills only the half-open table and answers to the frame's
+  source, so it never touches the ARP cache or a slot; a full table answers with SYN cookies (user-approved,
+  replacing oldest-first eviction; `syn_cookies`): the ISS holds one clock bit (16 s periods, this one or the last),
+  a 2-bit MSS index and 29 bits of SipHash over the connection and the peer's ISN, and a cookie ACK is accepted only
+  while the listener has sent cookies in the last two periods, never with SYN set, and failures are counted
+  (`bad_cookies`) and reset; a cookie connection runs without window scaling; RFC 5961 challenge
   ACKs (inexact in-window RST, any SYN, an ACK outside `snd_una - max window ..= snd_max`) at most 10 per second per
   connection (`challenge_acks`), never one global limit (CVE-2016-5696); an ACK above `snd_max` drops the whole
   segment; cwnd grows by bytes acknowledged, so ACK division gains nothing; an ICMP error must quote a sequence
   number in `snd_una..snd_max`, and a hard error aborts only a SYN-SENT connection (RFC 5927); a RST never ends
   TIME_WAIT (RFC 1337); a full TIME_WAIT table reuses its oldest entry (`time_wait_reused`), and a SYN above an
-  entry's sequence starts a new connection.
+  entry's sequence starts a new connection whose ISS is the old `snd_nxt` plus 65537 plus 24 keyed bits, above
+  anything the old connection sent and unpredictable; a window update needs `snd_una <= ack`.
 - ISNs are SipHash-2-4 of the connection under the caller's key plus a 4 us clock (RFC 6528); ephemeral ports are
   RFC 6056 algorithm 3 under the same key. The kernel's key comes from the DT seed (step 49).
-- Segments about a connection go to the MAC it resolved (a passive open: the SYN's source), never to a received
-  frame's source; a pure ACK carries `snd_max`, so a go-back-N `snd_nxt` never starts an ACK war.
+- Segments about a connection go to the MAC from its last ARP resolution (each send resolves the next hop; until
+  the first, a passive open's SYN source), never to a received frame's source; a pure ACK carries `snd_max`, so a
+  go-back-N `snd_nxt` never starts an ACK war. Demux tries the last matched slot first.
 - Congestion control is NewReno as plain code; a trait comes with a second controller.
 - IPv4 fragments (MF set or an offset) are dropped and counted: no reassembly memory to exhaust.
 - ARP learns only from a reply to an entry we asked about (first reply wins); a request aimed at our IP is answered
@@ -103,16 +121,24 @@ kernel, step 50), DHCP, DNS or IPv6 (phase 9), or IPv4 fragment reassembly.
 - TCP (`tests/tcp.rs`): A and B send 1 MiB each way at once and close, for 200 seeds at 0%, 1% and 5% loss (with 2%
   reordering, 1% duplication, 0.5% corruption, 1 ms delay), and 64 MiB each way for 3 seeds at each rate, every byte
   and both ends of stream checked; A's ISN starts half the transfer below 2^32 (the test picks the start time from a
-  dry run's ISN), so sequence numbers wrap. `sixty_four_mib_soak` (`--ignored`, about two minutes) runs 64 MiB for
+  dry run's ISN), so A's send and B's receive sequence numbers wrap; every step checks the liveness rule. `sixty_four_mib_soak` (`--ignored`, about 43 s) runs 64 MiB for
   200 seeds at each rate. A scripted peer on a `Tap` drives the attack tests (SYN flood, RFC 5961, ACK above
   `snd_max` and ACK division, RFC 5927), every timeout (SYN, data, SYN-ACK, FIN-WAIT-2, TIME_WAIT), and the link
   drives half-close, abort and refusal, simultaneous open, a reader stalled for 10 RTOs, 21 sequential connections
-  through one slot and four TIME_WAIT entries, and full tables. The mutation test replays 100k mutated copies of a
-  recorded TCP exchange into the same connection (same keys and times, so the same ISNs). `src/tcp.rs` unit-tests
+  through one slot and four TIME_WAIT entries, and full tables. Review regressions each have a test: a window update
+  in FIN-WAIT-2, silent zero-window probes, a timeout into a window below one MSS, a pure ACK during go-back-N, the
+  TIME_WAIT takeover's ISS (an old duplicate is rejected; the ISS is keyed), out-of-window ACK limiting, a silent
+  peer cut at a random point for 40 seeds, receiver silly-window avoidance, a SYN-ACK's window, simultaneous-open
+  scaling, an ACK below `snd_una`. SYN cookies: a flood inside the client's round trip keeps the real handshake,
+  forged, wrong-ISN and expired cookies are rejected and counted, a replayed ACK reaches the open connection, a
+  listener that sent no cookie accepts none, and a SYN-ACK is never a cookie's ACK. The mutation test replays 100k
+  mutated copies of a recorded TCP exchange into the same connection (same keys and times, so the same ISNs) and
+  checks the liveness rule after every frame. `src/tcp.rs` unit-tests
   SipHash against `std`'s and out-of-order reassembly across the wrap.
 - Interop (`tests/interop.rs`): our TCP against smoltcp 0.12's (pinned in `Cargo.lock`, a dev-dependency only) over
   the simulated link, each side opening in turn, 256 KiB each way for 20 seeds at 0%, 1% and 5% loss. smoltcp 0.12
-  drops its retransmission timer on entering CLOSING, so the test has it close only after its data is acknowledged.
+  drops its retransmission timer when a FIN moves it to CLOSING or CLOSE-WAIT, so the test sends it a FIN only after
+  its data has all arrived, and has it close only after ours has.
 - Benchmark: `cargo bench-host` runs `benches/net.rs` (includes `tests/sim/mod.rs`): UDP over the link and its
   receive path; TCP goodput on the loss-free link (64 KiB and 1 MiB windows), the per-segment receive path, connect
   plus close, and simulated goodput at 1% and 5% loss with 10 and 50 ms RTT (step 48's baseline). Rows in

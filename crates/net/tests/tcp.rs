@@ -270,7 +270,7 @@ fn sixty_four_mib_each_way_arrives_intact_at_0_1_and_5_percent_loss() {
 }
 
 #[test]
-#[ignore = "soak: 64 MiB each way for 200 seeds at each loss rate, about two minutes"]
+#[ignore = "soak: 64 MiB each way for 200 seeds at each loss rate, about 43 s"]
 fn sixty_four_mib_soak() {
     for loss in [0, 10, 50] {
         for seed in 0..200 {
