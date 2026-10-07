@@ -25,8 +25,8 @@ SECTIONS
     . = ALIGN(16);
     . += 0x10000;
     __stack_top = .;
-    /* 16 KiB stacks for cores 1 to MAX_CPUS - 1 (3): core n's ends at __stack_top + n * 0x4000. */
-    . += 3 * 0x4000;
+    /* 16 KiB stacks for cores 1 to MAX_CPUS - 1 (3), core n's ending at __stack_top + n * 0x4000, then core 0's idle stack. */
+    . += 4 * 0x4000;
     __kernel_end = .;
 
     /DISCARD/ : { *(.comment) *(.note*) *(.eh_frame*) }

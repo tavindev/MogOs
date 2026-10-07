@@ -70,7 +70,12 @@ touches memory through raw addresses: the board reads user buffers, copies pages
   the caller first takes and releases the process's own handles (`take_handles`), so its handle to itself does not
   keep it. `reap` hands out the budget limit once (later calls get 0); the last `close` / `close_thread` of a zombie
   frees its index or slot like `reap` / `join` (`src/sched.rs`).
-- `advance` runs the highest effective priority, round robin within a level, boot context when none is ready.
+- One run queue for every core (`start_cores` sizes the per-core state at boot from `Board::cpus`); every call about
+  "the current task" takes the core. `advance(cpu)` runs the highest effective priority no other core runs (a bit per
+  running slot), round robin within a level; slot 0 (the boot context) only on core 0; with none, core 0 the boot
+  context once no core runs a task, any other case the core's idle context (process 0, its frame saved by `switch`).
+  `wake` and `add` count the tasks made ready (`take_woken`) and `claim_idle` hands out an idle core to signal, once
+  per idle period. A thread another core runs is never ended in place: the board `mark`s it and its core ends it.
   Priority inheritance is one level only (`unboost` doc). The board calls `unboost(slot, ..)` when an owner loses a
   waiter (an unlock that woke one, or the end of a thread blocked on `Lock`); after such an unlock it switches at once if
   `outranked()` (any ready task beats the caller).

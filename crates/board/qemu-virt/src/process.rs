@@ -79,14 +79,15 @@ fn map_filled(
     Some(page)
 }
 
-/// Maps `pages` zeroed read-write pages at the current process's next map address, charged to its budget; returns
+/// Maps `pages` zeroed read-write pages at `cpu`'s current process's next map address, charged to its budget; returns
 /// their address, or `None` with nothing mapped if the budget or the frames run out.
 pub(crate) fn map(
     sched: &mut Sched,
+    cpu: usize,
     frames: &mut FrameAllocator<FRAME_WORDS>,
     pages: usize,
 ) -> Option<u64> {
-    let asid = sched.process();
+    let asid = sched.process(cpu);
     let l1 = sched.space(asid);
     let memory = sched.memory(asid);
     if pages > memory.budget.remaining() {
@@ -219,15 +220,17 @@ pub(crate) fn spawn_init(
             Budget::new(budget),
             init,
             (args, argc),
-        )
+        )?;
+        crate::kick(sched, arch::cpu());
+        Ok(())
     })
 }
 
 /// Spawns the boot archive's executable at `file` with the `len` handles at user address `ptr` and `budget` frames
-/// moved from the current process, which gets a handle to the child, at `priority` capped at the current process's
-/// own, with the arguments at user address `args`, both copied in through `buf`; on failure nothing moves.
+/// moved from `cpu`'s current process, which gets a handle to the child, at `priority` capped at that process's own,
+/// with the arguments at user address `args`, both copied in through `buf`; on failure nothing moves.
 pub(crate) fn spawn(
-    sched: &mut Sched,
+    (sched, cpu): (&mut Sched, usize),
     frames: &mut FrameAllocator<FRAME_WORDS>,
     buf: &mut [u8],
     file: Range<usize>,
@@ -244,15 +247,15 @@ pub(crate) fn spawn(
     for (handle, bytes) in list.iter_mut().zip(bytes.as_chunks::<8>().0) {
         *handle = u64::from_le_bytes(*bytes);
     }
-    let (mut parent, child) = sched.handles().split(&list[..len])?;
-    let current = sched.process();
+    let (mut parent, child) = sched.handles(cpu).split(&list[..len])?;
+    let current = sched.process(cpu);
     if budget > sched.memory(current).budget.remaining() {
         return Err(ENOMEM);
     }
     let (process, slot) = sched.free_process().zip(sched.free_slot()).ok_or(EAGAIN)?;
     let (index, generation) = process;
     let handle = parent.insert(Object::Process { index, generation }, WAIT | KILL)?;
-    let priority = priority.min(sched.priority());
+    let priority = priority.min(sched.priority(cpu));
     let child = (process, slot, child, priority);
     spawn_process(
         sched,
@@ -263,35 +266,40 @@ pub(crate) fn spawn(
         (args, argc),
     )?;
     sched.memory(current).budget.shrink(budget);
-    *sched.handles() = parent;
+    *sched.handles(cpu) = parent;
     Ok(handle)
 }
 
-/// Starts a thread of the current process at user address `entry` with SP_EL0 = `sp`, TPIDR_EL0 = `tls` and x0 =
+/// Starts a thread of `cpu`'s current process at user address `entry` with SP_EL0 = `sp`, TPIDR_EL0 = `tls` and x0 =
 /// `arg`, at the caller's priority, its kernel stack charged to the process's budget; returns a handle to it (wait,
-/// kill, duplicate, transfer). On failure nothing changes.
+/// kill, duplicate, transfer). On failure nothing changes. A caller marked to end gets `EAGAIN`, so a process being
+/// ended gains no thread.
 pub(crate) fn thread(
     sched: &mut Sched,
+    cpu: usize,
     frames: &mut FrameAllocator<FRAME_WORDS>,
     entry: u64,
     (sp, tls): (u64, u64),
     arg: u64,
 ) -> Result<u64, i64> {
+    if sched.marked(cpu).is_some() {
+        return Err(EAGAIN);
+    }
     let (slot, generation) = sched.free_slot().ok_or(EAGAIN)?;
-    let mut handles = *sched.handles();
+    let mut handles = *sched.handles(cpu);
     let thread = Object::Thread { slot, generation };
     let handle = handles.insert(thread, WAIT | KILL | DUPLICATE | TRANSFER)?;
-    let index = sched.process();
+    let index = sched.process(cpu);
     let budget = &mut sched.memory(index).budget;
     let stack = budget
         .alloc_contiguous(frames, TASK_STACK_FRAMES)
         .ok_or(ENOMEM)?;
     // SAFETY: the kernel stack below `stack.end` is fresh and owned by the new thread.
     let frame = unsafe { arch::new_user_task(stack.end.0 as usize, entry, (sp, tls), [arg, 0, 0]) };
-    let priority = sched.priority();
+    let priority = sched.priority(cpu);
     sched.add((slot, generation), index, (frame, stack.start), priority);
     sched.held(thread);
-    *sched.handles() = handles;
+    *sched.handles(cpu) = handles;
     Ok(handle)
 }
 

@@ -32,7 +32,7 @@ Every new `.md` file must be linked from its parent so it stays reachable from t
 ## Target
 
 - Architecture: AArch64 (matches the Apple Silicon host).
-- Machine: QEMU `virt`, `cortex-a72`, 1 core, 128 MiB RAM.
+- Machine: QEMU `virt`, `cortex-a72`, 4 cores, 128 MiB RAM.
 - Toolchain: stable Rust, target `aarch64-unknown-none-softfloat` (pinned in `rust-toolchain.toml`, links with bundled `rust-lld`).
 
 ## Commands

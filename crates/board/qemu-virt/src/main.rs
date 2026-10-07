@@ -67,10 +67,10 @@ const TIMER_IRQ: u32 = 27;
 const UART_IRQ: u32 = 33;
 const TICK_US: u64 = 10_000;
 
-/// The SGI that will wake a core to reschedule (step 25b); enabled on every core.
+/// The SGI that wakes an idle core to reschedule, or a core to end its marked thread; enabled on every core.
 const RESCHEDULE_SGI: u32 = 0;
 const PSCI_CPU_ON: u64 = 0xc400_0003;
-/// Each secondary core's stack, reserved in `linker.ld` above `__stack_top`.
+/// Each secondary core's stack, and core 0's idle context's, reserved in `linker.ld` above `__stack_top`.
 const SECONDARY_STACK: u64 = 0x4000;
 
 /// GIC distributor and CPU interface bases, set before the first IRQ can be delivered and before any secondary starts.
@@ -78,6 +78,8 @@ static GIC_DIST: AtomicU64 = AtomicU64::new(0);
 static GIC_CPU: AtomicU64 = AtomicU64::new(0);
 /// Bit `n` is set once core `n` has taken a timer tick.
 static TICKED: AtomicUsize = AtomicUsize::new(0);
+/// `Board::start_timer` was called: a core that runs a task ticks.
+static TICKS: AtomicBool = AtomicBool::new(false);
 /// `test=smp`: secondaries announce themselves and run their timer; otherwise they sleep until 25b gives them work.
 static SMP_TEST: AtomicBool = AtomicBool::new(false);
 /// The DTB's cores, at most `MAX_CPUS`; `start_cpus` starts them all or panics.
@@ -229,6 +231,7 @@ impl kernel::Board for QemuVirt {
     }
 
     fn start_timer(&mut self) {
+        TICKS.store(true, Relaxed);
         // SAFETY: the DTB's GICv2 distributor, in the device-mapped GiB 0.
         unsafe { arch::gic::unmask(self.gic.0, TIMER_IRQ) };
         arch::timer::arm(TICK_US);
@@ -254,6 +257,7 @@ impl kernel::Board for QemuVirt {
             // SAFETY: `start` is 16-byte aligned and the stack below it is fresh and owned by the new task.
             let frame = unsafe { arch::new_task(start, task_start, start) };
             sched.add(slot, 0, (frame, stack.start), 0);
+            kick(sched, arch::cpu());
             Ok(())
         })
     }
@@ -263,12 +267,17 @@ impl kernel::Board for QemuVirt {
     }
 
     fn run_others(&mut self) {
-        KERNEL.lock().sched.block(Event::Idle);
+        KERNEL.lock().sched.block(arch::cpu(), Event::Idle);
         arch::yield_now()
     }
 
     fn init_frames(&mut self, frames: FrameAllocator<FRAME_WORDS>) {
-        KERNEL.lock().frames = frames;
+        let top = &raw const __stack_top as usize + arch::MAX_CPUS * SECONDARY_STACK as usize;
+        // SAFETY: core 0's idle stack, reserved in `linker.ld` above the secondaries' and used by nothing else.
+        let idle = unsafe { arch::new_task(top, idle, 0) };
+        let mut kernel = KERNEL.lock();
+        kernel.frames = frames;
+        kernel.sched.start_cores(CPUS.load(Relaxed), idle);
     }
 
     fn free_frames(&self) -> usize {
@@ -371,6 +380,10 @@ impl kernel::Board for QemuVirt {
         CPUS.load(Relaxed)
     }
 
+    fn cpu(&self) -> usize {
+        arch::cpu()
+    }
+
     fn ticked_cpus(&self) -> usize {
         TICKED.load(Relaxed).count_ones() as usize
     }
@@ -450,10 +463,11 @@ fn start_cpu(cpu: usize) {
 }
 
 /// A secondary core's first Rust code, from `arch::secondary_entry`: MMU on, on its own stack, IRQs masked. It turns on
-/// its GIC CPU interface, timer PPI and reschedule SGI, and sleeps; it runs no task yet.
+/// its GIC CPU interface, timer PPI and reschedule SGI, and becomes its idle context.
 #[unsafe(no_mangle)]
 extern "C" fn kmain_secondary() -> ! {
     arch::install_vectors();
+    arch::timer::allow_user_counter();
     if arch::cpu() == 1 {
         (2..CPUS.load(Relaxed)).for_each(start_cpu);
     }
@@ -468,8 +482,30 @@ extern "C" fn kmain_secondary() -> ! {
         let _ = writeln!(Console, "cpu {}: online", arch::cpu());
         arch::timer::arm(TICK_US);
     }
+    idle(0)
+}
+
+/// A core's idle context: sleeps until an IRQ, whose handler switches to a ready task, if any.
+extern "C" fn idle(_: usize) -> ! {
     loop {
         arch::irq::wait();
+    }
+}
+
+/// Sends `cpu` the reschedule SGI.
+fn send_sgi(cpu: usize) {
+    // SAFETY: the DTB's GICv2 distributor, stored before any IRQ or secondary core, in device-mapped GiB 0; `cpu` is
+    // below `MAX_CPUS`.
+    unsafe { arch::gic::send_sgi(PhysAddr(GIC_DIST.load(Relaxed)), cpu, RESCHEDULE_SGI) };
+}
+
+/// Signals an idle core for each task made ready since the last call, while one is left to signal.
+fn kick(sched: &mut Sched, cpu: usize) {
+    for _ in 0..sched.take_woken() {
+        let Some(core) = sched.claim_idle(cpu) else {
+            return;
+        };
+        send_sgi(core);
     }
 }
 

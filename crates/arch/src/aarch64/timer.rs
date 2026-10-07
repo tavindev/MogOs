@@ -17,6 +17,18 @@ pub fn arm(us: u64) {
     };
 }
 
+/// Turns the EL1 virtual timer off, so its interrupt stops asserting.
+pub fn stop() {
+    // SAFETY: disabling the virtual timer only affects its own interrupt; `isb` completes it before a following EOI.
+    unsafe {
+        asm!(
+            "msr cntv_ctl_el0, xzr",
+            "isb",
+            options(nostack, preserves_flags)
+        )
+    };
+}
+
 /// Lets EL0 read the virtual counter (`CNTVCT_EL0`) and `CNTFRQ_EL0`; every other timer register stays EL1-only.
 pub fn allow_user_counter() {
     // SAFETY: CNTKCTL_EL1.EL0VCTEN only grants EL0 read access to the virtual counter.

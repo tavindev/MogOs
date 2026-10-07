@@ -42,6 +42,10 @@ fn boot_with_input(extra: &[&str], input: Option<(&str, &[&[u8]])>) -> (ExitStat
             "-kernel",
         ])
         .arg(root.join("target/aarch64-unknown-none-softfloat/debug/mog_os"))
+        .args(match extra.contains(&"-smp") {
+            true => &[][..],
+            false => &["-smp", "4"],
+        })
         .args(extra)
         .stdin(match input {
             Some(_) => Stdio::piped(),
@@ -175,7 +179,7 @@ fn unmapped_access_reports_data_abort() {
 
 #[test]
 fn tasks_alternate_on_yield() {
-    let (status, lines) = boot(&["-append", "test=yield"]);
+    let (status, lines) = boot(&["-smp", "1", "-append", "test=yield"]);
     let tasks: Vec<_> = lines.iter().filter(|l| l.starts_with("task ")).collect();
     assert_eq!(
         tasks,
@@ -197,7 +201,7 @@ fn tasks_alternate_on_yield() {
 
 #[test]
 fn timer_preempts_spinning_task() {
-    let (status, lines) = boot(&["-append", "test=preempt"]);
+    let (status, lines) = boot(&["-smp", "1", "-append", "test=preempt"]);
     let tasks: Vec<_> = lines.iter().filter(|l| l.starts_with("task ")).collect();
     assert_eq!(tasks, ["task b: 0", "task b: 1", "task b: 2"]);
     assert!(
@@ -259,7 +263,7 @@ fn handles_enforce_rights_and_generations() {
 
 #[test]
 fn syscall_bench_reports_round_trip() {
-    let (status, lines) = boot(&["-append", "test=bench-syscall"]);
+    let (status, lines) = boot(&["-smp", "1", "-append", "test=bench-syscall"]);
     assert!(
         !lines.iter().any(|l| l.starts_with("panic:")),
         "kernel panicked"
@@ -300,6 +304,16 @@ fn assert_no_leak(lines: &[String], test: &str) {
     assert_eq!(after, format!("{before} after"), "frames leaked");
 }
 
+/// Asserts that the lines starting with each of `prefixes` are, in order, the `expected` lines with that prefix: each
+/// process's own order, whichever cores they ran on.
+fn assert_each_in_order(lines: &[String], prefixes: &[&str], expected: &[&str]) {
+    for prefix in prefixes {
+        let got: Vec<_> = lines.iter().filter(|l| l.starts_with(prefix)).collect();
+        let want: Vec<_> = expected.iter().filter(|l| l.starts_with(prefix)).collect();
+        assert_eq!(got, want, "lines starting with {prefix:?}");
+    }
+}
+
 #[test]
 fn spawn_moves_handles_and_budget_to_the_child() {
     let (status, lines) = boot(&["-append", "test=spawn"]);
@@ -307,14 +321,10 @@ fn spawn_moves_handles_and_budget_to_the_child() {
         !lines.iter().any(|l| l.starts_with("panic:")),
         "kernel panicked"
     );
-    let s: Vec<_> = lines
-        .iter()
-        .filter(|l| l.starts_with("S: ") || l.starts_with("C: "))
-        .collect();
-    // The parent never yields and the timer is off, so all its lines precede the child's.
-    assert_eq!(
-        s,
-        [
+    assert_each_in_order(
+        &lines,
+        &["S: ", "C: "],
+        &[
             "S: open missing: ENOENT",
             "S: empty write: 0",
             "S: spawn non-ELF: ENOEXEC",
@@ -332,7 +342,7 @@ fn spawn_moves_handles_and_budget_to_the_child() {
             "C: statics work",
             "C: handle 1 not given: EBADF",
             "C: 32 args of 4096 bytes: child, a b",
-        ]
+        ],
     );
     // The one-frame-short spawn fails after mapping everything but the kernel stack, so this checks its rollback.
     assert_no_leak(&lines, "spawn");
@@ -341,7 +351,8 @@ fn spawn_moves_handles_and_budget_to_the_child() {
 
 #[test]
 fn parent_blocks_on_an_empty_pipe_until_the_child_writes() {
-    let (status, lines) = boot(&["-append", "test=pipe"]);
+    // An ordering scenario: on several cores the writer may run before the reader blocks.
+    let (status, lines) = boot(&["-smp", "1", "-append", "test=pipe"]);
     assert!(
         !lines.iter().any(|l| l.starts_with("panic:")),
         "kernel panicked"
@@ -382,15 +393,12 @@ fn an_exited_child_keeps_its_slot_until_waited_for() {
         !lines.iter().any(|l| l.starts_with("panic:")),
         "kernel panicked"
     );
-    let pc: Vec<_> = lines
-        .iter()
-        .filter(|l| l.starts_with("P: ") || l.starts_with("C: "))
-        .collect();
     // A exits (waking the parent blocked on a pipe whose only write end A held) before B is spawned, so B would
-    // take A's slot if exit freed it. B runs only once the parent's `wait` on it blocks.
-    assert_eq!(
-        pc,
-        [
+    // take A's slot if exit freed it.
+    assert_each_in_order(
+        &lines,
+        &["P: ", "C: "],
+        &[
             "P: spawned A",
             "P: EOF once A exits",
             "P: spawned B",
@@ -402,7 +410,7 @@ fn an_exited_child_keeps_its_slot_until_waited_for() {
             "P: both budgets returned",
             "P: third child exited",
             "P: close returned its budget",
-        ]
+        ],
     );
     assert_no_leak(&lines, "wait");
     assert!(status.success(), "QEMU exited with {status}");
@@ -410,7 +418,7 @@ fn an_exited_child_keeps_its_slot_until_waited_for() {
 
 #[test]
 fn priority_inheritance_lets_the_mutex_owner_outrun_a_middle_priority_spinner() {
-    let (status, lines) = boot(&["-append", "test=pi"]);
+    let (status, lines) = boot(&["-smp", "1", "-append", "test=pi"]);
     assert!(
         !lines.iter().any(|l| l.starts_with("panic:")),
         "kernel panicked"
@@ -446,8 +454,34 @@ fn priority_inheritance_lets_the_mutex_owner_outrun_a_middle_priority_spinner() 
 }
 
 #[test]
+fn a_mutex_waiter_on_another_core_gets_it_at_unlock_and_every_frame_returns() {
+    let (status, lines) = boot(&["-append", "test=pi"]);
+    assert!(
+        !lines.iter().any(|l| l.starts_with("panic:")),
+        "kernel panicked"
+    );
+    // On four cores Mid spins beside the others, so only each process's own order is fixed.
+    for expected in [
+        "L: locked",
+        "H: locking",
+        "H: acquired",
+        "L: relocked",
+        "P: high exited",
+        "P: mid killed",
+        "P: low exited",
+    ] {
+        assert!(
+            lines.iter().any(|l| l == expected),
+            "missing line: {expected}"
+        );
+    }
+    assert_no_leak(&lines, "pi");
+    assert!(status.success(), "QEMU exited with {status}");
+}
+
+#[test]
 fn pipe_bench_reports_round_trip() {
-    let (status, lines) = boot(&["-append", "test=bench-pipe"]);
+    let (status, lines) = boot(&["-smp", "1", "-append", "test=bench-pipe"]);
     assert!(
         !lines.iter().any(|l| l.starts_with("panic:")),
         "kernel panicked"
@@ -472,7 +506,7 @@ fn lock_bench_reports_round_trips_and_an_exact_count() {
         !lines.iter().any(|l| l.starts_with("panic:")),
         "kernel panicked"
     );
-    for lock in ["ticket", "test-and-set"] {
+    for lock in ["ticket", "test-and-set", "contended"] {
         lines
             .iter()
             .find_map(|l| {
@@ -489,10 +523,11 @@ fn lock_bench_reports_round_trips_and_an_exact_count() {
         .expect("missing adder line")
         .parse::<u64>()
         .unwrap();
-    assert!(first > 10_000_000, "the timer never interleaved the adders");
+    // Four adders, one per core, each adding 10^6.
+    assert!(first > 1_000_000, "the adders never interleaved");
     assert!(
-        lines.iter().any(|l| l == "lock: count 20000000"),
-        "the two adders' count is not exact"
+        lines.iter().any(|l| l == "lock: count 4000000"),
+        "the four adders' count is not exact"
     );
     assert!(status.success(), "QEMU exited with {status}");
 }
@@ -503,12 +538,7 @@ fn console_reads_edited_lines_typed_ahead() {
 }
 
 #[test]
-fn console_input_reaches_core_0_on_four_cores() {
-    console_echo(&["-smp", "4"]);
-}
-
-#[test]
-fn every_core_comes_online_and_takes_a_timer_tick() {
+fn every_core_comes_online_runs_a_task_and_takes_a_timer_tick() {
     let (status, lines) = boot(&["-smp", "4", "-append", "test=smp"]);
     assert!(
         !lines.iter().any(|l| l.starts_with("panic:")),
@@ -518,6 +548,21 @@ fn every_core_comes_online_and_takes_a_timer_tick() {
         let online = format!("cpu {cpu}: online");
         assert!(lines.contains(&online), "missing line: {online}");
     }
+    // `threads`' victim spins on one core while its other thread blocks; the kill ends both from another core.
+    assert!(
+        lines
+            .iter()
+            .any(|l| l == "T: killed a process with a spinning and a blocked thread"),
+        "the victim was not killed"
+    );
+    assert_no_leak(&lines, "smp");
+    // Each spinner waits until all four have started, so they ran at once, on four cores.
+    let mut cpus: Vec<_> = lines
+        .iter()
+        .filter_map(|l| l.strip_prefix("smp: spinner on cpu "))
+        .collect();
+    cpus.sort();
+    assert_eq!(cpus, ["0", "1", "2", "3"]);
     assert!(
         lines.iter().any(|l| l == "smp: 4 cpus ticked"),
         "missing line: smp: 4 cpus ticked"
@@ -563,7 +608,14 @@ fn disk_image(test: &str, blocks: u64) -> PathBuf {
 /// Boots with `image` attached as a virtio-blk device and `test` as the boot argument.
 fn boot_with_disk(image: &Path, test: &str) -> (ExitStatus, Vec<String>) {
     let drive = format!("file={},if=none,format=raw,id=d0", image.display());
+    // The benchmarks stay on one core.
+    let smp = match test {
+        "test=bench-disk" | "test=bench-fs" => "1",
+        _ => "4",
+    };
     boot(&[
+        "-smp",
+        smp,
         "-drive",
         &drive,
         "-device",

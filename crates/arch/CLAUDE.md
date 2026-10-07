@@ -18,8 +18,8 @@ It is **NOT** board-specific: no MMIO addresses, no memory map, no drivers, no s
   `secondary_entry` (PSCI `CPU_ON`'s entry: `aarch64_mmu_on` on the same table, the stack top from the context id),
   `map_page`, `unmap_page`, `free_space`, `set_ttbr0`, `flush_asid` (`tlbi aside1is`), `user_readable` /
   `user_writable` (`at` probes), `clean_dcache` / `invalidate_icache` (`ic ialluis`; clean each code page, invalidate once).
-- `irq::disable` / `restore` / `wait`, `gic::enable` / `enable_cpu` / `route` / `unmask` / `ack` / `eoi`, `timer::arm`,
-  `timer::allow_user_counter`.
+- `irq::disable` / `restore` / `wait`, `gic::enable` / `enable_cpu` / `route` / `unmask` / `send_sgi` / `ack` / `eoi`,
+  `timer::arm` / `stop`, `timer::allow_user_counter`.
 - `Lock<T>`, a ticket spinlock: `lock()` masks IRQs, then acquires, and its `Guard` releases, then restores DAIF;
   `lock_masked()` skips DAIF, for code entered masked; `Guard::leak` keeps it held until the `unsafe` `Lock::unlock`
   (how trap hooks return holding the board's kernel lock). `cpu()` (TPIDR_EL1: 0 from `_start`, MPIDR Aff0 from `aarch64_secondary`), `MAX_CPUS` (4),
@@ -74,7 +74,7 @@ It is **NOT** board-specific: no MMIO addresses, no memory map, no drivers, no s
 - End to end, `crates/e2e/tests/boot.rs`: `boots_and_powers_off` (vectors, MMU), `unmapped_access_reports_data_abort`,
   `tasks_alternate_on_yield`, `timer_preempts_spinning_task` (GIC, timer), `faulting_process_is_killed_and_others_keep_running`
   (EL0 faults, ASIDs), `syscall_bench_reports_round_trip`, `lock_bench_reports_round_trips_and_an_exact_count` (`Lock`),
-  `every_core_comes_online_and_takes_a_timer_tick` and `console_input_reaches_core_0_on_four_cores` (`-smp 4`).
+  `every_core_comes_online_runs_a_task_and_takes_a_timer_tick` and every scenario that boots `-smp 4`.
 - Hot paths by hand: `cargo run -- -append test=bench` (yield), `test=bench-syscall` and `test=bench-lock`
   (`docs/BENCHMARKS.md`).
 

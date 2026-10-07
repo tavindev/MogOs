@@ -171,8 +171,8 @@ const BENCHES: [(&str, u64, Bench); 27] = [
     }),
     ("enosys", 4096, |_, step| {
         if let Step::Timed(_) = step {
-            // SAFETY: there is no syscall 18, so the kernel touches no memory.
-            _ = unsafe { raw(18, [0; 7]) };
+            // SAFETY: there is no syscall 999, so the kernel touches no memory.
+            _ = unsafe { raw(999, [0; 7]) };
         }
     }),
 ];

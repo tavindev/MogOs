@@ -3,6 +3,7 @@ use mm::PhysAddr;
 const GICD_CTLR: u64 = 0x000;
 const GICD_ISENABLER: u64 = 0x100;
 const GICD_ITARGETSR: u64 = 0x800;
+const GICD_SGIR: u64 = 0xf00;
 const GICC_CTLR: u64 = 0x000;
 const GICC_PMR: u64 = 0x004;
 const GICC_IAR: u64 = 0x00c;
@@ -51,6 +52,18 @@ pub unsafe fn unmask(dist: PhysAddr, irq: u32) {
     let isenabler = dist.0 + GICD_ISENABLER + 4 * (irq / 32) as u64;
     // SAFETY: the caller guarantees `dist` is a GICv2 distributor.
     unsafe { (isenabler as *mut u32).write_volatile(1 << (irq % 32)) };
+}
+
+/// Sends SGI `sgi` (below 16) to the CPU interface numbered `cpu`, once the stores before it are visible to that core.
+///
+/// # Safety
+///
+/// `dist` must be a GICv2 distributor, mapped as Device memory, and `cpu` below 8.
+pub unsafe fn send_sgi(dist: PhysAddr, cpu: usize, sgi: u32) {
+    // SAFETY: a barrier only orders the stores before the SGI.
+    unsafe { core::arch::asm!("dsb ishst", options(nostack, preserves_flags)) };
+    // SAFETY: the caller guarantees `dist` is a GICv2 distributor.
+    unsafe { ((dist.0 + GICD_SGIR) as *mut u32).write_volatile(1 << (16 + cpu) | sgi) };
 }
 
 /// Acknowledges the highest-priority pending interrupt and returns its `GICC_IAR`: the ID in bits 0-9 (1023 if

@@ -18,8 +18,10 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
   `MAX_CPUS`), routes `UART_IRQ` to core 0 (`GICD_ITARGETSR`, else a GIC with several cores delivers it nowhere), builds
   `QemuVirt`, calls `kernel::run` with the image and DTB reserved. `Board::start_cpus`, the last step of boot, starts core 1
   with PSCI `CPU_ON` without waiting, and core 1 starts the rest (a refused `CPU_ON` panics). `kmain_secondary`: a started core enables its GIC CPU
-  interface, timer PPI and `RESCHEDULE_SGI` (its banked `ISENABLER0`) and idles in `wfi`; only under `test=smp`
-  (`SMP_TEST`) does it print `cpu <n>: online` and arm its timer. It runs no task yet (step 25b).
+  interface, timer PPI and `RESCHEDULE_SGI` (its banked `ISENABLER0`), lets EL0 read the counter, and becomes its idle
+  context (`idle`, `wfi` in a loop); only under `test=smp` (`SMP_TEST`) does it print `cpu <n>: online` and arm its
+  timer once. Core 0's idle context runs on its own 16 KiB stack above the secondaries' (`linker.ld`), its first frame
+  built by `init_frames`, which also gives the scheduler its cores (`Scheduler::start_cores`).
 - `KERNEL: Lock<Kernel>` (`Scheduler` with its process table, `FrameAllocator`, `Pipes`, `Mutexes`, console `Line`,
   the MogFS `Fs<FsDisk>` and whether it is mounted, and `buf`, the 8 KiB a syscall copies user inputs into), `HEAP` and
   `CONSOLE: Lock<Uart>` statics. `Fs::new` is const, so the 48 KiB file system is built in the static with an empty
@@ -29,7 +31,7 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
   that `dispatch` returns (user buffers, pages, frames, wake/block). `board_unlock`, called by the trap exit, releases `KERNEL`.
 - `Board::console` writes (`Console`) hold `CONSOLE` for a whole `write_fmt`, so no other `Console` line splits it (the unlocked writers below can); it is the PL011
   at `UART0`, like every other UART access. `test=bench-lock`'s `lock_round_trips` (ticket vs test-and-set) and `add_locked`;
-  `test=smp`'s `cpus` and `ticked_cpus` (`TICKED`, a bit per core set on each tick).
+  `test=smp`'s `cpus`, `cpu` and `ticked_cpus` (`TICKED`, a bit per core set on each tick).
 - Processes and threads: `spawn_process`, `spawn`, `thread`, `map` (`src/process.rs`); `end_thread`, `end_process`,
   `exit_thread`, `exit_process`, `kill`, `release`, and `switch`, which moves SP_EL0 and TPIDR_EL0 on every switch with
   a user thread on either side and writes TTBR0 only when the process changes (`src/trap.rs`).
@@ -71,9 +73,20 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
   methods take `lock()` guards and never hold one across a switch (`run_others` drops it before `yield_now`). Panic,
   fault, echo and user `write` output use `UART0` directly, never `CONSOLE`.
 - Locks need the MMU on (exclusives), so `kmain` calls `enable_mmu` first, before any output, trap or secondary core.
-- Only core 0 runs tasks: `board_irq` switches only there, since the scheduler has one `current`. Every core still
-  takes `KERNEL` in its trap hooks. IRQs dispatch on `iar & 0x3ff` and EOI the full IAR.
+- Every core runs tasks from the one run queue under `KERNEL`; each hook reads `arch::cpu()` once and passes it to the
+  scheduler. A core with no task runs its idle context (process 0, so `switch` loads the boot table); an idle core's
+  only trap is an IRQ, after which it always reschedules. Each task made ready (`add`, `wake`) signals one idle core
+  with `RESCHEDULE_SGI` (`kick`, at the end of each hook; once per idle period), never the calling core. A thread
+  end on another core signals core 0 when it idles or runs the boot context (`boot_waits`), whose `wait` loop counts
+  tasks. The tick only preempts a running task: it is rearmed only while the core runs a slot after `start_timer`
+  (`TICKS`), and stopped otherwise; an idle core starts it again when it picks a task. A thread another core runs is
+  never ended in place: `end_process` and `kill` mark it (`Scheduler::mark`) and signal its core, which ends it in
+  `board_irq`, or in `block` if it blocks first; a marked caller gets `EAGAIN` from `thread`, so its process gains
+  none. The last thread to end frees the address space (`exit_process`). IRQs dispatch on `iar & 0x3ff` and EOI the
+  full IAR.
 - Everything a secondary reads (`GIC_DIST`, `GIC_CPU`, `CPUS`, `SMP_TEST`) is stored before its `CPU_ON`, which `dsb ish` precedes.
+- Secondaries must set every per-core register core 0 sets (vectors, `CNTKCTL_EL1`): EL0 on a core without
+  `allow_user_counter` traps its counter reads.
 - A process's index is its ASID (`MAX_PROCESSES <= 256`, const-asserted); index 0 is the kernel, whose boot table
   keeps ASID 0 (`switch`). Tables: `MAX_TASKS` (8) threads, the boot context included, and `MAX_PROCESSES` (8)
   processes, the kernel included.

@@ -77,7 +77,7 @@ Speed is a primary goal, so performance is tested like behavior: measured, recor
 | `mutex` | 38.2 | 36.4 |
 | `lock`, uncontended | 36.9 | 33.1 |
 | `unlock`, no waiter | 37.9 | 35.9 |
-| unknown syscall 18, `ENOSYS` (`enosys`) | 32.9 | 30.0 |
+| unknown syscall 999 (18 until step 26 made it `thread`), `ENOSYS` (`enosys`) | 32.9 | 30.0 |
 
 ## Shell command baselines
 
