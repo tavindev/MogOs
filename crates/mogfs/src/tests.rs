@@ -76,6 +76,14 @@ fn next(state: &mut u64, below: u64) -> u64 {
     *state % below
 }
 
+/// A random entry of `dir`.
+fn pick(fs: &mut Fs<Guarded>, dir: Inode, rng: &mut u64) -> Option<(Vec<u8>, Inode)> {
+    let mut entries = vec![];
+    fs.readdir(dir, |n, i| entries.push((n.to_vec(), i)))
+        .unwrap();
+    (!entries.is_empty()).then(|| entries.swap_remove(next(rng, entries.len() as u64) as usize))
+}
+
 /// Random changes and commits: no write reaches a block either slot reaches, and after every commit the free space
 /// derived incrementally equals a fresh mount's.
 #[test]
@@ -88,7 +96,7 @@ fn incremental_free_space_matches_mount_and_never_writes_reachable() {
         let (mut files, mut dirs) = (vec![], vec![ROOT]);
         for step in 0..400 {
             let ctx = format!("seed {seed} step {step}");
-            let r = match next(rng, 10) {
+            let r = match next(rng, 12) {
                 0 | 1 => {
                     let d = dirs[next(rng, dirs.len() as u64) as usize];
                     fs.create(d, format!("f{step}").as_bytes())
@@ -119,6 +127,26 @@ fn incremental_free_space_matches_mount_and_never_writes_reachable() {
                     assert_eq!(m.free, fs.free, "{ctx}: free");
                     Ok(())
                 }
+                10 => {
+                    let d = dirs[next(rng, dirs.len() as u64) as usize];
+                    match pick(&mut fs, d, rng) {
+                        Some((name, i)) => fs.unlink(d, &name).map(|()| {
+                            files.retain(|&f| f != i);
+                            dirs.retain(|&d| d != i);
+                        }),
+                        None => Ok(()),
+                    }
+                }
+                11 => {
+                    let from = dirs[next(rng, dirs.len() as u64) as usize];
+                    let to = dirs[next(rng, dirs.len() as u64) as usize];
+                    match pick(&mut fs, from, rng) {
+                        Some((name, _)) => {
+                            fs.rename(from, &name, to, format!("r{step}").as_bytes())
+                        }
+                        None => Ok(()),
+                    }
+                }
                 9 => {
                     files.clear();
                     dirs.truncate(1);
@@ -127,7 +155,14 @@ fn incremental_free_space_matches_mount_and_never_writes_reachable() {
                 _ => Ok(()),
             };
             assert!(
-                matches!(r, Ok(()) | Err(Error::NoSpace | Error::TooBig)),
+                matches!(
+                    r,
+                    Ok(())
+                        | Err(Error::NoSpace
+                            | Error::TooBig
+                            | Error::NotEmpty
+                            | Error::InvalidName)
+                ),
                 "{ctx}: {r:?}"
             );
             let used: u32 = fs.used.iter().map(|w| w.count_ones()).sum();

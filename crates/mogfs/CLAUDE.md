@@ -3,7 +3,7 @@
 ## What this crate is
 
 The on-disk format (described at the top of `src/lib.rs`) and `Fs<D: Disk>`: `new` (const), in-place `format` and
-`mount`, `lookup`, `readdir`, `kind`, `mkdir`, `create`, `read`, `write`, `truncate`, `commit`. It also defines the
+`mount`, `lookup`, `readdir`, `kind`, `mkdir`, `create`, `read`, `write`, `truncate`, `unlink`, `rename`, `commit`. It also defines the
 `Disk` trait and `BLOCK_SIZE` that the kernel re-exports and the board's `VirtioBlk` implements. All in `src/lib.rs`.
 
 It is **NOT** paths, handles or `..` handling (`crates/kernel`, step 22), a block cache beyond its one data buffer, or
@@ -14,6 +14,9 @@ a device driver.
 - Format, mount (newest valid slot; the older one if the newest's table is corrupt), and atomic `commit`.
 - Copy-on-write with per-block checksums: a bad block is `Error::Corrupt`, never wrong data.
 - Free space derived in memory (`newest`, `committed`, `used`, `replaced` bitmaps and a `free` counter).
+- Directories stay packed: `unlink` and a cross-directory `rename` move the last entry into the freed slot, so entry
+  order is not creation order. `rename` never replaces a target (`Exists`) and rejects moving a directory into
+  itself or below it (`InvalidName`), found by scanning every directory below it (no parent pointers).
 
 ## Boundaries (hard)
 
@@ -39,8 +42,8 @@ a device driver.
 ## How it's tested
 
 - Host: `cargo test --target aarch64-apple-darwin -p mogfs` (`tests/fs.rs`: round trip, corruption and fallback,
-  crafted images, power cut through a write-back-cache disk at every write and flush with subsets of the pending
-  writes landing, `Io` handling, limits, block I/O counts). `src/tests.rs` runs random changes and commits on a disk
+  unlink and rename, crafted images, power cut (a change with renames, then one with unlinks) through a write-back-cache disk at every write and flush with subsets of the pending
+  writes landing, `Io` handling, limits, block I/O counts). `src/tests.rs` runs random changes (including unlink and rename) and commits on a disk
   that panics on a write to a block either slot reaches, and checks the in-memory free space against a fresh mount's.
 - Benchmark: `cargo bench-host` runs `benches/fs.rs`; baseline rows in `docs/BENCHMARKS.md`.
 - `examples/mkfs.rs` writes an empty image through a file-backed `Disk`.

@@ -10,7 +10,8 @@
 //!   data block numbers (0 = zeros). Inode `n` is record `n % 63` of table block `n / 63`; inode 0 is the root
 //!   directory. Inode numbers stay fixed while their blocks move.
 //! - File data: byte `i` lives at payload offset `i % 4088` of data block `i / 4088`.
-//! - Directory data: 56-byte entries (inode u32, name length u8, name), 73 per block, in creation order.
+//! - Directory data: 56-byte entries (inode u32, name length u8, name), 73 per block, packed: removing one moves the
+//!   last entry into its slot.
 //! - Copy-on-write: no block reachable from either slot is written. A change writes its data blocks at once, each to
 //!   a new block or over one allocated since the last commit; changed table blocks wait for `commit`, which writes
 //!   them, flushes, writes the other slot with the next generation, and flushes.
@@ -44,6 +45,7 @@ const FREE: u8 = 0;
 const FILE: u8 = 1;
 const DIR: u8 = 2;
 const WORDS: usize = MAX_BLOCKS as usize / 64;
+const INODE_WORDS: usize = (MAX_INODES as usize).div_ceil(64);
 
 type Bitmap = [u64; WORDS];
 
@@ -58,6 +60,7 @@ pub enum Error {
     InvalidName,
     TooBig,
     NoSpace,
+    NotEmpty,
 }
 
 /// A block device of 4 KiB blocks; a request covers `bufs.len()` consecutive blocks from `block`.
@@ -113,7 +116,7 @@ pub struct Fs<D> {
     free: u32,
     /// Every word of `used` before it is full.
     hint: usize,
-    /// Every inode before it is in use; inodes are only freed by `mount`.
+    /// Every inode before it is in use.
     inode_hint: usize,
     buf: [u8; BLOCK_SIZE],
     /// The data block `buf` holds unchanged.
@@ -225,14 +228,10 @@ impl<D: Disk> Fs<D> {
     }
 
     pub fn lookup(&mut self, dir: Inode, name: &[u8]) -> Result<Inode, Error> {
-        if !valid_name(name) {
-            return Err(Error::InvalidName);
-        }
-        self.scan(dir, false, |n, _| n == name)?
-            .ok_or(Error::NotFound)
+        Ok(self.find(dir, name)?.1)
     }
 
-    /// Calls `f` with each entry's name and inode, in creation order.
+    /// Calls `f` with each entry's name and inode.
     pub fn readdir(&mut self, dir: Inode, mut f: impl FnMut(&[u8], Inode)) -> Result<(), Error> {
         self.scan(dir, true, |n, i| {
             f(n, i);
@@ -307,6 +306,70 @@ impl<D: Disk> Fs<D> {
             ..Record::EMPTY
         };
         self.set(file, r)
+    }
+
+    /// Removes a file or an empty directory and frees its inode and blocks. `NoSpace` changes nothing.
+    pub fn unlink(&mut self, dir: Inode, name: &[u8]) -> Result<(), Error> {
+        let (e, inode) = self.find(dir, name)?;
+        if inode == ROOT {
+            return Err(Error::Corrupt);
+        }
+        let r = self.records[inode.0 as usize];
+        if r.kind == DIR && r.size != 0 {
+            return Err(Error::NotEmpty);
+        }
+        let mut d = self.dir(dir)?;
+        let (last, need) = self.last(&d, e)?;
+        self.reserve(need, &[dir, inode])?;
+        self.remove(&mut d, e, last)?;
+        self.set(dir, d)?;
+        self.set(inode, Record::EMPTY)?;
+        self.inode_hint = min(self.inode_hint, inode.0 as usize);
+        Ok(())
+    }
+
+    /// Moves an entry, possibly to another directory; `Exists` if `to_name` is taken, `InvalidName` if a directory would
+    /// move into itself or below itself. `NoSpace` changes nothing.
+    pub fn rename(
+        &mut self,
+        from_dir: Inode,
+        from_name: &[u8],
+        to_dir: Inode,
+        to_name: &[u8],
+    ) -> Result<(), Error> {
+        let (e, inode) = self.find(from_dir, from_name)?;
+        if !valid_name(to_name) {
+            return Err(Error::InvalidName);
+        }
+        if self.scan(to_dir, false, |n, _| n == to_name)?.is_some() {
+            return Err(Error::Exists);
+        }
+        let entry = dirent(inode, to_name);
+        let mut from = self.dir(from_dir)?;
+        if from_dir == to_dir {
+            self.reserve(
+                !self.fresh(from.ptrs[e / PER_DIR_BLOCK]) as usize,
+                &[from_dir],
+            )?;
+            self.write_data(&mut from, (e * DIRENT) as u64, &entry)?;
+            return self.set(from_dir, from);
+        }
+        if self.records[inode.0 as usize].kind == DIR && self.below(inode, to_dir)? {
+            return Err(Error::InvalidName);
+        }
+        let mut to = self.dir(to_dir)?;
+        let need = self.room(&to)?;
+        let (last, more) = self.last(&from, e)?;
+        self.reserve(need + more, &[from_dir, to_dir])?;
+        self.remove(&mut from, e, last)?;
+        self.set(from_dir, from)?;
+        // The entry is in neither directory until `to` is written.
+        let end = to.size as u64;
+        let r = self
+            .write_data(&mut to, end, &entry)
+            .and_then(|()| self.set(to_dir, to));
+        self.broken |= r.is_err();
+        r
     }
 
     /// Makes every change so far durable, atomically; does nothing if nothing changed.
@@ -633,13 +696,14 @@ impl<D: Disk> Fs<D> {
         Ok(())
     }
 
-    /// The first entry of `dir` for which `f` returns true; `names` checks each name, which a valid name to match never needs.
+    /// Index and inode of the first entry of `dir` for which `f` returns true; `names` checks each name, which a valid
+    /// name to match never needs.
     fn scan(
         &mut self,
         dir: Inode,
         names: bool,
         mut f: impl FnMut(&[u8], Inode) -> bool,
-    ) -> Result<Option<Inode>, Error> {
+    ) -> Result<Option<(usize, Inode)>, Error> {
         let r = self.dir(dir)?;
         for e in 0..r.size as usize / DIRENT {
             let at = e % PER_DIR_BLOCK * DIRENT;
@@ -655,37 +719,95 @@ impl<D: Disk> Fs<D> {
                 return Err(Error::Corrupt);
             }
             if f(&d[5..5 + len], Inode(inode)) {
-                return Ok(Some(Inode(inode)));
+                return Ok(Some((e, Inode(inode))));
             }
         }
         Ok(None)
     }
 
-    fn add(&mut self, dir: Inode, name: &[u8], kind: u8) -> Result<Inode, Error> {
+    fn find(&mut self, dir: Inode, name: &[u8]) -> Result<(usize, Inode), Error> {
         if !valid_name(name) {
             return Err(Error::InvalidName);
         }
-        if self.scan(dir, false, |n, _| n == name)?.is_some() {
-            return Err(Error::Exists);
-        }
-        let mut d = self.dir(dir)?;
+        self.scan(dir, false, |n, _| n == name)?
+            .ok_or(Error::NotFound)
+    }
+
+    /// Blocks an entry appended to `d` needs.
+    fn room(&self, d: &Record) -> Result<usize, Error> {
         if d.size as u64 + DIRENT as u64 > MAX_FILE_SIZE {
             return Err(Error::TooBig);
         }
+        // Entries never straddle blocks, so the new one needs at most its own block.
+        Ok(!self.fresh(d.ptrs[d.size as usize / PAYLOAD]) as usize)
+    }
+
+    /// The last entry of `d` unless slot `e` is last, and the blocks moving it into slot `e` needs.
+    fn last(&mut self, d: &Record, e: usize) -> Result<(Option<[u8; DIRENT]>, usize), Error> {
+        let last = d.size as usize / DIRENT - 1;
+        if e == last {
+            return Ok((None, 0));
+        }
+        match d.ptrs[last / PER_DIR_BLOCK] {
+            0 => return Err(Error::Corrupt),
+            p => self.load(p, false)?,
+        }
+        let at = last % PER_DIR_BLOCK * DIRENT;
+        let entry = self.buf[at..at + DIRENT].try_into().unwrap();
+        Ok((Some(entry), !self.fresh(d.ptrs[e / PER_DIR_BLOCK]) as usize))
+    }
+
+    /// Removes entry `e` from `d` (a copy), moving `last` into its slot. Call `reserve` first.
+    fn remove(
+        &mut self,
+        d: &mut Record,
+        e: usize,
+        last: Option<[u8; DIRENT]>,
+    ) -> Result<(), Error> {
+        if let Some(entry) = last {
+            self.write_data(d, (e * DIRENT) as u64, &entry)?;
+        }
+        d.size -= DIRENT as u32;
+        d.ptrs[(d.size as usize).div_ceil(PAYLOAD)..].fill(0);
+        Ok(())
+    }
+
+    /// Whether `target` is `dir` or below it; scans each directory below `dir` once, so a crafted cycle ends.
+    fn below(&mut self, dir: Inode, target: Inode) -> Result<bool, Error> {
+        let (mut seen, mut done) = ([0u64; INODE_WORDS], [0u64; INODE_WORDS]);
+        let mut next = Some(dir.0 as usize);
+        while let Some(d) = next {
+            if d == target.0 as usize {
+                return Ok(true);
+            }
+            done[d / 64] |= 1 << (d % 64);
+            self.scan(Inode(d as u32), false, |_, i| {
+                seen[i.0 as usize / 64] |= 1 << (i.0 % 64);
+                false
+            })?;
+            next = (0..MAX_INODES as usize).find(|&i| {
+                (seen[i / 64] & !done[i / 64]) >> (i % 64) & 1 != 0 && self.records[i].kind == DIR
+            });
+        }
+        Ok(false)
+    }
+
+    fn add(&mut self, dir: Inode, name: &[u8], kind: u8) -> Result<Inode, Error> {
+        match self.find(dir, name) {
+            Err(Error::NotFound) => {}
+            Ok(_) => return Err(Error::Exists),
+            Err(e) => return Err(e),
+        }
+        let mut d = self.dir(dir)?;
+        let need = self.room(&d)?;
         self.inode_hint += self.records[self.inode_hint..]
             .iter()
             .position(|r| r.kind == FREE)
             .ok_or(Error::NoSpace)?;
         let inode = Inode(self.inode_hint as u32);
-        // Entries never straddle blocks, so the new one needs at most its own block.
-        let need = !self.fresh(d.ptrs[d.size as usize / PAYLOAD]) as usize;
         self.reserve(need, &[dir, inode])?;
-        let mut entry = [0; DIRENT];
-        entry[..4].copy_from_slice(&inode.0.to_le_bytes());
-        entry[4] = name.len() as u8;
-        entry[5..5 + name.len()].copy_from_slice(name);
         let end = d.size as u64;
-        self.write_data(&mut d, end, &entry)?;
+        self.write_data(&mut d, end, &dirent(inode, name))?;
         self.set(dir, d)?;
         let r = Record {
             kind,
@@ -694,6 +816,14 @@ impl<D: Disk> Fs<D> {
         self.set(inode, r)?;
         Ok(inode)
     }
+}
+
+fn dirent(inode: Inode, name: &[u8]) -> [u8; DIRENT] {
+    let mut entry = [0; DIRENT];
+    entry[..4].copy_from_slice(&inode.0.to_le_bytes());
+    entry[4] = name.len() as u8;
+    entry[5..5 + name.len()].copy_from_slice(name);
+    entry
 }
 
 fn valid_name(name: &[u8]) -> bool {

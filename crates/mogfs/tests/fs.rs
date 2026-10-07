@@ -219,6 +219,98 @@ fn truncate_empties_a_file_and_frees_its_blocks() {
     assert_eq!(snapshot(&mut disk), Ok(vec![entry("/f", b"x")]));
 }
 
+fn names<D: Disk>(fs: &mut Fs<D>, dir: Inode) -> Vec<String> {
+    let mut out = Vec::new();
+    fs.readdir(dir, |n, _| out.push(String::from_utf8(n.to_vec()).unwrap()))
+        .unwrap();
+    out
+}
+
+#[test]
+fn unlink_removes_files_and_empty_directories_and_frees_their_space() {
+    let mut disk = MemDisk::new(20);
+    let mut fs = format(&mut disk);
+    let a = fs.create(ROOT, b"a").unwrap();
+    fs.write(a, 0, &[1; 9000]).unwrap();
+    fs.create(ROOT, b"b").unwrap();
+    let d = fs.mkdir(ROOT, b"d").unwrap();
+    fs.create(d, b"x").unwrap();
+    fs.commit().unwrap();
+    assert_eq!(fs.unlink(ROOT, b"d"), Err(Error::NotEmpty));
+    assert_eq!(fs.unlink(ROOT, b"missing"), Err(Error::NotFound));
+    assert_eq!(fs.unlink(ROOT, b".."), Err(Error::InvalidName));
+    assert_eq!(fs.unlink(a, b"x"), Err(Error::NotDir));
+    // The last entry moves into the freed slot.
+    fs.unlink(ROOT, b"a").unwrap();
+    assert_eq!(names(&mut fs, ROOT), ["d", "b"]);
+    assert_eq!(fs.kind(a), Err(Error::NotFound));
+    fs.unlink(d, b"x").unwrap();
+    fs.unlink(ROOT, b"d").unwrap();
+    // Freed inodes are reused; blocks of committed and uncommitted files are freed.
+    for _ in 0..100 {
+        let f = fs.create(ROOT, b"f").unwrap();
+        assert_eq!(f, a);
+        fs.write(f, 0, &[2; 9000]).unwrap();
+        fs.commit().unwrap();
+        fs.unlink(ROOT, b"f").unwrap();
+    }
+    fs.commit().unwrap();
+    assert_eq!(snapshot(&mut disk), Ok(vec![entry("/b", b"")]));
+}
+
+#[test]
+fn unlink_in_a_two_block_directory_frees_the_emptied_block() {
+    let mut disk = MemDisk::new(64);
+    let mut fs = format(&mut disk);
+    let dir = fs.mkdir(ROOT, b"many").unwrap();
+    for i in 0..74 {
+        fs.create(dir, format!("{i}").as_bytes()).unwrap();
+    }
+    fs.commit().unwrap();
+    fs.unlink(dir, b"0").unwrap();
+    fs.unlink(dir, b"72").unwrap();
+    fs.commit().unwrap();
+    let mut fs = mount(&mut disk).unwrap();
+    let dir = fs.lookup(ROOT, b"many").unwrap();
+    let mut expected: Vec<String> = (0..73).map(|i| i.to_string()).collect();
+    expected[0] = "73".to_string();
+    expected.retain(|n| n != "72");
+    assert_eq!(names(&mut fs, dir), expected);
+}
+
+#[test]
+fn rename_moves_entries_within_and_across_directories() {
+    let mut disk = MemDisk::new(64);
+    let mut fs = format(&mut disk);
+    let a = fs.mkdir(ROOT, b"a").unwrap();
+    let b = fs.mkdir(a, b"b").unwrap();
+    let f = fs.create(ROOT, b"f").unwrap();
+    fs.write(f, 0, b"data").unwrap();
+    fs.create(ROOT, b"g").unwrap();
+    fs.commit().unwrap();
+    assert_eq!(fs.rename(ROOT, b"f", ROOT, b"g"), Err(Error::Exists));
+    assert_eq!(fs.rename(ROOT, b"no", ROOT, b"h"), Err(Error::NotFound));
+    assert_eq!(fs.rename(ROOT, b"f", f, b"h"), Err(Error::NotDir));
+    assert_eq!(fs.rename(ROOT, b"f", ROOT, b"/"), Err(Error::InvalidName));
+    // A directory cannot move into itself or below itself.
+    assert_eq!(fs.rename(ROOT, b"a", a, b"x"), Err(Error::InvalidName));
+    assert_eq!(fs.rename(ROOT, b"a", b, b"x"), Err(Error::InvalidName));
+    fs.rename(ROOT, b"f", ROOT, b"h").unwrap();
+    fs.rename(ROOT, b"h", b, b"f").unwrap();
+    fs.rename(a, b"b", ROOT, b"b").unwrap();
+    assert_eq!(fs.lookup(ROOT, b"b"), Ok(b));
+    fs.commit().unwrap();
+    assert_eq!(
+        snapshot(&mut disk),
+        Ok(vec![
+            entry("/a/", b""),
+            entry("/g", b""),
+            entry("/b/", b""),
+            entry("/b/f", b"data"),
+        ])
+    );
+}
+
 #[test]
 fn flipped_byte_in_any_reachable_block_reads_as_corrupt_or_falls_back() {
     let disk = hello();
@@ -379,6 +471,37 @@ fn crafted_records_fall_back_and_crafted_entries_are_corrupt() {
     }
 }
 
+/// Entries naming the root, the directory itself, or a block-less tail are errors, never panics or hangs.
+#[test]
+fn crafted_entries_under_unlink_and_rename() {
+    let disk = hello();
+    let table = le32(&disk.durable[0], 20);
+    let docs = le32(&disk.durable[table], 64 + 8);
+    let mut bad = crafted(disk.clone(), &[docs], 0, &0u32.to_le_bytes());
+    let mut fs = mount(&mut bad).unwrap();
+    let d = fs.lookup(ROOT, b"docs").unwrap();
+    assert_eq!(fs.unlink(d, b"a.txt"), Err(Error::Corrupt));
+    assert_eq!(fs.rename(d, b"a.txt", ROOT, b"x"), Err(Error::InvalidName));
+    // `docs` holds itself: the search below it ends, and the move is allowed.
+    let mut bad = crafted(disk.clone(), &[docs], 0, &1u32.to_le_bytes());
+    let mut fs = mount(&mut bad).unwrap();
+    let e = fs.mkdir(ROOT, b"e").unwrap();
+    fs.rename(ROOT, b"docs", e, b"docs").unwrap();
+    // A two-block directory whose second block is missing.
+    let mut disk = MemDisk::new(64);
+    let mut fs = format(&mut disk);
+    let dir = fs.mkdir(ROOT, b"many").unwrap();
+    for i in 0..74 {
+        fs.create(dir, format!("{i}").as_bytes()).unwrap();
+    }
+    fs.commit().unwrap();
+    let table = le32(&disk.durable[0], 20);
+    let mut bad = crafted(disk, &[table], 64 + 12, &0u32.to_le_bytes());
+    let mut fs = mount(&mut bad).unwrap();
+    assert_eq!(fs.unlink(dir, b"0"), Err(Error::Corrupt));
+    assert_eq!(fs.rename(dir, b"0", ROOT, b"x"), Err(Error::Corrupt));
+}
+
 /// A free record pointing at a live block would release it when its inode is reused, and a later file would
 /// overwrite `/docs/a.txt`'s data.
 #[test]
@@ -501,21 +624,41 @@ fn failed_mount_leaves_the_fs_read_only() {
     assert_eq!(snapshot(&mut disk.crash(|_, _| true)), Ok(hello_tree()));
 }
 
-/// Mounts `disk`, overwrites `/docs/a.txt`, adds `/src` and `/docs/b.txt`, and commits.
+/// Mounts `disk`, overwrites `/docs/a.txt`, adds `/src` and `/docs/b.txt`, moves `a.txt` and then `docs` into `/src`,
+/// and commits.
 fn change(disk: &mut MemDisk) -> Result<(), Error> {
     let mut fs = mount(disk)?;
     let docs = fs.lookup(ROOT, b"docs")?;
     let a = fs.lookup(docs, b"a.txt")?;
     fs.write(a, 0, b"HE")?;
-    fs.mkdir(ROOT, b"src")?;
+    let src = fs.mkdir(ROOT, b"src")?;
     let b = fs.create(docs, b"b.txt")?;
     fs.write(b, 0, &[7; 5000])?;
+    fs.rename(docs, b"a.txt", src, b"a.txt")?;
+    fs.rename(ROOT, b"docs", src, b"docs")?;
+    fs.commit()
+}
+
+/// Mounts `disk` after `change` and unlinks everything under `/src`, then commits.
+fn remove(disk: &mut MemDisk) -> Result<(), Error> {
+    let mut fs = mount(disk)?;
+    let src = fs.lookup(ROOT, b"src")?;
+    let docs = fs.lookup(src, b"docs")?;
+    fs.unlink(src, b"a.txt")?;
+    fs.unlink(docs, b"b.txt")?;
+    fs.unlink(src, b"docs")?;
     fs.commit()
 }
 
 #[test]
 fn power_cut_anywhere_leaves_the_old_or_the_new_state() {
-    let base = hello();
+    let mut changed = hello();
+    change(&mut changed).unwrap();
+    power_cut(hello(), change);
+    power_cut(changed, remove);
+}
+
+fn power_cut(base: MemDisk, change: fn(&mut MemDisk) -> Result<(), Error>) {
     let old = snapshot(&mut base.clone()).unwrap();
     let mut full = base.with_cut(usize::MAX);
     change(&mut full).unwrap();
@@ -700,4 +843,23 @@ fn block_io_per_operation() {
     // Scans both blocks (the first still buffered) and appends to the second, now buffered.
     fs.create(dir, b"74").unwrap();
     assert_eq!(io.take(), [1, 1, 0]);
+
+    fs.commit().unwrap();
+    io.take();
+    // Within a directory: one scan, then the entry's block rewritten with the new name.
+    fs.rename(docs, b"b.txt", docs, b"c.txt").unwrap();
+    assert_eq!(io.take(), [1, 1, 0]);
+    // The last entry moves into the freed slot of the buffered block, now fresh and rewritten in place.
+    fs.unlink(docs, b"a.txt").unwrap();
+    assert_eq!(io.take(), [0, 1, 0]);
+    // Across directories: scans both, appends to the target; removing the last entry only shrinks the source.
+    fs.rename(docs, b"c.txt", ROOT, b"c.txt").unwrap();
+    assert_eq!(io.take(), [1, 1, 0]);
+    // A directory move also reads every directory below it (both blocks of `many`), then the root block again for
+    // its last entry; it writes the root's block and a first block for the emptied `docs`.
+    fs.rename(ROOT, b"many", docs, b"many").unwrap();
+    assert_eq!(io.take(), [3, 2, 0]);
+    // Unlinking the last entry only scans.
+    fs.unlink(ROOT, b"c.txt").unwrap();
+    assert_eq!(io.take(), [1, 0, 0]);
 }
