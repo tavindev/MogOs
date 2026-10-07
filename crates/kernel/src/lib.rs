@@ -45,7 +45,8 @@ pub trait Board {
     fn init_heap(&mut self, region: Range<PhysAddr>);
     /// Microseconds since the board entered the kernel.
     fn uptime_us(&self) -> u64;
-    /// Starts the periodic timer interrupt; each tick switches to the next task. IRQs are unmasked only in tasks and `idle`.
+    /// Starts the periodic timer interrupt on this core, and on each other core once it next leaves its idle context; each
+    /// tick switches to the next task. An idle core takes no tick. IRQs are unmasked only in tasks and `idle`.
     fn start_timer(&mut self);
     /// Sleeps until an interrupt arrives and handles it. Boot context only: returns with IRQs masked.
     fn idle(&mut self);
@@ -56,6 +57,9 @@ pub trait Board {
     fn yield_now(&mut self);
     /// Runs the other tasks until none is ready (each exited or blocked). Boot context only.
     fn run_others(&mut self);
+    /// Sets up every core's per-CPU area from `frames` and makes this core's its own; call once, right after the frame
+    /// allocator is built, before any trap, IRQ or other core.
+    fn init_cpus(&mut self, frames: &mut FrameAllocator<FRAME_WORDS>);
     /// Takes over the frame allocator: process memory and kernel stacks come from it from now on; call once.
     fn init_frames(&mut self, frames: FrameAllocator<FRAME_WORDS>);
     fn free_frames(&self) -> usize;
@@ -94,9 +98,11 @@ pub trait Board {
         &mut self,
         f: impl FnOnce(&mut network::Network, Option<&mut Self::Nic>, u64) -> R,
     ) -> R;
-    /// Makes `n` uncontended acquire + release round trips on a ticket lock like the board's kernel lock (`ticket`),
-    /// or on a test-and-set lock.
-    fn lock_round_trips(&mut self, n: u64, ticket: bool);
+    /// Makes `n` round trips of `kind`.
+    fn round_trips(&mut self, n: u64, kind: RoundTrip);
+    /// Sends core 1 an SGI `n` times, each answered with an SGI back before the next. Boot context only, two cores
+    /// or more.
+    fn ipi_round_trips(&mut self, n: u64);
     /// Adds 1 to a counter `n` times, taking a board `Lock` (the kind `KERNEL` is) for each; returns the counter.
     fn add_locked(&mut self, n: u64) -> u64;
     /// Starts the other cores without waiting for them; they idle until given work. Under `smp_test` each prints
@@ -104,11 +110,30 @@ pub trait Board {
     fn start_cpus(&mut self, smp_test: bool);
     /// Cores `start_cpus` starts, this one included.
     fn cpus(&self) -> usize;
+    /// The core this runs on.
+    fn cpu(&self) -> usize;
     /// Cores that have taken a timer tick.
     fn ticked_cpus(&self) -> usize;
+    /// Cores whose interrupt controller is set up, this one included, once `start_cpus` ran.
+    fn online_cpus(&self) -> usize;
+    /// Acquisitions of the board's kernel lock that had to wait, so far (wrapping).
+    fn contended(&self) -> u32;
     /// Prints the `spec:` line (speculative-execution vulnerabilities and the vector table) for the worst core, once
     /// every core `start_cpus` started has installed its vectors.
     fn report_speculation(&mut self);
+}
+
+/// What `Board::round_trips` times.
+#[derive(Clone, Copy)]
+pub enum RoundTrip {
+    /// Uncontended acquire + release of a ticket lock like the board's kernel lock.
+    Ticket,
+    /// The same on a test-and-set lock.
+    TestAndSet,
+    /// Reading this core's index.
+    Cpu,
+    /// One access to a per-CPU value.
+    PerCpu,
 }
 
 /// Bounds a user-derived index under speculation; the board's ends in a barrier (`csdb`), host tests use `min`.
@@ -147,14 +172,35 @@ pub enum Program {
     /// Maps a page at a time, checking each is zeroed and writable, until `map` fails with `ENOMEM`; prints the
     /// page count, then a line showing it still runs.
     Budget,
+    /// Started with its map cursor two pages below the board's end of user memory: a one-page `map` succeeds, a
+    /// three-page one fails with `ENOMEM` with budget left, and a last one-page `map` succeeds; a line for each.
+    MapEnd,
 }
 
 /// Round trips timed by `test=bench`.
 const BENCH_YIELDS: u64 = 100_000;
-/// Round trips per lock timed by `test=bench-lock`, and the additions each of its two adders makes.
+/// Round trips per lock timed by `test=bench-lock`.
 const BENCH_LOCKS: u64 = 10_000_000;
+/// Per `smpwork` worker of `test=bench-smp`: syscalls, pipe round trips, spawns; must equal its `SYSCALLS`,
+/// `ROUND_TRIPS` and `SPAWNS`.
+const SMP_SYSCALLS: u64 = 20_000;
+const SMP_ROUND_TRIPS: u64 = 2_000;
+const SMP_SPAWNS: u64 = 200;
+/// `smpwork`'s 9 frames, two pipe pages and `pong`'s 9, or `nop`'s 9, with 4 to spare.
+const SMP_WORK_BUDGET: usize = 24;
+/// `test=bench-smp`'s worker counts, those up to the core count.
+const SMP_WORKERS: [usize; 5] = [1, 2, 4, 8, 12];
+/// SGI round trips `test=bench-ipi` times.
+const IPI_ROUND_TRIPS: u64 = 1000;
+/// The additions each of `test=bench-lock`'s adders makes, one adder per core (at least two), the boot context one.
+const CONTENDED_LOCKS: u64 = 100_000;
 /// `test=bench-lock`'s adders that are done.
 static ADDERS_DONE: AtomicUsize = AtomicUsize::new(0);
+/// `test=smp`'s kernel tasks that each take a core at once (the full N-task form is step 31's `test=limits`).
+const MAX_SPINNERS: usize = 32;
+/// `test=smp`'s spinners that have started, and those that have printed their core.
+static SPINNERS: AtomicUsize = AtomicUsize::new(0);
+static SPUN: AtomicUsize = AtomicUsize::new(0);
 /// Round trips the boot archive's `ping` makes with `pong` under `test=bench-pipe`; must equal its `ROUND_TRIPS`.
 const PIPE_ROUND_TRIPS: u64 = 100_000;
 /// Blocks `test=bench-disk` writes and reads (8 MiB); the disk must hold at least this many.
@@ -214,6 +260,7 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
         frames.reserve(range.clone());
     }
     let _ = writeln!(board.console(), "frames: {} free", frames.free_count());
+    board.init_cpus(&mut frames);
 
     let heap = frames
         .alloc_contiguous(HEAP_FRAMES)
@@ -257,6 +304,7 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
         board.start_net(config, seed.expect("no rng-seed in DTB"));
     }
 
+    let cpus_started = board.uptime_us();
     board.start_cpus(bootargs.split_whitespace().any(|a| a == "test=smp"));
     let boot_us = board.uptime_us();
     let _ = writeln!(board.console(), "boot: {boot_us} us");
@@ -287,6 +335,7 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
             "test=user" => user_demo(board),
             "test=bench-syscall" => run_alone(board, Program::SyscallBench),
             "test=handles" => run_alone(board, Program::Handles),
+            "test=map-end" => run_alone(board, Program::MapEnd),
             "test=spawn" => run_archived(board, "spawn", "spawner", (BOOT_BUDGET, INIT_ARCHIVE)),
             "test=pipe" => run_archived(board, "pipe", "reader", (BOOT_BUDGET, INIT_ARCHIVE)),
             "test=wait" => run_archived(board, "wait", "waiter", (WAITER_BUDGET, INIT_ARCHIVE)),
@@ -317,7 +366,14 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
             ),
             "test=bench-pipe" => pipe_bench(board),
             "test=bench-lock" => lock_bench(board),
-            "test=smp" => smp_test(board),
+            "test=bench-smp" => smp_bench(board),
+            "test=bench-ipi" if board.cpus() > 1 => {
+                let start = board.uptime_us();
+                board.ipi_round_trips(IPI_ROUND_TRIPS);
+                let ns = (board.uptime_us() - start) * 1000 / IPI_ROUND_TRIPS;
+                let _ = writeln!(board.console(), "ipi: {ns} ns/round-trip");
+            }
+            "test=smp" => smp_test(board, cpus_started),
             "test=fuzz" => fuzz(board, bootargs),
             "test=httpd" => httpd(board, bootargs),
             "test=bench-shell" => shell_bench(board),
@@ -374,10 +430,24 @@ fn arg_value<T: core::str::FromStr>(bootargs: &str, prefix: &str) -> Option<T> {
         .find_map(|a| a.strip_prefix(prefix)?.parse().ok())
 }
 
-/// Core 0 joins the secondaries' `cpu <n>: online` lines, then waits until every core has taken a timer tick.
-fn smp_test<B: Board>(board: &mut B) {
-    let _ = writeln!(board.console(), "cpu 0: online");
+/// Waits until every core is online, which took this long from `started_us` (`start_cpus`); `threads` kills a process
+/// whose threads spin on another core and block; with the timer off, one kernel task per core (at most `MAX_SPINNERS`)
+/// waits until all have started, so each prints a distinct core; then every core must have taken a timer tick.
+fn smp_test<B: Board>(board: &mut B, started_us: u64) {
     let cpus = board.cpus();
+    while board.online_cpus() < cpus {
+        core::hint::spin_loop();
+    }
+    let us = board.uptime_us() - started_us;
+    let _ = writeln!(board.console(), "smp: {cpus} cpus online in {us} us");
+    run_archived(board, "smp", "threads", (THREADS_BUDGET, INIT_ARCHIVE));
+    let spinners = cpus.min(MAX_SPINNERS);
+    for _ in 0..spinners {
+        board.spawn(spin_together, spinners).expect("spawn");
+    }
+    while SPUN.load(Relaxed) < spinners {
+        board.yield_now();
+    }
     board.start_timer();
     while board.ticked_cpus() < cpus {
         board.idle();
@@ -411,6 +481,20 @@ fn preempt_demo<B: Board>(board: &mut B) -> ! {
     board.start_timer();
     loop {
         board.idle();
+    }
+}
+
+/// Counts itself in and spins until all `n` spinners have, prints its core, then only yields.
+fn spin_together<B: Board>(board: &mut B, n: usize) -> ! {
+    SPINNERS.fetch_add(1, Relaxed);
+    while SPINNERS.load(Relaxed) < n {
+        core::hint::spin_loop();
+    }
+    let cpu = board.cpu();
+    let _ = writeln!(board.console(), "smp: spinner on cpu {cpu}");
+    SPUN.fetch_add(1, Relaxed);
+    loop {
+        board.yield_now();
     }
 }
 
@@ -568,28 +652,73 @@ fn pipe_bench<B: Board>(board: &mut B) {
     let _ = writeln!(board.console(), "pipe: {ns} ns/round-trip");
 }
 
-/// Times uncontended acquire + release of the ticket and the test-and-set lock; then two tasks, preempted by the timer,
-/// each add `BENCH_LOCKS` to a counter under the board's lock, and the total must be exact.
+/// `test=bench-smp`: k `smpwork` processes at once for each mode, timed from their spawn until all exited; prints the
+/// aggregate operations per second and the kernel lock's contended acquisitions over the run.
+fn smp_bench<B: Board>(board: &mut B) {
+    run_checked(board, "bench-smp", |board| {
+        let modes = [
+            ("syscall", SMP_SYSCALLS),
+            ("pipe", SMP_ROUND_TRIPS),
+            ("spawn", SMP_SPAWNS),
+        ];
+        let cpus = board.cpus();
+        for (mode, ops) in modes {
+            let args = [b"smpwork\0", mode.as_bytes(), b"\0"].concat();
+            for k in SMP_WORKERS.into_iter().filter(|&k| k <= cpus) {
+                let (start, contended) = (board.uptime_us(), board.contended());
+                for _ in 0..k {
+                    board
+                        .spawn_archived("smpwork", SMP_WORK_BUDGET, INIT_ARCHIVE, &args)
+                        .expect("spawn");
+                }
+                wait(board);
+                let us = (board.uptime_us() - start).max(1);
+                let rate = k as u64 * ops * 1_000_000 / us;
+                let contended = board.contended().wrapping_sub(contended);
+                let _ = writeln!(
+                    board.console(),
+                    "bench-smp {mode} {k}: {rate} ops/s, {contended} contended"
+                );
+            }
+        }
+    });
+}
+
+/// Times uncontended acquire + release of the ticket and the test-and-set lock, reading the core index and a per-CPU
+/// access; then the boot context and a task per other core (at least one,
+/// so the timer interleaves them on one) each adds `CONTENDED_LOCKS` to a counter under the board's lock, timed from
+/// their spawn until all are done, and the total must be exact.
 fn lock_bench<B: Board>(board: &mut B) {
-    for (name, ticket) in [("ticket", true), ("test-and-set", false)] {
+    for (name, kind) in [
+        ("ticket", RoundTrip::Ticket),
+        ("test-and-set", RoundTrip::TestAndSet),
+        ("cpu", RoundTrip::Cpu),
+        ("per-cpu", RoundTrip::PerCpu),
+    ] {
         let start = board.uptime_us();
-        board.lock_round_trips(BENCH_LOCKS, ticket);
+        board.round_trips(BENCH_LOCKS, kind);
         let tenths = (board.uptime_us() - start) * 10_000 / BENCH_LOCKS;
         let (ns, tenth) = (tenths / 10, tenths % 10);
         let _ = writeln!(board.console(), "lock: {name} {ns}.{tenth} ns/round-trip");
     }
-    board.spawn(add_and_yield, 0).expect("spawn");
-    board.spawn(add_and_yield, 0).expect("spawn");
+    let adders = board.cpus().max(2);
+    let start = board.uptime_us();
+    for _ in 1..adders {
+        board.spawn(add_and_yield, 0).expect("spawn");
+    }
     board.start_timer();
-    while ADDERS_DONE.load(Relaxed) < 2 {
+    board.add_locked(CONTENDED_LOCKS);
+    while ADDERS_DONE.load(Relaxed) < adders - 1 {
         board.idle();
     }
+    let ns = (board.uptime_us() - start) * 1000 / CONTENDED_LOCKS;
+    let _ = writeln!(board.console(), "lock: contended {ns} ns/round-trip");
     let count = board.add_locked(0);
     let _ = writeln!(board.console(), "lock: count {count}");
 }
 
 fn add_and_yield<B: Board>(board: &mut B, _: usize) -> ! {
-    let count = board.add_locked(BENCH_LOCKS);
+    let count = board.add_locked(CONTENDED_LOCKS);
     let _ = writeln!(board.console(), "lock: adder done at {count}");
     ADDERS_DONE.fetch_add(1, Relaxed);
     loop {

@@ -3,7 +3,7 @@
 ## What this crate is
 
 The only architecture-specific crate: boot and secondary-core entry (`src/aarch64/boot.s`), exception vectors and `TrapFrame`
-(`trap.rs`), the per-core vector table choice and the `spec:` report (`spec.rs`), MMU and page tables (`mmu.rs`), GICv2 (`gic.rs`), the virtual timer (`timer.rs`), IRQ masking
+(`trap.rs`), the per-core vector table choice and the `spec:` report (`spec.rs`), MMU and page tables (`mmu.rs`), GICv3 (`gic.rs`: distributor and redistributor MMIO, CPU interface by system registers), the virtual timer (`timer.rs`), IRQ masking
 (`irq.rs`), the only lock and per-CPU primitives (`lock.rs`), `uptime_us` (`mod.rs`).
 
 It is **NOT** board-specific: no MMIO addresses, no memory map, no drivers, no scheduling policy (those are
@@ -14,9 +14,9 @@ It is **NOT** board-specific: no MMIO addresses, no memory map, no drivers, no s
 - `install_vectors(conduit)` (each core, once: picks its table from its own MIDR and ID registers and the SMCCC
   workarounds behind the DT's PSCI conduit, in Linux v6.18 `proton-pack.c` order, writes `VBAR_EL1`, runs
   `msr ssbs, #0` where FEAT_SSBS exists; it reads an ID register, a trap under hvf, or asks the firmware only when the
-  decision reaches it), `record_speculation(conduit)` (each core, once, off the boot path: the table read back from
-  `VBAR_EL1` with the v2, BHB, SSB, Meltdown and BSE states), `speculation(cpus)` (the
-  worst core's record and how many cores share it, once all have recorded), the vector asm (16 static tables, 2 KiB
+  decision reaches it), `record_speculation(conduit)` (each core, once, off the boot path: returns its record, the table
+  read back from `VBAR_EL1` with the v2, BHB, SSB, Meltdown and BSE states, which the board stores in its cores'
+  table), `speculation(records)` (the worst record and how many cores share it, once all have recorded), the vector asm (16 static tables, 2 KiB
   apart in `spec::TABLES` order: plain, `clrbhb`, firmware workaround 3 by `hvc` and by `smc`, and the branch loop
   for each Linux k (8, 11, 24, 32, 38, 132) with `dsb nsh; isb` or `sb`; only entries 8-15, from EL0, run the
   mitigation, before their first branch) and `aarch64_exception` routing: IRQ, EL0 `svc`, EL0 fault, EL1 `svc #0` (yield),
@@ -24,19 +24,23 @@ It is **NOT** board-specific: no MMIO addresses, no memory map, no drivers, no s
 - `new_task`, `new_user_task`, `switch_el0_regs`, `TrapFrame::restart`.
 - Descriptor encoding (the private `kernel`, `user_page`), `enable_mmu(&KernelMap)` (core 0 builds the boot tables: the
   device GiB PXN; the RAM GiB's level-2 table of 2 MiB blocks: the image's text blocks RX, its rodata blocks RO and PXN,
-  the rest RW and PXN; RAM's first 2 MiB by a level-3 table: the DTB's pages RO and PXN, guard pages unmapped, the rest
-  RW and PXN; all UXN and global; SCTLR's WXN set; then `aarch64_mmu_on`; the fill is plain stores of precomputed
-  attributes, since every access is uncached with the MMU off),
-  `secondary_entry` (PSCI `CPU_ON`'s entry: `aarch64_mmu_on` on the same table, the stack top from the context id),
-  `map_page`, `unmap_page`, `free_space`, `set_ttbr0`, `flush_asid` (`tlbi aside1is`), `clamp` (each of N values bounded by its max by `cmp`/`csel`, then one
-  `csdb`), `mask` (an `and` the compiler cannot see through), `user_readable` /
+  the rest RW and PXN; RAM's first 2 MiB by a level-3 table: the DTB's pages RO and PXN, core 0's boot-stack guard page
+  unmapped, the rest RW and PXN; all UXN and global; SCTLR's WXN set; then `aarch64_mmu_on`; the fill is plain stores
+  of precomputed attributes, since every access is uncached with the MMU off),
+  `secondary_entry` (PSCI `CPU_ON`'s entry: `aarch64_mmu_on` on the same table, then its per-CPU area, also its stack
+  top, and its index from the context id), `map_device_gib`,
+  `map_page` (`None` on a level-1 or level-2 block on the way, never writing a table into kernel memory), `unmap_page`,
+  `free_space`, `set_ttbr0`, `flush_asid` (`tlbi aside1is`), `clamp` (each of N values bounded by its max by
+  `cmp`/`csel`, then one `csdb`), `mask` (an `and` the compiler cannot see through), `user_readable` /
   `user_writable` (`at` probes), `clean_dcache` / `invalidate_icache` (`ic ialluis`; clean each code page, invalidate once).
-- `irq::disable` / `restore` / `wait`, `gic::enable` / `enable_cpu` / `route` / `unmask` / `ack` / `eoi`, `timer::arm`,
-  `timer::allow_user_counter`.
-- `Lock<T>`, a ticket spinlock: `lock()` masks IRQs, then acquires, and its `Guard` releases, then restores DAIF;
+- `irq::disable` / `restore` / `wait` / `window`, `gic::enable` / `affinity` / `enable_cpu` / `route` / `unmask` / `unmask_local` / `send_sgi` / `ack` / `eoi`, `mpidr`,
+  `timer::arm` / `stop`, `timer::allow_user_counter`.
+- `Lock<T>`, a ticket spinlock (it counts the acquisitions that had to wait, `contended`, on the slow path only): `lock()` masks IRQs, then acquires, and its `Guard` releases, then restores DAIF;
   `lock_masked()` skips DAIF, for code entered masked; `Guard::leak` keeps it held until the `unsafe` `Lock::unlock`
-  (how trap hooks return holding the board's kernel lock). `cpu()` (TPIDR_EL1: 0 from `_start`, MPIDR Aff0 from `aarch64_secondary`), `MAX_CPUS` (4),
-  `PerCpu<T>` (one `RefCell<T>` per core, reached through `with` with IRQs masked; reentry panics).
+  (how trap hooks return holding the board's kernel lock). TPIDR_EL1 holds the core's dense index in bits 48-63 and its per-CPU area's
+  signed offset from the `.percpu` template in bits 0-47 (0 on core 0 until `enter_percpu`): `cpu()` is `mrs` + `lsr`,
+  `PerCpu<T>::with` (a `RefCell<T>` template static in `.percpu`, its `new` `unsafe`) is `mrs` + `sbfx` + add, IRQs
+  masked, reentry panics. `enter_percpu` (core 0; copies the template, sets TPIDR_EL1), `percpu_size`, `mpidr`.
 
 ## Boundaries (hard)
 
@@ -77,7 +81,9 @@ It is **NOT** board-specific: no MMIO addresses, no memory map, no drivers, no s
 - `enable_mmu` runs once, on core 0, with the MMU off and before any atomic RMW (exclusives need Normal memory), so
   before any `Lock`. `aarch64_mmu_on` and the secondary entry up to its SCTLR write touch no memory (no load, store or
   atomic: constants by `movz`/`movk`, the table by `adrp`), and its `tlbi vmalle1` is local.
-- A core's index is its MPIDR Aff0 (one cluster); the board starts only cores below `MAX_CPUS`, which `PerCpu` indexes.
+- A core's index is dense, from the DTB (the board's table), not its MPIDR; there is no compile-time core count. A
+  secondary's entry copies the template into its area and sets TPIDR_EL1 from `CPU_ON`'s context id, with no MPIDR
+  lookup; the template is never written.
 - TLB and I-cache maintenance use the inner-shareable forms the hardware broadcasts to every core, so a shootdown
   needs no IPI.
 - `Lock` is the only lock: a waiter spins on `ldarh` of the owner ticket, with no `wfe` until measured (hvf may trap
@@ -96,7 +102,7 @@ It is **NOT** board-specific: no MMIO addresses, no memory map, no drivers, no s
   `kernel_text_is_read_only_data_never_executes_and_the_boot_stack_has_a_guard` (W^X, the guard page),
   `tasks_alternate_on_yield`, `timer_preempts_spinning_task` (GIC, timer), `faulting_process_is_killed_and_others_keep_running`
   (EL0 faults, ASIDs), `syscall_bench_reports_round_trip`, `lock_bench_reports_round_trips_and_an_exact_count` (`Lock`),
-  `every_core_comes_online_and_takes_a_timer_tick` and `console_input_reaches_core_0_on_four_cores` (`-smp 4`).
+  `every_core_comes_online_runs_a_task_and_takes_a_timer_tick` and every scenario that boots `-smp 4`.
 - Hot paths by hand: `cargo run -- -append test=bench` (yield), `test=bench-syscall` and `test=bench-lock`
   (`docs/BENCHMARKS.md`).
 

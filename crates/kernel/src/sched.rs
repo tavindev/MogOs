@@ -154,9 +154,31 @@ pub struct Processes<const P: usize> {
     entries: Entries<P>,
 }
 
+/// A core's current slot while it runs its idle context.
+const IDLE: usize = usize::MAX;
+/// The bit of slot `i` (below 64) in a slot mask; no overflow check on the hot paths.
+#[inline]
+fn bit(i: usize) -> u64 {
+    1u64.wrapping_shl(i as u32)
+}
+
+/// `Scheduler::woken`'s flag for core 0's signal.
+const RESUME_BOOT: usize = 1 << (usize::BITS - 1);
+
+/// What one core runs: a slot (`IDLE` for its idle context), that slot's process (0, the boot table, while idle), the
+/// idle context's saved frame, and whether it was signalled since it last went idle.
+#[derive(Clone, Copy)]
+struct Core {
+    current: usize,
+    process: usize,
+    idle: usize,
+    kicked: bool,
+}
+
 /// Run queue of up to `N` threads of up to `P` processes, each thread known by its saved trap frame address, process,
-/// kernel stack and priority. The highest-priority ready thread runs, round robin within a level; blocked ones are
-/// skipped; with none ready, the boot context (slot 0) runs.
+/// kernel stack and priority, shared by every core. A core runs the highest-priority ready thread no other core runs,
+/// round robin within a level; blocked ones are skipped; with none, its idle context, but core 0 runs the boot
+/// context (slot 0, never on another core) once no core runs a thread.
 pub struct Scheduler<const N: usize, const P: usize> {
     frame: [usize; N],
     process: [usize; N],
@@ -169,9 +191,17 @@ pub struct Scheduler<const N: usize, const P: usize> {
     effective: [u8; N],
     /// One past the highest slot ever used.
     end: usize,
-    current: usize,
-    /// `process[current]`, cached: the syscall, switch and exit paths read it on every call.
-    current_process: usize,
+    /// Per core, sized by `start_cores` and never freed (a slice, so indexing it is inline); a core's `process` caches
+    /// `process[current]`, which the syscall, switch and exit paths read on every call.
+    cores: &'static mut [Core],
+    /// A bit per slot some core runs.
+    running: u64,
+    /// A bit per slot to end with its `code` on its own core, which runs it, at its next switch or IRQ.
+    marked: u64,
+    code: [u64; N],
+    /// Tasks made ready (`add`, `wake`) since `take_woken`, as many idle cores may be signalled; `RESUME_BOOT` set once
+    /// every core went idle while the boot context waits, so core 0 is to be signalled. One word: one test when 0.
+    woken: usize,
     processes: Processes<P>,
 }
 
@@ -188,8 +218,11 @@ impl<const N: usize, const P: usize> Scheduler<N, P> {
             priority: [0; N],
             effective: [0; N],
             end: 1,
-            current: 0,
-            current_process: 0,
+            cores: &mut [],
+            running: 1,
+            marked: 0,
+            code: [0; N],
+            woken: 0,
             processes: Processes {
                 space: [PhysAddr(0); P],
                 handles: [Handles::new(); P],
@@ -198,6 +231,25 @@ impl<const N: usize, const P: usize> Scheduler<N, P> {
                 entries: Entries::new(),
             },
         }
+    }
+
+    /// Gives the scheduler `cpus` cores: core 0 runs the boot context, its idle context's first frame at `idle_frame`;
+    /// the others start idle and counted as signalled (an SGI before a core's interrupt controller is up is lost), so
+    /// each must reschedule once it is up; their idle frame is saved by that first switch.
+    pub fn start_cores(&mut self, cpus: usize, idle_frame: usize) {
+        let idle = Core {
+            current: IDLE,
+            process: 0,
+            idle: 0,
+            kicked: true,
+        };
+        self.cores = alloc::vec![idle; cpus].leak();
+        self.cores[0] = Core {
+            current: 0,
+            idle: idle_frame,
+            kicked: false,
+            ..idle
+        };
     }
 
     /// Starts a process with no threads yet at `index` with `generation` (from `free_process`), in address space
@@ -234,6 +286,7 @@ impl<const N: usize, const P: usize> Scheduler<N, P> {
         self.effective[slot] = priority;
         self.end = self.end.max(slot + 1);
         self.processes.threads[process] |= 1 << slot;
+        self.woken += 1;
     }
 
     /// The slot the next `add` takes, if any is free, and the generation it gives the thread there.
@@ -246,28 +299,93 @@ impl<const N: usize, const P: usize> Scheduler<N, P> {
         self.processes.entries.free()
     }
 
-    /// Saves the current task's `frame` and returns the next task's.
+    /// Saves `cpu`'s current `frame` (a task's or its idle context's) and returns the next one it runs.
     #[inline]
-    pub fn switch(&mut self, frame: usize) -> usize {
-        self.frame[self.current] = frame;
-        self.advance()
+    pub fn switch(&mut self, cpu: usize, frame: usize) -> usize {
+        let core = &mut self.cores[cpu];
+        match core.current {
+            IDLE => core.idle = frame,
+            current => self.frame[current] = frame,
+        }
+        self.advance(cpu)
     }
 
-    /// Marks the current task blocked until `wake(event)`; the caller switches away.
-    pub fn block(&mut self, event: Event) {
-        self.slots.state[self.current] = State::Blocked(event);
+    /// Marks `cpu`'s current task blocked until `wake(event)`; the caller switches away.
+    pub fn block(&mut self, cpu: usize, event: Event) {
+        self.slots.state[self.cores[cpu].current] = State::Blocked(event);
     }
 
-    /// True if a task was waiting for `event`.
-    pub fn wake(&mut self, event: Event) -> bool {
-        let mut woke = false;
+    /// Makes every task waiting for `event` ready; returns how many.
+    pub fn wake(&mut self, event: Event) -> usize {
+        let mut woke = 0;
         for state in &mut self.slots.state[..self.end] {
             if *state == State::Blocked(event) {
                 *state = State::Ready;
-                woke = true;
+                woke += 1;
             }
         }
+        self.woken += woke;
         woke
+    }
+
+    /// The cores to signal: the tasks made ready since the last call that are still ready and run nowhere (the caller
+    /// may have switched to one), if any core is left to signal, and core 0 if the boot context may resume.
+    #[inline]
+    pub fn take_woken(&mut self) -> usize {
+        if self.woken == 0 {
+            return 0;
+        }
+        let woken = core::mem::take(&mut self.woken);
+        let boot = (woken & RESUME_BOOT != 0) as usize;
+        let woken = woken & !RESUME_BOOT;
+        if woken == 0 || !self.cores.iter().any(|c| c.current == IDLE && !c.kicked) {
+            return boot;
+        }
+        let waiting = (1..self.end)
+            .filter(|&s| self.slots.state[s] == State::Ready && self.running & 1 << s == 0)
+            .count();
+        woken.min(waiting) + boot
+    }
+
+    /// An idle core other than `cpu`, not signalled since it went idle, now marked signalled: the caller sends it the
+    /// reschedule SGI. `cpu` needs none: an idle core reschedules at the end of every trap.
+    pub fn claim_idle(&mut self, cpu: usize) -> Option<usize> {
+        let (i, core) = (self.cores.iter_mut().enumerate())
+            .find(|(i, c)| c.current == IDLE && !c.kicked && *i != cpu)?;
+        core.kicked = true;
+        Some(i)
+    }
+
+    /// Whether `cpu` runs its idle context.
+    #[inline(always)]
+    pub fn idle(&self, cpu: usize) -> bool {
+        self.cores[cpu].current == IDLE
+    }
+
+    /// Whether the boot context may be waiting for `count()` to drop: core 0 idles or runs it.
+    pub fn boot_waits(&self) -> bool {
+        matches!(self.cores[0].current, 0 | IDLE)
+    }
+
+    /// The core that runs the thread in `slot`, if any.
+    pub fn core_of(&self, slot: usize) -> Option<usize> {
+        if self.running & 1 << slot == 0 {
+            return None;
+        }
+        self.cores.iter().position(|c| c.current == slot)
+    }
+
+    /// Marks the thread in `slot`, which another core runs, to end there with `code`.
+    pub fn mark(&mut self, slot: usize, code: u64) {
+        self.marked |= 1 << slot;
+        self.code[slot] = code;
+    }
+
+    /// The code `cpu`'s current thread is marked to end with, if it is.
+    #[inline(always)]
+    pub fn marked(&self, cpu: usize) -> Option<u64> {
+        let current = self.cores[cpu].current;
+        (current != IDLE && self.marked & bit(current) != 0).then(|| self.code[current])
     }
 
     /// Ends the live thread in `slot` (never slot 0) with `code`, a zombie while a handle reaches it, and wakes its
@@ -275,6 +393,7 @@ impl<const N: usize, const P: usize> Scheduler<N, P> {
     /// so its own handles must already be released (`take_handles`).
     pub fn end(&mut self, slot: usize, code: u64) -> (PhysAddr, Option<Event>) {
         assert!(slot != 0, "the boot context cannot exit");
+        self.marked &= !(1 << slot);
         let blocked = match self.slots.state[slot] {
             State::Blocked(event) => Some(event),
             _ => None,
@@ -364,19 +483,23 @@ impl<const N: usize, const P: usize> Scheduler<N, P> {
         live.then_some(&mut self.processes.memory[index].budget)
     }
 
-    /// The current task's slot and generation.
-    pub fn current(&self) -> (usize, u64) {
-        (self.current, self.slots.generation[self.current])
+    /// `cpu`'s current task's slot and generation.
+    #[inline]
+    pub fn current(&self, cpu: usize) -> (usize, u64) {
+        let current = self.cores[cpu].current;
+        (current, self.slots.generation[current])
     }
 
-    /// The current task's process index (and ASID).
-    pub fn process(&self) -> usize {
-        self.current_process
+    /// `cpu`'s current task's process index (and ASID); 0 while it idles.
+    #[inline(always)]
+    pub fn process(&self, cpu: usize) -> usize {
+        self.cores[cpu].process
     }
 
-    /// The current task's process generation.
-    pub fn generation(&self) -> u64 {
-        self.processes.entries.generation[self.process()]
+    /// `cpu`'s current task's process generation.
+    #[inline]
+    pub fn generation(&self, cpu: usize) -> u64 {
+        self.processes.entries.generation[self.process(cpu)]
     }
 
     /// The address space of the process at `index`.
@@ -394,20 +517,35 @@ impl<const N: usize, const P: usize> Scheduler<N, P> {
         self.processes.threads[index].count_ones() as usize
     }
 
-    /// A live thread of the process at `index`, if it has one.
-    pub fn thread_of(&self, index: usize) -> Option<usize> {
-        let threads = self.processes.threads[index];
+    /// A live thread of the process at `index` that no core but `cpu` runs, if it has one.
+    pub fn thread_of(&self, index: usize, cpu: usize) -> Option<usize> {
+        let threads = self.processes.threads[index] & !self.elsewhere(cpu);
         (threads != 0).then(|| threads.trailing_zeros() as usize)
     }
 
-    /// The current task's own priority.
-    pub fn priority(&self) -> u8 {
-        self.priority[self.current]
+    /// The live threads of the process at `index` that cores other than `cpu` run, a bit per slot.
+    pub fn threads_elsewhere(&self, index: usize, cpu: usize) -> u64 {
+        self.processes.threads[index] & self.elsewhere(cpu)
     }
 
-    /// The current task waits for a mutex `slot` owns: `slot` runs at least at the current task's priority.
-    pub fn boost(&mut self, slot: usize) {
-        self.effective[slot] = self.effective[slot].max(self.effective[self.current]);
+    /// The slots cores other than `cpu` run.
+    fn elsewhere(&self, cpu: usize) -> u64 {
+        match self.cores[cpu].current {
+            IDLE => self.running,
+            current => self.running & !(1 << current),
+        }
+    }
+
+    /// `cpu`'s current task's own priority.
+    #[inline]
+    pub fn priority(&self, cpu: usize) -> u8 {
+        self.priority[self.cores[cpu].current]
+    }
+
+    /// `cpu`'s current task waits for a mutex `slot` owns: `slot` runs at least at that task's priority.
+    pub fn boost(&mut self, cpu: usize, slot: usize) {
+        let current = self.cores[cpu].current;
+        self.effective[slot] = self.effective[slot].max(self.effective[current]);
     }
 
     /// `slot` lost a waiter (unlock or kill): it drops back to its own priority, raised by tasks still waiting for a
@@ -425,20 +563,26 @@ impl<const N: usize, const P: usize> Scheduler<N, P> {
         self.effective[slot] = priority;
     }
 
-    /// A ready task's effective priority beats the current task's.
-    pub fn outranked(&self) -> bool {
-        let current = self.effective[self.current];
-        (0..self.end).any(|s| self.slots.state[s] == State::Ready && self.effective[s] > current)
+    /// A ready task no core runs beats `cpu`'s current task's effective priority.
+    pub fn outranked(&self, cpu: usize) -> bool {
+        let current = self.effective[self.cores[cpu].current];
+        (0..self.end).any(|s| {
+            self.slots.state[s] == State::Ready
+                && self.running & 1 << s == 0
+                && self.effective[s] > current
+        })
     }
 
     /// The memory of the process at `index`.
+    #[inline]
     pub fn memory(&mut self, index: usize) -> &mut Memory {
         &mut self.processes.memory[index]
     }
 
-    /// The current process's handles.
-    pub fn handles(&mut self) -> &mut Handles {
-        &mut self.processes.handles[self.current_process]
+    /// `cpu`'s current process's handles.
+    #[inline(always)]
+    pub fn handles(&mut self, cpu: usize) -> &mut Handles {
+        &mut self.processes.handles[self.cores[cpu].process]
     }
 
     /// Empties the handle table of the process at `index`; returns what it held.
@@ -452,22 +596,48 @@ impl<const N: usize, const P: usize> Scheduler<N, P> {
         self.slots.state[..self.end].iter().filter(queued).count()
     }
 
-    /// Moves to the highest-priority ready task, the first after the current one (itself last) among equals; with none
-    /// ready, to the boot context.
-    fn advance(&mut self) -> usize {
-        let (mut slot, mut next) = (self.current, None);
+    /// Moves `cpu` to the highest-priority ready task no other core runs, the first after its current one (itself
+    /// last) among equals, slot 0 only on core 0; with none, core 0 to the boot context if no core runs a task, else
+    /// to its idle context.
+    fn advance(&mut self, cpu: usize) -> usize {
+        let mut slot = match self.cores[cpu].current {
+            IDLE => self.end - 1,
+            current => {
+                self.running &= !bit(current);
+                current
+            }
+        };
+        // Slot 0 is the boot context's, pinned to core 0.
+        let free = !self.running & !((cpu != 0) as u64);
+        let mut next = None;
         for _ in 0..self.end {
             slot = if slot + 1 == self.end { 0 } else { slot + 1 };
             if matches!(self.slots.state[slot], State::Ready)
+                && free & bit(slot) != 0
                 && next.is_none_or(|n: usize| self.effective[slot] > self.effective[n])
             {
                 next = Some(slot);
             }
         }
-        self.current = next.unwrap_or(0);
-        self.slots.state[self.current] = State::Ready;
-        self.current_process = self.process[self.current];
-        self.frame[self.current]
+        let next = match next {
+            Some(slot) => slot,
+            None if cpu == 0 && self.running == 0 => 0,
+            None => {
+                // The boot context waits for every core to idle: signal core 0 (first in `claim_idle`'s order).
+                let boot = self.cores[0];
+                if cpu != 0 && self.running == 0 && boot.current == IDLE && !boot.kicked {
+                    self.woken |= RESUME_BOOT;
+                }
+                let core = &mut self.cores[cpu];
+                (core.current, core.process, core.kicked) = (IDLE, 0, false);
+                return core.idle;
+            }
+        };
+        self.slots.state[next] = State::Ready;
+        self.running |= bit(next);
+        let core = &mut self.cores[cpu];
+        (core.current, core.process) = (next, self.process[next]);
+        self.frame[next]
     }
 }
 

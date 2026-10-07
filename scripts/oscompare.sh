@@ -32,7 +32,7 @@ APKS="e2fsprogs-1.47.4-r0 e2fsprogs-libs-1.47.4-r0 libcom_err-1.47.4-r0 libblkid
 OPT=-Os
 
 DISK_MIB=64
-QEMU=(qemu-system-aarch64 -M virt -cpu cortex-a72 -accel hvf -m 128M -smp 1 -nographic
+QEMU=(qemu-system-aarch64 -M virt,gic-version=3 -cpu cortex-a72 -accel hvf -m 128M -smp 1 -nographic
     -global virtio-mmio.force-legacy=false -global virtio-mmio.ioeventfd=off
     -drive file="$OUT/disk.img",if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0)
 MOGOS=(-kernel "$ROOT/target/aarch64-unknown-none-softfloat/release/mog_os")

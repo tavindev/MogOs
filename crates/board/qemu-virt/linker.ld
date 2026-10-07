@@ -21,6 +21,14 @@ SECTIONS
     __rodata_end = .;
     .data : { *(.data .data.*) }
 
+    /* The per-CPU template: each core's area is a copy, made at boot; the template itself is never written. */
+    .percpu : ALIGN(64) {
+        __percpu_start = .;
+        KEEP(*(.percpu .percpu.*))
+        . = ALIGN(16);
+        __percpu_end = .;
+    }
+
     .bss (NOLOAD) : ALIGN(16) {
         __bss_start = .;
         *(.bss .bss.*)
@@ -35,11 +43,10 @@ SECTIONS
     /DISCARD/ : { *(.comment) *(.note*) *(.eh_frame*) }
 }
 
-/* The stacks live below the image, at the top of RAM's first 2 MiB (mapped by 4 KiB pages, the DTB below them),
-   each with an unmapped 4 KiB guard page below it: core 0's 64 KiB, ending at the image, then cores 1 to MAX_CPUS - 1
-   (3), 16 KiB each, core n's ending at __boot_guard - (n - 1) * 0x5000. */
+/* Core 0's 64 KiB boot stack lives below the image, at the top of RAM's first 2 MiB (mapped by 4 KiB pages, the DTB
+   below it), with an unmapped 4 KiB guard page below it; the other cores' stacks are in their per-CPU blocks. */
 __stack_top = __kernel_start;
 __boot_guard = __stack_top - 0x11000;
-__stacks = __boot_guard - 3 * 0x5000;
+__stacks = __boot_guard;
 
 ASSERT(__kernel_start % 0x200000 == 0, "the image must start a 2 MiB block")

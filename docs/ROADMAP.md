@@ -8,7 +8,7 @@ Ordered by dependency: each phase builds on the previous one.
 | 2 | Time and concurrency: the kernel multitasks | [phase-2-time-concurrency.md](phases/phase-2-time-concurrency.md) | Done |
 | 3 | User space: isolated programs, capability-based native ABI | [phase-3-user-space.md](phases/phase-3-user-space.md) | Done |
 | 4 | Shell, async I/O, MogFS | [phase-4-io-storage.md](phases/phase-4-io-storage.md) | Done (step 23: musl, busybox; `^C` deferred) |
-| 5 | SMP with no practical core cap (512 under TCG), threads, fair scheduling, resource groups, no fixed object limits; the locking model fixed first | [phase-5-smp-threads.md](phases/phase-5-smp-threads.md) | In progress (steps 24, 25a, 26 done) |
+| 5 | SMP with no practical core cap (512 under TCG), threads, fair scheduling, resource groups, no fixed object limits; the locking model fixed first | [phase-5-smp-threads.md](phases/phase-5-smp-threads.md) | In progress (steps 24, 25a, 25b, 25c, 26 done) |
 | 6 | Virtual memory: demand paging under no-overcommit, page cache, file mmap, CoW fork in libc, higher-half kernel, KASLR (kernel W^X moved to phase 10 step 60c); from phase 5: all RAM mapped (past the 3 GiB identity window), user image and stack sized from the ELF with a stack budget, kernel stack guard pages, the GIC's 256 GiB redistributor hole leaving user VA | not written | |
 | 7 | Storage that scales: MogFS v2 (extents, snapshots, scrub), async block path, multi-queue NVMe | [phase-7-storage.md](phases/phase-7-storage.md) | |
 | 8 | Networking: safe TCP/IP, sockets as handles, virtio-net | [phase-8-networking.md](phases/phase-8-networking.md) | In progress (steps 46, 49, 50, 51 done) |

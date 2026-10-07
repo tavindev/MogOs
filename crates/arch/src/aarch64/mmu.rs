@@ -139,7 +139,8 @@ pub struct KernelMap {
     /// In RAM's first 2 MiB, mapped by 4 KiB pages: read-only and PXN; the rest of that block read-write and PXN but
     /// for the unmapped `guards`.
     pub dtb: Range<PhysAddr>,
-    pub guards: [PhysAddr; super::MAX_CPUS],
+    /// Core 0's boot-stack guard page (the other cores' stacks are in their per-CPU blocks).
+    pub guard: PhysAddr,
     /// The image's 2 MiB blocks: read-only and executable below `text_end`, read-only and PXN below `rodata_end`,
     /// read-write and PXN above.
     pub image: PhysAddr,
@@ -191,11 +192,23 @@ pub unsafe fn enable_mmu(map: &KernelMap) {
     fill(l3, (0, dtb.0), map.ram.0, PAGE, pages(Kernel::ReadWrite));
     fill(l3, dtb, map.ram.0, PAGE, pages(Kernel::ReadOnly));
     fill(l3, (dtb.1, 512), map.ram.0, PAGE, pages(Kernel::ReadWrite));
-    for guard in map.guards {
-        l3[page(guard.0) as usize] = 0;
-    }
+    l3[page(map.guard.0) as usize] = 0;
     // SAFETY: the tables are written and the caller guarantees they map everything in use.
     unsafe { asm!("bl aarch64_mmu_on", out("x9") _, out("x10") _, out("x30") _) }
+}
+
+/// Maps the GiB at `addr` as EL1-only Device memory in the boot table.
+///
+/// # Safety
+///
+/// The GiB must be MMIO the kernel may touch and its boot-table entry invalid; call after `enable_mmu`, on core 0,
+/// before any other core starts.
+pub unsafe fn map_device_gib(addr: PhysAddr) {
+    let table = &raw mut L1;
+    // SAFETY: core 0 alone; the entry was invalid, so no walk or TLB entry depends on it (no break-before-make).
+    unsafe { (*table).0[(addr.0 >> 30) as usize] = kernel(addr.0, Kernel::Device, VALID_BLOCK) };
+    // SAFETY: barriers only complete the table write before later walks.
+    unsafe { asm!("dsb ishst", "isb", options(nostack, preserves_flags)) };
 }
 
 /// The boot level-1 table that `enable_mmu` loaded, with ASID 0.
@@ -204,7 +217,8 @@ pub fn boot_table() -> PhysAddr {
 }
 
 /// Maps the 4 KiB page at `va` to `leaf` (a `user_page` descriptor) in the tables under `l1`, taking each
-/// missing level-2 or level-3 table from `alloc`; `None` if `alloc` ran out.
+/// missing level-2 or level-3 table from `alloc`; `None` if `alloc` ran out or a level-1 or level-2 entry on the way is
+/// a block (a kernel mapping), not a table.
 ///
 /// # Safety
 ///
@@ -221,10 +235,14 @@ pub unsafe fn map_page(
         let entry = (table as *mut u64).wrapping_add((va >> shift) as usize & 511);
         // SAFETY: the caller guarantees `table` is an identity-mapped table frame of this address space.
         let mut desc = unsafe { entry.read() };
-        if desc & VALID_TABLE_OR_PAGE == 0 {
-            desc = table_entry(alloc()?);
-            // SAFETY: as above.
-            unsafe { entry.write(desc) };
+        match desc & VALID_TABLE_OR_PAGE {
+            0 => {
+                desc = table_entry(alloc()?);
+                // SAFETY: as above.
+                unsafe { entry.write(desc) };
+            }
+            VALID_TABLE_OR_PAGE => {}
+            _ => return None,
         }
         table = desc & ADDR;
     }
@@ -288,7 +306,7 @@ unsafe fn free_table<F: FnMut(PhysAddr)>(table: PhysAddr, level: u32, free: &mut
         if desc & VALID_TABLE_OR_PAGE != VALID_TABLE_OR_PAGE {
             continue;
         }
-        // SAFETY: the boot table is only written by `enable_mmu`, before any address space exists.
+        // SAFETY: the boot table is written only by `enable_mmu` and `map_device_gib`, before any address space exists.
         if level == 1 && unsafe { (*boot).0[i] } != 0 {
             continue;
         }

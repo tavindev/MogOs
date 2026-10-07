@@ -20,9 +20,22 @@ fn boot(extra: &[&str]) -> (ExitStatus, Vec<String>) {
     boot_with_input(extra, None)
 }
 
+/// As `boot`, with a cap of `secs` instead of `CAP`, and a silence limit of a tenth of it if that is longer.
+fn boot_for(secs: u64, extra: &[&str]) -> (ExitStatus, Vec<String>) {
+    boot_with(Duration::from_secs(secs), extra, None)
+}
+
 /// As `boot`; with `input` = (`ready`, `chunks`), writes chunk `i` to QEMU's stdin once the output contains `ready`
 /// `i + 1` times.
 fn boot_with_input(extra: &[&str], input: Option<(&str, &[&[u8]])>) -> (ExitStatus, Vec<String>) {
+    boot_with(CAP, extra, input)
+}
+
+fn boot_with(
+    cap: Duration,
+    extra: &[&str],
+    input: Option<(&str, &[&[u8]])>,
+) -> (ExitStatus, Vec<String>) {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     // Once per run: even a fresh `cargo build` replaces `mog_os`, so a build beside a booting test can leave QEMU no ELF.
     static BUILD: Once = Once::new();
@@ -40,7 +53,7 @@ fn boot_with_input(extra: &[&str], input: Option<(&str, &[&[u8]])>) -> (ExitStat
         false => &["-cpu", "cortex-a72"][..],
     };
     let mut qemu = Command::new("qemu-system-aarch64")
-        .args(["-M", "virt"])
+        .args(["-M", "virt,gic-version=3"])
         .args(cpu)
         .args([
             "-m",
@@ -53,6 +66,10 @@ fn boot_with_input(extra: &[&str], input: Option<(&str, &[&[u8]])>) -> (ExitStat
             "-kernel",
         ])
         .arg(root.join("target/aarch64-unknown-none-softfloat/debug/mog_os"))
+        .args(match extra.contains(&"-smp") {
+            true => &[][..],
+            false => &["-smp", "4"],
+        })
         .args(extra)
         .stdin(match input {
             Some(_) => Stdio::piped(),
@@ -78,7 +95,8 @@ fn boot_with_input(extra: &[&str], input: Option<(&str, &[&[u8]])>) -> (ExitStat
             (seen, last) = (len, now);
         }
         silence = silence.max(now - last);
-        if now - last > SILENCE || now - start > CAP {
+        // A longer cap (hundreds of TCG cores) allows a longer silence too: QEMU starts every vCPU before any output.
+        if now - last > SILENCE.max(cap / 10) || now - start > cap {
             qemu.kill().unwrap();
             qemu.wait().unwrap();
             break None;
@@ -147,7 +165,7 @@ fn boots_and_powers_off() {
         "mmu: on",
         "heap: ok",
         "disk: none",
-        "spec: v1 mitigated, v2 vulnerable, bhb not mitigated (v2 vulnerable), ssb vulnerable, meltdown not affected, bse vulnerable, table plain on 1/1 cores",
+        "spec: v1 mitigated, v2 vulnerable, bhb not mitigated (v2 vulnerable), ssb vulnerable, meltdown not affected, bse vulnerable, table plain on 4/4 cores",
     ] {
         assert!(
             lines.iter().any(|l| l == expected),
@@ -236,7 +254,7 @@ fn kernel_text_is_read_only_data_never_executes_and_the_boot_stack_has_a_guard()
 
 #[test]
 fn tasks_alternate_on_yield() {
-    let (status, lines) = boot(&["-append", "test=yield"]);
+    let (status, lines) = boot(&["-smp", "1", "-append", "test=yield"]);
     let tasks: Vec<_> = lines.iter().filter(|l| l.starts_with("task ")).collect();
     assert_eq!(
         tasks,
@@ -258,7 +276,7 @@ fn tasks_alternate_on_yield() {
 
 #[test]
 fn timer_preempts_spinning_task() {
-    let (status, lines) = boot(&["-append", "test=preempt"]);
+    let (status, lines) = boot(&["-smp", "1", "-append", "test=preempt"]);
     let tasks: Vec<_> = lines.iter().filter(|l| l.starts_with("task ")).collect();
     assert_eq!(tasks, ["task b: 0", "task b: 1", "task b: 2"]);
     assert!(
@@ -320,7 +338,7 @@ fn handles_enforce_rights_and_generations() {
 
 #[test]
 fn syscall_bench_reports_round_trip() {
-    let (status, lines) = boot(&["-append", "test=bench-syscall"]);
+    let (status, lines) = boot(&["-smp", "1", "-append", "test=bench-syscall"]);
     assert!(
         !lines.iter().any(|l| l.starts_with("panic:")),
         "kernel panicked"
@@ -336,6 +354,17 @@ fn syscall_bench_reports_round_trip() {
 
 /// Lines from QEMU 9.2.1's models (`target/arm/tcg/cpu64.c`): cortex-a72 is r0p3 without CSV2 or firmware, cortex-a76
 /// has CSV2, CSV3 and SSBS but no SB, max has CSV2_3, CSV3, SSBS2 and SB.
+#[test]
+fn spec_line_counts_all_sixty_four_cores() {
+    let (status, lines) = boot(&["-smp", "64"]);
+    let expected = "spec: v1 mitigated, v2 vulnerable, bhb not mitigated (v2 vulnerable), ssb vulnerable, meltdown not affected, bse vulnerable, table plain on 64/64 cores";
+    assert!(
+        lines.iter().any(|l| l == expected),
+        "missing line: {expected}"
+    );
+    assert!(status.success(), "QEMU exited with {status}");
+}
+
 #[test]
 fn spec_line_matches_the_cpu() {
     for (cpu, spec) in [
@@ -373,6 +402,24 @@ fn spec_line_matches_the_cpu() {
 }
 
 #[test]
+fn map_stops_at_the_end_of_user_memory_with_budget_left() {
+    let (status, lines) = boot(&["-append", "test=map-end"]);
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.starts_with("panic:") || l.starts_with("fault:")),
+        "kernel panicked or the fixture faulted"
+    );
+    let n: Vec<_> = lines.iter().filter(|l| l.starts_with("N: ")).collect();
+    // From two pages below the end: one page, then three would pass it, then the last page.
+    assert_eq!(
+        n,
+        ["N: one page", "N: past the end: ENOMEM", "N: the last page"]
+    );
+    assert!(status.success(), "QEMU exited with {status}");
+}
+
+#[test]
 fn map_stops_at_budget_and_exit_returns_every_frame() {
     let (status, lines) = boot(&["-append", "test=budget"]);
     assert!(
@@ -399,6 +446,16 @@ fn assert_no_leak(lines: &[String], test: &str) {
     assert_eq!(after, format!("{before} after"), "frames leaked");
 }
 
+/// Asserts that the lines starting with each of `prefixes` are, in order, the `expected` lines with that prefix: each
+/// process's own order, whichever cores they ran on.
+fn assert_each_in_order(lines: &[String], prefixes: &[&str], expected: &[&str]) {
+    for prefix in prefixes {
+        let got: Vec<_> = lines.iter().filter(|l| l.starts_with(prefix)).collect();
+        let want: Vec<_> = expected.iter().filter(|l| l.starts_with(prefix)).collect();
+        assert_eq!(got, want, "lines starting with {prefix:?}");
+    }
+}
+
 #[test]
 fn spawn_moves_handles_and_budget_to_the_child() {
     let (status, lines) = boot(&["-append", "test=spawn"]);
@@ -406,14 +463,10 @@ fn spawn_moves_handles_and_budget_to_the_child() {
         !lines.iter().any(|l| l.starts_with("panic:")),
         "kernel panicked"
     );
-    let s: Vec<_> = lines
-        .iter()
-        .filter(|l| l.starts_with("S: ") || l.starts_with("C: "))
-        .collect();
-    // The parent never yields and the timer is off, so all its lines precede the child's.
-    assert_eq!(
-        s,
-        [
+    assert_each_in_order(
+        &lines,
+        &["S: ", "C: "],
+        &[
             "S: open missing: ENOENT",
             "S: empty write: 0",
             "S: spawn non-ELF: ENOEXEC",
@@ -431,7 +484,7 @@ fn spawn_moves_handles_and_budget_to_the_child() {
             "C: statics work",
             "C: handle 1 not given: EBADF",
             "C: 32 args of 4096 bytes: child, a b",
-        ]
+        ],
     );
     // The one-frame-short spawn fails after mapping everything but the kernel stack, so this checks its rollback.
     assert_no_leak(&lines, "spawn");
@@ -440,7 +493,8 @@ fn spawn_moves_handles_and_budget_to_the_child() {
 
 #[test]
 fn parent_blocks_on_an_empty_pipe_until_the_child_writes() {
-    let (status, lines) = boot(&["-append", "test=pipe"]);
+    // An ordering scenario: on several cores the writer may run before the reader blocks.
+    let (status, lines) = boot(&["-smp", "1", "-append", "test=pipe"]);
     assert!(
         !lines.iter().any(|l| l.starts_with("panic:")),
         "kernel panicked"
@@ -481,15 +535,12 @@ fn an_exited_child_keeps_its_slot_until_waited_for() {
         !lines.iter().any(|l| l.starts_with("panic:")),
         "kernel panicked"
     );
-    let pc: Vec<_> = lines
-        .iter()
-        .filter(|l| l.starts_with("P: ") || l.starts_with("C: "))
-        .collect();
     // A exits (waking the parent blocked on a pipe whose only write end A held) before B is spawned, so B would
-    // take A's slot if exit freed it. B runs only once the parent's `wait` on it blocks.
-    assert_eq!(
-        pc,
-        [
+    // take A's slot if exit freed it.
+    assert_each_in_order(
+        &lines,
+        &["P: ", "C: "],
+        &[
             "P: spawned A",
             "P: EOF once A exits",
             "P: spawned B",
@@ -501,7 +552,7 @@ fn an_exited_child_keeps_its_slot_until_waited_for() {
             "P: both budgets returned",
             "P: third child exited",
             "P: close returned its budget",
-        ]
+        ],
     );
     assert_no_leak(&lines, "wait");
     assert!(status.success(), "QEMU exited with {status}");
@@ -509,7 +560,7 @@ fn an_exited_child_keeps_its_slot_until_waited_for() {
 
 #[test]
 fn priority_inheritance_lets_the_mutex_owner_outrun_a_middle_priority_spinner() {
-    let (status, lines) = boot(&["-append", "test=pi"]);
+    let (status, lines) = boot(&["-smp", "1", "-append", "test=pi"]);
     assert!(
         !lines.iter().any(|l| l.starts_with("panic:")),
         "kernel panicked"
@@ -545,8 +596,34 @@ fn priority_inheritance_lets_the_mutex_owner_outrun_a_middle_priority_spinner() 
 }
 
 #[test]
+fn a_mutex_waiter_on_another_core_gets_it_at_unlock_and_every_frame_returns() {
+    let (status, lines) = boot(&["-append", "test=pi"]);
+    assert!(
+        !lines.iter().any(|l| l.starts_with("panic:")),
+        "kernel panicked"
+    );
+    // On four cores Mid spins beside the others, so only each process's own order is fixed.
+    for expected in [
+        "L: locked",
+        "H: locking",
+        "H: acquired",
+        "L: relocked",
+        "P: high exited",
+        "P: mid killed",
+        "P: low exited",
+    ] {
+        assert!(
+            lines.iter().any(|l| l == expected),
+            "missing line: {expected}"
+        );
+    }
+    assert_no_leak(&lines, "pi");
+    assert!(status.success(), "QEMU exited with {status}");
+}
+
+#[test]
 fn pipe_bench_reports_round_trip() {
-    let (status, lines) = boot(&["-append", "test=bench-pipe"]);
+    let (status, lines) = boot(&["-smp", "1", "-append", "test=bench-pipe"]);
     assert!(
         !lines.iter().any(|l| l.starts_with("panic:")),
         "kernel panicked"
@@ -566,12 +643,26 @@ fn pipe_bench_reports_round_trip() {
 
 #[test]
 fn lock_bench_reports_round_trips_and_an_exact_count() {
-    let (status, lines) = boot(&["-append", "test=bench-lock"]);
+    lock_bench(4, 300);
+}
+
+#[test]
+#[ignore = "the ticket lock convoys with 64 TCG vCPUs on 12 host cores: until step 32's queued lock"]
+fn every_one_of_sixty_four_cores_adds_under_the_lock_and_the_count_is_exact() {
+    lock_bench(64, 1800);
+}
+
+/// `test=bench-lock` on `cpus` cores within `secs`.
+fn lock_bench(cpus: usize, secs: u64) {
+    let (status, lines) = boot_for(
+        secs,
+        &["-smp", &cpus.to_string(), "-append", "test=bench-lock"],
+    );
     assert!(
         !lines.iter().any(|l| l.starts_with("panic:")),
         "kernel panicked"
     );
-    for lock in ["ticket", "test-and-set"] {
+    for lock in ["ticket", "test-and-set", "cpu", "per-cpu", "contended"] {
         lines
             .iter()
             .find_map(|l| {
@@ -588,11 +679,55 @@ fn lock_bench_reports_round_trips_and_an_exact_count() {
         .expect("missing adder line")
         .parse::<u64>()
         .unwrap();
-    assert!(first > 10_000_000, "the timer never interleaved the adders");
+    // One adder per core, the boot context one of them, each adding 10^5.
+    assert!(first > 100_000, "the adders never interleaved");
+    let count = format!("lock: count {}", cpus * 100_000);
+    assert!(lines.contains(&count), "missing line: {count}");
+    assert!(status.success(), "QEMU exited with {status}");
+}
+
+#[test]
+fn smp_bench_reports_throughput_and_contention_for_each_worker_count() {
+    let (status, lines) = boot(&["-append", "test=bench-smp"]);
     assert!(
-        lines.iter().any(|l| l == "lock: count 20000000"),
-        "the two adders' count is not exact"
+        !lines
+            .iter()
+            .any(|l| l.starts_with("panic:") || l.starts_with("fault:")),
+        "kernel panicked or a worker faulted"
     );
+    for mode in ["syscall", "pipe", "spawn"] {
+        for k in [1, 2, 4] {
+            let line = format!("bench-smp {mode} {k}: ");
+            let rest = lines
+                .iter()
+                .find_map(|l| l.strip_prefix(&line))
+                .unwrap_or_else(|| panic!("missing line: {line}"));
+            let (rate, contended) = rest.split_once(" ops/s, ").unwrap();
+            assert!(rate.parse::<u64>().unwrap() > 0);
+            contended
+                .strip_suffix(" contended")
+                .unwrap()
+                .parse::<u32>()
+                .unwrap();
+        }
+    }
+    assert_no_leak(&lines, "bench-smp");
+    assert!(status.success(), "QEMU exited with {status}");
+}
+
+#[test]
+fn ipi_bench_reports_an_sgi_round_trip_between_cores() {
+    let (status, lines) = boot(&["-append", "test=bench-ipi"]);
+    assert!(
+        !lines.iter().any(|l| l.starts_with("panic:")),
+        "kernel panicked"
+    );
+    lines
+        .iter()
+        .find_map(|l| l.strip_prefix("ipi: ")?.strip_suffix(" ns/round-trip"))
+        .expect("missing ipi line")
+        .parse::<u64>()
+        .unwrap();
     assert!(status.success(), "QEMU exited with {status}");
 }
 
@@ -602,25 +737,62 @@ fn console_reads_edited_lines_typed_ahead() {
 }
 
 #[test]
-fn console_input_reaches_core_0_on_four_cores() {
-    console_echo(&["-smp", "4"]);
+fn every_core_comes_online_runs_a_task_and_takes_a_timer_tick() {
+    every_core_runs(4, 300);
+}
+
+/// TCG; about 7 s alone on a loaded host.
+#[test]
+fn sixty_four_cores_come_online_run_tasks_and_take_a_timer_tick() {
+    every_core_runs(64, 300);
 }
 
 #[test]
-fn every_core_comes_online_and_takes_a_timer_tick() {
-    let (status, lines) = boot(&["-smp", "4", "-append", "test=smp"]);
+#[ignore = "TCG at 128 cores: run with --ignored --test-threads=1"]
+fn a_hundred_and_twenty_eight_cores_come_online_run_tasks_and_take_a_timer_tick() {
+    every_core_runs(128, 600);
+}
+
+#[test]
+#[ignore = "TCG at 512 cores: run with --ignored --test-threads=1"]
+fn five_hundred_and_twelve_cores_come_online_run_tasks_and_take_a_timer_tick() {
+    every_core_runs(512, 1800);
+}
+
+/// `test=smp` on `cpus` cores within `secs`.
+fn every_core_runs(cpus: usize, secs: u64) {
+    let (status, lines) = boot_for(secs, &["-smp", &cpus.to_string(), "-append", "test=smp"]);
     assert!(
         !lines.iter().any(|l| l.starts_with("panic:")),
         "kernel panicked"
     );
-    for cpu in 0..4 {
-        let online = format!("cpu {cpu}: online");
-        assert!(lines.contains(&online), "missing line: {online}");
-    }
+    let online = format!("smp: {cpus} cpus online in ");
     assert!(
-        lines.iter().any(|l| l == "smp: 4 cpus ticked"),
-        "missing line: smp: 4 cpus ticked"
+        lines
+            .iter()
+            .any(|l| l.starts_with(&online) && l.ends_with(" us")),
+        "missing line: {online}<us> us"
     );
+    // `threads`' victim spins on one core while its other thread blocks; the kill ends both from another core.
+    assert!(
+        lines
+            .iter()
+            .any(|l| l == "T: killed a process with a spinning and a blocked thread"),
+        "the victim was not killed"
+    );
+    assert_no_leak(&lines, "smp");
+    // Each spinner (one per core, at most 32) waits until all have started, so they ran at once, on distinct cores.
+    let mut spun: Vec<usize> = lines
+        .iter()
+        .filter_map(|l| l.strip_prefix("smp: spinner on cpu ")?.parse().ok())
+        .collect();
+    let count = spun.len();
+    spun.sort();
+    spun.dedup();
+    assert_eq!((count, spun.len()), (cpus.min(32), cpus.min(32)));
+    assert!(spun.iter().all(|&c| c < cpus));
+    let ticked = format!("smp: {cpus} cpus ticked");
+    assert!(lines.contains(&ticked), "missing line: {ticked}");
     assert!(status.success(), "QEMU exited with {status}");
 }
 
@@ -662,7 +834,14 @@ fn disk_image(test: &str, blocks: u64) -> PathBuf {
 /// Boots with `image` attached as a virtio-blk device and `test` as the boot argument.
 fn boot_with_disk(image: &Path, test: &str) -> (ExitStatus, Vec<String>) {
     let drive = format!("file={},if=none,format=raw,id=d0", image.display());
+    // The benchmarks stay on one core.
+    let smp = match test {
+        "test=bench-disk" | "test=bench-fs" => "1",
+        _ => "4",
+    };
     boot(&[
+        "-smp",
+        smp,
         "-drive",
         &drive,
         "-device",
@@ -1049,7 +1228,9 @@ fn musl_bench_reports_round_trips() {
 fn oscb_runs_the_cross_os_benchmarks() {
     let image = mogfs_image("oscb", 1024);
     let script = "sh -c 'oscb syscalls / oscnop; oscb pipe / oscnop; oscb spawn / oscnop; oscb files / oscnop'";
-    let (status, got) = shell(&image, &[script, "exit"]);
+    let drive = format!("file={},if=none,format=raw,id=d0", image.display());
+    // A benchmark scenario: one core.
+    let (status, got) = shell_on(&["-smp", "1", "-drive", &drive], &[script, "exit"]);
     std::fs::remove_file(&image).unwrap();
     assert!(status.success(), "QEMU exited with {status}");
     let names: Vec<&str> = got[0]
@@ -1370,7 +1551,15 @@ fn host_page(body: &'static str) -> u16 {
     let port = listener.local_addr().unwrap().port();
     thread::spawn(move || {
         for mut stream in listener.incoming().flatten() {
-            let _ = stream.read(&mut [0; 1024]);
+            // The whole head: replying and closing with request bytes unread would reset the connection, and on
+            // several cores the guest's request may arrive in more than one segment.
+            let (mut head, mut buf) = (Vec::new(), [0; 1024]);
+            while !head.ends_with(b"\r\n\r\n") {
+                match stream.read(&mut buf) {
+                    Ok(n) if n > 0 => head.extend_from_slice(&buf[..n]),
+                    _ => break,
+                }
+            }
             let head = format!("HTTP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
             let _ = stream.write_all((head + body).as_bytes());
         }

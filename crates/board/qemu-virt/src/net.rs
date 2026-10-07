@@ -14,7 +14,7 @@ use net::Config;
 use crate::usermem::{UserIn, UserOut};
 use crate::virtio_net::{NET_DEVICE, POOL_FRAMES, VirtioNet};
 use crate::{
-    CPUS, GIC_DIST, KERNEL, MAX_PROCESSES, QemuVirt, Sched, VIRTIO, VIRTIO_COUNT, VIRTIO_STRIDE,
+    GIC_DIST, KERNEL, MAX_PROCESSES, QemuVirt, Sched, VIRTIO, VIRTIO_COUNT, VIRTIO_STRIDE,
 };
 
 const _: () = assert!(MAX_PROCESSES <= network::MAX_HOLDERS);
@@ -99,10 +99,8 @@ fn setup(board: &mut QemuVirt) {
     if nic.is_some() {
         let irq = IRQ.load(Relaxed);
         let dist = PhysAddr(GIC_DIST.load(Relaxed));
-        if CPUS.load(Relaxed) > 1 {
-            // SAFETY: the DTB's GICv2 distributor, in the device-mapped GiB 0; `irq` is an SPI, core 0's interface is 0.
-            unsafe { arch::gic::route(dist, irq, 0) };
-        }
+        // SAFETY: the DTB's GICv3 distributor, in the device-mapped GiB 0; `irq` is an SPI, routed to core 0.
+        unsafe { arch::gic::route(dist, irq, crate::mpidr(0)) };
         // SAFETY: as above.
         unsafe { arch::gic::unmask(dist, irq) };
     }
@@ -119,7 +117,7 @@ pub fn with<R>(f: impl FnOnce(&mut Network, Option<&mut VirtioNet>, u64) -> R) -
         if NET.lock().is_some() {
             break;
         }
-        kernel.sched.block(Event::Idle);
+        kernel.sched.block(arch::cpu(), Event::Idle);
         drop(kernel);
         arch::yield_now();
     }
@@ -128,6 +126,7 @@ pub fn with<R>(f: impl FnOnce(&mut Network, Option<&mut VirtioNet>, u64) -> R) -
     let (nic, network) = net.as_mut().expect("set up above");
     let result = f(network, nic.as_mut(), now());
     wake(&mut kernel.sched);
+    crate::kick(&mut kernel.sched, arch::cpu());
     result
 }
 
@@ -163,9 +162,9 @@ const SOCKET_RIGHTS: u64 = READ | WRITE | DUPLICATE | TRANSFER;
 /// Runs a socket syscall for the current process: its result (an `io_wait`'s tag and peer in `out`, x1 and x2), or
 /// `None` while `io_wait` must block. Out of line, so `board_syscall` stays as lean for every other call.
 #[inline(never)]
-pub fn syscall(sched: &mut Sched, call: NetCall, out: &mut [u64; 2]) -> Option<i64> {
+pub fn syscall(sched: &mut Sched, cpu: usize, call: NetCall, out: &mut [u64; 2]) -> Option<i64> {
     Some(match call {
-        NetCall::Socket(allowed) => socket(sched, allowed),
+        NetCall::Socket(allowed) => socket(sched, cpu, allowed),
         NetCall::Bind {
             sock,
             port,
@@ -189,50 +188,50 @@ pub fn syscall(sched: &mut Sched, call: NetCall, out: &mut [u64; 2]) -> Option<i
             peer,
             tag,
         } => submit(
-            sched,
+            (sched, cpu),
             sock,
             ((op.into(), ptr, len as usize, tag), peer),
             rights.into(),
         ),
         NetCall::IoWait => {
-            let (result, done, peer) = io_wait(sched)?;
+            let (result, done, peer) = io_wait(sched, cpu)?;
             (out[0], out[1]) = (done, peer);
             result
         }
     })
 }
 
-/// A socket of the current process with NetStack rights `allowed`, and its handle.
-fn socket(sched: &mut Sched, allowed: u64) -> i64 {
+/// A socket of `cpu`'s current process with NetStack rights `allowed`, and its handle.
+fn socket(sched: &mut Sched, cpu: usize, allowed: u64) -> i64 {
     let mut net = NET.lock();
     let network = &mut net.as_mut().expect("a NetStack without a network").1;
-    let made = network.socket(sched.process(), allowed, sched);
+    let made = network.socket(sched.process(cpu), allowed, sched);
     drop(net);
     match made {
-        Ok(sock) => handle(sched, sock, SOCKET_RIGHTS),
+        Ok(sock) => handle(sched, cpu, sock, SOCKET_RIGHTS),
         Err(error) => error,
     }
 }
 
-/// A handle with `rights` to the new `sock` in the current process's table; closes it if the table is full.
-fn handle(sched: &mut Sched, sock: Sock, rights: u64) -> i64 {
-    match sched.handles().insert(Object::Socket(sock), rights) {
+/// A handle with `rights` to the new `sock` in `cpu`'s current process's table; closes it if the table is full.
+fn handle(sched: &mut Sched, cpu: usize, sock: Sock, rights: u64) -> i64 {
+    match sched.handles(cpu).insert(Object::Socket(sock), rights) {
         Ok(handle) => handle as i64,
         Err(error) => {
-            close(sched, sock, sched.process());
+            close(sched, cpu, sock, sched.process(cpu));
             error
         }
     }
 }
 
-/// `io_submit` of `op` on `sock` for the current process.
+/// `io_submit` of `op` on `sock` for `cpu`'s current process.
 fn submit(
-    sched: &mut Sched,
+    (sched, cpu): (&mut Sched, usize),
     sock: Sock,
     (op, peer): ((u64, u64, usize, u64), (u32, u16)),
     rights: u64,
 ) -> i64 {
-    let current = (sched.process(), sched.generation());
+    let current = (sched.process(cpu), sched.generation(cpu));
     let mut net = NET.lock();
     let network = &mut net.as_mut().expect("a socket without a network").1;
     let result = network.submit(sock, (op, peer), rights, (current, now()), sched, &mut User);
@@ -241,9 +240,9 @@ fn submit(
     status(result)
 }
 
-/// `io_wait`'s result and tag, or `None` while the current process's ops are all unfinished.
-fn io_wait(sched: &mut Sched) -> Option<(i64, u64, u64)> {
-    let current = (sched.process(), sched.generation());
+/// `io_wait`'s result, tag and peer, or `None` while `cpu`'s current process's ops are all unfinished.
+fn io_wait(sched: &mut Sched, cpu: usize) -> Option<(i64, u64, u64)> {
+    let current = (sched.process(cpu), sched.generation(cpu));
     let mut net = NET.lock();
     let Some((_, network)) = net.as_mut() else {
         return Some((EINVAL, 0, 0));
@@ -258,7 +257,7 @@ fn io_wait(sched: &mut Sched) -> Option<(i64, u64, u64)> {
     let (result, peer) = match done.accepted {
         Some((sock, rights, peer)) => {
             let peer = u64::from(u32::from(*peer.ip())) << 16 | u64::from(peer.port());
-            (handle(sched, sock, rights & SOCKET_RIGHTS), peer)
+            (handle(sched, cpu, sock, rights & SOCKET_RIGHTS), peer)
         }
         None => (done.result, 0),
     };
@@ -272,11 +271,14 @@ pub fn open(sock: Sock) {
     }
 }
 
-/// Drops a handle of process `holder` to `sock`; refunds `holder` once it has no other handle to it.
-pub fn close(sched: &mut Sched, sock: Sock, holder: usize) {
+/// Drops a handle of process `holder` to `sock` on `cpu`; refunds `holder` once it has no other handle to it.
+pub fn close(sched: &mut Sched, cpu: usize, sock: Sock, holder: usize) {
     // A process other than the current one is ending, its table already emptied.
-    let last =
-        holder != sched.process() || !sched.handles().objects().any(|o| o == Object::Socket(sock));
+    let last = holder != sched.process(cpu)
+        || !sched
+            .handles(cpu)
+            .objects()
+            .any(|o| o == Object::Socket(sock));
     if let Some((_, network)) = NET.lock().as_mut() {
         network.close(sock, holder, last, sched);
     }
@@ -299,7 +301,7 @@ pub fn spawn_charge(child: &Handles, budget: &mut mm::Budget) -> Result<(), i64>
 
 /// After a spawn `spawn_charge` allowed: the child at `index` holds its sockets, and the current process stops
 /// paying for those it no longer holds.
-pub fn spawned(sched: &mut Sched, index: usize, child: &Handles) {
+pub fn spawned(sched: &mut Sched, cpu: usize, index: usize, child: &Handles) {
     if !STARTED.load(Relaxed) {
         return;
     }
@@ -307,10 +309,14 @@ pub fn spawned(sched: &mut Sched, index: usize, child: &Handles) {
     let Some((_, network)) = net.as_mut() else {
         return;
     };
-    let current = sched.process();
+    let current = sched.process(cpu);
     for sock in sockets(child) {
         network.hold(sock, index);
-        if !sched.handles().objects().any(|o| o == Object::Socket(sock)) {
+        if !sched
+            .handles(cpu)
+            .objects()
+            .any(|o| o == Object::Socket(sock))
+        {
             network.unhold(sock, current, sched);
         }
     }
@@ -361,7 +367,7 @@ fn task(board: &mut QemuVirt, _: usize) -> ! {
     loop {
         let mut kernel = KERNEL.lock();
         if !PENDING.swap(false, Relaxed) {
-            kernel.sched.block(Event::Net);
+            kernel.sched.block(arch::cpu(), Event::Net);
             drop(kernel);
             arch::yield_now();
             continue;
@@ -372,5 +378,6 @@ fn task(board: &mut QemuVirt, _: usize) -> ! {
             PENDING.fetch_or(more || nic.as_ref().is_some_and(VirtioNet::capped), Relaxed);
         }
         kernel.sched.wake(Event::NetIo);
+        crate::kick(&mut kernel.sched, arch::cpu());
     }
 }

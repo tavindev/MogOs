@@ -2,7 +2,8 @@
 
 ## What this crate is
 
-Reads the flattened device tree QEMU passes: `total_size`, then `Dtb::memory`, `gic` (GICv2), `cpus` (the count of second-level nodes, the `/cpus` children, with `device_type = "cpu"`),
+Reads the flattened device tree QEMU passes: `total_size`, then `Dtb::memory`, `gic` (the first `arm,gic-v3`: its distributor and `#redistributor-regions` regions), `cpus` (each `/cpus` child with `device_type = "cpu"`: its `reg`, the MPIDR affinity, decoded with `/cpus`' own
+`#address-cells`, in order, and the count),
 `chosen` (`/chosen`'s `bootargs` and the first 16 bytes of `rng-seed`, the TCP key, in one walk) and `psci_method`
 (`/psci`'s `method`: `hvc` or `smc`). All in `src/lib.rs`. It is **NOT** a general device-tree library: no writing, no phandles, no
 nested-bus address translation.
@@ -24,7 +25,7 @@ nested-bus address translation.
 
 ## How it's tested
 
-- Host: `cargo test --target aarch64-apple-darwin -p dtb` (`tests/virt.rs`: bad and truncated headers).
+- Host: `cargo test --target aarch64-apple-darwin -p dtb` (`tests/virt.rs`: bad and truncated headers; QEMU 9.2.1's `-M virt,gic-version=3 -smp 128` blob, `virt-gicv3-128.dtb`, padding cut: every core's MPIDR in order and both redistributor regions).
 - The real QEMU blob: e2e `boots_and_powers_off` asserts the `ram: 0x40000000..0x48000000` line; every `test=*`
   scenario depends on `bootargs`.
 

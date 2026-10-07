@@ -4,9 +4,7 @@
 use core::arch::asm;
 use core::fmt;
 use core::sync::atomic::AtomicU32;
-use core::sync::atomic::Ordering::{Acquire, Release};
-
-use super::{MAX_CPUS, cpu};
+use core::sync::atomic::Ordering::Acquire;
 
 /// Reads the system register `$name`.
 macro_rules! sysreg {
@@ -171,9 +169,6 @@ const BHB_ECBHB: u32 = 2;
 const BHB_UNLISTED: u32 = 3;
 const BHB_V2: u32 = 4;
 
-/// Each core's record, written once by `record_speculation`.
-static RECORDS: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
-
 fn field(reg: u64, shift: u32) -> u32 {
     ((reg >> shift) & 0xf) as u32
 }
@@ -240,9 +235,9 @@ pub fn install_vectors(conduit: Option<Conduit>) {
     }
 }
 
-/// Records this core's state for `speculation`: the table read back from `VBAR_EL1`, and v2, BHB, SSB, Meltdown and
-/// BSE as `install_vectors` decided them. Call once, after `install_vectors`.
-pub fn record_speculation(conduit: Option<Conduit>) {
+/// This core's record for `speculation`: the table read back from `VBAR_EL1`, and v2, BHB, SSB, Meltdown and BSE as
+/// `install_vectors` decided them. Call after `install_vectors`; never 0.
+pub fn record_speculation(conduit: Option<Conduit>) -> u32 {
     let (v2, bhb, _) = decide(conduit);
     let installed = (sysreg!("vbar_el1") - vectors()) / 2048;
     let midr = sysreg!("midr_el1") as u32;
@@ -267,14 +262,13 @@ pub fn record_speculation(conduit: Option<Conduit>) {
         (true, Table::Firmware(_)) => MITIGATED,
         (true, _) => VULNERABLE,
     };
-    let record = RECORDED
+    RECORDED
         | bhb << BHB
         | v2 << V2
         | ssb << SSB
         | bse << BSE
         | meltdown << MELTDOWN
-        | installed as u32;
-    RECORDS[cpu()].store(record, Release);
+        | installed as u32
 }
 
 /// `ARCH_FEATURES` for `workaround`, or -1 (not supported) without SMCCC 1.1, as Linux's `arm_smccc_1_1_get_conduit`
@@ -346,9 +340,9 @@ fn vectors() -> u64 {
     base
 }
 
-/// The worst of the first `cpus` cores' records and how many cores share it, once each has installed its vectors.
-pub fn speculation(cpus: usize) -> Option<Speculation> {
-    let records = &RECORDS[..cpus];
+/// The worst of `records` (one per core, 0 until its core records) and how many cores share it, once each recorded.
+pub fn speculation(records: &[AtomicU32]) -> Option<Speculation> {
+    let cpus = records.len();
     let record = records.iter().map(|r| r.load(Acquire)).max()?;
     if records.iter().any(|r| r.load(Acquire) == 0) {
         return None;

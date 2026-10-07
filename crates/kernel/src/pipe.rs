@@ -40,11 +40,12 @@ const FREE: Pipe = Pipe {
     writers: 0,
 };
 
-pub struct Pipes<const N: usize>([Pipe; N]);
+/// The table, and one past the highest entry ever used, which bounds `charged_to`'s scan.
+pub struct Pipes<const N: usize>([Pipe; N], usize);
 
 impl<const N: usize> Pipes<N> {
     pub const fn new() -> Self {
-        Self([FREE; N])
+        Self([FREE; N], 0)
     }
 
     /// The read end of the pipe the next `create` makes, if an entry is free.
@@ -61,6 +62,7 @@ impl<const N: usize> Pipes<N> {
     /// Makes the pipe whose read end is `read` (from `free`), with one handle to each end and its buffer at `page`,
     /// charged to `creator`.
     pub fn create(&mut self, read: End, page: PhysAddr, creator: (usize, u64)) {
+        self.1 = self.1.max(read.index as usize + 1);
         self.0[read.index as usize] = Pipe {
             page,
             creator,
@@ -98,7 +100,7 @@ impl<const N: usize> Pipes<N> {
     /// Open pipes whose page is charged to `creator`.
     pub fn charged_to(&self, creator: (usize, u64)) -> usize {
         let charged = |p: &&Pipe| p.page.0 != 0 && p.creator == creator;
-        self.0.iter().filter(charged).count()
+        self.0[..self.1].iter().filter(charged).count()
     }
 }
 

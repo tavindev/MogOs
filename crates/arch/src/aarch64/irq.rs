@@ -20,6 +20,19 @@ pub fn restore(state: State) {
     unsafe { asm!("msr daif, {}", in(reg) state.0, options(nostack, preserves_flags)) };
 }
 
+/// With IRQs masked, takes any pending IRQ: unmasks them for one instruction, without sleeping.
+pub fn window() {
+    // SAFETY: the `isb` makes sure a pending IRQ is taken before re-masking; its handler restores every register.
+    unsafe {
+        asm!(
+            "msr daifclr, #2",
+            "isb",
+            "msr daifset, #2",
+            options(nostack)
+        )
+    };
+}
+
 /// With IRQs masked, sleeps until an interrupt is pending, then briefly unmasks so its handler runs.
 pub fn wait() {
     // SAFETY: `wfi` wakes on a pending IRQ even while masked; the `isb` makes sure it is taken before re-masking.

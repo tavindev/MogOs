@@ -6,7 +6,7 @@ jobs = 6
 [target.aarch64-unknown-none-softfloat]
 # rust-lld ignores cargo's jobserver, so cap its threads to match.
 rustflags = ["-C", "link-arg=--threads=6"]
-runner = "qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -global virtio-mmio.force-legacy=false -global virtio-mmio.ioeventfd=off -nographic -kernel"
+runner = "qemu-system-aarch64 -M virt,gic-version=3 -cpu cortex-a72 -smp 4 -m 128M -global virtio-mmio.force-legacy=false -global virtio-mmio.ioeventfd=off -nographic -kernel"
 
 [alias]
 # Strings, not arrays: a worktree under `.claude/worktrees` also loads this file, and cargo concatenates arrays (duplicate `--workspace`) but overrides strings.
@@ -22,4 +22,4 @@ shell = "run -- -drive file=disk.img,if=none,format=raw,id=d0 -device virtio-blk
 httpd = "run -- -netdev user,id=n0,hostfwd=tcp:127.0.0.1:8080-10.0.2.15:80 -device virtio-net-device,netdev=n0 -append test=httpd"
 # Array alias (its quoted runner can't be a string), so it doesn't work inside nested worktrees.
 # Same as `cargo run`, but in a QEMU window that doesn't grab the mouse and stays open after power-off.
-window = ["run", "--config", "target.aarch64-unknown-none-softfloat.runner='qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -global virtio-mmio.force-legacy=false -global virtio-mmio.ioeventfd=off -device virtio-tablet-pci -display cocoa,show-cursor=on -serial vc -no-shutdown -kernel'"]
+window = ["run", "--config", "target.aarch64-unknown-none-softfloat.runner='qemu-system-aarch64 -M virt,gic-version=3 -cpu cortex-a72 -smp 4 -m 128M -global virtio-mmio.force-legacy=false -global virtio-mmio.ioeventfd=off -device virtio-tablet-pci -display cocoa,show-cursor=on -serial vc -no-shutdown -kernel'"]

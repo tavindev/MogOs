@@ -46,36 +46,56 @@ impl<'a> Dtb<'a> {
         })
     }
 
-    /// Distributor and CPU interface bases of the first top-level GICv2 (`arm,cortex-a15-gic`).
-    pub fn gic(&self) -> Option<(PhysAddr, PhysAddr)> {
-        let reg = self.reg_of(b"arm,cortex-a15-gic")?;
-        Some((PhysAddr(reg.reg(0)?.0), PhysAddr(reg.reg(1)?.0)))
-    }
-
-    /// Number of second-level nodes (the `/cpus` children) whose `device_type` is `cpu`.
-    pub fn cpus(&self) -> usize {
-        let mut count = 0;
-        self.find(|p| {
-            count += (p.depth == 3 && p.name == b"device_type" && p.value == b"cpu\0") as usize;
-            None::<()>
-        });
-        count
-    }
-
-    /// `reg` property of the first top-level node compatible with `compatible`.
-    fn reg_of(&self, compatible: &[u8]) -> Option<Prop<'a>> {
-        let (mut node, mut reg, mut found) = (0, None, false);
+    /// The first top-level GICv3 (`arm,gic-v3`) with its `#redistributor-regions`.
+    pub fn gic(&self) -> Option<Gic<'a>> {
+        let (mut node, mut reg, mut regions, mut found) = (0, None, None, false);
         self.find(|p| {
             if p.node_offset != node {
-                (node, reg, found) = (p.node_offset, None, false);
+                (node, reg, regions, found) = (p.node_offset, None, None, false);
             }
             match p.name {
                 b"reg" if p.depth == 2 => reg = Some(*p),
-                b"compatible" => found = p.value.split(|&b| b == 0).any(|c| c == compatible),
+                b"#redistributor-regions" if p.depth == 2 => regions = be32(p.value, 0),
+                b"compatible" => found = p.value.split(|&b| b == 0).any(|c| c == b"arm,gic-v3"),
                 _ => {}
             }
-            reg.filter(|_| found)
+            let gic = Gic {
+                reg: reg?,
+                regions: regions? as usize,
+            };
+            found.then_some(gic)
         })
+    }
+
+    /// Calls `f` with the `reg` (its MPIDR affinity on Arm) of each second-level node whose `device_type` is `cpu` (the
+    /// `/cpus` children), in order, decoded with `/cpus`' `#address-cells`; returns how many.
+    pub fn cpus(&self, mut f: impl FnMut(u64)) -> usize {
+        let (mut cells, mut node, mut reg, mut cpu) = (1, 0, None, false);
+        let mut count = 0;
+        self.find(|p| {
+            if p.depth == 2 && p.node == b"cpus" && p.name == b"#address-cells" {
+                cells = be32(p.value, 0)? as usize;
+            }
+            if p.depth != 3 {
+                return None::<()>;
+            }
+            if p.node_offset != node {
+                (node, reg, cpu) = (p.node_offset, None, false);
+            }
+            match p.name {
+                b"reg" => reg = self::cells(p.value, 0, cells),
+                b"device_type" => cpu = p.value == b"cpu\0",
+                _ => return None,
+            }
+            if let Some(mpidr) = reg.filter(|_| cpu) {
+                f(mpidr);
+                count += 1;
+                // Once per node: neither property can complete it again.
+                (reg, cpu) = (None, false);
+            }
+            None
+        });
+        count
     }
 
     /// `/chosen`'s `bootargs` (QEMU sets it from `-append`) and the first 16 bytes of its `rng-seed` (random on every
@@ -160,6 +180,23 @@ impl<'a> Dtb<'a> {
                 _ => return None,
             }
         }
+    }
+}
+
+/// A GICv3's registers: `reg` holds the distributor, then each redistributor region.
+pub struct Gic<'a> {
+    reg: Prop<'a>,
+    regions: usize,
+}
+
+impl Gic<'_> {
+    pub fn distributor(&self) -> Option<PhysAddr> {
+        Some(PhysAddr(self.reg.reg(0)?.0))
+    }
+
+    /// Each redistributor region's base and size.
+    pub fn redistributors(&self) -> impl Iterator<Item = (PhysAddr, u64)> {
+        (1..=self.regions).map_while(|i| self.reg.reg(i).map(|(base, size)| (PhysAddr(base), size)))
     }
 }
 

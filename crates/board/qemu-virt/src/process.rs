@@ -4,6 +4,7 @@ use core::arch::global_asm;
 use core::ops::Range;
 use core::ptr;
 use core::slice;
+use core::sync::atomic::Ordering::Relaxed;
 
 use arch::{UserAccess, user_page};
 use kernel::elf::{Elf, Segment};
@@ -19,7 +20,7 @@ use mogfs::ROOT;
 use crate::usermem::copy_in;
 use crate::{
     ARCHIVE, IMAGE, KERNEL, KERNEL_ENTRIES, Kernel, MAP_BASE, Nospec, PAGE, Sched,
-    TASK_STACK_FRAMES, USER_BASE, USER_STACK_TOP,
+    TASK_STACK_FRAMES, USER_BASE, USER_END, USER_STACK_TOP, gic_gibs,
 };
 
 /// Returns a thread's kernel stack at `stack` to `frames`, refunding `budget`.
@@ -71,8 +72,8 @@ fn map_filled(
     // SAFETY: as above.
     unsafe { ptr::write_bytes(base.wrapping_add(end), 0, PAGE - end) };
     let leaf = user_page(page, access);
-    // SAFETY: `l1` is a process's table built from zeroed frames like these, and `va` is a user address it leaves unmapped;
-    // map's `next` only grows, by at most the budget, and budgets stay within RAM, so `va` stays far below 512 GiB.
+    // SAFETY: `l1` is a process's table built from zeroed frames like these, and `va` is a user address it leaves
+    // unmapped, from 4 GiB up to `USER_END`.
     if unsafe { arch::map_page(l1, va, leaf, || zeroed(frames, budget)) }.is_none() {
         budget.free(frames, page);
         return None;
@@ -80,21 +81,23 @@ fn map_filled(
     Some(page)
 }
 
-/// Maps `pages` zeroed read-write pages at the current process's next map address, charged to its budget; returns
-/// their address, or `None` with nothing mapped if the budget or the frames run out.
+/// Maps `pages` zeroed read-write pages at `cpu`'s current process's next map address, charged to its budget; returns
+/// their address, or `None` with nothing mapped if the budget or the frames run out or the pages would reach
+/// `USER_END`.
 pub(crate) fn map(
     sched: &mut Sched,
+    cpu: usize,
     frames: &mut FrameAllocator<FRAME_WORDS>,
     pages: usize,
 ) -> Option<u64> {
-    let asid = sched.process();
+    let asid = sched.process(cpu);
     let l1 = sched.space(asid);
     let memory = sched.memory(asid);
-    if pages > memory.budget.remaining() {
-        return None;
-    }
     let start = memory.next;
     let end = start + (pages * PAGE) as u64;
+    if pages > memory.budget.remaining() || end > USER_END.load(Relaxed) {
+        return None;
+    }
     for va in (start..end).step_by(PAGE) {
         if map_zeroed(frames, &mut memory.budget, l1, va, UserAccess::ReadWrite).is_none() {
             for va in (start..va).step_by(PAGE) {
@@ -111,14 +114,14 @@ pub(crate) fn map(
 }
 
 /// Builds a process from `file`'s `segments` (entered at `entry`): address space, pages and its first thread's kernel
-/// stack, all charged to `budget`, and queues it at the free index `process`, its thread in the free `slot`, with
+/// stack, all charged to `memory`'s budget, its first `map` at `memory`'s `next`, and queues it at the free index `process`, its thread in the free `slot`, with
 /// `handles` at `priority`; on failure (`ENOMEM`) returns every frame it took. With `args` (`argc` of them, at most a
 /// page), the top stack page holds them and the stack gets a page below it.
 fn spawn_process(
     sched: &mut Sched,
     frames: &mut FrameAllocator<FRAME_WORDS>,
     (file, segments, entry): (&[u8], impl Iterator<Item = Segment>, u64),
-    mut budget: Budget,
+    Memory { mut budget, next }: Memory,
     (process, slot, handles, priority): ((usize, u64), (usize, u64), Handles, u8),
     (args, argc): (&[u8], usize),
 ) -> Result<(), i64> {
@@ -131,6 +134,13 @@ fn spawn_process(
             KERNEL_ENTRIES,
         )
     };
+    let boot = arch::boot_table().0 as *const u64;
+    for gib in gic_gibs().map(|g| g as usize) {
+        // SAFETY: a boot-table entry `kmain` added, below 512, fixed after `kmain`.
+        let entry = unsafe { boot.wrapping_add(gib).read() };
+        // SAFETY: as above, the fresh frame.
+        unsafe { (l1.0 as *mut u64).wrapping_add(gib).write(entry) };
+    }
     let stack = (|| {
         for segment in segments {
             let data = &file[segment.data];
@@ -174,10 +184,7 @@ fn spawn_process(
     let x = [argc as u64, at, args.len() as u64];
     // SAFETY: the kernel stack below `stack.end` is fresh and owned by the new process.
     let frame = unsafe { arch::new_user_task(stack.end.0 as usize, entry, (at & !15, 0), x) };
-    let memory = Memory {
-        budget,
-        next: MAP_BASE,
-    };
+    let memory = Memory { budget, next };
     sched.add_process(process, l1, memory, handles);
     sched.add(slot, process.0, (frame, stack.start), priority);
     // Its one handle: the spawner's, or init's own.
@@ -196,10 +203,11 @@ pub(crate) fn executable(
     Ok((file, elf.segments(), entry))
 }
 
-/// Queues `executable` from boot context with init's handles, a budget of `budget` frames, `priority` and `args`.
+/// Queues `executable` from boot context with init's handles, a budget of `budget` frames, its first `map` at `next`,
+/// `priority` and `args`.
 pub(crate) fn spawn_init(
     executable: (&[u8], impl Iterator<Item = Segment>, u64),
-    budget: usize,
+    (budget, next): (usize, u64),
     priority: u8,
     archive: Rights,
     args: &[u8],
@@ -218,27 +226,26 @@ pub(crate) fn spawn_init(
         if *mounted {
             handles.insert(Object::Dir(ROOT), READ | WRITE | DUPLICATE | TRANSFER)?;
         }
-        if crate::net::STARTED.load(core::sync::atomic::Ordering::Relaxed) {
+        if crate::net::STARTED.load(Relaxed) {
             let rights = CONNECT | LISTEN | DUPLICATE | TRANSFER;
             handles.insert(Object::NetStack, rights)?;
         }
         let init = (process, slot, handles, priority);
-        spawn_process(
-            sched,
-            frames,
-            executable,
-            Budget::new(budget),
-            init,
-            (args, argc),
-        )
+        let memory = Memory {
+            budget: Budget::new(budget),
+            next,
+        };
+        spawn_process(sched, frames, executable, memory, init, (args, argc))?;
+        crate::kick(sched, arch::cpu());
+        Ok(())
     })
 }
 
 /// Spawns the boot archive's executable at `file` with the `len` handles at user address `ptr` and `budget` frames
-/// moved from the current process, which gets a handle to the child, at `priority` capped at the current process's
-/// own, with the arguments at user address `args`, both copied in through `buf`; on failure nothing moves.
+/// moved from `cpu`'s current process, which gets a handle to the child, at `priority` capped at that process's own,
+/// with the arguments at user address `args`, both copied in through `buf`; on failure nothing moves.
 pub(crate) fn spawn(
-    sched: &mut Sched,
+    (sched, cpu): (&mut Sched, usize),
     frames: &mut FrameAllocator<FRAME_WORDS>,
     buf: &mut [u8],
     file: Range<usize>,
@@ -257,52 +264,61 @@ pub(crate) fn spawn(
     }
     // `len` is at most `MAX_HANDLES` (`dispatch`); the modulo keeps the slice in bounds on a mispredicted path too.
     let (mut parent, child) = sched
-        .handles()
+        .handles(cpu)
         .split::<Nospec>(&list[..len % (MAX_HANDLES + 1)])?;
-    let current = sched.process();
+    let current = sched.process(cpu);
     if budget > sched.memory(current).budget.remaining() {
         return Err(ENOMEM);
     }
     let (process, slot) = sched.free_process().zip(sched.free_slot()).ok_or(EAGAIN)?;
     let (index, generation) = process;
     let handle = parent.insert(Object::Process { index, generation }, WAIT | KILL)?;
-    let priority = priority.min(sched.priority());
+    let priority = priority.min(sched.priority(cpu));
     let mut child_budget = Budget::new(budget);
     crate::net::spawn_charge(&child, &mut child_budget)?;
     let moved = child;
     let child = (process, slot, child, priority);
-    spawn_process(sched, frames, executable, child_budget, child, (args, argc))?;
+    let memory = Memory {
+        budget: child_budget,
+        next: MAP_BASE,
+    };
+    spawn_process(sched, frames, executable, memory, child, (args, argc))?;
     sched.memory(current).budget.shrink(budget);
-    *sched.handles() = parent;
-    crate::net::spawned(sched, index, &moved);
+    *sched.handles(cpu) = parent;
+    crate::net::spawned(sched, cpu, index, &moved);
     Ok(handle)
 }
 
-/// Starts a thread of the current process at user address `entry` with SP_EL0 = `sp`, TPIDR_EL0 = `tls` and x0 =
+/// Starts a thread of `cpu`'s current process at user address `entry` with SP_EL0 = `sp`, TPIDR_EL0 = `tls` and x0 =
 /// `arg`, at the caller's priority, its kernel stack charged to the process's budget; returns a handle to it (wait,
-/// kill, duplicate, transfer). On failure nothing changes.
+/// kill, duplicate, transfer). On failure nothing changes. A caller marked to end gets `EAGAIN`, so a process being
+/// ended gains no thread.
 pub(crate) fn thread(
     sched: &mut Sched,
+    cpu: usize,
     frames: &mut FrameAllocator<FRAME_WORDS>,
     entry: u64,
     (sp, tls): (u64, u64),
     arg: u64,
 ) -> Result<u64, i64> {
+    if sched.marked(cpu).is_some() {
+        return Err(EAGAIN);
+    }
     let (slot, generation) = sched.free_slot().ok_or(EAGAIN)?;
-    let mut handles = *sched.handles();
+    let mut handles = *sched.handles(cpu);
     let thread = Object::Thread { slot, generation };
     let handle = handles.insert(thread, WAIT | KILL | DUPLICATE | TRANSFER)?;
-    let index = sched.process();
+    let index = sched.process(cpu);
     let budget = &mut sched.memory(index).budget;
     let stack = budget
         .alloc_contiguous(frames, TASK_STACK_FRAMES)
         .ok_or(ENOMEM)?;
     // SAFETY: the kernel stack below `stack.end` is fresh and owned by the new thread.
     let frame = unsafe { arch::new_user_task(stack.end.0 as usize, entry, (sp, tls), [arg, 0, 0]) };
-    let priority = sched.priority();
+    let priority = sched.priority(cpu);
     sched.add((slot, generation), index, (frame, stack.start), priority);
     sched.held(thread);
-    *sched.handles() = handles;
+    *sched.handles(cpu) = handles;
     Ok(handle)
 }
 
@@ -321,6 +337,8 @@ unsafe extern "C" {
     static user_handles_end: u8;
     static user_budget: u8;
     static user_budget_end: u8;
+    static user_map_end: u8;
+    static user_map_end_end: u8;
 }
 
 /// A user program's code and the address it is mapped and starts at.
@@ -350,6 +368,11 @@ pub(crate) fn user_program(program: Program) -> (&'static [u8], u64) {
         Program::Budget => (
             &raw const user_budget,
             &raw const user_budget_end,
+            USER_BASE,
+        ),
+        Program::MapEnd => (
+            &raw const user_map_end,
+            &raw const user_map_end_end,
             USER_BASE,
         ),
     };

@@ -303,6 +303,15 @@ static long rw(int fd, char *buf, size_t n, int write)
 static long rwv(int fd, const struct iovec *iov, int count, int write)
 {
 	long total = 0;
+	/* A short gathered write is one call, so stdio's line is not split by another core's output. */
+	char line[512];
+	size_t len = 0;
+	int i = 0;
+	for (; write && i < count && len + iov[i].iov_len <= sizeof line; i++) {
+		memcpy(line + len, iov[i].iov_base, iov[i].iov_len);
+		len += iov[i].iov_len;
+	}
+	if (write && i == count) return rw(fd, line, len, 1);
 	for (int i = 0; i < count; i++) {
 		long r = rw(fd, iov[i].iov_base, iov[i].iov_len, write);
 		if (r < 0) return total ? total : r;
