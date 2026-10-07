@@ -432,6 +432,30 @@ pub fn shutdown(socket: u64) -> i64 {
     syscall(25, [socket, 0, 0, 0])
 }
 
+/// The body length an HTTP request head declares in `Content-Length`, 0 without one; `Err(400)` for a malformed or
+/// repeated one, `Err(413)` for one over `max`. Never panics, whatever the bytes.
+pub fn body_length(head: &[u8], max: u64) -> Result<u64, u16> {
+    let mut length = None;
+    for line in head.split(|&b| b == b'\n') {
+        let Some(colon) = line.iter().position(|&b| b == b':') else {
+            continue;
+        };
+        let (name, value) = (&line[..colon], &line[colon + 1..]);
+        if !name.eq_ignore_ascii_case(b"content-length") {
+            continue;
+        }
+        let value = value.trim_ascii();
+        if length.is_some() || value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
+            return Err(400);
+        }
+        let n = value.iter().try_fold(0u64, |n, &d| {
+            n.checked_mul(10)?.checked_add((d - b'0').into())
+        });
+        length = Some(n.filter(|&n| n <= max).ok_or(413u16)?);
+    }
+    Ok(length.unwrap_or(0))
+}
+
 /// Nanoseconds on the virtual counter.
 pub fn now_ns() -> u64 {
     let (count, freq): (u64, u64);
@@ -503,6 +527,65 @@ pub fn grant(name: &[u8]) -> Option<Grant> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn body_length_rejects_malformed_repeated_and_oversized_values() {
+        let head = |h: &str| format!("POST / HTTP/1.1\r\nHost: x\r\n{h}\r\n\r\n");
+        let cases = [
+            ("Content-Length: 5", Ok(5)),
+            ("content-length:7", Ok(7)),
+            ("X: y", Ok(0)),
+            ("Content-Length: 1000", Ok(1000)),
+            ("Content-Length: 1001", Err(413)),
+            ("Content-Length: 99999999999999999999", Err(413)),
+            ("Content-Length: 18446744073709551615", Err(413)),
+            ("Content-Length: -5", Err(400)),
+            ("Content-Length: 5x", Err(400)),
+            ("Content-Length: ", Err(400)),
+            ("Content-Length: 1 2", Err(400)),
+            ("Content-Length: 1\r\nContent-Length: 1", Err(400)),
+        ];
+        for (header, expected) in cases {
+            assert_eq!(
+                body_length(head(header).as_bytes(), 1000),
+                expected,
+                "{header}"
+            );
+        }
+    }
+
+    #[test]
+    fn body_length_never_panics_or_exceeds_the_limit_on_random_heads() {
+        let mut seed = 1u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let pieces: [&[u8]; 8] = [
+            b"Content-Length",
+            b":",
+            b" ",
+            b"\r\n",
+            b"9",
+            b"0",
+            b"-",
+            b"\xff",
+        ];
+        for _ in 0..100_000 {
+            let mut head = Vec::new();
+            for _ in 0..next() % 32 {
+                match next() % 3 {
+                    0 => head.push(next() as u8),
+                    _ => head.extend_from_slice(pieces[(next() % 8) as usize]),
+                }
+            }
+            if let Ok(n) = body_length(&head, 1 << 20) {
+                assert!(n <= 1 << 20);
+            }
+        }
+    }
 
     #[test]
     fn each_command_gets_only_what_its_job_needs() {

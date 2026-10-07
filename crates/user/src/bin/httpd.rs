@@ -12,8 +12,9 @@ const DIR: u64 = 2;
 /// The server's NetStack: after its console.
 const NET: u64 = 1;
 const PORT: u16 = 80;
-/// Largest request head (request line and headers).
+/// Largest request head (request line and headers), and body: the body streams through, so its bound is a choice.
 const HEAD: usize = 8192;
+const BODY: u64 = 1 << 30;
 /// The server's and `fetch`'s own frames (measured, as `nettest`'s) and their sockets'.
 const SERVER_BUDGET: usize = 16 + 2 * 8;
 const FETCH_BUDGET: usize = 16 + 8;
@@ -97,12 +98,20 @@ fn echo(conn: u64, buf: &mut [u8]) {
         if let Some(end) = buf[..got].windows(4).position(|w| w == b"\r\n\r\n") {
             break end + 4;
         }
+        if got == buf.len() {
+            return refuse(conn, b"431 Request Header Fields Too Large");
+        }
         match receive(conn, &mut buf[got..]) {
             n if n > 0 => got += n as usize,
             _ => return,
         }
     };
-    let body = content_length(&buf[..head]);
+    let body = match body_length(&buf[..head], BODY) {
+        Ok(body) => body,
+        Err(400) => return refuse(conn, b"400 Bad Request"),
+        Err(_) => return refuse(conn, b"413 Content Too Large"),
+    };
+    // At most `HEAD + BODY`: no overflow.
     let total = head as u64 + body;
     let mut digits = [0; 20];
     if send(conn, OK) != 0
@@ -129,15 +138,17 @@ fn echo(conn: u64, buf: &mut [u8]) {
     }
 }
 
-/// The `Content-Length` header's value in `head`, 0 if absent.
-fn content_length(head: &[u8]) -> u64 {
-    head.split(|&b| b == b'\n')
-        .find_map(|line| {
-            let (name, value) = line.split_at_checked(15)?;
-            name.eq_ignore_ascii_case(b"content-length:")
-                .then(|| number(value.trim_ascii()))
-        })
-        .unwrap_or(0)
+/// Answers `status` with no body.
+fn refuse(conn: u64, status: &[u8]) {
+    for part in [
+        b"HTTP/1.1 ",
+        status,
+        b"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    ] {
+        if send(conn, part) != 0 {
+            return;
+        }
+    }
 }
 
 /// A decimal number; 0 if `s` is not one.

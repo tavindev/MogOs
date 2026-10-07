@@ -1296,6 +1296,15 @@ fn exchange(port: u16, request: &str) -> Option<String> {
 fn httpd_echoes_more_sequential_requests_than_its_tables_hold_and_fetch_gets_a_host_page() {
     // More than the 16 TCP slots and 8 TIME_WAIT entries, so entries are reused.
     const REQUESTS: usize = 24;
+    // Bad heads, each refused with its status, after which the server still answers: no body, so nothing is left
+    // unread and the close is clean.
+    const BAD: [(&str, &str); 5] = [
+        ("Content-Length: 99999999999999999999", "413"),
+        ("Content-Length: 18446744073709551615", "413"),
+        ("Content-Length: -5", "400"),
+        ("Content-Length: 5x", "400"),
+        ("Content-Length: 0\r\nContent-Length: 0", "400"),
+    ];
     let page = host_page("hello from the host\n");
     let forward = std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -1319,6 +1328,17 @@ fn httpd_echoes_more_sequential_requests_than_its_tables_hold_and_fetch_gets_a_h
                     );
                     assert_eq!(response, expected);
                     echoed += 1;
+                    if echoed == 1 {
+                        for (header, status) in BAD {
+                            let request = format!("POST / HTTP/1.1\r\n{header}\r\n\r\n");
+                            let response = exchange(forward, &request).unwrap_or_default();
+                            let line = response.lines().next().unwrap_or_default();
+                            assert!(
+                                line.starts_with(&format!("HTTP/1.1 {status} ")),
+                                "{header}: {line}"
+                            );
+                        }
+                    }
                 }
                 None => sleep(Duration::from_millis(100)),
             }
@@ -1326,8 +1346,10 @@ fn httpd_echoes_more_sequential_requests_than_its_tables_hold_and_fetch_gets_a_h
         echoed
     });
     let netdev = format!("user,id=n0,hostfwd=tcp:127.0.0.1:{forward}-10.0.2.15:80");
-    let args =
-        format!("test=httpd net=10.0.2.15/24,gw=10.0.2.2 httpd={REQUESTS} fetch=10.0.2.2:{page}");
+    let args = format!(
+        "test=httpd net=10.0.2.15/24,gw=10.0.2.2 httpd={} fetch=10.0.2.2:{page}",
+        REQUESTS + BAD.len()
+    );
     let (status, lines) = boot(&[
         "-netdev",
         &netdev,
