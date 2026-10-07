@@ -80,6 +80,8 @@ static GIC_CPU: AtomicU64 = AtomicU64::new(0);
 static TICKED: AtomicUsize = AtomicUsize::new(0);
 /// `test=smp`: secondaries announce themselves and run their timer; otherwise they sleep until 25b gives them work.
 static SMP_TEST: AtomicBool = AtomicBool::new(false);
+/// The DTB's cores, at most `MAX_CPUS`; `start_cpus` starts them all or panics.
+static CPUS: AtomicUsize = AtomicUsize::new(1);
 /// Set once `Board::disk` handed out the block device.
 static DISK_TAKEN: AtomicBool = AtomicBool::new(false);
 /// QEMU `virt`'s 32 virtio-mmio transports: the first one's base, and the stride between them.
@@ -179,8 +181,6 @@ struct QemuVirt {
     /// GICv2 distributor and CPU interface.
     gic: (PhysAddr, PhysAddr),
     entry_us: u64,
-    /// The DTB's cores (at most `MAX_CPUS`) until `start_cpus`, then those running.
-    cpus: usize,
 }
 
 impl kernel::Board for QemuVirt {
@@ -359,11 +359,14 @@ impl kernel::Board for QemuVirt {
 
     fn start_cpus(&mut self, smp_test: bool) {
         SMP_TEST.store(smp_test, Relaxed);
-        self.cpus = 1 + (1..self.cpus).filter(|&cpu| start_cpu(cpu)).count();
+        // Core 1 starts the rest, so boot pays one call.
+        if CPUS.load(Relaxed) > 1 {
+            start_cpu(1);
+        }
     }
 
     fn cpus(&self) -> usize {
-        self.cpus
+        CPUS.load(Relaxed)
     }
 
     fn ticked_cpus(&self) -> usize {
@@ -405,6 +408,7 @@ extern "C" fn kmain() -> ! {
     unsafe { arch::gic::unmask(gic.0, UART_IRQ) };
     Uart::new(UART0).enable_rx_irq();
     let cpus = dtb.cpus().min(arch::MAX_CPUS);
+    CPUS.store(cpus, Relaxed);
     // A one-core GIC delivers every interrupt to that core (ITARGETSR is RAZ/WI), and no other core sends it an SGI.
     if cpus > 1 {
         // SAFETY: as above; UART_IRQ is an SPI and core 0's CPU interface is 0.
@@ -418,16 +422,14 @@ extern "C" fn kmain() -> ! {
             console: Console,
             gic,
             entry_us,
-            cpus,
         },
         dtb,
         &[image, dtb_range],
     )
 }
 
-/// Starts core `cpu` (MPIDR `cpu` on QEMU `virt`) at `arch::secondary_entry` on its stack, without waiting for it;
-/// whether PSCI accepted.
-fn start_cpu(cpu: usize) -> bool {
+/// Starts core `cpu` (MPIDR `cpu` on QEMU `virt`) at `arch::secondary_entry` on its stack, without waiting for it.
+fn start_cpu(cpu: usize) {
     let stack_top = &raw const __stack_top as u64 + cpu as u64 * SECONDARY_STACK;
     let status: i64;
     // SAFETY: CPU_ON starts an off core on an unused stack; `dsb ish` first completes the stores it reads.
@@ -442,7 +444,7 @@ fn start_cpu(cpu: usize) -> bool {
             clobber_abi("C"),
         )
     };
-    status == 0
+    assert_eq!(status, 0, "PSCI CPU_ON {cpu}");
 }
 
 /// A secondary core's first Rust code, from `arch::secondary_entry`: MMU on, on its own stack, IRQs masked. It turns on
@@ -450,6 +452,9 @@ fn start_cpu(cpu: usize) -> bool {
 #[unsafe(no_mangle)]
 extern "C" fn kmain_secondary() -> ! {
     arch::install_vectors();
+    if arch::cpu() == 1 {
+        (2..CPUS.load(Relaxed)).for_each(start_cpu);
+    }
     let dist = PhysAddr(GIC_DIST.load(Relaxed));
     // SAFETY: the DTB's GICv2 CPU interface, stored by `kmain` before it started this core, in device-mapped GiB 0.
     unsafe { arch::gic::enable_cpu(PhysAddr(GIC_CPU.load(Relaxed))) };

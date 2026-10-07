@@ -84,7 +84,7 @@ pub trait Board {
     /// Starts the other cores without waiting for them; they idle until given work. Under `smp_test` each prints
     /// `cpu <n>: online` and runs its timer. Call once, as the last step of boot.
     fn start_cpus(&mut self, smp_test: bool);
-    /// Cores running, this one included.
+    /// Cores `start_cpus` starts, this one included.
     fn cpus(&self) -> usize;
     /// Cores that have taken a timer tick.
     fn ticked_cpus(&self) -> usize;
