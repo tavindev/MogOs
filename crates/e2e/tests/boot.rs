@@ -8,6 +8,12 @@ use std::sync::{Arc, Mutex, Once};
 use std::thread::{self, JoinHandle, sleep};
 use std::time::{Duration, Instant};
 
+/// A boot is killed (and fails) once QEMU prints nothing for this long, or at the cap: a slow scenario under load
+/// still passes while it makes progress, and a hang fails as fast as the old 30 s deadline. Silent phases (a timed
+/// benchmark loop, httpd serving) reached 15.6 s under 12 `yes` with the suite in parallel (several were killed at 10).
+const SILENCE: Duration = Duration::from_secs(30);
+const CAP: Duration = Duration::from_secs(300);
+
 /// Builds the kernel, boots it in QEMU with `extra` arguments, and returns the exit status and serial lines.
 fn boot(extra: &[&str]) -> (ExitStatus, Vec<String>) {
     boot_with_input(extra, None)
@@ -56,13 +62,20 @@ fn boot_with_input(extra: &[&str], input: Option<(&str, &[&[u8]])>) -> (ExitStat
 
     let (out, out_reader) = drain(qemu.stdout.take().unwrap());
     let (err, err_reader) = drain(qemu.stderr.take().unwrap());
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let start = Instant::now();
+    let (mut seen, mut last, mut silence) = (0, start, Duration::ZERO);
     let mut sent = 0;
     let status = loop {
         if let Some(status) = qemu.try_wait().unwrap() {
             break Some(status);
         }
-        if Instant::now() > deadline {
+        let now = Instant::now();
+        let len = out.lock().unwrap().len();
+        if len != seen {
+            (seen, last) = (len, now);
+        }
+        silence = silence.max(now - last);
+        if now - last > SILENCE || now - start > CAP {
             qemu.kill().unwrap();
             qemu.wait().unwrap();
             break None;
@@ -85,7 +98,10 @@ fn boot_with_input(extra: &[&str], input: Option<(&str, &[&[u8]])>) -> (ExitStat
     let out = String::from_utf8_lossy(&out.lock().unwrap()).into_owned();
     let err = String::from_utf8_lossy(&err.lock().unwrap()).into_owned();
     // Captured, so a failing test shows how QEMU ended.
-    println!("QEMU status: {status:?}\nQEMU stderr:\n{err}\nQEMU stdout:\n{out}");
+    println!(
+        "QEMU status: {status:?}, longest silence {} ms\nQEMU stderr:\n{err}\nQEMU stdout:\n{out}",
+        silence.as_millis()
+    );
     let status = status.expect("QEMU timed out");
     let lines = out
         .lines()
