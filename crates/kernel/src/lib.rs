@@ -250,6 +250,8 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
     if net {
         // Scenarios count free frames, so the net task's setup ends before the first (after `boot:`, so not in it).
         board.with_net(|_, _, _| ());
+        let ready_us = board.uptime_us();
+        let _ = writeln!(board.console(), "net: ready {ready_us} us");
     }
 
     for arg in bootargs.split_whitespace() {

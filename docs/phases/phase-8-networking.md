@@ -192,3 +192,14 @@ Decision: write `crates/net` fresh. smoltcp is a host-only dev-dependency of `cr
   a second walk of the whole blob cost about 45000 instructions): boot with a NIC runs 164000 instructions against
   157000 without one (TCG `-icount`; main: 264000 against 156000); of that, the DTB walk is removed, the NIC and network setup is moved past the `boot:` stamp (a scenario waits for it). A `net=` without a NIC starts nothing (`Board::has_nic` reads device IDs only). Still open: `accept` cannot report the peer's
   address until `crates/net` exposes a connection's remote address (`TcpInfo` has none).
+- **Flake fix and checks.** `httpd_echoes_more_sequential_requests_than_its_tables_hold_and_fetch_gets_a_host_page`
+  failed once under load with "QEMU timed out": its client gave up after its own 25 s, counted from before `boot`,
+  which first waits for the kernel build shared by every test (`Once`); httpd then waited for requests nobody sent
+  until the boot's 30 s deadline. The client now sends exactly the requests httpd counts, retrying one only while
+  nothing listens behind the forward, without a read timeout (a retried request would be counted twice), and stops
+  only once QEMU has ended, so the boot's deadline is the only one. Under load (12 `yes`, the whole suite in a
+  loop) the old test passed 45 runs without reproducing it, while `oscb_runs_the_cross_os_benchmarks` timed out in 5
+  of 15 (a heavy C benchmark against the same 30 s, not networking); the new one passed 15 loaded suite runs with
+  every test green. `net: ready <N> us` reports boot to network ready (TCG
+  `-icount`: 226000 instructions, against main's 264000 with the setup inside `boot:`). e2e: a socket moved to a
+  child refunds its old holder (`nettest: moving a socket refunds its old holder`; it fails without the refund).
