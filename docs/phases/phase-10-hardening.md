@@ -9,89 +9,108 @@ when the phase starts.
 
 Security hardening has no step before phase 10, yet it is the largest unpaid syscall cost in the cross-OS comparison:
 Linux pays 22.4 ns per syscall for Spectre-BHB here (`docs/BENCHMARKS.md`, debt ledger). These steps are cheap now and
-need neither SMP nor the phase 6 memory work, so they run beside phase 5. They touch `crates/arch` (vectors, MMU) and
-the board's `linker.ld`, so each rebases onto the phase 5 step in flight there. Speed with complete safety is the
-moat: no mitigation a CPU needs is skipped, and each one takes its cheapest correct form, measured. Each step's measured
-cost goes into the ledger row it pays.
+need neither SMP nor the phase 6 memory work, so they run beside phase 5. They touch `crates/arch` (vectors, MMU), the
+board's `linker.ld` and user-memory helpers, `kernel`'s handle table and `mogfs`'s block index, so each rebases onto
+the phase 5 step in flight. Speed with complete safety is the moat: no mitigation a CPU needs is skipped, and each one
+takes its cheapest correct form, measured. Each step's measured cost goes into the ledger row it pays.
 
 Benchmarks are hvf medians of 21 interleaved boots against the step's base commit: syscall (`test=bench-syscall` and
-`test=bench-syscalls`), yield (`test=bench`), pipe (`test=bench-pipe`), boot. The cost is pre-declared and then measured;
-"holds" means within noise. The e2e harness runs under TCG, whose `cortex-a72` is the model's own registers (no CSV2),
-while hvf passes the host's ID_AA64PFR0_EL1 to the guest. So e2e checks the detection on several CPU models, and hvf
-gives the cost.
+`test=bench-syscalls`), yield (`test=bench`), pipe (`test=bench-pipe`), boot; the cost is pre-declared, then measured,
+and "holds" means within noise. The e2e harness runs under TCG, where each `-cpu` model shows its own ID registers;
+under hvf the guest gets the model's MIDR and PFR1/ISAR1/MMFR1/MMFR2 but the host's PFR0 (so the M4's CSV2 and CSV3;
+QEMU 9.2.1 `target/arm/hvf/hvf.c`). So e2e proves the decision per model, and hvf gives the cost. Boot tests take the
+`-cpu` model as an argument (today `crates/e2e/tests/boot.rs` hard-codes `cortex-a72`).
 
 | # | Step | Done when |
 | --- | --- | --- |
-| 60a | Speculation report and Spectre-BHB | At boot `arch` reads MIDR_EL1, ID_AA64PFR0/PFR1/MMFR1_EL1 and asks firmware through SMCCC (`SMCCC_VERSION` via PSCI_FEATURES, then `ARCH_FEATURES` for workarounds 1-3, over the DT's PSCI conduit). It decides each variant the way Linux's `proton-pack.c` does, with one deliberate difference: Linux skips the BHB loop when v2 is vulnerable ("no point mitigating Spectre-BHB alone"), while MogOs still applies it, since Arm's Spectre-BHB whitepaper says the loop works on A72 before r1p0. It then picks the vector table and prints one `spec:` line (v1, v2, BHB, SSB, Meltdown). BHB: CSV2_3 or ECBHB means none needed; otherwise the loop with k from Linux's MIDR lists (A72 and A57: 8); otherwise firmware `ARCH_WORKAROUND_3`; otherwise the largest k in Linux's lists, flagged as an unlisted CPU. The loop (`mov`, then k times `b . + 4; subs; b.ne`, then `dsb nsh; isb`) sits in the lower-EL entries (8-15) of a second vector table, after `stp x0, x1` and before the first branch. Boot points `VBAR_EL1` at the table it needs, so entries from EL1 and unaffected CPUs run no extra instruction. SSB: with FEAT_SSBS, `SCTLR_EL1.DSSBS` is left 0, so the kernel runs mitigated from every entry for free; without it and without `ARCH_WORKAROUND_2`, the line says vulnerable, as Linux does. e2e `spec_line_matches_the_cpu`: TCG `-cpu cortex-a72` prints BHB loop 8 and v2 vulnerable (no CSV2, no firmware), `-cpu cortex-a76` prints loop 24, and `-cpu max` prints whatever its ID registers state (check them in the step); each boot then runs the syscall and pipe scenarios on the selected table. Benchmarks: syscall and pipe with the pre-declared cost of about Linux's 22 ns per trap; yield and boot hold (yield traps from EL1). The measured cost goes into the ledger's BHB row. |
-| 60b | Spectre v1: user pointers and handle indexes | The `at s1e0r/w` probe returns the address it checked, masked to 0 by `csel` and then `csdb` when the check fails, and every user access uses the returned address, so a mispredicted check cannot load kernel memory. The handle-table lookup clamps the user's index the same way (`cmp`, `csel`, `csdb`) before its load. `csdb` needs `arch`, and the lookup lives in the safe `kernel` crate, so it gets the clamp from an inlined port call (static dispatch, no indirect branch). The syscall number reaches a `match`, whose jump table is clamped too. e2e: every existing scenario passes, and `test=fuzz` stays clean, including kernel-address and out-of-range-handle arguments (`EFAULT`, `EBADF`). The step lists each user-controlled index the kernel loads through, and the reviewer checks it. Benchmarks: syscall, pipe, `bench-syscalls`' `open` and `readdir`; pre-declared about 1 ns per user buffer or handle. Measured into the ledger's v1 row. |
-| 60c | Kernel W^X | Today the RAM GiB is one level-1 block, EL1 read-write and executable (`l1_block`: no PXN, no read-only bit), so kernel text is writable, and data, heap and every user frame's identity alias are executable at EL1. Device memory is already PXN and UXN. New map: the RAM GiB points at a level-2 table, the 2 MiB at the image base (0x40200000, 2 MiB aligned; text, rodata, data, bss and the four stacks take about 0.85 MiB in a debug build) at a level-3 table, and the rest of RAM uses 2 MiB blocks, RW, PXN and UXN. Inside the image, `.text` is read-only and executable, `.rodata` read-only with PXN, data, bss and stacks RW with PXN; `linker.ld` aligns each to 4 KiB. `SCTLR_EL1.WXN` is set, so the hardware refuses any writable mapping as executable at EL1. Every process's level 1 points at the shared kernel table, which is a table descriptor (`0b11`), not a block. `free_table` skipped kernel entries by their block type, so it now skips the kernel's index explicitly, or every process exit would free the kernel tables. e2e: `test=wx-text` (a store to `kmain`'s address) and `test=wx-exec` (a branch to a `.data` word) each end in the fault dump naming a permission fault at that address; `spawn`, `kill` and `assert_no_leak` scenarios pass, proving teardown leaves the kernel tables alone; ELF loading still writes through the RW alias, which is now PXN. Benchmarks: syscall, yield, pipe, boot, spawn; pre-declared 0, with the TLB cost of the 4 KiB image pages over today's single 1 GiB entry measured and recorded. |
+| 60a | Speculation report and Spectre-BHB | Each core, at boot, reads its own MIDR_EL1, ID_AA64PFR0/PFR1/ISAR1/ISAR2/MMFR1_EL1 and, only if `SMCCC_VERSION` (asked through PSCI_FEATURES) is at least 1.1, `ARCH_FEATURES` for workarounds 1-3 over the DT's PSCI conduit; below 1.1 there are no workarounds (Linux's `arm_smccc_1_1_get_conduit`). It decides as Linux v6.18's `proton-pack.c` does. v2: CSV2, or a MIDR on Linux's v2 safe list, is not affected; else firmware workaround 1; else vulnerable. BHB: CSV2_3 or a MIDR on Linux's BHB safe list (A35, A53, A55, A510, A520, B53, Kryo 2XX-4XX silver) is not affected; with v2 vulnerable nothing is done ("no point mitigating Spectre-BHB alone"); else ECBHB (nothing to run), else CLRBHB (`clearbhb; isb`), else the loop with Linux's k for the MIDR (A72 and A57: 8; A76, A77, N1: 24; up to 132), else firmware workaround 3, else vulnerable. SSB: FEAT_SSBS keeps `SCTLR_EL1.DSSBS` at 0, so every exception entry sets PSTATE.SSBS to 0 for free, and boot runs `msr ssbs, #0` because DSSBS only acts on entry; without SSBS or workaround 2 it is vulnerable. The vectors are static tables built with `.irp`: plain, CLRBHB, firmware, and one loop table per k and barrier (`sb` where ID_AA64ISAR1_EL1.SB, else `dsb nsh; isb`), the count an immediate, so entry does no load. Only the eight lower-EL entries run the mitigation, after `stp x0, x1` and before the first branch: `mov x0, #k`, then the three-instruction loop (`b . + 4; subs x0, x0, #1; b.ne`) runs k times, then the barrier. Each core writes `VBAR_EL1` once. The `spec:` line (v1, v2, BHB, SSB, Meltdown, BSE, and the table's name) is derived from the table read back from `VBAR_EL1`, and reports the worst core. e2e `spec_line_matches_the_cpu`, lines pinned from QEMU 9.2.1 `target/arm/tcg/cpu64.c`: `-cpu cortex-a72` (r0p3, CSV2 0, no firmware) prints v2 vulnerable, BHB not mitigated (v2 vulnerable), SSB vulnerable, plain table; `-cpu cortex-a76` (CSV2 1, SSBS 1, no SB) prints the loop of 24 with `dsb nsh; isb` and SSB mitigated; `-cpu max` (CSV2_3, SSBS2, SB, CSV3) prints BHB not affected, SSB mitigated, plain table. Each boot then runs the syscall and pipe scenarios, and at `-smp 4` every core's read-back table is the same. Benchmarks: syscall and pipe, pre-declared at or a little under Linux's 22 ns per trap (no trampoline hop); yield and boot hold (yield traps from EL1). Recorded in the ledger's BHB row. |
+| 60b | Spectre v1: every user-derived index and pointer | Each user-derived value that indexes memory passes a clamp, `cmp` + `sbc` + `and` (Linux's `array_index_mask_nospec`) or `csel`, then `csdb`, from `arch`. Arm's "Cache Speculation Side-channels" v2.5 says only the pair is sufficient "on ALL Arm implementations", so no `csdb`-less mask is used. The list is exhaustive and the reviewer checks it. (1) User buffers: `arch::mask_user(ptr, len)` (`cmp`/`ccmp`/`csel`, then `csdb`) runs once per buffer as `user_bytes` and `user_bytes_mut` build the slice, returning null when the range leaves user space. The `at s1e0r/w` probe stays as the permission check. (2) Handles: `Handles::entry` clamps the index before its load, and `close` reuses that clamped index instead of re-indexing; through it the kernel loads every handle-derived index (pipe, mutex, process slot, inode), and those objects are kernel-written. (3) Syscall dispatch: after the `ENOSYS` check, `nr` is clamped to 0. (4) MogFS: `read` and `write` index `Record::ptrs` from the user's `offset`, and `scan` (`readdir`'s `start`) from the entry number. A mispredicted loop bound runs one more iteration with `pos` at `end` (at most `MAX_FILE_SIZE`), so `ptrs[PTRS]` is reachable speculatively, and clamping `offset` first does not bound it. So `mogfs` stays safe and indexes `ptrs` through a clamp on its `Disk` port (static dispatch, inlined): the board's implementation uses `arch`'s, and host tests use `min`. The archive's `readdir` only counts `start` entries (`skip`), never indexing by it. A new syscall that indexes with a user value joins the list. e2e: every existing scenario passes, and `test=fuzz` stays clean with kernel-address buffers (`EFAULT`) and out-of-range handles (`EBADF`); new: `io_submit_wait` on a file at `offset` at and past its size returns 0 (read), and `readdir` with `start` past the last entry returns 0. Benchmarks: syscall, pipe, and `bench-syscalls`' `open`, `readdir`, `file-read`; pre-declared about 1 ns per buffer or handle. Recorded in the ledger's v1 row. |
+| 60c | Kernel W^X | Today the RAM GiB is one level-1 block, EL1 read-write and executable (`l1_block`: no PXN, no read-only bit). Kernel text is writable, and data, heap and every user frame's identity alias are executable at EL1; device memory is already PXN and UXN. In the new map the RAM GiB points at a level-2 table. The 2 MiB at the image base (0x40200000, 2 MiB aligned) points at a level-3 table, with `.text` read-only and executable, `.rodata` read-only and PXN, and data, bss and the stacks RW and PXN. Every stack gets an unmapped 4 KiB guard page below it, boot's and the three secondaries'. The DTB's 2 MiB at RAM base is read-only and PXN, and the rest of RAM is 2 MiB blocks, RW, PXN and UXN. All kernel entries stay global (nG = 0). `linker.ld` aligns each section and guard to 4 KiB, exports their bounds as symbols, and `ASSERT`s that `__kernel_end` stays within the 2 MiB, so a larger image fails to link instead of booting unmapped. `SCTLR_EL1.WXN` is set as defence in depth; no test isolates it, since the descriptor bits already fault. Core 0 builds the tables from the linker symbols before the MMU is on. Every process's level 1 copies its kernel entries from `arch::boot_table()` instead of the `KERNEL_L1` constant. The RAM entry is now a table descriptor (`0b11`), so `free_table` skips the kernel's indexes explicitly; skipping by block type would free the shared kernel tables at every exit. e2e: `test=wx-text` (a store to `kmain`) and `test=wx-exec` (a branch to a `.data` word) each end in the fault dump naming a permission fault at that address; `test=wx-guard` (core 0 recurses past its stack) faults on the guard page. The `spawn`, `kill` and `assert_no_leak` scenarios pass, so teardown leaves the kernel tables alone, and ELF loading still writes through the RW alias, now PXN. Benchmarks: syscall, yield, pipe, boot, spawn; pre-declared 0, with the TLB cost of 4 KiB image pages over one 1 GiB entry measured. Under hvf each guest entry also passes through the host's stage-2 tables, so the measured cost may not match hardware. If the image pages cost more than noise, text and rodata switch to contiguous-bit 64 KiB runs, and that is measured too. Recorded in the ledger's W^X row. |
 
 ### Step details
 
-- **60a.** Invariants: the vector table is chosen once per core at boot, never patched at run time; the decision is the
-  same on every core (`-smp 4` boots check that); an unknown CPU gets the stronger choice, never "not affected". Avoids:
-  Linux's per-CPU vector indirection and code patching (`alternative_cb`). With fixed tables and no modules, two
-  static vector tables cover every case. Under hvf the result is correct for the CPU the guest is shown: an A72 MIDR
-  (r0p3) with the M4's CSV2. Correctness on a real A72 is checked in phase 11.
-- **60b.** Invariants: one probe helper and one handle lookup remain the only ways user input reaches a kernel load.
-  A new syscall that indexes a table with a user value goes through the clamp. Avoids: Linux's audit of scattered
-  `array_index_nospec` call sites; here the choke points already exist.
-- **60c.** Invariants: no kernel mapping is ever both writable and executable (WXN enforces it); user pages are
-  unchanged (RX or RW+UXN, always PXN). Depends on nothing in phase 6. The higher-half move (phase 6) rebuilds this map
-  under TTBR1 and keeps the invariant.
+- **60a.** Invariants:
+  - A table is chosen per core from that core's own registers and written once, never patched at run time.
+  - An unknown MIDR without CSV2_3, ECBHB or CLRBHB gets the largest k (132) and a warning, never "not affected".
+  - On a v2-vulnerable CPU the line says BHB is not mitigated, as Linux's does, instead of a loop that does not fix
+    v2.
+
+  Avoids Linux's `alternative_cb` code patching and its one system-wide `max_bhb_k`: with no modules, a few static
+  tables (about 2 KiB each) cover every case.
+
+  Under hvf the result is correct for the CPU the guest is shown: an A72 r0p3 MIDR with the M4's CSV2, hence v2 not
+  affected and the k = 8 loop. A real A72 is phase 11.
+- **60b.** Invariants:
+  - Every user-derived array index goes through the clamp. The list in the step is exhaustive, and the reviewer checks
+    it on every step that adds a syscall or a user-indexed table.
+  - The clamp runs where the index is used, not only where it enters.
+
+  Avoids Linux's scattered `array_index_nospec` call sites; here the choke points already exist.
+
+  Linux masks user pointers with one `bic` of bit 55, possible because its kernel lives in TTBR1. After phase 6's
+  higher-half move, `mask_user` becomes that one instruction and its cost is re-measured.
+- **60c.** Invariants:
+  - No kernel mapping is both writable and executable.
+  - Each kernel stack built at boot has a guard page.
+  - User pages are unchanged: RX, or RW and UXN, always PXN.
+
+  Not covered yet: per-task kernel stacks are allocator frames in the RW blocks with no guard, so a deep kernel
+  recursion overruns the next frame. Phase 6's higher-half kernel gives them guarded virtual stacks (the ledger's
+  VMAP_STACK row).
+
+  Phase 6 rebuilds this map under TTBR1 and keeps the invariants.
 
 ## Which variants apply (cortex-a72)
 
-From Arm's Speculative Processor Vulnerability table (developer.arm.com, document 110280; read from the December 2023
-snapshot, since the live page needs JavaScript), Linux master's `arch/arm64/kernel/proton-pack.c` and `cpufeature.c`,
-and QEMU 9.2.1's `target/arm/hvf/hvf.c` and `target/arm/tcg/psci.c`, all read 2026-10-07:
+Sources, all read 2026-10-07:
+- Arm's Speculative Processor Vulnerability table (developer.arm.com 110280; the December 2023 snapshot, since the live
+  page needs JavaScript).
+- Arm's Spectre-BHB whitepaper v1.6.
+- Arm's Spectre-BSE bulletin (110360, published 2025-07-22; read through a text proxy).
+- Linux v6.18: `arch/arm64/kernel/proton-pack.c`, `cpu_errata.c`, `entry.S`, `include/asm/assembler.h`, `uaccess.h`
+  and `barrier.h`; `arch/arm64/mm/context.c`.
+- QEMU 9.2.1: `target/arm/tcg/cpu64.c`, `target/arm/hvf/hvf.c` and `target/arm/tcg/psci.c`.
 
 | Variant | A72 before r1p0 (QEMU's model is r0p3) | A72 r1p0 and later | Under QEMU here | MogOs |
 | --- | --- | --- | --- | --- |
-| v1 bounds bypass (CVE-2017-5753) | affected | affected | affected | 60b: pointer and index masking |
-| v2 branch target injection (CVE-2017-5715) | affected | not affected | hvf shows the host's CSV2, so not affected; TCG `cortex-a72` has no CSV2 and no firmware, so vulnerable | nothing to pay under hvf; the `ARCH_WORKAROUND_1` call at Linux's triggers (an EL0 instruction abort or PC fault on a kernel address, an EL0 IRQ with a kernel PC) in phase 11, on real firmware |
+| v1 bounds bypass (CVE-2017-5753) | affected | affected | affected | 60b |
+| v2 branch target injection (CVE-2017-5715) | affected | not affected | hvf: not affected (host CSV2); TCG `cortex-a72`: vulnerable (no CSV2, no firmware) | phase 11, on real firmware: `ARCH_WORKAROUND_1` at Linux v6.18's sites: every context switch (`check_and_switch_context`), an EL0 instruction abort or PC fault on a kernel address, an EL0 breakpoint or single-step, an EL0 IRQ with a kernel PC |
 | v3 Meltdown (CVE-2017-5754) | not affected | not affected | not affected | no KPTI |
-| v3a system register read (CVE-2018-3640) | affected | not affected | as the model | leaks VBAR_EL1 and other system registers, which matters only once KASLR exists: phase 6 |
-| v4 speculative store bypass (CVE-2018-3639) | affected | affected | no SSBS (the model's PFR1 is 0, and the M4 lacks FEAT_SSBS), no firmware: vulnerable, as Linux reports | 60a: SSBS where present; A72's `ARCH_WORKAROUND_2` in phase 11 |
-| Spectre-BHB (CVE-2022-23960) | affected, loop k = 8 | affected, loop k = 8 | affected (no CSV2_3, no ECBHB) | 60a: the loop |
-| Spectre-BSE (CVE-2024-10929) | affected (Arm's CVE record) | not listed | as the model | 60a reads Arm's Spectre-BSE page and records whether the BHB loop covers it |
+| v3a system register read (CVE-2018-3640) | affected | not affected | as the model | in the sources, the only target is the kernel's location (VBAR_EL1): Linux builds its v3a capability only with KASLR, and its code fix is for KVM's EL2 vectors. So phase 6, with KASLR |
+| v4 speculative store bypass (CVE-2018-3639) | affected | affected | hvf `cortex-a72`: no SSBS (the model's PFR1 is 0), no firmware: vulnerable, as Linux reports | 60a: SSBS where present; A72's `ARCH_WORKAROUND_2` (Linux calls it on every kernel entry and exit) in phase 11 |
+| Spectre-BHB (CVE-2022-23960) | affected, k = 8 | affected, k = 8 | hvf: the k = 8 loop; TCG `cortex-a72`: not mitigated, since v2 is vulnerable | 60a |
+| Spectre-BSE (CVE-2024-10929) | affected | not affected | no firmware: vulnerable (Linux has no BSE handling) | Arm's only mitigation for A72 before r1p0 is firmware `ARCH_WORKAROUND_1` or `_3` (an EL3 MMU off/on); no Arm statement says the BHB loop covers it. So 60a reports it vulnerable without firmware, and phase 11's workaround-1 path covers it. Arm rates practical exploitation "very low" |
 
-QEMU answers no SMCCC call: under both hvf and TCG, an HVC that is not PSCI returns -1, and `PSCI_FEATURES` for
-`SMCCC_VERSION` is not supported. So firmware workarounds 1-3 do not exist in either guest. Linux under hvf therefore
+QEMU 9.2.1 answers no SMCCC call: under hvf and TCG a non-PSCI HVC returns -1, and PSCI_FEATURES for `SMCCC_VERSION`
+is not supported. So SMCCC stays at 1.0 and no firmware workaround exists in either guest. Linux under hvf therefore
 reports `spectre_v2: Mitigation: CSV2, BHB` and `spec_store_bypass: Vulnerable`, the strings recorded in the cross-OS
 run.
 
 ## Decided
 
-- **The minimal mitigation set**, for the CPU the kernel is shown:
-  - BHB loop (60a)
-  - v1 masking (60b)
+- **The minimal mitigation set**, for the CPU each core is shown:
+  - BHB per Linux's order (60a)
+  - v1 clamps (60b)
   - SSBS when present (60a)
-  - W^X (60c)
+  - W^X with stack guards (60c)
 
-  Firmware workarounds are called only when discovery says they exist and are needed, which means phase 11 on real
-  A72 firmware. There they are priced against Linux, which issues `ARCH_WORKAROUND_2` on every kernel entry and exit.
-  No mitigation is left out because it is slow; a costly one is measured and paid.
-- **No per-syscall kernel stack offset randomization.** Linux's `RANDOMIZE_KSTACK_OFFSET` moves the stack pointer by
-  up to about 6 bits of entropy per syscall, from `get_random_u16()` on 6.18 arm64. A per-CPU PRNG in 2026 master
-  replaced it as "too costly for the level of protection".
-  - What it hardens: attacks that need a predictable kernel stack layout across syscalls. These are stack buffer
-    overflows, uninitialized-stack leaks, and stack spraying for use-after-return.
-  - Why MogOs has none of them: each is a memory-safety bug in kernel code. The logic crates are
-    `forbid(unsafe_code)`, so safe Rust cannot overflow a buffer or read an uninitialized stack slot. The `unsafe`
-    left in `arch` and the board puts no user-sized data on a kernel stack: the trap frame is a fixed 288 bytes, and
-    user data moves through frames and probed addresses.
-  - It is a probabilistic blur, not a fix, and it costs on every syscall.
-  - Its own threat model is ruled out, so declining it gives away no security. The ledger marks it declined, not
-    paid, and the cross-OS rerun isolates Linux's share with `randomize_kstack_offset=off`, so the margin is labelled
-    by design.
+  Firmware workarounds 1-3 are called only when SMCCC 1.1 discovery says they exist and are needed, that is in
+  phase 11 on real A72 firmware, where they are priced against Linux. No mitigation is left out because it is slow;
+  a costly one is measured and paid.
+- **No per-syscall kernel stack offset randomization.** The argument rests on memory safety alone, not on cost.
+  - Linux's `RANDOMIZE_KSTACK_OFFSET` makes the kernel stack layout unpredictable across syscalls. That defeats
+    attacks built on memory-safety bugs in kernel code: stack buffer overflows, uninitialized-stack reads, and stack
+    spraying for use-after-return.
+  - In MogOs the logic crates are `forbid(unsafe_code)`, where safe Rust cannot express those bugs.
+  - The `unsafe` in `arch` and the board puts no user-sized or uninitialized data on a kernel stack: the trap frame is
+    a fixed 288 bytes, and user data moves through frames and checked addresses.
+  - With the attack's precondition ruled out, declining gives away no security. The ledger marks it declined, and
+    the cross-OS rerun isolates Linux's share with `randomize_kstack_offset=off`.
   - Reopen it if `unsafe` code ever puts user-sized or uninitialized data on a kernel stack.
-- **KASLR stays in phase 6**, with the higher-half kernel (survey steps 32 and 38). It carries two questions from
-  here:
-  - A72 before r1p0 leaks VBAR_EL1 through v3a, and prefetch timing can find kernel mappings. Linux forces KPTI with
-    KASLR on any CPU without E0PD (`kaslr_requires_kpti`). Phase 6 measures KPTI's cost against fixed-address vectors
-    and a KASLR that randomizes only what v3a cannot reveal.
-  - The mapping seal, which stays with KASLR there.
+- **KASLR stays in phase 6**, with the higher-half kernel (survey steps 32 and 38). It carries this question: A72
+  before r1p0 leaks VBAR_EL1 through v3a, and Linux forces KPTI with KASLR on CPUs without E0PD
+  (`kaslr_requires_kpti`). Phase 6 measures KPTI-style fixed vectors against a KASLR that randomizes only what v3a
+  cannot reveal. The mapping seal stays with KASLR there.
 
 ## Notes
 
@@ -101,8 +120,9 @@ run.
   - 60c takes the W^X kernel map from survey step 32. That step keeps the higher-half move.
   - Survey steps 60-66 keep their numbers. Step 66 (mitigation completion: predictor scrub for untrusted processes,
     side-channel regression tests) builds on 60a.
-- What these steps cost and pay is tracked in `docs/BENCHMARKS.md`'s debt ledger. A cross-OS rerun after 60a compares
-  MogOs-with-mitigations against the `Linux` column, not the `mitigations=off` one.
+- What these steps cost and pay is tracked in `docs/BENCHMARKS.md`'s debt ledger, which also judges Linux's other
+  hardening defaults. A cross-OS rerun after 60a compares MogOs-with-mitigations against the `Linux` column, not the
+  `mitigations=off` one.
 
 ## What was done
 
