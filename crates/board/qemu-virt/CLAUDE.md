@@ -26,8 +26,9 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
   failure is `mogfs::Error::Io`. `Board::disk` hands it out
   once (`DISK_TAKEN`), scanning QEMU `virt`'s fixed virtio-mmio transports from the highest down and stopping at the first empty one
   (QEMU `virt` fills them from the top with no gaps; a board fact like `UART_IRQ`).
-- `build.rs`: nested `cargo build` of `crates/user` into `target/user`, newc `boot.cpio` into `OUT_DIR` (plus a
-  non-ELF `bad` entry), `-T linker.ld`. Why it is built this way: `docs/DEVELOPMENT.md` settings table.
+- `build.rs`: nested `cargo build` of `crates/user` into `target/user`, `make -C c` (musl, busybox and the C
+  programs into `target/c`, `c/CLAUDE.md`), newc `boot.cpio` into `OUT_DIR` (every user program, busybox as `sh`,
+  `hello`, `cbench`, plus a non-ELF `bad` entry), `-T linker.ld`. Why it is built this way: `docs/DEVELOPMENT.md` settings table.
 
 ## Boundaries (hard)
 

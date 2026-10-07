@@ -39,7 +39,11 @@ board crate).
   directory, and passes a program only the console (write, never read) and the handles its `Grant` names, narrowed
   by `dup` to those rights plus transfer: `cat` a read-only file, `ls` a read-only directory, `mkdir` and `rm` the
   parent directory with write, `touch` and `write` the parent with read and write, `mv` both parents with write,
-  `sync` the root with no right, `echo` nothing. The leaf name goes as an argument. A program never gets the root
+  `sync` the root with no right, `echo` nothing. The one exception is `sh` (busybox, `Grant::Posix`, the C layout of
+  `c/CLAUDE.md`): a shell reads commands, changes files anywhere and runs programs, so it gets the console with read
+  and write as stdin, stdout and stderr, the root with read and write, and the boot archive with read and exec, each
+  also with duplicate and transfer to hand on, plus 2048 frames (`POSIX_BUDGET`) and a first argument
+  `<argc> /<cwd>`. msh's words are split on spaces, except a word in single quotes. The leaf name goes as an argument. A program never gets the root
   unless its job needs it (`sync`), nor a right it does not use; the lib's host test pins the table. A shell program
   exits with the errno of its failure (`status`), which msh prints by name.
 - A failed check exits instead of printing, so a wrong result shows as a missing line in the e2e test; panic is
@@ -54,7 +58,7 @@ board crate).
   `pi` / `low` / `mid` / `high` (`priority_inheritance_lets_the_mutex_owner_outrun_a_middle_priority_spinner`),
   `ping` / `pong` (`pipe_bench_reports_round_trip`), `readlines` (`console_reads_edited_lines_typed_ahead`), `msh`
   and its programs `ls`, `mkdir`, `touch`, `write`, `cat`, `rm`, `mv`, `echo`, `sync`
-  (`shell_files_survive_a_reboot_only_once_synced`, `sync_reports_a_failed_flush`),
+  (`shell_files_survive_a_reboot_only_once_synced`, `sync_reports_a_failed_flush`), and `sh` (the musl tests in `c/CLAUDE.md`),
   `fsbench` (`fs_bench_reports_round_trips`), `spawnbench` / `nop` (`spawn_bench_reports_round_trip`), all in `crates/e2e/tests/boot.rs`.
 - Clippy and fmt via the `crates/user` commands in `docs/DEVELOPMENT.md` must be clean.
 
