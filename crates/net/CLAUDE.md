@@ -70,7 +70,7 @@ kernel, step 50), DHCP, DNS or IPv6 (phase 9), or IPv4 fragment reassembly.
   source, so it never touches the ARP cache or a slot; a full table answers with SYN cookies (user-approved,
   replacing oldest-first eviction; `syn_cookies`): the ISS holds one clock bit (16 s periods, this one or the last),
   a 2-bit MSS index and 29 bits of SipHash over the connection and the peer's ISN, and a cookie ACK is accepted only
-  while the listener has sent cookies in the last two periods, never with SYN set, and failures are counted
+  while the stack (any listener) has sent cookies in the last two periods, never with SYN set, and failures are counted
   (`bad_cookies`) and reset; a cookie connection runs without window scaling; RFC 5961 challenge
   ACKs (inexact in-window RST, any SYN, an ACK outside `snd_una - max window ..= snd_max`) at most 10 per second per
   connection (`challenge_acks`), never one global limit (CVE-2016-5696); an ACK above `snd_max` drops the whole
@@ -131,7 +131,7 @@ kernel, step 50), DHCP, DNS or IPv6 (phase 9), or IPv4 fragment reassembly.
   peer cut at a random point for 40 seeds, receiver silly-window avoidance, a SYN-ACK's window, simultaneous-open
   scaling, an ACK below `snd_una`. SYN cookies: a flood inside the client's round trip keeps the real handshake,
   forged, wrong-ISN and expired cookies are rejected and counted, a replayed ACK reaches the open connection, a
-  listener that sent no cookie accepts none, and a SYN-ACK is never a cookie's ACK. The mutation test replays 100k
+  stack that sent no cookie accepts none, and a SYN-ACK is never a cookie's ACK. The mutation test replays 100k
   mutated copies of a recorded TCP exchange into the same connection (same keys and times, so the same ISNs) and
   checks the liveness rule after every frame. `src/tcp.rs` unit-tests
   SipHash against `std`'s and out-of-order reassembly across the wrap.

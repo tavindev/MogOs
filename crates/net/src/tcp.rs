@@ -5,7 +5,7 @@
 //!   receive ring at its offset and tracked as up to `OOO` ranges; each segment is acknowledged at once.
 //! - A passive open lives in the half-open table until the handshake completes, so a SYN flood never takes a slot.
 //!   A full table answers with SYN cookies (the ISS encodes the MSS and a keyed hash; no window scaling), accepted
-//!   only while the listener has sent cookies recently.
+//!   only while the stack has sent cookies recently.
 //! - A connection entering TIME_WAIT leaves its slot for a compact entry; a full TIME_WAIT table reuses its oldest,
 //!   and a SYN above the entry's sequence number starts a new connection whose ISS is 65537 plus 24 keyed bits above
 //!   the old one (RFC 9293 3.10.7.4 note, RFC 1122 4.2.2.13).
@@ -1259,7 +1259,7 @@ impl<'a> Stack<'a> {
     }
 
     /// The half-open state a valid cookie ACK stands for: issued this period or the last, for this SYN, while
-    /// this listener has sent cookies within that time (no flood, no cookie to guess).
+    /// this stack has sent cookies within that time (no flood, no cookie to guess).
     fn cookie_in(&self, s: &Seg, mac: Mac, now: u64) -> Option<HalfOpen> {
         self.tcp
             .cookie_at

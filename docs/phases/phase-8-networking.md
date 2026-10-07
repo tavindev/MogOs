@@ -88,7 +88,7 @@ Decision: write `crates/net` fresh. smoltcp is a host-only dev-dependency of `cr
   zero-window probes never giving up on a silent peer (now after 10). Tests check after every step that a connection
   with work outstanding has a deadline and that a silent peer always ends in CLOSED. SYN cookies replace oldest-first
   eviction (user decision): a 29-bit SipHash over the connection and the peer's ISN, an MSS index and one clock bit,
-  accepted only within two 16 s periods of the listener sending one. A SYN taking over TIME_WAIT starts 65537 plus 24
+  accepted only within two 16 s periods of the stack sending one. A SYN taking over TIME_WAIT starts 65537 plus 24
   keyed bits above the old sequence space. Out-of-window ACKs are limited to one per 500 ms per connection; receiver
   silly-window avoidance; a SYN-ACK offers a connection slot's window; simultaneous open scales only if the peer
   offered; an ACK below `snd_una` never updates the window; demux tries the last matched slot first (63 idle
