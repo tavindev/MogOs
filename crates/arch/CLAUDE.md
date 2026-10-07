@@ -46,7 +46,8 @@ It is **NOT** board-specific: no MMIO addresses, no memory map, no drivers, no s
 ## Invariants & rules
 
 - `TrapFrame` layout is fixed by the vector asm (`size_of == 288`, const-asserted); `sp_el0` and `tpidr_el0` are
-  touched only by `switch_el0_regs`, needed only when the address space changes.
+  touched only by `switch_el0_regs`, needed on every switch with a user thread on either side (each thread has its
+  own; `new_user_task` sets both).
 - No FP/SIMD state is saved (softfloat target, `docs/DEVELOPMENT.md`).
 - Descriptor bits are const-asserted in `mmu.rs` because TCG ignores cacheability attributes, so a wrong bit would
   still boot. User pages are always `PXN` and not global (ASID-tagged); a page is RX or RW, never W+X.

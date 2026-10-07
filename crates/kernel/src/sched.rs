@@ -1,7 +1,7 @@
 use mm::{Budget, PhysAddr};
 
 use crate::handle::{Handles, Object};
-use crate::syscall::{EBADF, KILLED};
+use crate::syscall::EBADF;
 
 /// Priority levels: 0 (lowest; the boot context and kernel tasks) to `PRIORITIES - 1`.
 pub const PRIORITIES: u8 = 4;
@@ -10,17 +10,14 @@ pub const PRIORITIES: u8 = 4;
 #[derive(Debug)]
 pub struct Full;
 
-/// A task's kernel stack and, for a process, its budget and where its next `map` goes. Handle tables are fixed arrays
-/// in the scheduler, so they are not charged.
+/// A process's budget, which pays for its threads' kernel stacks too, and where its next `map` goes. Handle tables
+/// are fixed arrays in the process table, so they are not charged.
 pub struct Memory {
-    /// First frame of the kernel stack.
-    pub stack: PhysAddr,
     pub budget: Budget,
     pub next: u64,
 }
 
 const NO_MEMORY: Memory = Memory {
-    stack: PhysAddr(0),
     budget: Budget::new(0),
     next: 0,
 };
@@ -30,8 +27,10 @@ const NO_MEMORY: Memory = Memory {
 pub enum Event {
     /// Data, room or a closed end in the pipe at this table index.
     Pipe(usize),
-    /// The process in this slot exiting.
+    /// The process at this index ending.
     Exit(usize),
+    /// The thread in this slot ending.
+    Join(usize),
     /// The mutex at this table index being unlocked.
     Lock(usize),
     /// A console line being entered.
@@ -40,31 +39,41 @@ pub enum Event {
     Idle,
 }
 
-/// What `kill` hands back: handles, address space, kernel stack, and the event the task was blocked on.
-pub type Killed = (Handles, PhysAddr, PhysAddr, Option<Event>);
-
+/// A thread's state; a process is `Ready` while it has threads, and never `Blocked`.
 #[derive(Clone, Copy, PartialEq)]
 enum State {
     Ready,
     Blocked(Event),
-    /// A free slot; the task that last ran in it exited with this code.
+    /// Free; what was last here ended with this code.
     Exited(u64),
-    /// Exited with this code, its slot kept until its parent `reap`s it or closes its process handle.
+    /// Ended with this code, kept until it is reaped (`reap`, `join`) or the last handle to it closes.
     Zombie(u64),
 }
 
-/// Run queue of up to `N` tasks, each known by its saved trap frame address and address space (its level-1 table;
-/// `PhysAddr(0)` is the boot table), its memory, its handle table and its priority. The highest-priority ready task
-/// runs, round robin within a level; blocked tasks are skipped; with none ready, the boot context (slot 0) runs.
-pub struct Scheduler<const N: usize> {
-    /// Frame address and address space per slot.
-    tasks: [(usize, PhysAddr); N],
+/// The process table: per index, an address space (its level-1 table; `PhysAddr(0)` is the boot table), handles,
+/// memory and live thread count. Index 0 is the kernel: the boot context and kernel tasks, in the boot table.
+pub struct Processes<const P: usize> {
+    space: [PhysAddr; P],
+    handles: [Handles; P],
+    /// An ended process's budget stays here until `reap`.
+    memory: [Memory; P],
+    threads: [usize; P],
+    /// Bumped by each `add_process`, so a process handle reaches one process, never a later one at the same index.
+    generation: [u64; P],
+    state: [State; P],
+}
+
+/// Run queue of up to `N` threads of up to `P` processes, each thread known by its saved trap frame address, process,
+/// kernel stack and priority. The highest-priority ready thread runs, round robin within a level; blocked ones are
+/// skipped; with none ready, the boot context (slot 0) runs.
+pub struct Scheduler<const N: usize, const P: usize> {
+    frame: [usize; N],
+    process: [usize; N],
+    /// First frame of the kernel stack, charged to the thread's process.
+    stack: [PhysAddr; N],
     state: [State; N],
-    /// Bumped by each `add`, so a process handle reaches one task, never a later one in the same slot.
+    /// Bumped by each `add`, so a thread handle reaches one thread, never a later one in the same slot.
     generation: [u64; N],
-    /// An exited task's budget stays here until `reap`.
-    memory: [Memory; N],
-    handles: [Handles; N],
     /// Own priority per slot.
     priority: [u8; N],
     /// Own priority, raised while a higher-priority task waits for a mutex the slot owns.
@@ -72,58 +81,94 @@ pub struct Scheduler<const N: usize> {
     /// One past the highest slot ever used.
     end: usize,
     current: usize,
+    /// `process[current]`, cached: the syscall, switch and exit paths read it on every call.
+    current_process: usize,
+    processes: Processes<P>,
 }
 
-impl<const N: usize> Scheduler<N> {
-    /// Slot 0 is the boot context in the boot table; its frame is recorded on its first switch.
+impl<const N: usize, const P: usize> Scheduler<N, P> {
+    /// Slot 0 is the boot context, the kernel process's first thread; its frame is recorded on its first switch.
     pub const fn new() -> Self {
         let mut state = [State::Exited(0); N];
         state[0] = State::Ready;
+        let mut process_state = [State::Exited(0); P];
+        process_state[0] = State::Ready;
+        let mut threads = [0; P];
+        threads[0] = 1;
         Self {
-            tasks: [(0, PhysAddr(0)); N],
+            frame: [0; N],
+            process: [0; N],
+            stack: [PhysAddr(0); N],
             state,
             generation: [0; N],
-            memory: [NO_MEMORY; N],
-            handles: [Handles::new(); N],
             priority: [0; N],
             effective: [0; N],
             end: 1,
             current: 0,
+            current_process: 0,
+            processes: Processes {
+                space: [PhysAddr(0); P],
+                handles: [Handles::new(); P],
+                memory: [NO_MEMORY; P],
+                threads,
+                generation: [0; P],
+                state: process_state,
+            },
         }
     }
 
-    /// Queues a new task in `slot` with `generation` (from `free_slot`), its first frame at `frame` in address space
-    /// `space`, with `memory`, `handles` and `priority` (below `PRIORITIES`).
-    pub fn add(
+    /// Starts a process with no threads yet at `index` with `generation` (from `free_process`), in address space
+    /// `space`, with `memory` and `handles`.
+    pub fn add_process(
         &mut self,
-        (slot, generation): (usize, u64),
-        frame: usize,
+        (index, generation): (usize, u64),
         space: PhysAddr,
         memory: Memory,
         handles: Handles,
+    ) {
+        let p = &mut self.processes;
+        p.space[index] = space;
+        p.handles[index] = handles;
+        p.memory[index] = memory;
+        p.threads[index] = 0;
+        p.generation[index] = generation;
+        p.state[index] = State::Ready;
+    }
+
+    /// Queues a new thread of the live `process` in `slot` with `generation` (from `free_slot`), its first frame at
+    /// `frame`, its kernel stack at `stack`, at `priority` (below `PRIORITIES`).
+    pub fn add(
+        &mut self,
+        (slot, generation): (usize, u64),
+        process: usize,
+        (frame, stack): (usize, PhysAddr),
         priority: u8,
     ) {
-        self.tasks[slot] = (frame, space);
+        self.frame[slot] = frame;
+        self.process[slot] = process;
+        self.stack[slot] = stack;
         self.state[slot] = State::Ready;
         self.generation[slot] = generation;
-        self.memory[slot] = memory;
-        self.handles[slot] = handles;
         self.priority[slot] = priority;
         self.effective[slot] = priority;
         self.end = self.end.max(slot + 1);
+        self.processes.threads[process] += 1;
     }
 
-    /// The slot the next `add` takes, if any is free, and the generation it gives the task there.
+    /// The slot the next `add` takes, if any is free, and the generation it gives the thread there.
     pub fn free_slot(&self) -> Option<(usize, u64)> {
-        let slot = 1 + self.state[1..]
-            .iter()
-            .position(|s| matches!(s, State::Exited(_)))?;
-        Some((slot, self.generation[slot] + 1))
+        free(&self.state, &self.generation)
+    }
+
+    /// The index the next `add_process` takes, if any is free, and the generation it gives the process there.
+    pub fn free_process(&self) -> Option<(usize, u64)> {
+        free(&self.processes.state, &self.processes.generation)
     }
 
     /// Saves the current task's `frame` and returns the next task's.
+    #[inline]
     pub fn switch(&mut self, frame: usize) -> usize {
-        self.tasks[self.current].0 = frame;
+        self.frame[self.current] = frame;
         self.advance()
     }
 
@@ -144,94 +189,133 @@ impl<const N: usize> Scheduler<N> {
         woke
     }
 
-    /// Ends the current task (never slot 0) with `code` and wakes its waiters; returns the next task's frame and the
-    /// ended task's kernel stack, which the caller frees with its other frames. The caller first takes and releases
-    /// its handles; its budget stays for `reap`, and while another task holds a handle to it, so does its slot.
-    pub fn exit(&mut self, code: u64) -> (usize, PhysAddr) {
-        assert!(self.current != 0, "the boot context cannot exit");
-        let stack = self.memory[self.current].stack;
-        self.end(self.current, code);
-        (self.advance(), stack)
-    }
-
-    /// Ends the process in `slot` with `generation`, not the current task, as a fault would (`KILLED`) and wakes its
-    /// waiters; returns its handles (for the caller to release), address space, kernel stack (to free) and the event it
-    /// was blocked on, or `None` if it already exited; `EBADF` once a newer task took the slot.
-    pub fn kill(&mut self, slot: usize, generation: u64) -> Result<Option<Killed>, i64> {
-        if self.generation[slot] != generation {
-            return Err(EBADF);
-        }
+    /// Ends the live thread in `slot` (never slot 0) with `code`, a zombie while a handle reaches it, and wakes its
+    /// joiners; returns its kernel stack and the event it was blocked on. With its last thread its process ends alike,
+    /// so its handles must already be taken (`take_handles`).
+    pub fn end(&mut self, slot: usize, code: u64) -> (PhysAddr, Option<Event>) {
+        assert!(slot != 0, "the boot context cannot exit");
         let blocked = match self.state[slot] {
-            State::Ready => None,
             State::Blocked(event) => Some(event),
-            _ => return Ok(None),
+            _ => None,
         };
-        let handles = core::mem::take(&mut self.handles[slot]);
-        self.end(slot, KILLED);
-        Ok(Some((
-            handles,
-            self.tasks[slot].1,
-            self.memory[slot].stack,
-            blocked,
-        )))
-    }
-
-    /// Marks the task in `slot` exited with `code`, kept as a zombie while another task holds a handle to it, and wakes
-    /// its waiters.
-    fn end(&mut self, slot: usize, code: u64) {
-        let process = Object::Process {
+        let index = self.process[slot];
+        let thread = Object::Thread {
             slot,
             generation: self.generation[slot],
         };
-        self.state[slot] = match self.holds(|o| o == process) {
+        let ended = |held| match held {
             true => State::Zombie(code),
             false => State::Exited(code),
         };
-        self.wake(Event::Exit(slot));
-    }
-
-    /// Whether any task's handle table holds a handle to an object `f` matches.
-    pub fn holds(&self, f: impl Fn(Object) -> bool) -> bool {
-        self.handles[..self.end].iter().any(|h| h.objects().any(&f))
-    }
-
-    /// For the process in `slot` with `generation`: `None` while it runs; once it exited, its code and its budget's
-    /// limit, which only the first call gets (later ones get 0), and its slot is freed; `EBADF` once a newer task took
-    /// the slot.
-    pub fn reap(&mut self, slot: usize, generation: u64) -> Result<Option<(u64, usize)>, i64> {
-        if self.generation[slot] != generation {
-            return Err(EBADF);
+        self.state[slot] = ended(self.holds(|o| o == thread));
+        self.wake(Event::Join(slot));
+        self.processes.threads[index] -= 1;
+        if self.processes.threads[index] == 0 {
+            let process = Object::Process {
+                index,
+                generation: self.processes.generation[index],
+            };
+            self.processes.state[index] = ended(self.holds(|o| o == process));
+            self.wake(Event::Exit(index));
         }
-        let (State::Exited(code) | State::Zombie(code)) = self.state[slot] else {
+        (self.stack[slot], blocked)
+    }
+
+    /// Whether any process's handle table holds a handle to an object `f` matches. Only running processes but the
+    /// kernel hold handles: an ended process's table was taken.
+    pub fn holds(&self, f: impl Fn(Object) -> bool) -> bool {
+        let p = &self.processes;
+        (1..P).any(|i| p.state[i] == State::Ready && p.handles[i].objects().any(&f))
+    }
+
+    /// For the process at `index` with `generation`: `None` while it runs; once it ended, its code and its budget's
+    /// limit, which only the first call gets (later ones get 0), and its index is freed; `EBADF` once a newer process
+    /// took the index.
+    pub fn reap(&mut self, index: usize, generation: u64) -> Result<Option<(u64, usize)>, i64> {
+        let p = &mut self.processes;
+        let Some(code) = reap(&mut p.state[index], p.generation[index], generation)? else {
             return Ok(None);
         };
-        self.state[slot] = State::Exited(code);
-        let budget = core::mem::replace(&mut self.memory[slot].budget, Budget::new(0));
+        let budget = core::mem::replace(&mut p.memory[index].budget, Budget::new(0));
         Ok(Some((code, budget.limit())))
     }
 
-    /// A handle to the process in `slot` with `generation` was closed: if it exited, frees its slot and returns its
+    /// For the thread in `slot` with `generation`: `None` while it runs; once it ended, its code, and its slot is
+    /// freed; `EBADF` once a newer thread took the slot.
+    pub fn join(&mut self, slot: usize, generation: u64) -> Result<Option<u64>, i64> {
+        reap(&mut self.state[slot], self.generation[slot], generation)
+    }
+
+    /// A handle to the process at `index` with `generation` was closed: if it ended, frees its index and returns its
     /// budget's limit, as `reap` would; otherwise 0.
-    pub fn close(&mut self, slot: usize, generation: u64) -> usize {
-        if !matches!(self.state[slot], State::Zombie(_)) {
+    pub fn close(&mut self, index: usize, generation: u64) -> usize {
+        if !matches!(self.processes.state[index], State::Zombie(_)) {
             return 0;
         }
-        match self.reap(slot, generation) {
+        match self.reap(index, generation) {
             Ok(Some((_, limit))) => limit,
             _ => 0,
         }
     }
 
-    /// The budget of the process in `slot` with `generation`, unless it exited.
-    pub fn budget(&mut self, slot: usize, generation: u64) -> Option<&mut Budget> {
-        let live = self.generation[slot] == generation
-            && matches!(self.state[slot], State::Ready | State::Blocked(_));
-        live.then_some(&mut self.memory[slot].budget)
+    /// A handle to the thread in `slot` with `generation` was closed: if it ended, frees its slot.
+    pub fn close_thread(&mut self, slot: usize, generation: u64) {
+        if matches!(self.state[slot], State::Zombie(_)) {
+            let _ = self.join(slot, generation);
+        }
     }
 
-    /// The current task's slot and address space.
-    pub fn current(&self) -> (usize, PhysAddr) {
-        (self.current, self.tasks[self.current].1)
+    /// Whether the process at `index` with `generation` still runs; `EBADF` once a newer process took the index.
+    pub fn process_live(&self, index: usize, generation: u64) -> Result<bool, i64> {
+        let p = &self.processes;
+        live(p.state[index], p.generation[index], generation)
+    }
+
+    /// Whether the thread in `slot` with `generation` still runs; `EBADF` once a newer thread took the slot.
+    pub fn thread_live(&self, slot: usize, generation: u64) -> Result<bool, i64> {
+        live(self.state[slot], self.generation[slot], generation)
+    }
+
+    /// The budget of the process at `index` with `generation`, unless it ended.
+    pub fn budget(&mut self, index: usize, generation: u64) -> Option<&mut Budget> {
+        let live = self.process_live(index, generation) == Ok(true);
+        live.then_some(&mut self.processes.memory[index].budget)
+    }
+
+    /// The current task's slot and generation.
+    pub fn current(&self) -> (usize, u64) {
+        (self.current, self.generation[self.current])
+    }
+
+    /// The current task's process index (and ASID).
+    pub fn process(&self) -> usize {
+        self.current_process
+    }
+
+    /// The current task's process generation.
+    pub fn generation(&self) -> u64 {
+        self.processes.generation[self.process()]
+    }
+
+    /// The address space of the process at `index`.
+    pub fn space(&self, index: usize) -> PhysAddr {
+        self.processes.space[index]
+    }
+
+    /// The process the thread in `slot` belongs to.
+    pub fn process_of(&self, slot: usize) -> usize {
+        self.process[slot]
+    }
+
+    /// The live threads of the process at `index`.
+    pub fn threads(&self, index: usize) -> usize {
+        self.processes.threads[index]
+    }
+
+    /// A live thread of the process at `index`, if it has one.
+    pub fn thread_of(&self, index: usize) -> Option<usize> {
+        let live = |s: usize| matches!(self.state[s], State::Ready | State::Blocked(_));
+        (1..self.end).find(|&s| self.process[s] == index && live(s))
     }
 
     /// The current task's own priority.
@@ -265,22 +349,22 @@ impl<const N: usize> Scheduler<N> {
         (0..self.end).any(|s| self.state[s] == State::Ready && self.effective[s] > current)
     }
 
-    /// The current task's generation.
-    pub fn generation(&self) -> u64 {
-        self.generation[self.current]
+    /// The memory of the process at `index`.
+    pub fn memory(&mut self, index: usize) -> &mut Memory {
+        &mut self.processes.memory[index]
     }
 
-    /// The current task's memory.
-    pub fn memory(&mut self) -> &mut Memory {
-        &mut self.memory[self.current]
-    }
-
-    /// The current task's handles.
+    /// The current process's handles.
     pub fn handles(&mut self) -> &mut Handles {
-        &mut self.handles[self.current]
+        &mut self.processes.handles[self.current_process]
     }
 
-    /// Tasks in the queue, the boot context included.
+    /// Empties the handle table of the process at `index`; returns what it held.
+    pub fn take_handles(&mut self, index: usize) -> Handles {
+        core::mem::take(&mut self.processes.handles[index])
+    }
+
+    /// Threads in the queue, the boot context included.
     pub fn count(&self) -> usize {
         let queued = |s: &&State| matches!(s, State::Ready | State::Blocked(_));
         self.state[..self.end].iter().filter(queued).count()
@@ -300,12 +384,41 @@ impl<const N: usize> Scheduler<N> {
         }
         self.current = next.unwrap_or(0);
         self.state[self.current] = State::Ready;
-        self.tasks[self.current].0
+        self.current_process = self.process[self.current];
+        self.frame[self.current]
     }
 }
 
-impl<const N: usize> Default for Scheduler<N> {
+impl<const N: usize, const P: usize> Default for Scheduler<N, P> {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The first free entry after entry 0 and the generation its next occupant gets.
+fn free(state: &[State], generation: &[u64]) -> Option<(usize, u64)> {
+    let i = 1 + state[1..]
+        .iter()
+        .position(|s| matches!(s, State::Exited(_)))?;
+    Some((i, generation[i] + 1))
+}
+
+/// For an entry at `current` generation reached with `generation`: whether it runs; `EBADF` if they differ.
+fn live(state: State, current: u64, generation: u64) -> Result<bool, i64> {
+    if current != generation {
+        return Err(EBADF);
+    }
+    Ok(matches!(state, State::Ready | State::Blocked(_)))
+}
+
+/// As `live`, but once the entry ended, frees it and returns its code.
+fn reap(state: &mut State, current: u64, generation: u64) -> Result<Option<u64>, i64> {
+    if current != generation {
+        return Err(EBADF);
+    }
+    let (State::Exited(code) | State::Zombie(code)) = *state else {
+        return Ok(None);
+    };
+    *state = State::Exited(code);
+    Ok(Some(code))
 }

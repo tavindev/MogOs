@@ -5,7 +5,7 @@
 The adapter that implements `kernel::Board` for QEMU `virt` and owns everything stateful and unsafe outside
 `crates/arch`: `kmain`, the global kernel state, the `#[global_allocator]` and the `Board` impl (`src/main.rs`), the
 PL011 driver (`src/uart.rs`), the virtio-blk driver (`src/virtio_blk.rs`), the trap hooks (`src/trap.rs`), process
-construction and ELF loading (`src/process.rs`), user-pointer checks (`src/usermem.rs`), the file system's disk
+construction, ELF loading and threads (`src/process.rs`), user memory access (`src/usermem.rs`), the file system's disk
 (`src/fs.rs`), the asm test programs (`src/user.s`), `linker.ld`, and `build.rs`, which builds `crates/user` and
 bundles it as the boot archive.
 
@@ -15,15 +15,18 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
 ## Responsibilities
 
 - `kmain`: reads the DTB at RAM base, builds `QemuVirt`, calls `kernel::run` with the image and DTB reserved.
-- `KERNEL: Lock<Kernel>` (`Scheduler`, `FrameAllocator`, `Pipes`, `Mutexes`, console `Line`, the MogFS `Fs<FsDisk>`
-  and whether it is mounted), `HEAP` and `CONSOLE: Lock<Uart>` statics. `Fs::new` is const, so the 48 KiB file system is built in the static with an empty
+- `KERNEL: Lock<Kernel>` (`Scheduler` with its process table, `FrameAllocator`, `Pipes`, `Mutexes`, console `Line`,
+  the MogFS `Fs<FsDisk>` and whether it is mounted, and `buf`, the 8 KiB a syscall copies user inputs into), `HEAP` and
+  `CONSOLE: Lock<Uart>` statics. `Fs::new` is const, so the 48 KiB file system is built in the static with an empty
   `FsDisk(None)` (`Io` until `Board::mount` puts the `VirtioBlk` in through `Fs::disk`). File syscalls run their disk I/O inside the trap under `KERNEL`: a `sync` holds it
   for its writes and two flushes. Boot-spawned processes get the root directory as handle 3 once mounted (`spawn_init`).
 - Trap hooks `task_switch`, `board_irq`, `board_syscall`, `board_user_fault`: execute the `kernel::syscall::Call`
   that `dispatch` returns (user buffers, pages, frames, wake/block). `board_unlock`, called by the trap exit, releases `KERNEL`.
 - `Board::console` writes (`Console`) hold `CONSOLE` for a whole `write_fmt`, so a line is never split; it is the PL011
   at `UART0`, like every other UART access. `test=bench-lock`'s `lock_round_trips` (ticket vs test-and-set) and `add_locked`.
-- Processes: `spawn_process`, `spawn`, `task_exit`, `kill`, `map`, `release`, `enter` (TTBR0/ASID switch).
+- Processes and threads: `spawn_process`, `spawn`, `thread`, `map` (`src/process.rs`); `end_thread`, `end_process`,
+  `exit_thread`, `exit_process`, `kill`, `release`, and `switch`, which moves SP_EL0 and TPIDR_EL0 on every switch with
+  a user thread on either side and writes TTBR0 only when the process changes (`src/trap.rs`).
 - `VirtioBlk` (`src/virtio_blk.rs`) implements `kernel::Disk` (`mogfs::Disk`): modern (version 2) virtio-mmio only,
   one 4-entry queue in one frame, one request in flight, completion polled (no IRQ), DMA straight to the caller's
   blocks (only inside the identity-mapped RAM GiB); a buffer outside it, a request past the capacity or a device
@@ -62,19 +65,31 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
   methods take `lock()` guards and never hold one across a switch (`run_others` drops it before `yield_now`). Panic,
   fault, echo and user `write` output use `UART0` directly, never `CONSOLE`.
 - Locks need the MMU on (exclusives), so `kernel::run` calls `enable_mmu` first, before any output or trap.
-- A process's slot is its ASID (`MAX_TASKS <= 256`, const-asserted); the boot table keeps ASID 0 (`enter`).
-- Every frame a process uses (tables, pages, kernel stack, pipe pages it creates) is charged to its `Budget`;
-  `spawn_process` returns every frame on failure, `spawn` moves nothing on failure.
-- `task_exit` frees the kernel stack it runs on: sound because the frames are back in `KERNEL`'s allocator, which no
-  core can reach until the trap exit has left that stack and released `KERNEL`.
+- A process's index is its ASID (`MAX_PROCESSES <= 256`, const-asserted); index 0 is the kernel, whose boot table
+  keeps ASID 0 (`switch`). Tables: `MAX_TASKS` (8) threads, the boot context included, and `MAX_PROCESSES` (8)
+  processes, the kernel included.
+- Every frame a process uses (tables, pages, each thread's kernel stack, pipe pages it creates) is charged to its
+  `Budget`; a thread's end refunds its stack (`free_stack`). `spawn_process` returns every frame on failure; a failed
+  `spawn` or `thread` changes nothing.
+- A thread's end frees the kernel stack it may run on, and a process's end frees its index before `exit_process` has
+  switched away from its address space and freed it (`flush_asid`, then `free_space`): sound because both go back
+  under `KERNEL`, which no core can take until the trap exit has left that stack and released it. Step 25b, with
+  threads on other cores, makes the last thread to leave a core do the free, and frees the index only after it.
+- Ending a process (`exit`, a fault, `kill`) takes and releases its handles first, then ends every thread (mutexes
+  released, a lent boost dropped, stacks refunded), all before `switch` picks the next task, so whatever they woke can
+  be it.
 - A blocking call rewinds its `svc` (`block` calls `TrapFrame::restart`) and reruns when woken.
-- User memory is read only through `user_bytes` / `user_bytes_mut`, which probe every page with
-  `arch::user_readable` / `user_writable`; slices live only until the trap returns.
+- User memory is reached only through `UserIn` / `UserOut` (`src/usermem.rs`), which probe every page with
+  `arch::user_readable` / `user_writable` once and then move bytes by raw copy, in the same trap, before any switch;
+  never through a reference, since a sibling thread may write the memory meanwhile. Inputs the kernel parses (paths,
+  spawn arguments and handle lists) are copied into `buf` (`copy_in`) once and validated there; bulk data goes straight
+  between user memory and its destination (a pipe page) or through `buf` (console, files, `readdir`). A pipe read that
+  would wait skips the probe (`Pipe::read_waits`): under hvf a probe costs more than the rest of the call.
 - User layout: code at `USER_BASE` (4 GiB), ELF segments within `IMAGE` (below the top two pages and an unmapped guard page, so a stack overflow faults), one stack page
   below `USER_STACK_TOP`; a `spawn` with arguments copies them to the end of that page and adds a stack page below it
   (both charged to the child), and the child starts with x0-x2 = count, address, length,
   `map` from `MAP_BASE` upward. Kernel blocks (`KERNEL_L1`) are EL1-only in every address space.
-- `MAX_MUTEXES = MAX_TASKS * MAX_HANDLES`: every live mutex holds a handle, so the handle tables are the quota.
+- `MAX_MUTEXES = MAX_PROCESSES * MAX_HANDLES`: every live mutex holds a handle, so the handle tables are the quota.
 - `linker.ld` provides `__stack_top`, `__bss_start`, `__bss_end`, `__kernel_start`, `__kernel_end`; its load address
   is explained in `docs/DEVELOPMENT.md`.
 - Performance is the moat: a slowdown is never accepted because it has an explanation; it is removed, or shown to

@@ -14,7 +14,7 @@ board crate).
   `docs/DEVELOPMENT.md`. `cargo test-host` does not build it; its lib's host test (the command table) runs with the
   `cargo test --manifest-path` command there.
 - `#![no_std]` (the lib `cfg_attr(not(test))`), `#![no_main]`, no dependencies. `unsafe` only in `src/lib.rs` for
-  `svc`, `map`'s slice and `start`'s argument slice, and in bins for `#[unsafe(no_mangle)]` and the one call to the
+  `svc`, the `mrs` of `now_ns` and `tls`, `map`'s slice and `start`'s argument slice, and in bins for `#[unsafe(no_mangle)]` and the one call to the
   `unsafe fn start`; each block with a `// SAFETY:`.
 - A program that takes arguments defines `_start(argc, _, len)` and calls `unsafe { start(argc, len, main) }` with
   its x0 and x2, which hands `main` the arguments as `&[&[u8]]` (the kernel puts them at the end of the top stack page,
@@ -31,8 +31,11 @@ board crate).
   change both together.
 - `link.ld` and `build.rs`: static ELFs at 4 GiB, one RX and one RW `PT_LOAD`, `-zmax-page-size=4096`. Everything
   must fit in the board's `IMAGE` (below a guard page and the top two stack pages, which end at 4 GiB + 2 MiB) or `spawn` returns `ENOEXEC`.
-- Child budgets (`CHILD_BUDGET`, `A_BUDGET`, `PONG_BUDGET`, ...) are sized deliberately, some exact, some with slack,
-  as their comments say; they must fit in the kernel's `BOOT_BUDGET`, `WAITER_BUDGET`, `PI_BUDGET`. `ROUND_TRIPS` in
+- Threads: `thread(entry, stack, tls, arg)` starts `entry(arg)` on a stack the caller mapped, with TPIDR_EL0 = `tls`
+  (`tls()` reads it back); `wait` on its handle joins it, `thread_exit` ends one thread, `exit` the whole process. Its
+  kernel stack (4 frames) comes out of the process's budget.
+- Child budgets (`CHILD_BUDGET`, `A_BUDGET`, `PONG_BUDGET`, `VICTIM_BUDGET`, ...) are sized deliberately, some exact, some with slack,
+  as their comments say; they must fit in the kernel's `BOOT_BUDGET`, `WAITER_BUDGET`, `PI_BUDGET`, `THREADS_BUDGET`. `ROUND_TRIPS` in
   `ping.rs` must equal the kernel's `PIPE_ROUND_TRIPS`.
 - Least privilege (security rule): msh runs only the programs in `COMMANDS` (`src/lib.rs`; anything else, even in
   the archive, is `command not found`), resolves every path argument itself, against its root handle and current
@@ -59,7 +62,9 @@ board crate).
   `ping` / `pong` (`pipe_bench_reports_round_trip`), `readlines` (`console_reads_edited_lines_typed_ahead`), `msh`
   and its programs `ls`, `mkdir`, `touch`, `write`, `cat`, `rm`, `mv`, `echo`, `sync`
   (`shell_files_survive_a_reboot_only_once_synced`, `sync_reports_a_failed_flush`), and `sh` (the musl tests in `c/CLAUDE.md`),
-  `fsbench` (`fs_bench_reports_round_trips`), `spawnbench` / `nop` (`spawn_bench_reports_round_trip`), all in `crates/e2e/tests/boot.rs`.
+  `fsbench` (`fs_bench_reports_round_trips`), `spawnbench` / `nop` (`spawn_bench_reports_round_trip`), `threads` /
+  `victim` (`threads_share_a_counter_keep_their_tls_and_end_with_their_process`), `threadbench`
+  (`thread_bench_reports_round_trips`), all in `crates/e2e/tests/boot.rs`.
 - Clippy and fmt via the `crates/user` commands in `docs/DEVELOPMENT.md` must be clean.
 
 ---

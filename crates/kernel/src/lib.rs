@@ -122,6 +122,9 @@ const SHELL_BUDGET: usize = BOOT_BUDGET + 2048;
 const WAITER_BUDGET: usize = 28;
 /// `pi`'s 9 frames, its two pipes' pages and its three children's 9 each.
 const PI_BUDGET: usize = 38;
+/// `threads`' 10 frames, its four threads' stack pages, their map table and 4 kernel stack frames each, a pipe page,
+/// and the 18 it gives `victim`, with 2 to spare.
+const THREADS_BUDGET: usize = 52;
 
 /// `reserved` lists physical ranges in use (kernel image, DTB).
 pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> ! {
@@ -204,6 +207,16 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
                 board.start_timer();
                 run_archived(board, "pi", "pi", (PI_BUDGET, INIT_ARCHIVE));
             }
+            "test=threads" => {
+                board.start_timer();
+                run_archived(board, "threads", "threads", (THREADS_BUDGET, INIT_ARCHIVE));
+            }
+            "test=bench-threads" => run_archived(
+                board,
+                "bench-threads",
+                "threadbench",
+                (BOOT_BUDGET, INIT_ARCHIVE),
+            ),
             "test=bench-pipe" => pipe_bench(board),
             "test=bench-lock" => lock_bench(board),
             "test=budget" => {

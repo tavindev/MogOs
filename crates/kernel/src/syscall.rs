@@ -8,7 +8,7 @@ use crate::handle::{EXEC, Handles, KILL as KILL_RIGHT, MAX_HANDLES, Object, READ
 use crate::mutex::Mutex;
 use crate::pipe::End;
 
-/// `exit(code)`: ends the calling process; `wait` reports the low 8 bits of `code`.
+/// `exit(code)`: ends the calling process, every thread; `wait` reports the low 8 bits of `code`.
 const EXIT: u64 = 0;
 /// `io_submit_wait(handle, op, ptr, len, offset)`: submits I/O on `handle` and waits for it to complete; returns the
 /// bytes moved. `op` is `IO_READ` (into `ptr`, read right) or `IO_WRITE` (from `ptr`, write right). libc's `pread` and
@@ -43,9 +43,10 @@ const SPAWN: u64 = 6;
 /// closes. Reading it empty waits for data, or returns 0 once no write end is left; a write waits until all of it fits
 /// (so every write is atomic, as `MAX_BUFFER` is the buffer size), or fails with `EPIPE` once no read end is left.
 const PIPE: u64 = 7;
-/// `wait(process)`: waits for the process (wait right) to exit; returns its exit code (`KILLED` if a fault killed it)
-/// and moves what is left of its budget back to the caller. An exited process keeps its slot until waited for or its
-/// handle closes; after that, `EBADF` once a newer process took the slot.
+/// `wait(handle)`: waits for the process (wait right) to exit; returns its exit code (`KILLED` if a fault killed it)
+/// and moves what is left of its budget back to the caller. An exited process keeps its index until waited for or its
+/// handle closes; after that, `EBADF` once a newer process took the index. On a thread handle it is a join: waits for
+/// the thread to end and returns its exit code, with the same rules for its slot.
 const WAIT: u64 = 8;
 /// `mutex()`: returns a handle (duplicate, transfer) to a new unlocked mutex; the table slot is fixed, so nothing is
 /// charged.
@@ -55,7 +56,8 @@ const MUTEX: u64 = 9;
 const LOCK: u64 = 10;
 /// `unlock(mutex)`: frees the mutex, which the caller must own (`EPERM`). An exiting owner frees what it holds.
 const UNLOCK: u64 = 11;
-/// `kill(process)`: ends the process (kill right) as a fault would; `wait` reports `KILLED`. 0 if it already exited.
+/// `kill(handle)`: ends the process (kill right) as a fault would, or the thread (its process ends with its last
+/// thread); `wait` reports `KILLED`. 0 if it already ended.
 const KILL: u64 = 12;
 /// `mkdir(dir, path_ptr, path_len)`: makes a directory at `path` under `dir` (write right), resolved as by `open`;
 /// returns 0. `EROFS` on the boot archive.
@@ -76,6 +78,14 @@ const UNLINK: u64 = 16;
 /// to the path `to` under `to_dir` (both write right), resolved as by `open`; returns 0. `EEXIST` if `to` exists,
 /// `EINVAL` if a directory would move below itself, `EROFS` on the boot archive.
 const RENAME: u64 = 17;
+/// `thread(entry, stack, tls, arg)`: starts a thread of the caller's process at `entry` with SP = `stack`, TPIDR_EL0 =
+/// `tls` and x0 = `arg`, at the caller's own priority; its kernel stack is charged to the process's budget (`ENOMEM`),
+/// its user stack is the caller's own memory. Returns a thread handle (wait, kill, duplicate, transfer); `EAGAIN` if
+/// no slot is free. On failure nothing changes.
+const THREAD: u64 = 18;
+/// `thread_exit(code)`: ends the calling thread; its process ends with its last thread, with this code. A join
+/// reports the low 8 bits of `code`.
+const THREAD_EXIT: u64 = 19;
 
 /// Most arguments a `spawn` passes.
 pub const MAX_ARGS: usize = 32;
@@ -105,7 +115,7 @@ pub const ENOEXEC: i64 = -8;
 
 /// Bad, closed or stale handle.
 pub const EBADF: i64 = -9;
-/// No free process slot.
+/// No free process index or thread slot.
 pub const EAGAIN: i64 = -11;
 /// Over the memory budget, or out of frames.
 pub const ENOMEM: i64 = -12;
@@ -149,7 +159,7 @@ pub const ENOTEMPTY: i64 = -39;
 const USER: Range<u64> = 1 << 32..1 << 39;
 /// Longest user buffer a syscall reads or writes (I/O data, `open` name, `spawn` handles), so its IRQs-masked work
 /// stays bounded.
-const MAX_BUFFER: u64 = 4096;
+pub const MAX_BUFFER: u64 = 4096;
 const _: () = assert!(
     MAX_BUFFER as usize <= crate::pipe::SIZE,
     "a longer pipe write would never fit"
@@ -158,8 +168,17 @@ const _: () = assert!(
 const MAX_MAP: u64 = 16 * 4096;
 
 pub enum Call {
-    /// End the caller with this code.
+    /// End the caller's process with this code.
     Exit(u64),
+    /// End the calling thread with this code.
+    ThreadExit(u64),
+    /// Start a thread of the caller's process.
+    Thread {
+        entry: u64,
+        stack: u64,
+        tls: u64,
+        arg: u64,
+    },
     /// Write to the console; `ptr..ptr + len` lies in `USER` unless empty, but may be unmapped.
     Write {
         ptr: u64,
@@ -178,8 +197,13 @@ pub enum Call {
     },
     /// Create a pipe.
     NewPipe,
-    /// Wait for the process in `slot` with `generation`.
+    /// Wait for the process at `index` with `generation`.
     Wait {
+        index: usize,
+        generation: u64,
+    },
+    /// Wait for the thread in `slot` with `generation`.
+    Join {
         slot: usize,
         generation: u64,
     },
@@ -252,8 +276,13 @@ pub enum Call {
     NewMutex,
     Lock(Mutex),
     Unlock(Mutex),
-    /// Kill the process in `slot` with `generation`.
+    /// Kill the process at `index` with `generation`.
     Kill {
+        index: usize,
+        generation: u64,
+    },
+    /// Kill the thread in `slot` with `generation`.
+    KillThread {
         slot: usize,
         generation: u64,
     },
@@ -266,6 +295,13 @@ const _: () = assert!(size_of::<Call>() == 56, "every syscall returns a Call");
 pub fn dispatch(nr: u64, args: &[u64; 7], handles: &mut Handles) -> Result<Call, i64> {
     match nr {
         EXIT => Ok(Call::Exit(args[0] & 0xff)),
+        THREAD_EXIT => Ok(Call::ThreadExit(args[0] & 0xff)),
+        THREAD => Ok(Call::Thread {
+            entry: args[0],
+            stack: args[1],
+            tls: args[2],
+            arg: args[3],
+        }),
         IO => {
             let (handle, op, ptr, len) = (args[0], args[1], args[2], args[3]);
             let need = match op {
@@ -355,7 +391,8 @@ pub fn dispatch(nr: u64, args: &[u64; 7], handles: &mut Handles) -> Result<Call,
         }
         PIPE => Ok(Call::NewPipe),
         WAIT => match handles.get(args[0], crate::handle::WAIT)? {
-            Object::Process { slot, generation } => Ok(Call::Wait { slot, generation }),
+            Object::Process { index, generation } => Ok(Call::Wait { index, generation }),
+            Object::Thread { slot, generation } => Ok(Call::Join { slot, generation }),
             _ => Err(EACCES),
         },
         MUTEX => Ok(Call::NewMutex),
@@ -365,7 +402,8 @@ pub fn dispatch(nr: u64, args: &[u64; 7], handles: &mut Handles) -> Result<Call,
             _ => Err(EACCES),
         },
         KILL => match handles.get(args[0], KILL_RIGHT)? {
-            Object::Process { slot, generation } => Ok(Call::Kill { slot, generation }),
+            Object::Process { index, generation } => Ok(Call::Kill { index, generation }),
+            Object::Thread { slot, generation } => Ok(Call::KillThread { slot, generation }),
             _ => Err(EACCES),
         },
         MKDIR | UNLINK => {
