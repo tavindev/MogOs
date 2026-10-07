@@ -537,7 +537,7 @@ impl<'a, D: Disk> Fs<'a, D> {
         let pages = (end - 1) / BLOCK_SIZE as u64 - offset / BLOCK_SIZE as u64 + 1;
         // Each page may add an extent or a sum; the extents at both ends may split.
         let bytes = (pages as usize + 2) * (ITEM + 16) * 2 + 2 * EXTENT_ITEM;
-        self.reserve(pages, 3, bytes)?;
+        self.reserve(pages, 3, bytes, false)?;
         let r = self.write_pages(file.0, offset, data).and_then(|()| {
             it.size = it.size.max(end);
             (it.mtime, it.ctime) = (self.now, self.now);
@@ -557,7 +557,7 @@ impl<'a, D: Disk> Fs<'a, D> {
         if it.size == 0 && bytes == 0 {
             return Ok(());
         }
-        self.reserve(0, 2, bytes)?;
+        self.reserve(0, 2, bytes, true)?;
         let r = self.remove_extents(file.0).and_then(|()| {
             it.size = 0;
             (it.mtime, it.ctime) = (self.now, self.now);
@@ -586,7 +586,7 @@ impl<'a, D: Disk> Fs<'a, D> {
             return Err(Error::NotEmpty);
         }
         let bytes = self.extent_bytes(inode.0)?;
-        self.reserve(0, 4, bytes)?;
+        self.reserve(0, 4, bytes, true)?;
         let r = self
             .delete(key(dir.0, DIRENT, off))
             .and_then(|()| self.remove_extents(inode.0))
@@ -633,7 +633,7 @@ impl<'a, D: Disk> Fs<'a, D> {
         if from_dir != to_dir && kind == DIR && self.below(inode.0, to_dir.0)? {
             return Err(Error::InvalidName);
         }
-        self.reserve(0, 5, 0)?;
+        self.reserve(0, 5, 0, false)?;
         let r = self
             .delete(key(from_dir.0, DIRENT, off))
             .and_then(|()| self.put_entry(to_dir.0, slot, inode.0, kind, to_name))
@@ -763,7 +763,7 @@ impl<'a, D: Disk> Fs<'a, D> {
             let (l, n, c) = (
                 self.bits[i],
                 self.bits[NEWEST * w + i],
-                &mut self.bits[2 * w + i],
+                &mut self.bits[COMMITTED * w + i],
             );
             let before = (l | *c).count_ones();
             *c = n | l;
@@ -788,6 +788,7 @@ impl<'a, D: Disk> Fs<'a, D> {
         }
         (self.blocks, self.pages, self.words) = (blocks, pages, pages * PAGE_WORDS);
         (self.base, self.top) = (base, base + pool);
+        (self.index, self.hint) = ((0, 0), 0);
         self.blk.fill(EMPTY);
         self.dirt.fill(false);
         self.ndirty = 0;
@@ -979,7 +980,7 @@ impl<'a, D: Disk> Fs<'a, D> {
         let slot = slot.ok_or(Error::Collision)?;
         let inode = self.next_inode;
         let next = inode.checked_add(1).ok_or(Error::NoSpace)?;
-        self.reserve(0, 3, ITEM + 9 + name.len() + ITEM + INODE_LEN)?;
+        self.reserve(0, 3, ITEM + 9 + name.len() + ITEM + INODE_LEN, false)?;
         let it = Item {
             kind,
             mode: if kind == DIR { 0o755 } else { 0o644 },
@@ -1189,12 +1190,15 @@ impl<'a, D: Disk> Fs<'a, D> {
     }
 
     /// Fails with `NoSpace` unless `data` blocks, the nodes `paths` tree changes touching `bytes` of items may dirty
-    /// or add, and what commit needs (every dirty node, the bitmap pages and an index) are free.
-    fn reserve(&self, data: u64, paths: usize, bytes: usize) -> Result<(), Error> {
+    /// or add, and what commit needs (every dirty node, the bitmap pages and an index) are free. A change that is not
+    /// a `removal` also leaves room for one, so a full disk can still be emptied.
+    fn reserve(&self, data: u64, paths: usize, bytes: usize, removal: bool) -> Result<(), Error> {
         // Adjacent leaves together hold at least a quarter leaf, and internal nodes are at least a quarter full.
-        let leaves = 2 * bytes.div_ceil(QUARTER);
-        let nodes = 2 * (paths * (self.height + 1) + leaves);
-        let need = data + (nodes + self.ndirty + self.pages + 1) as u64;
+        let nodes = |paths: usize, bytes: usize| {
+            2 * (paths * (self.height + 1) + 2 * bytes.div_ceil(QUARTER))
+        };
+        let floor = if removal { 0 } else { nodes(4, 0) };
+        let need = data + (nodes(paths, bytes) + floor + self.ndirty + self.pages + 1) as u64;
         if need > self.free {
             return Err(Error::NoSpace);
         }
@@ -1416,9 +1420,6 @@ impl<'a, D: Disk> Fs<'a, D> {
             };
             if !ok {
                 return Err(Error::Corrupt);
-            }
-            if kind != EXTENT {
-                prev_end = None;
             }
         }
         Ok(())

@@ -255,8 +255,8 @@ fn the_disk_can_be_replaced_before_mount() {
 
 #[test]
 fn truncate_empties_a_file_and_frees_its_blocks() {
-    let mut disk = MemDisk::new(48);
-    let mut mem = Mem::new(48, POOL);
+    let mut disk = MemDisk::new(96);
+    let mut mem = Mem::new(96, POOL);
     let mut fs = format(&mut mem, &mut disk);
     let f = fs.create(ROOT, b"f").unwrap();
     fs.write(f, 0, &[1; 9000]).unwrap();
@@ -276,8 +276,8 @@ fn truncate_empties_a_file_and_frees_its_blocks() {
 
 #[test]
 fn unlink_removes_files_and_empty_directories_and_never_reuses_inodes() {
-    let mut disk = MemDisk::new(48);
-    let mut mem = Mem::new(48, POOL);
+    let mut disk = MemDisk::new(96);
+    let mut mem = Mem::new(96, POOL);
     let mut fs = format(&mut mem, &mut disk);
     let a = fs.create(ROOT, b"a").unwrap();
     fs.write(a, 0, &[1; 9000]).unwrap();
@@ -760,13 +760,13 @@ fn limits_and_misuse_return_errors() {
 
 #[test]
 fn no_space_changes_nothing() {
-    let mut disk = MemDisk::new(40);
-    let mut mem = Mem::new(40, POOL);
+    let mut disk = MemDisk::new(64);
+    let mut mem = Mem::new(64, POOL);
     let mut fs = format(&mut mem, &mut disk);
     let f = fs.create(ROOT, b"f").unwrap();
     fs.write(f, 0, &[7; 4096]).unwrap();
     fs.commit().unwrap();
-    assert_eq!(fs.write(f, 0, &[1; 40 * 4096]), Err(Error::NoSpace));
+    assert_eq!(fs.write(f, 0, &[1; 64 * 4096]), Err(Error::NoSpace));
     let mut b = [0; 1];
     fs.read(f, 0, &mut b).unwrap();
     assert_eq!(b[0], 7);
@@ -960,8 +960,12 @@ fn an_inode_is_reached_only_through_the_entry_it_records() {
 #[test]
 fn the_last_generation_is_not_passed_when_nodes_are_written_out() {
     // Slot 1 (the empty file system) claims the last generation; enough changes to write nodes out before a commit.
-    let mut disk = crafted(hello(), &[1], 1, u64::MAX);
-    let mut mem = Mem::new(64, POOL);
+    let mut disk = MemDisk::new(512);
+    let mut mem = Mem::new(512, POOL);
+    let mut fs = format(&mut mem, &mut disk);
+    fs.create(ROOT, b"a").unwrap();
+    fs.commit().unwrap();
+    let mut disk = crafted(disk, &[1], 1, u64::MAX);
     let mut fs = mount(&mut mem, &mut disk).unwrap();
     let r = (0..300).try_for_each(|i| fs.create(ROOT, format!("{i:0>100}").as_bytes()).map(|_| ()));
     assert_eq!(r, Err(Error::Corrupt));
@@ -1230,4 +1234,45 @@ fn an_older_slot_larger_than_the_memory_is_reserved_without_reading_past_it() {
     let mut fs = small.fs(&mut disk);
     fs.mount().unwrap();
     assert_eq!(names(&mut fs, ROOT), ["a"]);
+}
+
+#[test]
+fn a_full_disk_can_still_be_emptied() {
+    for blocks in [64, 128, 300] {
+        let mut disk = MemDisk::new(blocks);
+        let mut mem = Mem::new(blocks, POOL);
+        let mut fs = format(&mut mem, &mut disk);
+        let mut n = 0;
+        while fs.create(ROOT, format!("{n:0>60}").as_bytes()).is_ok() && fs.commit().is_ok() {
+            n += 1;
+        }
+        assert_eq!(fs.create(ROOT, b"more"), Err(Error::NoSpace), "{blocks}");
+        assert!(n > 10, "{blocks}: {n}");
+        let mut fs = mount(&mut mem, &mut disk).unwrap();
+        for i in 0..n {
+            fs.unlink(ROOT, format!("{i:0>60}").as_bytes()).unwrap();
+            fs.commit().unwrap();
+        }
+        fs.create(ROOT, b"room again").unwrap();
+        fs.commit().unwrap();
+        assert_eq!(snapshot_names(&mut disk), ["room again"], "{blocks}");
+    }
+}
+
+fn snapshot_names(disk: &mut MemDisk) -> Vec<String> {
+    let mut mem = Mem::new(disk.durable.len(), POOL);
+    let mut fs = mount(&mut mem, disk).unwrap();
+    names(&mut fs, ROOT)
+}
+
+#[test]
+fn format_can_run_again_on_the_same_fs() {
+    let mut disk = hello();
+    let mut mem = Mem::new(64, POOL);
+    let mut fs = mount(&mut mem, &mut disk).unwrap();
+    fs.format(2).unwrap();
+    fs.create(ROOT, b"x").unwrap();
+    fs.commit().unwrap();
+    fs.format(3).unwrap();
+    assert_eq!(snapshot(&mut disk), Ok(vec![]));
 }
