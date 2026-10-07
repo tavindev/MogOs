@@ -22,7 +22,10 @@ use dtb::Dtb;
 use kernel::console::Line;
 use kernel::elf::{Elf, Segment};
 use kernel::file;
-use kernel::handle::{DUPLICATE, Handles, KILL, MAX_HANDLES, Object, READ, TRANSFER, WAIT, WRITE};
+use kernel::handle::{
+    DUPLICATE, Handles, INIT_ARCHIVE, KILL, MAX_HANDLES, Object, READ, Rights, TRANSFER, WAIT,
+    WRITE,
+};
 use kernel::mutex::Mutexes;
 use kernel::pipe::{self, End, Pipes};
 use kernel::syscall::{Call, EAGAIN, EBADF, EFAULT, ENFILE, ENOENT, ENOEXEC, ENOMEM, KILLED};
@@ -33,7 +36,7 @@ use mogfs::{Error, Fs, ROOT};
 use uart::Uart;
 use virtio_blk::VirtioBlk;
 
-/// Panic- and trap-path console; normal output uses the PL011 from the DTB.
+/// The PL011 every console write and read uses (QEMU `virt` fixes it there).
 const UART0: PhysAddr = PhysAddr(0x0900_0000);
 /// QEMU loads the DTB at RAM base for an ELF kernel (x0 stays 0), if it fits below the image.
 const DTB: PhysAddr = PhysAddr(0x4000_0000);
@@ -127,8 +130,8 @@ struct Kernel {
     mounted: bool,
 }
 
-/// `Board::console` output, a leaf lock; the DTB's PL011 from `enable_mmu` on. Panic, fault, echo and user `write`
-/// output go straight to `UART0`, so a panic under this lock still prints.
+/// `Board::console` output on `UART0`, a leaf lock. Panic, fault, echo and user `write` output go straight to `UART0`,
+/// so a panic under this lock still prints.
 static CONSOLE: Lock<Uart> = Lock::new(Uart::new(UART0));
 
 /// `Board::console`: each formatted write holds `CONSOLE` for its whole line.
@@ -531,6 +534,7 @@ fn spawn_init(
     executable: (&[u8], impl Iterator<Item = Segment>, u64),
     budget: usize,
     priority: u8,
+    archive: Rights,
 ) -> Result<(), i64> {
     let mut kernel = KERNEL.lock();
     let Kernel {
@@ -540,7 +544,7 @@ fn spawn_init(
         ..
     } = &mut *kernel;
     sched.free_slot().ok_or(EAGAIN).and_then(|slot| {
-        let mut handles = Handles::init(slot.0, slot.1);
+        let mut handles = Handles::init(slot.0, slot.1, archive);
         if *mounted {
             handles.insert(Object::Dir(ROOT), READ | WRITE | DUPLICATE | TRANSFER)?;
         }
@@ -695,8 +699,6 @@ extern "C" fn task_start(start: usize) -> ! {
 
 #[derive(Clone)]
 struct QemuVirt {
-    /// The DTB's PL011, `CONSOLE` once the MMU is on.
-    uart: Uart,
     console: Console,
     /// GICv2 distributor and CPU interface.
     gic: (PhysAddr, PhysAddr),
@@ -727,7 +729,6 @@ impl kernel::Board for QemuVirt {
     fn enable_mmu(&mut self) {
         // SAFETY: called at boot with the MMU off, before any atomic RMW; MMIO is in GiB 0, and the image, stack and DTB are in RAM in GiB 1.
         unsafe { arch::enable_mmu(&KERNEL_L1, arch::MAIR) }
-        *CONSOLE.lock() = self.uart.clone();
     }
 
     fn read_unmapped(&mut self) {
@@ -807,12 +808,17 @@ impl kernel::Board for QemuVirt {
             size: code.len() as u64,
             writable: false,
         };
-        spawn_init((code, [segment].into_iter(), entry), budget, 0)
+        spawn_init(
+            (code, [segment].into_iter(), entry),
+            budget,
+            0,
+            INIT_ARCHIVE,
+        )
     }
 
-    fn spawn_archived(&mut self, name: &str, budget: usize) -> Result<(), i64> {
+    fn spawn_archived(&mut self, name: &str, budget: usize, archive: Rights) -> Result<(), i64> {
         let file = kernel::cpio::find(ARCHIVE, name.as_bytes()).ok_or(ENOENT)?;
-        spawn_init(executable(file)?, budget, PRIORITIES - 1)
+        spawn_init(executable(file)?, budget, PRIORITIES - 1, archive)
     }
 
     fn tasks(&self) -> usize {
@@ -894,7 +900,6 @@ extern "C" fn kmain() -> ! {
     let dtb_range = DTB..PhysAddr(DTB.0 + size as u64);
 
     let dtb = Dtb::new(blob).expect("bad DTB");
-    let uart = dtb.uart().expect("no PL011 in DTB");
     let gic = dtb.gic().expect("no GICv2 in DTB");
     GIC_CPU.store(gic.1.0, Relaxed);
     // SAFETY: the DTB's GICv2 registers, in the device-mapped GiB 0.
@@ -905,7 +910,6 @@ extern "C" fn kmain() -> ! {
 
     kernel::run(
         &mut QemuVirt {
-            uart: Uart::new(uart),
             console: Console,
             gic,
             entry_us,

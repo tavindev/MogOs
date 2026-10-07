@@ -24,6 +24,11 @@ pub const EXEC: Rights = 1 << 5;
 pub const WAIT: Rights = 1 << 6;
 pub const KILL: Rights = 1 << 7;
 
+/// An init's boot archive handle: it spawns from it.
+pub const INIT_ARCHIVE: Rights = READ | EXEC;
+/// msh's (`test=shell`): it also hands the archive to `sh`, which spawns from it.
+pub const SHELL_ARCHIVE: Rights = INIT_ARCHIVE | DUPLICATE | TRANSFER;
+
 /// A kernel object a handle reaches.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Object {
@@ -57,12 +62,12 @@ impl Handles {
     }
 
     /// init's handles: 0 is the console (read, write, duplicate, transfer), 1 is the process itself (kill), in `slot`
-    /// with `generation`, 2 is the boot archive (read, exec).
-    pub fn init(slot: usize, generation: u64) -> Self {
+    /// with `generation`, 2 is the boot archive with `archive` (`INIT_ARCHIVE`, or `SHELL_ARCHIVE` for msh).
+    pub fn init(slot: usize, generation: u64, archive: Rights) -> Self {
         let mut handles = Self::new();
         handles.0[0].1 = Some((Object::Console, READ | WRITE | DUPLICATE | TRANSFER));
         handles.0[1].1 = Some((Object::Process { slot, generation }, KILL));
-        handles.0[2].1 = Some((Object::Archive, READ | EXEC));
+        handles.0[2].1 = Some((Object::Archive, archive));
         handles
     }
 

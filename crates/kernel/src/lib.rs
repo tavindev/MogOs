@@ -23,6 +23,7 @@ use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::Ordering::Relaxed;
 
 use dtb::Dtb;
+use handle::{INIT_ARCHIVE, Rights, SHELL_ARCHIVE};
 use mm::{FrameAllocator, PhysAddr};
 
 /// What the kernel needs from the hardware; each board implements it.
@@ -60,9 +61,9 @@ pub trait Board {
     /// its tables, pages and kernel stack, and init's handles (`Handles::init`), at priority 0 like the boot context;
     /// `ENOMEM` or `EAGAIN` (no free slot).
     fn spawn_user(&mut self, program: Program, budget: usize) -> Result<(), i64>;
-    /// As `spawn_user`, for the boot archive's executable `name`, at the top priority (`PRIORITIES - 1`); `ENOENT` or
-    /// `ENOEXEC` if it is missing or invalid.
-    fn spawn_archived(&mut self, name: &str, budget: usize) -> Result<(), i64>;
+    /// As `spawn_user`, for the boot archive's executable `name`, at the top priority (`PRIORITIES - 1`), its archive
+    /// handle with `archive`; `ENOENT` or `ENOEXEC` if it is missing or invalid.
+    fn spawn_archived(&mut self, name: &str, budget: usize, archive: Rights) -> Result<(), i64>;
     /// Tasks in the run queue, the boot context included.
     fn tasks(&self) -> usize;
     /// The board's block device, set up with memory from the frame allocator; call once, after `init_frames`.
@@ -115,6 +116,8 @@ pub const FRAME_WORDS: usize = 512;
 const HEAP_FRAMES: usize = 256;
 /// Each boot-spawned process's budget in frames; a process moves part of its own to each child it spawns.
 const BOOT_BUDGET: usize = 25;
+/// msh's 25 and the 2048 it gives `sh` (busybox) and the C programs `sh` spawns.
+const SHELL_BUDGET: usize = BOOT_BUDGET + 2048;
 /// `waiter`'s 9 frames and its two children's 9 and 10 at once.
 const WAITER_BUDGET: usize = 28;
 /// `pi`'s 9 frames, its two pipes' pages and its three children's 9 each.
@@ -183,16 +186,23 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
             "test=user" => user_demo(board),
             "test=bench-syscall" => run_alone(board, Program::SyscallBench),
             "test=handles" => run_alone(board, Program::Handles),
-            "test=spawn" => run_archived(board, "spawn", "spawner", BOOT_BUDGET),
-            "test=pipe" => run_archived(board, "pipe", "reader", BOOT_BUDGET),
-            "test=wait" => run_archived(board, "wait", "waiter", WAITER_BUDGET),
-            "test=echo" => run_archived(board, "echo", "readlines", BOOT_BUDGET),
-            "test=shell" => run_archived(board, "shell", "msh", BOOT_BUDGET),
-            "test=bench-fs" => run_archived(board, "bench-fs", "fsbench", BOOT_BUDGET),
-            "test=bench-spawn" => run_archived(board, "bench-spawn", "spawnbench", BOOT_BUDGET),
+            "test=spawn" => run_archived(board, "spawn", "spawner", (BOOT_BUDGET, INIT_ARCHIVE)),
+            "test=pipe" => run_archived(board, "pipe", "reader", (BOOT_BUDGET, INIT_ARCHIVE)),
+            "test=wait" => run_archived(board, "wait", "waiter", (WAITER_BUDGET, INIT_ARCHIVE)),
+            "test=echo" => run_archived(board, "echo", "readlines", (BOOT_BUDGET, INIT_ARCHIVE)),
+            "test=shell" => run_archived(board, "shell", "msh", (SHELL_BUDGET, SHELL_ARCHIVE)),
+            "test=bench-fs" => {
+                run_archived(board, "bench-fs", "fsbench", (BOOT_BUDGET, INIT_ARCHIVE))
+            }
+            "test=bench-spawn" => run_archived(
+                board,
+                "bench-spawn",
+                "spawnbench",
+                (BOOT_BUDGET, INIT_ARCHIVE),
+            ),
             "test=pi" => {
                 board.start_timer();
-                run_archived(board, "pi", "pi", PI_BUDGET);
+                run_archived(board, "pi", "pi", (PI_BUDGET, INIT_ARCHIVE));
             }
             "test=bench-pipe" => pipe_bench(board),
             "test=bench-lock" => lock_bench(board),
@@ -280,9 +290,16 @@ fn user_demo<B: Board>(board: &mut B) {
 
 /// Runs the boot archive's `program` with `budget` frames until every task has exited; prints the free frames before
 /// and after as `<test>: free frames <n> before, <n> after`.
-fn run_archived<B: Board>(board: &mut B, test: &str, program: &str, budget: usize) {
+fn run_archived<B: Board>(
+    board: &mut B,
+    test: &str,
+    program: &str,
+    (budget, archive): (usize, Rights),
+) {
     let before = board.free_frames();
-    board.spawn_archived(program, budget).expect("spawn");
+    board
+        .spawn_archived(program, budget, archive)
+        .expect("spawn");
     wait(board);
     let after = board.free_frames();
     let _ = writeln!(
@@ -321,7 +338,9 @@ fn yield_bench<B: Board>(board: &mut B) {
 /// and exit are well under 1% of it.
 fn pipe_bench<B: Board>(board: &mut B) {
     let start = board.uptime_us();
-    board.spawn_archived("ping", BOOT_BUDGET).expect("spawn");
+    board
+        .spawn_archived("ping", BOOT_BUDGET, INIT_ARCHIVE)
+        .expect("spawn");
     wait(board);
     let ns = (board.uptime_us() - start) * 1000 / PIPE_ROUND_TRIPS;
     let _ = writeln!(board.console(), "pipe: {ns} ns/round-trip");

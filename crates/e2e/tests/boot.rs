@@ -742,7 +742,7 @@ fn shell_files_survive_a_reboot_only_once_synced() {
                 "help",
                 &[
                     "builtins: cd pwd exit help",
-                    "commands: cat ls echo sync mkdir rm touch write mv",
+                    "commands: cat ls echo sync mkdir rm touch write mv sh",
                 ],
             ),
             ("exit", &[]),
@@ -811,6 +811,92 @@ fn shell_files_survive_a_reboot_only_once_synced() {
             ("exit", &[]),
         ])
     );
+}
+
+#[test]
+fn busybox_sh_changes_files_that_survive_a_reboot_once_synced() {
+    let image = mogfs_image("busybox", 1024);
+    let script = "sh -c 'mkdir d; echo hi > d/f; echo x > d/x; mv d/x d/y; rm d/y; cat d/f; ls d; sync; echo late > d/g'";
+    let (status, boot1) = shell(&image, &[script, "exit"]);
+    assert!(status.success(), "QEMU exited with {status}");
+    assert_eq!(boot1, session(&[(script, &["hi", "f"]), ("exit", &[])]));
+
+    // d/g was written after the sync, so the reboot drops it.
+    let script = "sh -c 'cat d/f; ls d; cd d; cat f'";
+    let (status, boot2) = shell(&image, &[script, "exit"]);
+    std::fs::remove_file(&image).unwrap();
+    assert!(status.success(), "QEMU exited with {status}");
+    assert_eq!(
+        boot2,
+        session(&[(script, &["hi", "f", "hi"]), ("exit", &[])])
+    );
+}
+
+#[test]
+fn busybox_redirects_and_pipes_reach_spawned_programs_and_runs_only_c_programs() {
+    let image = mogfs_image("busybox-io", 1024);
+    let script = "sh -c 'echo a > f; cat < f; mkdir d; echo 1 > d/aaaa; echo 2 > d/b; ls d > out; echo x >> out; cat out; echo hi | cat; mid'";
+    let (status, got) = shell(&image, &[script, "exit"]);
+    std::fs::remove_file(&image).unwrap();
+    assert!(status.success(), "QEMU exited with {status}");
+    assert_eq!(
+        got,
+        session(&[
+            (
+                script,
+                &[
+                    "a",
+                    "aaaa",
+                    "b",
+                    "x",
+                    "hi",
+                    "sh: can't execute 'mid': No such file or directory",
+                    "msh: sh: 127"
+                ]
+            ),
+            ("exit", &[]),
+        ])
+    );
+}
+
+#[test]
+fn a_c_program_on_musl_prints_gets_enosys_and_exits_with_its_code() {
+    let image = mogfs_image("hello", 1024);
+    let (status, got) = shell(&image, &["sh -c hello", "exit"]);
+    std::fs::remove_file(&image).unwrap();
+    assert!(status.success(), "QEMU exited with {status}");
+    assert_eq!(
+        got,
+        session(&[
+            (
+                "sh -c hello",
+                &[
+                    "hello from musl: hello, 1 args",
+                    "syscall 999: ENOSYS",
+                    "fork: ENOSYS",
+                    "msh: sh: 42",
+                ]
+            ),
+            ("exit", &[]),
+        ])
+    );
+}
+
+#[test]
+fn musl_bench_reports_round_trips() {
+    let image = mogfs_image("cbench", 1024);
+    let (status, got) = shell(&image, &["sh -c cbench", "exit"]);
+    std::fs::remove_file(&image).unwrap();
+    assert!(status.success(), "QEMU exited with {status}");
+    let lines = &got[0].1;
+    for (i, prefix) in ["musl syscall: ", "busybox spawn: "].iter().enumerate() {
+        let ns: u64 = lines[i]
+            .strip_prefix(prefix)
+            .and_then(|l| l.strip_suffix(" ns/round-trip"))
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("no {prefix} line in {lines:?}"));
+        assert!(ns > 0);
+    }
 }
 
 #[test]
