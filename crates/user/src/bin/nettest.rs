@@ -46,6 +46,7 @@ fn main(args: &[&[u8]]) -> u64 {
             )
         }
         b"hold" => 0,
+        b"move" => move_socket(),
         b"readaccept" => {
             // Handle 1 is a read-only listener: what it accepts must not be writable.
             let conn = match accept(1, 0) {
@@ -171,7 +172,40 @@ fn transfer() -> bool {
         CONSOLE,
         b"nettest: a moved socket is charged to its new holder\n",
     );
-    true
+    // A child whose budget holds its own frames, one socket and its grandchild's budget, nothing more.
+    let exe = open(DIR, b"nettest", 0) as u64;
+    let handles = [console(), net(), exe, console()];
+    let budget = OWN_BUDGET + SOCKET_FRAMES + MOVED_BUDGET;
+    reaped(spawn_at(me, &handles, budget, u64::MAX, b"nettest\0move\0"))
+}
+
+/// A `hold` child's budget: its own frames and the socket it gets.
+const MOVED_BUDGET: usize = OWN_BUDGET + SOCKET_FRAMES;
+
+/// Moves its only socket to a child (`hold`); while that child is not reaped, a new socket fits only if the move
+/// refunded this process.
+fn move_socket() -> u64 {
+    // Handles: 0 the console, 1 a NetStack, 2 `nettest`, 3 a console for the child.
+    let sock = socket(CHILD_NET);
+    let child = spawn_at(
+        2,
+        &[3, sock as u64],
+        MOVED_BUDGET,
+        u64::MAX,
+        b"nettest\0hold\0",
+    );
+    if sock < 0 || child < 0 {
+        return 1;
+    }
+    let again = socket(CHILD_NET);
+    if again < 0 || wait(child as u64) != 0 {
+        return status(again);
+    }
+    write(
+        CONSOLE,
+        b"nettest: moving a socket refunds its old holder\n",
+    );
+    0
 }
 
 /// A child accepts through a read-only duplicate of a listener; the connection's handle must not write.

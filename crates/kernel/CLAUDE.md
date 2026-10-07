@@ -36,7 +36,7 @@ touches memory through raw addresses: the board reads user buffers, copies pages
   for `test=sockets` / `test=bench-sockets`, `run` calls `Board::start_net` (the address, and the DTB's `rng-seed`
   from the same `Dtb::chosen` walk as the bootargs as the TCP key) before `start_cpus`; the board's net task probes
   the NIC (`net: no nic` without one) and builds the `Network` off the boot path, and `run` waits for it
-  (`with_net`) after the `boot:` line, before any scenario counts frames. `test=httpd` runs `httpd` with the `httpd=` and `fetch=`
+  (`with_net`) after the `boot:` line and prints `net: ready <N> us`, before any scenario counts frames. `test=httpd` runs `httpd` with the `httpd=` and `fetch=`
   bootargs as arguments, and alone implies `net=10.0.2.15/24,gw=10.0.2.2` (QEMU's user network). A socket is an entry reached by index and generation,
   counted by handles like a pipe. Every process holding a handle to it pays its `cost` (`SOCKET_FRAMES`, 8, plus 8 per
   backlog place of a listener; `Budget::charge`, accounting, as the memory is the fixed pool), tracked as a bitmask of

@@ -2,6 +2,8 @@ use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, Mutex, Once};
 use std::thread::{self, JoinHandle, sleep};
 use std::time::{Duration, Instant};
@@ -1282,10 +1284,9 @@ fn host_page(body: &'static str) -> u16 {
 /// Sends `request` to the host's `port` and reads the response to its end; `None` if the connection fails or closes
 /// at once (nothing listening behind QEMU's forward yet).
 fn exchange(port: u16, request: &str) -> Option<String> {
+    // No read timeout: a slow answer is waited for (a retry would be a request the server counts twice), and QEMU
+    // ending closes the connection.
     let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).ok()?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .ok()?;
     stream.write_all(request.as_bytes()).ok()?;
     let mut response = String::new();
     stream.read_to_string(&mut response).ok()?;
@@ -1311,39 +1312,49 @@ fn httpd_echoes_more_sequential_requests_than_its_tables_hold_and_fetch_gets_a_h
         .local_addr()
         .unwrap()
         .port();
-    let client = thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(25);
-        let mut echoed = 0;
-        while echoed < REQUESTS && Instant::now() < deadline {
-            let body = format!("hello {echoed}");
-            let request = format!(
-                "POST /anything HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
-                body.len()
-            );
-            match exchange(forward, &request) {
-                Some(response) => {
-                    let expected = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{request}",
-                        request.len()
-                    );
-                    assert_eq!(response, expected);
-                    echoed += 1;
-                    if echoed == 1 {
-                        for (header, status) in BAD {
-                            let request = format!("POST / HTTP/1.1\r\n{header}\r\n\r\n");
-                            let response = exchange(forward, &request).unwrap_or_default();
-                            let line = response.lines().next().unwrap_or_default();
-                            assert!(
-                                line.starts_with(&format!("HTTP/1.1 {status} ")),
-                                "{header}: {line}"
-                            );
-                        }
+    // Exactly the requests httpd counts, in order: one good one, the bad ones, the rest good. Each is retried only while
+    // nothing listens behind the forward (QEMU closes it at once), and the client stops only when QEMU has ended, so
+    // the server's count and the client's always agree and the boot's own deadline is the only one.
+    let good = |i: usize| {
+        let body = format!("hello {i}");
+        let request = format!(
+            "POST /anything HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let expected = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{request}",
+            request.len()
+        );
+        (request, expected)
+    };
+    let bad = BAD.map(|(header, status)| {
+        let request = format!("POST / HTTP/1.1\r\n{header}\r\n\r\n");
+        (request, format!("HTTP/1.1 {status} "))
+    });
+    let exchanges: Vec<_> = [good(0)]
+        .into_iter()
+        .chain(bad)
+        .chain((1..REQUESTS).map(good))
+        .collect();
+    let ended = Arc::new(AtomicBool::new(false));
+    let client = thread::spawn({
+        let (requests, ended) = (exchanges.clone(), ended.clone());
+        move || {
+            let mut responses = Vec::new();
+            for (request, _) in requests {
+                loop {
+                    if ended.load(Relaxed) {
+                        return responses;
                     }
+                    if let Some(response) = exchange(forward, &request) {
+                        responses.push(response);
+                        break;
+                    }
+                    sleep(Duration::from_millis(100));
                 }
-                None => sleep(Duration::from_millis(100)),
             }
+            responses
         }
-        echoed
     });
     let netdev = format!("user,id=n0,hostfwd=tcp:127.0.0.1:{forward}-10.0.2.15:80");
     let args = format!(
@@ -1358,7 +1369,12 @@ fn httpd_echoes_more_sequential_requests_than_its_tables_hold_and_fetch_gets_a_h
         "-append",
         &args,
     ]);
-    assert_eq!(client.join().unwrap(), REQUESTS, "requests echoed");
+    ended.store(true, Relaxed);
+    let responses = client.join().unwrap();
+    assert_eq!(responses.len(), exchanges.len(), "requests answered");
+    for (response, (request, expected)) in responses.iter().zip(&exchanges) {
+        assert!(response.starts_with(expected), "{request:?}: {response:?}");
+    }
     assert!(
         lines.iter().any(|l| l == "hello from the host"),
         "fetch did not print the host's page"
@@ -1394,6 +1410,7 @@ fn sockets_echo_over_loopback_wait_for_any_and_need_the_net_handle_and_budget() 
         "nettest: ENOBUFS after 3 sockets",
         // A socket's charge follows it to the process that holds it.
         "nettest: a moved socket is charged to its new holder",
+        "nettest: moving a socket refunds its old holder",
     ] {
         assert!(
             lines.iter().any(|l| l == expected),
