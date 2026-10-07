@@ -54,19 +54,34 @@ impl<const WORDS: usize> FrameAllocator<WORDS> {
 
     /// Allocates the first run of `count` free frames.
     pub fn alloc_contiguous(&mut self, count: usize) -> Option<Range<PhysAddr>> {
-        let mut run = 0;
-        for i in 0..self.frames {
-            run = if self.used[i / 64] & (1 << (i % 64)) == 0 {
-                run + 1
+        let mut run = 0; // free frames ending at the previous word's top
+        for (w, &word) in self.used.iter().enumerate() {
+            let free = !word;
+            let start = if run + free.trailing_ones() as usize >= count {
+                Some(w * 64 - run)
+            } else if count < 64 {
+                // Bit i of `fit` stays set while frames i..i + k are all free.
+                let (mut fit, mut k) = (free, 1);
+                while k < count {
+                    let shift = k.min(count - k);
+                    fit &= fit >> shift;
+                    k += shift;
+                }
+                (fit != 0).then(|| w * 64 + fit.trailing_zeros() as usize)
             } else {
-                0
+                None
             };
-            if run == count {
-                let first = self.base + (i + 1 - count) as u64 * FRAME_SIZE;
+            if let Some(start) = start {
+                let first = self.base + start as u64 * FRAME_SIZE;
                 let range = PhysAddr(first)..PhysAddr(first + count as u64 * FRAME_SIZE);
                 self.reserve(range.clone());
                 return Some(range);
             }
+            run = if word == 0 {
+                run + 64
+            } else {
+                free.leading_ones() as usize
+            };
         }
         None
     }

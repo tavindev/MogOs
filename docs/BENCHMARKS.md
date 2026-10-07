@@ -105,6 +105,7 @@ Speed is a primary goal, so performance is tested like behavior: measured, recor
 | Benchmark | Mode | Min | Median | Commit |
 | --- | --- | --- | --- | --- |
 | `mm` frames: alloc+free of 1000 frames, 128 MiB allocator (ns/op) | Host, M4 Pro | 4.6 | 5.2 | uncommitted |
+| `mm` frames: `alloc_contiguous(4)` + free, 128 MiB allocator: empty / behind 725 reserved frames (boot's prefix) / behind 4096 frames with every fourth used (ns/op; bit-by-bit base 7.5 / 287 / 1464 min, 8.7 / 290 / 1513 median) | Host, M4 Pro | 7.4 / 12.3 / 46.5 | 7.6 / 12.6 / 47.1 | `mm` word-wise `alloc_contiguous` |
 | `mogfs` create + 100-byte write + commit, 400 files in one directory, in-memory disk (ns/op) | Host, M4 Pro | 1873 | 1956 | phase 4 MogFS unlink and rename |
 | `mogfs` lookup in a 400-entry directory, in-memory disk (ns/op) | Host, M4 Pro | 758 | 784 | phase 4 MogFS unlink and rename |
 | `net` UDP over the loss-free simulated link: `send_to` on A, `poll` + `recv_from` on B, batches of 16, 64-byte / 1472-byte datagrams (ns/datagram; 17.9 / 7.5 M datagrams/s at the median) | Host, M4 Pro | 53.6 / 130.3 | 55.8 / 133.7 | phase 8 step 46 |
@@ -130,6 +131,9 @@ Speed is a primary goal, so performance is tested like behavior: measured, recor
 | Syscall round trip through musl, `sh -c cbench`: 100000 `write(1, "", 0)` (the `test=bench-syscall` call through the dispatcher) timed in user space (ns) | QEMU hvf (`-cpu cortex-a72`), dev build, 11 boots, load about 25 | 36 | 37 | phase 4 step 23 |
 | busybox spawn, `sh -c cbench`: `posix_spawn` + `waitpid` of busybox `true`, 100 trips, timed in user space (ns) | QEMU hvf (`-cpu cortex-a72`), dev build, 11 boots, load about 25 | 26367 | 27407 | phase 4 step 23 |
 | Spawn round trip, `test=bench-spawn`: `spawn` of `nop` (one page of program) + `wait` + `close`, 1000 trips, timed in user space, without / with two arguments (ns) | QEMU hvf (`-cpu cortex-a72`), dev build, 42 boots, load about 9 | 3096 / 3254 | 3430 / 3604 | phase 4 shell review |
+| Spawn round trip, `test=bench-spawn`, as above (ns; bit-by-bit `alloc_contiguous` base 3348 / 3372 min, 3516 / 3719 median in the same run) | QEMU hvf (`-cpu cortex-a72`), dev build, 31 interleaved boots, load about 11 | 2898 / 3005 | 3122 / 3329 | `mm` word-wise `alloc_contiguous` |
+| `spawn` / `spawn-args` per call, `scripts/bench.sh bench-syscalls` (ns; base 2393 / 2576 min, 2479 / 2698 median in the same run; every other call within noise) | QEMU hvf (`-cpu cortex-a72`), dev build, 31 interleaved rounds, load about 13 | 1623 / 1857 | 1706 / 1911 | `mm` word-wise `alloc_contiguous` |
+| Kernel boot, kmain to end of init, `-smp 1`, no disk (us; base 188 / 243 in the same run, held: boot's one `alloc_contiguous` is under the noise) | QEMU hvf (`-cpu cortex-a72`), dev build, 41 interleaved boots, load about 11 | 194 | 243 | `mm` word-wise `alloc_contiguous` |
 | Kernel boot with a MogFS disk mounted, mount in 3 requests (us; 2-block superblock read) | QEMU hvf (`-cpu cortex-a72`), dev build, 42 interleaved boots (busy machine) | 294 | 342 | phase 4 shell commands |
 | `Board::disk` probe, timed in the kernel around the call (us; no disk: one device-ID read; disk: one read plus the setup) | QEMU hvf (`-cpu cortex-a72`), dev build, 21 boots each | 1 / 45 | 2 / 50 | phase 4 step 20 |
 
