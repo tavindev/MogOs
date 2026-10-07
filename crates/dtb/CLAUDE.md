@@ -2,7 +2,7 @@
 
 ## What this crate is
 
-Reads the flattened device tree QEMU passes: `total_size`, then `Dtb::memory`, `gic` (GICv2) and
+Reads the flattened device tree QEMU passes: `total_size`, then `Dtb::memory`, `gic` (GICv2), `cpus` (the count of second-level nodes, the `/cpus` children, with `device_type = "cpu"`) and
 `bootargs` (`/chosen`). All in `src/lib.rs`. It is **NOT** a general device-tree library: no writing, no phandles, no
 nested-bus address translation.
 
@@ -10,7 +10,7 @@ nested-bus address translation.
 
 - `#![cfg_attr(not(test), no_std)]`, depends only on `mm` (`PhysAddr`), workspace `forbid(unsafe_code)`.
 - Works on a `&[u8]`; the board (`kmain` in `crates/board/qemu-virt`) builds that slice from RAM base.
-- Callers: `qemu-virt` (`gic`) and `kernel::run` (`memory`, `bootargs`).
+- Callers: `qemu-virt` (`gic`, `cpus`) and `kernel::run` (`memory`, `bootargs`).
 
 ## Invariants & rules
 

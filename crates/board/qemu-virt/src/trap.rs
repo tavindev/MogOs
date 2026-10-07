@@ -16,8 +16,8 @@ use crate::process::{enter, free_stack, map, spawn};
 use crate::uart::Uart;
 use crate::usermem::{user_bytes, user_bytes_mut};
 use crate::{
-    ARCHIVE, GIC_CPU, KERNEL, Kernel, MAX_MUTEXES, MAX_PIPES, MAX_TASKS, TICK_US, TIMER_IRQ,
-    UART_IRQ, UART0,
+    ARCHIVE, GIC_CPU, KERNEL, Kernel, MAX_MUTEXES, MAX_PIPES, MAX_TASKS, TICK_US, TICKED,
+    TIMER_IRQ, UART_IRQ, UART0,
 };
 
 /// # Safety
@@ -211,10 +211,12 @@ unsafe extern "C" fn board_irq(frame: usize) -> usize {
     let cpu = PhysAddr(GIC_CPU.load(Relaxed));
     // SAFETY: IRQs are delivered only after `kmain` stored the DTB's GIC CPU interface.
     let iar = unsafe { arch::gic::ack(cpu) };
-    let tick = iar == TIMER_IRQ;
+    let irq = iar & 0x3ff;
+    let tick = irq == TIMER_IRQ;
     if tick {
         arch::timer::arm(TICK_US);
-    } else if iar == UART_IRQ {
+        TICKED.fetch_or(1 << arch::cpu(), Relaxed);
+    } else if irq == UART_IRQ {
         let mut uart = Uart::new(UART0);
         while let Some(byte) = uart.get() {
             if line.push(byte, |echo| uart.write(echo)) {
@@ -224,7 +226,8 @@ unsafe extern "C" fn board_irq(frame: usize) -> usize {
     }
     // SAFETY: as above.
     unsafe { arch::gic::eoi(cpu, iar) };
-    if !tick {
+    // Only core 0 runs tasks: the scheduler's one `current` is core 0's.
+    if !tick || arch::cpu() != 0 {
         return frame;
     }
     // SAFETY: the caller masked IRQs, and `frame` came from the trap path.
