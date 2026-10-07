@@ -30,11 +30,33 @@ touches memory through raw addresses: the board reads user buffers, copies pages
 - `syscall::dispatch` (`src/syscall.rs`): decodes `x8`/`x0`-`x5`, checks handles and rights, returns a `Call` for the
   board to execute. Syscall numbers and error constants are defined here.
 - `cpio::find`, `cpio::entries`, `elf::Elf::parse` (`src/cpio.rs`, `src/elf.rs`).
+- `network` (`src/network.rs`, design notes at its top): `Network`, up to three `net::Stack`s (`ETH` on the NIC,
+  the loopback pair `LO` 127.0.0.1 and `PEER` 127.0.0.2 over a `Wire`, since a stack never sends to itself) and the
+  socket table; `config` parses `net=<ip>/<prefix>[,gw=<ip>]`; `test=net` / `test=bench-net`. `run` probes the NIC
+  (`Board::nic`) only with that bootarg (`net: no nic` without one) and starts the network (`Board::memory` for the
+  rings, `Network::new` with the DTB's `rng_seed` as the TCP key, `Board::start_net`) with a NIC or for
+  `test=sockets` / `test=bench-sockets`, before `start_cpus`. `test=httpd` runs `httpd` with the `httpd=` and `fetch=`
+  bootargs as arguments, and alone implies `net=10.0.2.15/24,gw=10.0.2.2` (QEMU's user network). A socket is an entry reached by index and generation,
+  counted by handles like a pipe, charged `SOCKET_FRAMES` (8) to its creator's budget (`Budget::charge`; the memory is
+  the fixed pool, so the charge is accounting) and refunded with the last handle if the owner runs (`Budgets`, which
+  `Scheduler` implements). A listener holds at most `BACKLOG` (8) connections before they are accepted, each charged
+  to the listener's owner by the net task's `poll` and moved to the accepter at accept; one past it, or past the
+  owner's budget, is reset, so a peer cannot queue connections nobody pays for. Open: a closed connection keeps its
+  TCP slot, uncharged, until its FIN exchange ends, and a peer advertising a zero window keeps it in FIN-WAIT-1
+  forever (`crates/net` probes a zero window without limit), so peers can fill the 16 slots; a socket that outlives
+  its creator is charged to nobody (the parent's `wait` refund does not subtract it, unlike pipes); the backlog's
+  charge falls on the listener's creator, so it fails once that process exits and peers can spend up to 64 of its
+  frames. The NIC's receive stops at a ring's worth of frames per poll (`VirtioNet::capped`), so a flood never holds
+  `KERNEL` without end.
+  Ops run in the submitter's context (its buffers are mapped only there): tried at submit (not an accept) and by every
+  `complete` (`io_wait`); the board's net task only polls and wakes `Event::NetIo`. One receive-side op (receive,
+  accept, connect) and one send per socket: the ops a process has in flight are bounded by its sockets, so by its
+  budget (the step's "bounded queue charged to the budget"). A dead submitter's op slot is taken over (`alive`).
 
 ## Boundaries (hard)
 
 - `#![no_std]` with `extern crate alloc`; workspace `unsafe_code = "forbid"` applies, no opt-out ever.
-- Depends only on `mm`, `dtb` and `mogfs`. Never on `arch` or a board crate: dependencies point inward, boards depend on it.
+- Depends only on `mm`, `dtb`, `mogfs` and `net` (the stack, from phase 8 step 49, as `crates/net`'s contract planned). Never on `arch` or a board crate: dependencies point inward, boards depend on it.
 - Hardware reaches it only through `Board` (generic `B: Board`); AGENTS.md Architecture rules apply.
 - Callers: `crates/board/qemu-virt` (implements `Board`, calls `run`, `dispatch` and the table types) and its host
   tests in `tests/`. The user ABI it decodes is mirrored by hand in `crates/user/src/lib.rs`.
@@ -80,6 +102,10 @@ touches memory through raw addresses: the board reads user buffers, copies pages
 - `MAX_BUFFER` (4 KiB) and `MAX_MAP` (16 pages) bound the work a syscall does under the board's big lock (IRQs masked); `user_buffer` checks
   every user range lies in `USER` (4 GiB..512 GiB).
 - Errors are negated musl errno values; `KILLED` (256) sits outside `exit`'s 0..=255.
+- Syscalls 20-25 (phase 8 step 50): socket, bind, listen, io_submit, io_wait (result in x0, tag in x1), shutdown. A
+  `NetStack` handle (`CONNECT`, `LISTEN`) makes sockets, which remember which of the two it held; socket handles carry
+  read and write; `bind` and `listen` need write, `io_submit` read (receive, accept) or write (send, connect), and an
+  accepted connection's handle gets no right the accepting handle lacks.
 - Syscalls 0-19 (`src/syscall.rs` docs): exit, io_submit_wait, dup, close, map, open, spawn, pipe, wait, mutex, lock,
   unlock, kill, mkdir, readdir, sync, unlink, rename, thread, thread_exit. `exit` ends the whole process; `thread_exit`
   ends the caller, and its process with its last thread; `wait` and `kill` take a process or a thread handle (`wait`
@@ -104,7 +130,7 @@ touches memory through raw addresses: the board reads user buffers, copies pages
   once), and about 7000, about 150 ms, on a crafted one (504 directories of 14 blocks each).
 - `Elf::parse` accepts only page-aligned, address-ordered, in-region `PT_LOAD`s, never W+X, entry in an executable one.
 - init's handles (`Handles::init`): 0 console (read, write, duplicate, transfer), 1 itself (kill), 2 the boot archive
-  with `INIT_ARCHIVE` (read, exec); only msh (`test=shell`, `test=bench-shell`) gets `SHELL_ARCHIVE` (also duplicate, transfer), since it
+  with `INIT_ARCHIVE` (read, exec); only msh (`test=shell`, `test=bench-shell`) and `nettest` (`test=sockets`, which hands it to a C program that spawns) get `SHELL_ARCHIVE` (also duplicate, transfer), since it
   hands the archive to `sh`, which spawns from it. Every other init can neither copy nor pass it on.
 - `BOOT_BUDGET`, `SHELL_BUDGET` (msh under `test=shell` and `test=bench-shell`: its 25 frames and the 2048 it gives `sh`), `WAITER_BUDGET`, `PI_BUDGET`, `FUZZ_BUDGET`, `SYSBENCH_BUDGET`, `THREADS_BUDGET` are sized to the user programs' frame needs: too small and `run`'s
   `expect("spawn")` panics. `PIPE_ROUND_TRIPS` must equal `ROUND_TRIPS` in `crates/user/src/bin/ping.rs`; a mismatch
@@ -114,6 +140,8 @@ touches memory through raw addresses: the board reads user buffers, copies pages
 
 ## How it's tested
 
+- Host: `tests/network.rs` drives `Network` over loopback (data both ways, stale socket generations, budget charge,
+  rights, ports, op slots).
 - Host: `cargo test --target aarch64-apple-darwin -p kernel` runs `tests/sched.rs` (slot and process generations,
   zombies, last-thread exit, joins, priorities), `tests/handle.rs`,
   `tests/pipe.rs`, `tests/exec.rs` (cpio, ELF, archive listing), `tests/args.rs` (`spawn`'s argument checks), `tests/dispatch.rs` (`unlink`, `rename`, `sync` handle checks), `tests/file.rs` (path walk limits, `readdir` at

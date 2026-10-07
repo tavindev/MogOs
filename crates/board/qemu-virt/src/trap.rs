@@ -13,6 +13,7 @@ use kernel::pipe::{self, End, Pipes};
 use kernel::syscall::{Call, EBADF, EFAULT, ENFILE, ENOENT, ENOMEM, KILLED, MAX_BUFFER};
 use mm::{FrameAllocator, PhysAddr};
 
+use crate::net;
 use crate::process::{free_stack, map, spawn, thread};
 use crate::uart::Uart;
 use crate::usermem::{UserIn, UserOut, copy_in};
@@ -185,6 +186,7 @@ fn release(
     let end = match object {
         Object::Pipe(end) => end,
         Object::Mutex(mutex) => return mutexes.close(mutex),
+        Object::Socket(sock) => return net::close(sched, sock),
         Object::Process { index, generation } => {
             let limit = sched.close(index, generation);
             let held = pipes.charged_to((index, generation));
@@ -259,6 +261,9 @@ unsafe extern "C" fn board_irq(frame: usize) -> usize {
     if tick {
         arch::timer::arm(TICK_US);
         TICKED.fetch_or(1 << arch::cpu(), Relaxed);
+        net::tick(sched);
+    } else if irq == net::IRQ.load(Relaxed) {
+        net::interrupt(sched);
     } else if irq == UART_IRQ {
         let mut uart = Uart::new(UART0);
         while let Some(byte) = uart.get() {
@@ -397,6 +402,7 @@ unsafe extern "C" fn board_syscall(frame: &mut arch::TrapFrame) -> usize {
             match object {
                 Object::Pipe(end) => pipes.open(end),
                 Object::Mutex(mutex) => mutexes.open(mutex),
+                Object::Socket(sock) => net::open(sock),
                 object => sched.held(object),
             }
             handle
@@ -558,6 +564,11 @@ unsafe extern "C" fn board_syscall(frame: &mut arch::TrapFrame) -> usize {
             }
             Ok(false) => 0,
             Err(error) => error as u64,
+        },
+        Ok(Call::Net(call)) => match net::syscall(sched, call, &mut frame.x[1]) {
+            Some(result) => result as u64,
+            // SAFETY: the caller masked IRQs, and `frame` is the current process's.
+            None => return unsafe { block(sched, frame, Event::NetIo) },
         },
         Err(error) => error as u64,
     };

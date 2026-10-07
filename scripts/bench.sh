@@ -3,8 +3,9 @@
 # Boots the kernel <rounds> times under hvf with -append test=<test>, each boot on a fresh 1024-block MogFS image, and
 # prints the median and min of every `bench <name>: <ns> ns` line. With a base kernel, each round boots both, the order
 # alternating, and prints the base, the new and the delta of each; `SLOWER` marks a call whose median and min both rose.
+# <test> may carry more bootargs; QEMU_ARGS adds QEMU arguments (a NIC: `-netdev user,id=n0 -device virtio-net-device,netdev=n0`).
 set -eu
-[ $# -ge 3 ] || { sed -n '2,5s/^# //p' "$0"; exit 2; }
+[ $# -ge 3 ] || { sed -n '2,6s/^# //p' "$0"; exit 2; }
 test=$1 rounds=$2 new=$3 base=${4:-}
 root=$(cd "$(dirname "$0")/.." && pwd)
 tmp=$(mktemp -d)
@@ -17,7 +18,7 @@ boot() {
     cp "$tmp/clean.img" "$tmp/disk.img"
     qemu-system-aarch64 -M virt -accel hvf -cpu cortex-a72 -m 128M -global virtio-mmio.force-legacy=false \
         -global virtio-mmio.ioeventfd=off -nographic -kernel "$2" \
-        -drive file="$tmp/disk.img",if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0 \
+        -drive file="$tmp/disk.img",if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0 ${QEMU_ARGS:-} \
         -append "test=$test" </dev/null | tr -d '\r' >"$tmp/out"
     if grep -qE '^(panic|fault):' "$tmp/out" || ! grep -q '^bench ' "$tmp/out"; then
         cat "$tmp/out" >&2

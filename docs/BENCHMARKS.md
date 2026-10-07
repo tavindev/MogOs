@@ -77,7 +77,7 @@ Speed is a primary goal, so performance is tested like behavior: measured, recor
 | `mutex` | 38.2 | 36.4 |
 | `lock`, uncontended | 36.9 | 33.1 |
 | `unlock`, no waiter | 37.9 | 35.9 |
-| unknown syscall 18, `ENOSYS` (`enosys`) | 32.9 | 30.0 |
+| unknown syscall 64 (18 before phase 8 step 50), `ENOSYS` (`enosys`) | 32.9 | 30.0 |
 
 ## Shell command baselines
 
@@ -153,6 +153,11 @@ Speed is a primary goal, so performance is tested like behavior: measured, recor
 | Kernel boot, kmain to end of init, `-smp 1`, no disk (us; base 188 / 243 in the same run, held: boot's one `alloc_contiguous` is under the noise) | QEMU hvf (`-cpu cortex-a72`), dev build, 41 interleaved boots, load about 11 | 194 | 243 | `mm` word-wise `alloc_contiguous` |
 | Kernel boot with a MogFS disk mounted, mount in 3 requests (us; 2-block superblock read) | QEMU hvf (`-cpu cortex-a72`), dev build, 42 interleaved boots (busy machine) | 294 | 342 | phase 4 shell commands |
 | `Board::disk` probe, timed in the kernel around the call (us; no disk: one device-ID read; disk: one read plus the setup) | QEMU hvf (`-cpu cortex-a72`), dev build, 21 boots each | 1 / 45 | 2 / 50 | phase 4 step 20 |
+| Network: `test=bench-net` with `net=10.0.2.15/24,gw=10.0.2.2 udp=<port>`, 64-byte UDP datagrams to a host echo (`python3`, on 127.0.0.1) through QEMU's user network: one round trip / one send of a 10000 burst / one datagram each way with 16 in flight (ns; QEMU's user network and the host echo dominate: each send is one queue notify, which QEMU serves in the vCPU thread with a host `sendto`) | QEMU hvf (`-cpu cortex-a72`), dev build, 21 boots, load about 39 | 42820 / 13522 / 16049 | 56683 / 16135 / 20201 | phase 8 step 49 |
+| Kernel boot with a NIC and `net=` (us; the NIC's setup and its 66 frames; without `net=` the NIC is never probed; base without a NIC 198 / 236 in the same run) | QEMU hvf (`-cpu cortex-a72`), dev build, 21 interleaved boots, load about 39 | 260 | 296 | phase 8 step 49 |
+| Loopback TCP, `test=bench-sockets` (`nettest bench` against `nettest benchserve`, each its own process): 64-byte send + receive round trip / connect + close / one 4 KiB send of a 16 MiB stream (ns; the stream is 1134 MiB/s at the median; the pipe's round trip is about 390 ns in the same conditions: each TCP round trip also carries two segments, four syscalls a side and the net task's polls) | QEMU hvf (`-cpu cortex-a72`), dev build, 21 boots, load about 9 | 2824 / 2376 / 3371 | 2889 / 2516 / 3446 | phase 8 step 50 |
+| HTTP through QEMU's `hostfwd` (`test=httpd`): host to guest, a GET round trip on a new connection timed by a Python client (us) / guest to host, `fetch` of a 20-byte page from a Python server, 200 GETs, mean per GET (us; 3 boots) / 64 MiB to `httpd`'s echo, both ways at once (MiB/s each way; 3 runs) / 64 MiB fetched from the host (MiB/s; 3 boots). QEMU's user network ends TCP in QEMU, so these measure it more than our stack; recorded as found (min / median columns: best and median of the runs) | QEMU hvf (`-cpu cortex-a72`), dev build, load about 31 | 104 / 195 / 67.5 / 148 | 156 / 212 / 66.3 / 148 | phase 8 step 51 |
+| Phase 8 (steps 49-51) against main `a597dcf`, exact TCG instruction counts (`-icount shift=0`): yield / syscall / pipe round trip, boot without bootargs (instructions; boot in us of 1000) | QEMU TCG, `-icount shift=0`, dev build | 345 / 218 / 2480 / 156 | same; main 345 / 218 / 2480 / 163 | phase 8 step 51 |
 
 ## Cross-OS comparison
 

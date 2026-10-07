@@ -117,3 +117,68 @@ Decision: write `crates/net` fresh. smoltcp is a host-only dev-dependency of `cr
   (66.3-67.8 against 64.3-65.2) with no change on its path, and both builds match with loops aligned to 64 bytes
   (65.5-67.7 against 65.2-66.1), so it is code placement; `-C llvm-args=-align-loops=64` in the build config is the
   fix outside this crate; it is queued as its own experiment (every benchmark measured), and the row records it.
+- **49.** `crates/board/qemu-virt/src/virtio_net.rs`: modern virtio-mmio only, `VIRTIO_NET_F_MAC` and
+  `VIRTIO_F_VERSION_1` (12-byte header, no offloads), one RX and one TX queue of 64 descriptors, each owning a 2 KiB
+  buffer of a 256 KiB pool taken from the frame allocator once when the network starts, never grown. Every RX buffer
+  stays posted and is re-posted once the stack has read its frame (one notify per poll that re-posted any); a full RX
+  ring makes QEMU drop (it waits for a notify), never the driver allocate. TX descriptors are a free bitmask,
+  reclaimed from the used ring when a buffer is needed (TX raises no interrupt). Device-written used-ring ids and
+  lengths are range-checked before a buffer is touched. `src/net.rs` holds the NIC and the stack under `NET` (lock
+  order `KERNEL`, then `NET`) and runs the stack in a kernel net task (`Board::spawn`, priority 0), woken
+  (`Event::Net`) by the NIC's interrupt (SPI `16 + i` for transport `i`, routed to core 0), by the timer tick once
+  the stack's deadline passed (10 ms granularity against a 200 ms RTO floor and 1 s ARP retry) and by
+  `Board::with_net`. `kernel::network` parses `net=<ip>/<prefix>[,gw=<ip>]` and builds the stack's tables on the
+  heap (fallible); `Board::start_net` probes only when that bootarg is given, so a boot without it (NIC or not) is
+  unchanged: the block-device probe still stops at the first block device and the NIC probe looks past it (the e2e
+  attaches the disk first, so it is above the NIC). QEMU 9.2's user network answers ICMP echo to 10.0.2.2 and maps
+  UDP to 10.0.2.2 onto the host's loopback. e2e: `virtio_net_pings_the_gateway_and_echoes_udp_through_the_host`
+  (the host test runs the echo) and `a_net_bootarg_without_a_nic_boots_as_before`. Deviation: the net task runs at
+  priority 0, so a spinning top-priority process starves it until the fair class (phase 5 step 29). Benchmarks
+  (`test=bench-net`, `scripts/bench.sh` with `QEMU_ARGS`) in `docs/BENCHMARKS.md`.
+- **50.** Without phase 7 step 42 (no general non-blocking submit yet) and step 28: the completion ops are socket
+  ops only. `kernel::network` (design notes at its top): a NetStack handle (`CONNECT`, `LISTEN`) makes sockets, which
+  are kernel table entries reached by index and generation and counted by handles (a stale value never reaches a
+  later socket; the stack's bare `TcpId` is never used after its socket closes). Syscalls 20-25 (18 and 19 are threads): `socket`, `bind`,
+  `listen`, `io_submit` (receive, send, accept, connect), `io_wait` (result in x0, tag in x1; wait-any) and
+  `shutdown`, the one typed option. Buffers can be touched only in the submitter's address space, so an op is tried at
+  submit (an accept only in `io_wait`, which makes its handle at once) and again by each `io_wait` until it finishes;
+  the net task only polls and wakes `Event::NetIo`. One receive-side op and one send per socket, so a process's
+  in-flight ops are bounded by its sockets and so by its budget: that is the step's bounded queue charged to the
+  budget, without a separate queue. The rings (16 KiB each way, 16 TCP slots per stack) are a pool taken from the
+  frame allocator once when the network starts; a socket charges `SOCKET_FRAMES` (8) to its creator's budget as
+  accounting (`Budget::charge`, `ENOBUFS`) and refunds it with the last handle if the creator still runs. The
+  loopback `Nic` is a wire between two stacks, `LO` (127.0.0.1, listeners) and `PEER` (127.0.0.2, connections to
+  127/8), since a stack never routes to its own address; a listener listens on `LO` and, with a NIC, `ETH`. The TCP key
+  is the DTB's `/chosen/rng-seed` (`Dtb::rng_seed`). musl maps `AF_INET` stream sockets (`c/CLAUDE.md`), handle 5
+  is the NetStack. e2e `sockets_echo_over_loopback_wait_for_any_and_need_the_net_handle_and_budget`: the C `tcpecho`
+  pair on musl, one process serving 8 connections at once through `io_wait` and another driving 8 clients the same
+  way, a child without the handle (`EBADF`), one with a listen-only duplicate (`EACCES`), one whose budget holds 3
+  sockets (`ENOBUFS`), no frame leaked; host `crates/kernel/tests/network.rs`. The socket calls are one `Call::Net`
+  handled out of line (`net::syscall`), which kept `board_syscall` unchanged for other calls: with them inline, an
+  A/B showed `wait` +4% and `kill` +33% (the latter from `free_table`'s loop moving across a cache line; it moved
+  back). Deviations: `bind` takes only a port (a socket listens on every interface), `accept` reports no peer
+  address, and the fuzzer reaches the socket calls only without a NetStack. Security review fixes (each with a test
+  that failed first): `bind` and `listen` need the socket's write right (`tests/dispatch.rs`); an accepted handle has
+  only the accepting handle's rights (`tests/network.rs`, and `nettest: read-only accept send: EACCES` e2e); musl never
+  passes the NetStack to a spawned child (`tcpecho: child socket: EBADF` e2e); a listener's connections waiting for
+  accept are at most `BACKLOG` (8), each charged to its owner until accepted, the rest reset (`tests/network.rs`).
+- **51.** `httpd` is an echo server (the owner's change to "serves one page"): for each request on port 80 it answers
+  `200 OK`, `text/plain`, with the request it received (request line, headers, body) as the body, streaming a body of
+  any `Content-Length` back as it arrives, then closes; one connection at a time. As init (`test=httpd`) it runs
+  `fetch` with a connect-only NetStack, then itself as the server with a listen-only one and the console (no
+  directory: an echo serves no file). `fetch <ip>:<port>[/<path>] [<times>]` GETs over HTTP/1.0 and prints the body.
+  `cargo httpd` boots into it with `hostfwd=tcp:127.0.0.1:8080-10.0.2.15:80`; `test=httpd` alone implies QEMU's
+  user-network address, since a string alias cannot quote a two-word `-append`. e2e
+  `httpd_echoes_more_sequential_requests_than_its_tables_hold_and_fetch_gets_a_host_page`: 24 sequential POSTs from
+  a plain TCP client through `hostfwd` (more than the 16 TCP slots and 8 TIME_WAIT entries; the server closes
+  first, so each leaves a TIME_WAIT entry), each echo checked byte for byte, and `fetch` printing the test's host
+  page. Benchmarks in `docs/BENCHMARKS.md`.
+- **Review (steps 49-51).** Fixed: the NIC's receive stops at a ring's worth of frames per poll and the net task
+  polls again, so a flood never holds `KERNEL` without end; `bind` takes an address, 127.0.0.1 listening on loopback
+  only (musl passes `sin_addr`; any other address is `EADDRNOTAVAIL`), so a C server bound to loopback is not exposed
+  on the NIC. Open, for the step-47 owner and phase 10: a closed connection whose peer advertises a zero window stays
+  in FIN-WAIT-1 forever (`crates/net` persists without limit), so peers can fill the 16 TCP slots; a socket that
+  outlives its creator is charged to nobody (the parent's refund does not subtract it as it does pipes); the backlog
+  is charged to the listener's creator (fails once it exits; peers can spend up to 64 of its frames; charging it at
+  `listen` would fix both); the net task runs at priority 0 (`Board::spawn`), so any busy process delays the stack,
+  until the board can spawn kernel tasks at a priority (the e2e host page then must read the whole request).

@@ -40,6 +40,7 @@ Every new `.md` file must be linked from its parent so it stays reachable from t
 - Build: `cargo build`
 - Run in QEMU: `cargo run` (prints to the terminal via PL011 UART, exits via PSCI `SYSTEM_OFF`)
 - Shell on a persistent disk: `[ -f disk.img ] || cargo mkfs; cargo shell` (msh builtins `cd`, `pwd`, `exit`, `help`; programs `ls`, `mkdir`, `touch`, `write`, `cat`, `rm`, `mv`, `echo`, `sync`, and `sh`: busybox on musl)
+- HTTP echo server on QEMU's user network: `cargo httpd`, then `curl -v http://localhost:8080/anything -d hello` from the Mac shows its own request back
 - Run in a QEMU window: `cargo window` (mouse stays free; Ctrl+Option+G releases a grab)
 - Quit a hung QEMU: `Ctrl-A` then `X`
 - Test: `cargo test-host` (host tests, `crates/user`'s included, plus the QEMU boot tests in `crates/e2e`; must pass)
@@ -50,7 +51,7 @@ Every new `.md` file must be linked from its parent so it stays reachable from t
 
 ## Layout
 
-- `crates/kernel` ([CLAUDE.md](crates/kernel/CLAUDE.md)) — OS logic, `#![no_std]`, **no `unsafe`** (`forbid`). Defines ports (traits) like `Board` (and re-exports `mogfs`'s `Disk`), the scheduler and process table, handles, pipes, mutexes, the console line discipline, syscall decoding and the boot archive's cpio and ELF parsers.
+- `crates/kernel` ([CLAUDE.md](crates/kernel/CLAUDE.md)) — OS logic, `#![no_std]`, **no `unsafe`** (`forbid`). Defines ports (traits) like `Board` (and re-exports `mogfs`'s `Disk`), the scheduler and process table, handles, pipes, mutexes, the console line discipline, syscall decoding, the network (sockets over `crates/net`'s stacks) and the boot archive's cpio and ELF parsers.
 - `crates/mm` ([CLAUDE.md](crates/mm/CLAUDE.md)) — arch-independent memory management (`PhysAddr`, frame allocator). Safe, host-tested.
 - `crates/dtb` ([CLAUDE.md](crates/dtb/CLAUDE.md)) — minimal FDT parser. Safe, host-tested.
 - `crates/mogfs` ([CLAUDE.md](crates/mogfs/CLAUDE.md)) — MogFS: checksummed copy-on-write file system over a `Disk` trait (format at the top of `src/lib.rs`). Safe, `no_std`, host-tested; `examples/mkfs.rs` writes an empty image.

@@ -11,12 +11,14 @@ board crate).
 ## Boundaries (hard)
 
 - Outside the workspace (own `Cargo.lock`): lint and format with the `--manifest-path` commands in
-  `docs/DEVELOPMENT.md`. `cargo test-host` builds it only for its lib's host test (the command
-  table), through `crates/e2e/tests/user.rs`, which runs the `cargo test --manifest-path` command there.
+  `docs/DEVELOPMENT.md`. `cargo test-host` builds it only for its lib's host tests (the command
+  table, and `body_length`, httpd's `Content-Length` parser, with a seeded random-input run), through `crates/e2e/tests/user.rs`, which runs the `cargo test --manifest-path` command there.
 - `#![no_std]` (the lib `cfg_attr(not(test))`), `#![no_main]`, no dependencies. `unsafe` only in `src/lib.rs` for
   `svc`, the `mrs` of `now_ns` and `tls`, `map`'s slice and `start`'s argument slice, and in bins for `#[unsafe(no_mangle)]`, the one call to the
   `unsafe fn start`, and `fuzz`'s and `sysbench`'s calls to `unsafe fn raw` (any syscall, all seven arguments; the caller keeps what the
-  kernel may write unreferenced); each block with a `// SAFETY:`.
+  kernel may write unreferenced), and `nettest`'s calls to `unsafe fn io_submit` (a receive buffer stays unreferenced
+  until `io_wait` reports it; `receive` and `send` wrap it safely for a process with one op in flight); each block with
+  a `// SAFETY:`.
 - A program that takes arguments defines `_start(argc, _, len)` and calls `unsafe { start(argc, len, main) }` with
   its x0 and x2, which hands `main` the arguments as `&[&[u8]]` (the kernel puts them at the end of the top stack page,
   `STACK_TOP`) and exits with its result; boot-spawned programs get none, except `fuzz` and msh under
@@ -68,7 +70,9 @@ board crate).
   (`fuzzer_never_crashes_the_kernel_or_leaks_frames`), `sysbench` / `nop` (`syscall_benches_report_every_call`),
   `shellsetup` / `msh` with arguments (`shell_bench_times_each_command_from_spawn_to_reap`), `threads` / `victim`
   (`threads_share_a_counter_keep_their_tls_and_end_with_their_process`), `threadbench`
-  (`thread_bench_reports_round_trips`), all in `crates/e2e/tests/boot.rs`.
+  (`thread_bench_reports_round_trips`), `nettest` and the C `tcpecho`
+  (`sockets_echo_over_loopback_wait_for_any_and_need_the_net_handle_and_budget`), `httpd` and `fetch`
+  (`httpd_echoes_more_sequential_requests_than_its_tables_hold_and_fetch_gets_a_host_page`), all in `crates/e2e/tests/boot.rs`.
 - Clippy and fmt via the `crates/user` commands in `docs/DEVELOPMENT.md` must be clean.
 
 ---
