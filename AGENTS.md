@@ -20,7 +20,8 @@ AGENTS.md
 ├── docs/BENCHMARKS.md                benchmark kinds, workflow, regression rule, baselines
 ├── docs/WORKFLOW.md                  development loop, which agent does each step, reviewer pass
 └── docs/ROADMAP.md                   phases, status, open decisions
-    └── docs/phases/phase-N-*.md      steps, done-when, what was done
+    ├── docs/phases/phase-N-*.md      steps, done-when, what was done
+    └── docs/research/linux-survey.md what Linux gets right/wrong; source of phases 5-12
 ```
 
 Each crate carries a `CLAUDE.md` ownership contract (what it is and is not, boundaries, invariants, how it is

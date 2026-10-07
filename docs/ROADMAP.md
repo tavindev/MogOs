@@ -7,9 +7,30 @@ Ordered by dependency: each phase builds on the previous one.
 | 1 | Foundations: the kernel survives on its own | [phase-1-foundations.md](phases/phase-1-foundations.md) | Done |
 | 2 | Time and concurrency: the kernel multitasks | [phase-2-time-concurrency.md](phases/phase-2-time-concurrency.md) | Done |
 | 3 | User space: isolated programs, capability-based native ABI | [phase-3-user-space.md](phases/phase-3-user-space.md) | Done |
-| 4 | Shell, async I/O, MogFS | [phase-4-io-storage.md](phases/phase-4-io-storage.md) | Not started |
+| 4 | Shell, async I/O, MogFS | [phase-4-io-storage.md](phases/phase-4-io-storage.md) | Milestone done (step 22); step 23 next |
+| 5 | SMP, threads, fair scheduling, resource groups; the locking model fixed first | not written | Next |
+| 6 | Virtual memory: demand paging under no-overcommit, page cache, file mmap, CoW fork in libc, kernel W^X/KASLR | not written | |
+| 7 | Storage that scales: MogFS v2 (extents, snapshots, scrub), async block path, multi-queue NVMe | not written | |
+| 8 | Networking: safe TCP/IP, sockets as handles, virtio-net | not written | |
+| 9 | POSIX completeness and Linux binary compatibility; native ABI frozen | not written | |
+| 10 | Observability, debugging, security hardening | not written | |
+| 11 | Real hardware, boot, power | not written | |
+| 12 | Graphics, desktop, virtualization | not written | |
 
-Later: Linux binary-compatibility layer, multicore (SMP), networking, graphics, power management, real hardware.
+Phases 5-12 come from [research/linux-survey.md](research/linux-survey.md): what Linux gets right that we must match, what it got wrong, and the order (dependencies first, then the largest competitive gain per effort). Each phase doc is written and plan-reviewed for simplicity and speed before its first step.
+
+## Decided (from the Linux survey)
+
+- Page cache is kernel-owned and reclaimable under a global cap, outside per-process budgets; budgets cover anonymous memory and kernel objects (Linux charging cache to the first toucher is its worst memcg complaint).
+- Demand paging keeps no-overcommit: the budget is the commit charge, frames materialize lazily.
+- The locking model (spinlocks, per-CPU cells in `arch`/`board`, a safe `Lock<T>` for the kernel) is fixed before SMP or any new shared table.
+- Scheduling: the strict-priority RT class with priority inheritance stays above a fair (EEVDF-style) class.
+- `fork` is not in the native ABI; libc builds it as a budget-charged CoW clone for compat, so a fork can fail cleanly. `spawn` stays the fast path.
+- Signals: the kernel offers an exception channel and a notify bit on handles; libc builds POSIX signals from them.
+- Containers need no namespaces: a container is a process tree with restricted handles.
+- Completion I/O avoids io_uring's traps: a small fixed op set checked against handle rights at submit, no kernel worker with the caller's authority, ring memory charged to the budget.
+- All drivers stay in the kernel (monolithic); Rust safety with `unsafe` confined to arch/board/driver code is the isolation.
+- The native ABI is frozen after Linux compatibility (phase 9) has exercised it, not before.
 
 ## Ongoing in every phase
 
