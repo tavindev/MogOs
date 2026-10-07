@@ -118,8 +118,10 @@ pub struct Counters {
     pub unacceptable: u64,
     /// Challenge ACKs sent (RFC 5961), at most `CHALLENGES` per second per connection.
     pub challenge_acks: u64,
-    /// Half-open connections evicted by a newer SYN.
-    pub syn_evicted: u64,
+    /// SYN-ACKs sent as SYN cookies, because the half-open table was full.
+    pub syn_cookies: u64,
+    /// ACKs to a listener whose cookie failed: forged, for another SYN or expired.
+    pub bad_cookies: u64,
     /// TIME_WAIT entries reused before they expired because the table was full.
     pub time_wait_reused: u64,
 }

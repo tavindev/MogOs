@@ -184,8 +184,19 @@ fn wrap_start(key: [u64; 2], before: u32) -> u64 {
     0u32.wrapping_sub(before).wrapping_sub(isn) as u64 * 4000
 }
 
+/// Liveness: a connection with work outstanding (anything but idle in ESTABLISHED or CLOSE-WAIT) has a deadline.
+fn live(s: &Stack, id: TcpId) {
+    let i = s.tcp_info(id).unwrap();
+    let idle = matches!(i.state, State::Closed | State::Listen)
+        || (matches!(i.state, State::Established | State::CloseWait) && i.queued == 0);
+    assert!(
+        idle || i.deadline.is_some(),
+        "work outstanding and no deadline: {i:?}"
+    );
+}
+
 /// A connects to B and both send `bytes` of the pattern at once, then close; every byte and both ends of stream
-/// are checked. A's ISN sits half the transfer below 2^32, so both directions' sequence numbers wrap on A's side.
+/// are checked. A's ISN sits half the transfer below 2^32, so A's send and B's receive sequence numbers wrap.
 fn transfer(seed: u64, faults: Faults, bytes: usize, ring: usize) -> u64 {
     let (ka, kb) = ([seed, 0xa], [seed, 0xb]);
     let start = wrap_start(ka, (bytes / 2) as u32);
@@ -204,7 +215,9 @@ fn transfer(seed: u64, faults: Faults, bytes: usize, ring: usize) -> u64 {
         let mut progress = pump(a, ca, &mut fa, bytes, &pat, &mut buf);
         if let Some(cb) = cb {
             progress |= pump(b, cb, &mut fb, bytes, &pat, &mut buf);
+            live(b, cb);
         }
+        live(a, ca);
         let closed = |s: &Stack, id| s.tcp_info(id).unwrap().state == State::Closed;
         let done = fa.eof && fb.eof && closed(a, ca) && cb.is_some_and(|cb| closed(b, cb));
         (progress, done)
@@ -270,6 +283,7 @@ struct Seg {
     seq: u32,
     ack: u32,
     flags: u8,
+    win: u16,
     data: Vec<u8>,
 }
 
@@ -283,6 +297,7 @@ fn parse(f: &[u8]) -> Option<Seg> {
         seq: be32(&t[4..]),
         ack: be32(&t[8..]),
         flags: t[13],
+        win: u16::from_be_bytes([t[14], t[15]]),
         data: t[(t[12] >> 4) as usize * 4..].to_vec(),
     })
 }
@@ -649,7 +664,11 @@ fn ten_thousand_spoofed_syns_then_a_real_client_connects_within_one_rto() {
     let answers = feed(&mut b, &mut tap, 0, syns);
     assert_eq!(answers.len(), 10_000, "every SYN answered by a SYN-ACK");
     assert!(tap.tx.iter().all(|f| f[12..14] == [8, 0]), "no ARP traffic");
-    assert_eq!(b.counters.syn_evicted, 10_000 - 8);
+    assert_eq!(
+        b.counters.syn_cookies,
+        10_000 - 8,
+        "the table holds 8, the rest get cookies"
+    );
 
     let mut link = Link::new(1, faults(0), [MAC_A, MAC_B]);
     let mut ma = Mem::new(1, 4096, 4096, 4, 4);
@@ -913,6 +932,8 @@ fn fin_wait_2_and_time_wait_time_out() {
         (ACK, p.seq + 1),
         "TIME_WAIT answers a resent FIN"
     );
+    let bogus = p.seg(p.seq + 5, p.ack, FIN | ACK, 65535, &[], &[]);
+    assert_eq!(feed(&mut a, &mut tap, 50 * SEC, [bogus])[0].flags, ACK);
     let gone = feed(&mut a, &mut tap, 91 * SEC, [p.now(FIN | ACK, &[])]);
     assert_eq!(
         gone[0].flags, RST,
@@ -1074,6 +1095,7 @@ fn mutated_tcp_segments_never_panic_and_are_dropped_and_counted() {
         tap.tx.clear();
         stack.poll(tap, now);
         let c = stack.counters;
+        live(stack, id);
         assert_eq!(c.rx, before.rx + 1);
         assert_eq!(
             drops(&c) - drops(&before) + c.tcp - before.tcp,
@@ -1138,4 +1160,439 @@ fn full_tables_give_named_errors_and_a_handshake_waits_for_a_free_slot() {
         b"hi",
         "the retransmitted data completed the handshake"
     );
+}
+
+#[test]
+fn a_window_update_in_fin_wait_2_does_not_pin_a_released_slot() {
+    let mut m = Mem::new(2, 4096, 4096, 4, 4);
+    host!(a, m, IP_A, [1, 1]);
+    let mut tap = Tap::new(MAC_A);
+    let (c, mut p) = accepted(&mut a, &mut tap);
+    a.tcp_close(c);
+    feed(&mut a, &mut tap, 0, []);
+    p.ack += 1;
+    feed(&mut a, &mut tap, 0, [p.now(ACK, &[])]);
+    assert_eq!(state(&a, c), State::FinWait2);
+    feed(
+        &mut a,
+        &mut tap,
+        0,
+        [p.seg(p.seq, p.ack, ACK, 1234, &[], &[])],
+    );
+    timers(&mut a, &mut tap, 0, 3600 * SEC);
+    let to = SocketAddrV4::new(IP_B, PEER_PORT);
+    assert!(
+        a.connect(61 * SEC, 0, to).is_ok(),
+        "freed 60 s after the peer's last segment"
+    );
+}
+
+#[test]
+fn zero_window_probes_give_up_on_a_silent_peer() {
+    let mut m = Mem::new(2, 4096, 4096, 4, 4);
+    host!(a, m, IP_A, [1, 1]);
+    let mut tap = Tap::new(MAC_A);
+    let (c, p) = accepted(&mut a, &mut tap);
+    feed(&mut a, &mut tap, 0, [p.seg(p.seq, p.ack, ACK, 0, &[], &[])]);
+    a.send(c, &[1; 1000]).unwrap();
+    let probes = timers(&mut a, &mut tap, 0, 24 * 3600 * SEC);
+    assert!((10..=12).contains(&probes.len()), "{} probes", probes.len());
+    assert_eq!(a.recv(c, &mut [0; 8]), Err(Error::TimedOut));
+}
+
+#[test]
+fn a_timeout_retransmits_even_into_a_window_below_one_mss() {
+    let mut m = Mem::new(2, 4096, 64 << 10, 4, 4);
+    host!(a, m, IP_A, [1, 1]);
+    let mut tap = Tap::new(MAC_A);
+    let (c, p) = accepted(&mut a, &mut tap);
+    feed(
+        &mut a,
+        &mut tap,
+        0,
+        [p.seg(p.seq, p.ack, ACK, 500, &[], &[])],
+    );
+    a.send(c, &[1; 300]).unwrap();
+    let first = feed(&mut a, &mut tap, 0, []);
+    assert_eq!(first[0].data.len(), 300);
+    a.send(c, &[2; 10_000]).unwrap();
+    let sent = timers(&mut a, &mut tap, 1, 10 * SEC);
+    assert!(
+        sent.iter()
+            .any(|(_, s)| s.seq == first[0].seq && s.data.len() >= 300),
+        "the lost 300 bytes are resent"
+    );
+}
+
+#[test]
+fn a_pure_ack_during_go_back_n_carries_snd_max() {
+    let mut m = Mem::new(2, 4096, 64 << 10, 4, 4);
+    host!(a, m, IP_A, [1, 1]);
+    let mut tap = Tap::new(MAC_A);
+    let (c, p) = accepted(&mut a, &mut tap);
+    a.send(c, &[1; 3 * 1460]).unwrap();
+    assert_eq!(feed(&mut a, &mut tap, 0, []).len(), 3);
+    let resent = feed(&mut a, &mut tap, SEC, []);
+    assert_eq!(resent[0].seq, p.ack, "the timeout goes back to snd_una");
+    let ack = feed(&mut a, &mut tap, SEC, [p.now(ACK, b"hi")]);
+    assert_eq!((ack[0].seq, ack[0].ack), (p.ack + 3 * 1460, p.seq + 2));
+}
+
+#[test]
+fn time_wait_takeover_starts_above_the_old_sequence_space() {
+    let mut link = Link::new(
+        1,
+        Faults {
+            delay: MS,
+            ..Faults::default()
+        },
+        [MAC_A, MAC_B],
+    );
+    let (mut ma, mut mb) = (
+        Mem::new(1, 64 << 10, 64 << 10, 4, 4),
+        Mem::new(2, 64 << 10, 64 << 10, 4, 4),
+    );
+    host!(a, ma, IP_A, [1, 1]);
+    host!(b, mb, IP_B, [2, 2]);
+    let listener = b.listen(PORT).unwrap();
+    let ca = a.connect(0, 5555, SocketAddrV4::new(IP_B, PORT)).unwrap();
+    link.record = Some(Vec::new());
+    let bytes = 4 << 20;
+    let (pat, mut buf) = (pattern(), vec![0u8; 64 << 10]);
+    let (mut cb, mut fb, mut got, mut a_closed) = (None, Flow::default(), 0usize, false);
+    run(&mut link, &mut a, &mut b, 600 * SEC, |a, b, _| {
+        cb = cb.or_else(|| b.accept(listener));
+        let mut progress = false;
+        if let Some(cb) = cb {
+            progress |= pump(b, cb, &mut fb, bytes, &pat, &mut buf);
+        }
+        loop {
+            match a.recv(ca, &mut buf) {
+                Ok(0) if !a_closed => {
+                    a.tcp_close(ca);
+                    (a_closed, progress) = (true, true);
+                }
+                Ok(n) if n > 0 => (got, progress) = (got + n, true),
+                _ => break,
+            }
+        }
+        let done = a_closed
+            && state(a, ca) == State::Closed
+            && cb.is_some_and(|c| state(b, c) == State::Closed);
+        (progress, done)
+    });
+    b.tcp_close(cb.unwrap());
+    let old = link.record.take().unwrap();
+    let t1 = link.now;
+    let ca2 = a.connect(t1, 5555, SocketAddrV4::new(IP_B, PORT)).unwrap();
+    let mut cb2 = None;
+    run(&mut link, &mut a, &mut b, t1 + 10 * SEC, |a, b, _| {
+        cb2 = cb2.or_else(|| b.accept(listener));
+        (false, cb2.is_some() && state(a, ca2) == State::Established)
+    });
+    let mut tap = Tap::new(MAC_A);
+    let old_data = old
+        .iter()
+        .filter(|f| f[..6] == MAC_A && parse(f).is_some_and(|s| !s.data.is_empty()));
+    tap.rx.extend(old_data.cloned());
+    a.poll(&mut tap, link.now);
+    assert_eq!(
+        a.recv(ca2, &mut buf),
+        Err(Error::WouldBlock),
+        "no old duplicate reaches the new connection"
+    );
+}
+
+#[test]
+fn out_of_window_segments_get_at_most_one_ack_per_half_second() {
+    let mut m = Mem::new(2, 4096, 4096, 4, 4);
+    host!(a, m, IP_A, [1, 2]);
+    let mut tap = Tap::new(MAC_A);
+    let (_, p) = accepted(&mut a, &mut tap);
+    let blind = |i| {
+        p.seg(
+            p.seq.wrapping_add(1 << 30).wrapping_add(i),
+            12345,
+            ACK,
+            65535,
+            &[],
+            &[],
+        )
+    };
+    assert_eq!(feed(&mut a, &mut tap, 0, (0..100).map(blind)).len(), 1);
+    assert_eq!(
+        feed(&mut a, &mut tap, 400 * MS, (0..10).map(blind)).len(),
+        0
+    );
+    assert_eq!(
+        feed(&mut a, &mut tap, 500 * MS, (0..10).map(blind)).len(),
+        1
+    );
+}
+
+#[test]
+fn a_silent_peer_always_ends_in_closed() {
+    for seed in 0..40 {
+        let mut link = Link::new(seed, faults(10), [MAC_A, MAC_B]);
+        let (mut ma, mut mb) = (
+            Mem::new(1, 16 << 10, 16 << 10, 4, 4),
+            Mem::new(2, 16 << 10, 16 << 10, 4, 4),
+        );
+        host!(a, ma, IP_A, [seed, 1]);
+        host!(b, mb, IP_B, [seed, 2]);
+        let listener = b.listen(PORT).unwrap();
+        let ca = a.connect(0, 0, SocketAddrV4::new(IP_B, PORT)).unwrap();
+        let (pat, mut buf) = (pattern(), vec![0u8; 4096]);
+        let (mut fa, mut fb, mut cb) = (Flow::default(), Flow::default(), None);
+        let cut = Rng::new(seed).below(400) * MS;
+        run(&mut link, &mut a, &mut b, 3600 * SEC, |a, b, now| {
+            cb = cb.or_else(|| b.accept(listener));
+            if now >= cut || (fa.eof && fb.eof) {
+                return (false, true);
+            }
+            let mut progress = pump(a, ca, &mut fa, 256 << 10, &pat, &mut buf);
+            if let Some(cb) = cb {
+                progress |= pump(b, cb, &mut fb, 256 << 10, &pat, &mut buf);
+            }
+            (progress, false)
+        });
+        link.faults.loss = 1000;
+        if seed % 2 == 1 {
+            a.tcp_close(ca);
+            cb.inspect(|&cb| b.tcp_close(cb));
+        }
+        let ends: Vec<_> = [Some(ca), cb].into_iter().flatten().collect();
+        run(&mut link, &mut a, &mut b, cut + 1800 * SEC, |a, b, _| {
+            live(a, ca);
+            cb.inspect(|&cb| live(b, cb));
+            let done = |s: &Stack, id| {
+                let i = s.tcp_info(id).unwrap();
+                i.state == State::Closed || i.deadline.is_none()
+            };
+            (
+                false,
+                done(a, ends[0]) && ends.get(1).is_none_or(|&cb| done(b, cb)),
+            )
+        });
+    }
+}
+
+#[test]
+fn receiver_silly_window_avoidance_holds_small_window_increases() {
+    let mut m = Mem::new(2, 4096, 4096, 4, 4);
+    host!(a, m, IP_A, [1, 1]);
+    let mut tap = Tap::new(MAC_A);
+    let (c, mut p) = accepted(&mut a, &mut tap);
+    let mut last = None;
+    for chunk in [1460, 1460, 1176] {
+        last = feed(&mut a, &mut tap, 0, [p.now(ACK, &vec![7; chunk])]).pop();
+        p.seq += chunk as u32;
+    }
+    assert_eq!(last.unwrap().win, 0, "the ring is full");
+    a.recv(c, &mut [0; 100]).unwrap();
+    assert!(
+        feed(&mut a, &mut tap, 0, []).is_empty(),
+        "100 bytes are not worth a window update"
+    );
+    let probe = feed(
+        &mut a,
+        &mut tap,
+        0,
+        [p.seg(p.seq - 1, p.ack, ACK, 65535, &[], &[])],
+    );
+    assert_eq!(
+        probe[0].win, 0,
+        "the window stays shut below min(MSS, ring / 2)"
+    );
+    a.recv(c, &mut [0; 2000]).unwrap();
+    let update = feed(&mut a, &mut tap, 0, []);
+    assert_eq!(update[0].win, 2100);
+}
+
+#[test]
+fn a_syn_ack_offers_the_window_of_a_connection_slot() {
+    let mut m = Mem::new(2, 8192, 4096, 4, 4);
+    m.rx[0] = vec![0; 64];
+    host!(a, m, IP_A, [1, 1]);
+    let mut tap = Tap::new(MAC_A);
+    a.listen(PORT).unwrap();
+    let p = Peer {
+        port: PEER_PORT,
+        to: PORT,
+        seq: 1000,
+        ack: 0,
+    };
+    let synack = feed(&mut a, &mut tap, 0, [p.seg(1000, 0, SYN, 65535, &[], &[])]);
+    assert_eq!(synack[0].win, 8192);
+}
+
+#[test]
+fn a_simultaneous_open_offers_window_scaling_only_if_the_peer_did() {
+    let mut m = Mem::new(1, 1 << 20, 4096, 4, 4);
+    host!(a, m, IP_A, [1, 1]);
+    let mut tap = Tap::new(MAC_A);
+    a.connect(0, PORT, SocketAddrV4::new(IP_B, PEER_PORT))
+        .unwrap();
+    let syn = feed(&mut a, &mut tap, 0, []);
+    let p = Peer {
+        port: PEER_PORT,
+        to: PORT,
+        seq: 1000,
+        ack: 0,
+    };
+    feed(&mut a, &mut tap, 0, [p.seg(1000, 0, SYN, 65535, &[], &[])]);
+    let synack = tap
+        .tx
+        .iter()
+        .find(|f| parse(f).is_some_and(|s| s.flags == SYN | ACK))
+        .unwrap();
+    assert_eq!(parse(synack).unwrap().seq, syn[0].seq);
+    assert_eq!(
+        &synack[34 + 24..34 + 28],
+        &[1, 1, 1, 1],
+        "no window-scale option"
+    );
+    assert_eq!(parse(synack).unwrap().win, 0xffff);
+}
+
+#[test]
+fn an_ack_below_snd_una_never_updates_the_window() {
+    let mut m = Mem::new(2, 4096, 4096, 4, 4);
+    host!(a, m, IP_A, [1, 1]);
+    let mut tap = Tap::new(MAC_A);
+    let (c, p) = accepted(&mut a, &mut tap);
+    a.send(c, &[1; 1000]).unwrap();
+    feed(&mut a, &mut tap, 0, []);
+    feed(
+        &mut a,
+        &mut tap,
+        0,
+        [p.seg(p.seq, p.ack + 1000, ACK, 40000, &[], &[])],
+    );
+    feed(
+        &mut a,
+        &mut tap,
+        0,
+        [p.seg(p.seq, p.ack, ACK, 0, &[], b"x")],
+    );
+    assert_eq!(a.tcp_info(c).unwrap().snd_wnd, 40000);
+}
+
+/// The scripted peer opens a connection from `port` on a listener whose half-open table is full; returns the
+/// cookie SYN-ACK.
+fn cookie_syn(a: &mut Stack, tap: &mut Tap, now: u64, port: u16) -> Seg {
+    let p = Peer {
+        port,
+        to: PORT,
+        seq: 7000,
+        ack: 0,
+    };
+    let synack = feed(
+        a,
+        tap,
+        now,
+        [p.seg(7000, 0, SYN, 65535, &[2, 4, 5, 0xb4, 1, 3, 3, 7], &[])],
+    );
+    assert_eq!(synack[0].flags, SYN | ACK);
+    synack.into_iter().next().unwrap()
+}
+
+#[test]
+fn syn_cookies_take_over_when_the_half_open_table_is_full() {
+    let mut m = Mem::new(4, 4096, 4096, 1, 4);
+    host!(a, m, IP_A, [1, 1]);
+    let mut tap = Tap::new(MAC_A);
+    let listener = a.listen(PORT).unwrap();
+    let real = Peer {
+        port: PEER_PORT,
+        to: PORT,
+        seq: 1000,
+        ack: 0,
+    };
+    let iss = feed(
+        &mut a,
+        &mut tap,
+        0,
+        [real.seg(1000, 0, SYN, 65535, &[], &[])],
+    )[0]
+    .seq;
+    // A flood inside the real client's round trip no longer evicts it.
+    let flood = (0..8).map(|i| {
+        Peer {
+            port: 2000 + i,
+            ..real
+        }
+        .seg(77, 0, SYN, 65535, &[], &[])
+    });
+    assert_eq!(feed(&mut a, &mut tap, MS, flood).len(), 8);
+    assert_eq!(a.counters.syn_cookies, 8);
+    assert!(
+        feed(
+            &mut a,
+            &mut tap,
+            2 * MS,
+            [real.seg(1001, iss + 1, ACK, 65535, &[], &[])]
+        )
+        .is_empty()
+    );
+    assert!(a.accept(listener).is_some());
+
+    feed(
+        &mut a,
+        &mut tap,
+        3 * MS,
+        [Peer { port: 2999, ..real }.seg(5, 0, SYN, 65535, &[], &[])],
+    );
+    let cookie = cookie_syn(&mut a, &mut tap, 3 * MS, 3000);
+    let q = Peer {
+        port: 3000,
+        to: PORT,
+        seq: 7001,
+        ack: cookie.seq + 1,
+    };
+    assert_eq!(
+        &tap.tx[0][34 + 20..34 + 24],
+        &[2, 4, 5, 0xb4],
+        "the MSS survives in the cookie"
+    );
+    assert_eq!(
+        &tap.tx[0][34 + 24..34 + 28],
+        &[1, 1, 1, 1],
+        "no window scaling without timestamps"
+    );
+    let bad = a.counters.bad_cookies;
+    let forged = q.seg(7001, cookie.seq + 2, ACK, 65535, &[], &[]);
+    assert_eq!(feed(&mut a, &mut tap, 3 * MS, [forged])[0].flags, RST);
+    let wrong_isn = q.seg(7002, cookie.seq + 1, ACK, 65535, &[], &[]);
+    assert_eq!(feed(&mut a, &mut tap, 3 * MS, [wrong_isn])[0].flags, RST);
+    assert_eq!(a.counters.bad_cookies, bad + 2);
+    assert!(feed(&mut a, &mut tap, 4 * MS, [q.now(ACK, b"GET")]).len() == 1);
+    let c = a
+        .accept(listener)
+        .expect("a valid cookie opens the connection");
+    assert_eq!(a.recv(c, &mut [0; 8]), Ok(3));
+    feed(&mut a, &mut tap, 5 * MS, [q.now(ACK, b"GET")]);
+    assert_eq!(
+        a.accept(listener),
+        None,
+        "a replayed cookie ACK reaches the open connection, not a new one"
+    );
+
+    let late = cookie_syn(&mut a, &mut tap, 10 * MS, 3001);
+    let r = Peer {
+        port: 3001,
+        to: PORT,
+        seq: 7001,
+        ack: late.seq + 1,
+    };
+    assert_eq!(
+        feed(&mut a, &mut tap, 10 * MS + 40 * SEC, [r.now(ACK, &[])])[0].flags,
+        RST
+    );
+    assert_eq!(
+        a.counters.bad_cookies,
+        bad + 3,
+        "an expired cookie is rejected"
+    );
+    assert_eq!(a.accept(listener), None);
 }
