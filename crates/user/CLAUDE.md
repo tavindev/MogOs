@@ -30,7 +30,7 @@ board crate).
 - The ABI is mirrored by hand from `crates/kernel/src/syscall.rs` (numbers, rights bits, error values, `KILLED`);
   change both together.
 - `link.ld` and `build.rs`: static ELFs at 4 GiB, one RX and one RW `PT_LOAD`, `-zmax-page-size=4096`. Everything
-  must fit in the board's `IMAGE` (below the top two stack pages, which end at 4 GiB + 2 MiB) or `spawn` returns `ENOEXEC`.
+  must fit in the board's `IMAGE` (below a guard page and the top two stack pages, which end at 4 GiB + 2 MiB) or `spawn` returns `ENOEXEC`.
 - Child budgets (`CHILD_BUDGET`, `A_BUDGET`, `PONG_BUDGET`, ...) are sized deliberately, some exact, some with slack,
   as their comments say; they must fit in the kernel's `BOOT_BUDGET`, `WAITER_BUDGET`, `PI_BUDGET`. `ROUND_TRIPS` in
   `ping.rs` must equal the kernel's `PIPE_ROUND_TRIPS`.

@@ -1,6 +1,7 @@
 ENTRY(_start)
 
-/* The kernel maps each PT_LOAD at its page-aligned address, below the stack page at 4 GiB + 2 MiB. */
+/* The kernel maps each PT_LOAD at its page-aligned address, below a guard page and the two stack pages that end at
+   4 GiB + 2 MiB. */
 PHDRS
 {
     text PT_LOAD FLAGS(5);

@@ -52,8 +52,8 @@ const USER_BASE: u64 = 1 << 32;
 const USER_STACK_TOP: u64 = USER_BASE + (2 << 20);
 /// Where a process's first `map` goes; later ones follow it.
 const MAP_BASE: u64 = USER_STACK_TOP;
-/// Where an executable's segments may go: below the stack and argument pages, so they share one level-3 table.
-const IMAGE: Range<u64> = USER_BASE..USER_STACK_TOP - 2 * PAGE as u64;
+/// Where an executable's segments may go: below the two stack pages and an unmapped guard page, in one level-3 table.
+const IMAGE: Range<u64> = USER_BASE..USER_STACK_TOP - 3 * PAGE as u64;
 /// The boot archive (cpio, newc), built by `build.rs` from `crates/user`.
 static ARCHIVE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/boot.cpio"));
 /// EL1 virtual timer PPI.

@@ -81,7 +81,8 @@ touches memory through raw addresses: the board reads user buffers, copies pages
   blocks, a `readdir` call lists at most 64 entries, and file I/O moves at most `MAX_BUFFER`. Worst case: `open(CREATE)`
   on a 16-component path of full directories is about 240 block requests, about 5 ms with IRQs masked. A
   directory `rename` across directories also reads every directory below the one moved (mogfs's cycle check), up to
-  the whole tree.
+  the whole tree: about 500 requests, about 10.5 ms with IRQs masked, on a well-formed image (each directory read
+  once), and about 7000, about 150 ms, on a crafted one (504 directories of 14 blocks each).
 - `Elf::parse` accepts only page-aligned, address-ordered, in-region `PT_LOAD`s, never W+X, entry in an executable one.
 - `BOOT_BUDGET`, `WAITER_BUDGET`, `PI_BUDGET` are sized to the user programs' frame needs: too small and `run`'s
   `expect("spawn")` panics. `PIPE_ROUND_TRIPS` must equal `ROUND_TRIPS` in `crates/user/src/bin/ping.rs`; a mismatch
