@@ -49,7 +49,8 @@ const OOW_ACK: u64 = 500 * MS;
 const COOKIE_PERIOD: u64 = 16 * SEC;
 /// The MSS values a cookie can carry, by its 2-bit index.
 const COOKIE_MSS: [u16; 4] = [536, 1220, 1440, 1460];
-/// The new ISS for a SYN taking over TIME_WAIT sits this far above the old connection's (RFC 1122 4.2.2.13).
+/// The new ISS for a SYN taking over TIME_WAIT sits at least this far above the old connection's (RFC 1122
+/// 4.2.2.13), plus 24 keyed bits so it stays unpredictable (RFC 6528).
 const TIME_WAIT_GAP: u32 = 65537;
 const OOO: usize = 4;
 const EPHEMERAL: u32 = 49152;
@@ -857,6 +858,8 @@ pub struct Tcp<'a> {
     next_port: u32,
     /// The slot the last segment matched, tried first.
     last: usize,
+    /// When a SYN cookie was last sent.
+    cookie_at: Option<u64>,
 }
 
 impl<'a> Tcp<'a> {
@@ -873,6 +876,7 @@ impl<'a> Tcp<'a> {
             time_wait,
             next_port: 0,
             last: 0,
+            cookie_at: None,
         }
     }
 }
@@ -1115,7 +1119,8 @@ impl<'a> Stack<'a> {
             let w = self.tcp.time_wait[t];
             if s.flags & SYN != 0 && gt(s.seq, w.rcv_nxt) {
                 self.tcp.time_wait[t] = TimeWait::EMPTY;
-                iss = Some(w.snd_nxt.wrapping_add(TIME_WAIT_GAP));
+                let keyed = self.isn(s.port, s.from, now) & 0xff_ffff;
+                iss = Some(w.snd_nxt.wrapping_add(TIME_WAIT_GAP + keyed));
             } else if s.flags & RST != 0 {
                 // RFC 1337: a RST never cuts TIME_WAIT short.
                 return Err(Reason::Unacceptable);
@@ -1177,7 +1182,8 @@ impl<'a> Stack<'a> {
             return Err(Reason::Unacceptable);
         }
         if s.flags & ACK != 0 {
-            let Some(e) = self.cookie_in(s, macs.0, now) else {
+            let cookie = (s.flags & SYN == 0).then(|| self.cookie_in(s, macs.0, now));
+            let Some(e) = cookie.flatten() else {
                 self.counters.bad_cookies += 1;
                 self.reply_tcp(macs, s.from, s.port, &rst_for(s));
                 return Err(Reason::Unacceptable);
@@ -1193,6 +1199,7 @@ impl<'a> Stack<'a> {
         let Some(h) = self.tcp.half_open.iter().position(|h| h.remote.port() == 0) else {
             // A full table answers statelessly: the ISS encodes the MSS and is checked when the ACK returns.
             self.counters.syn_cookies += 1;
+            self.tcp.cookie_at = Some(now);
             let peer = s.mss.unwrap_or(DEFAULT_MSS);
             let idx = COOKIE_MSS.iter().rposition(|&m| m <= peer).unwrap_or(0);
             let o = Out {
@@ -1223,8 +1230,8 @@ impl<'a> Stack<'a> {
         Ok(())
     }
 
-    /// The cookie ISS for a SYN: a 6-bit clock, the 2-bit MSS index and 24 bits of keyed hash over both, the
-    /// connection and the peer's ISN.
+    /// The cookie ISS for a SYN: the clock's low bit, the 2-bit MSS index and 29 bits of keyed hash over both,
+    /// the connection and the peer's ISN.
     fn cookie(&self, local: u16, from: SocketAddrV4, irs: u32, t: u64, idx: u32) -> u32 {
         let ips = (u32::from(self.config.ip) as u64) << 32 | u32::from(*from.ip()) as u64;
         let ports = (local as u64) << 48 | (from.port() as u64) << 32 | irs as u64;
@@ -1232,13 +1239,17 @@ impl<'a> Stack<'a> {
             self.tcp.key[0] ^ t,
             self.tcp.key[1] ^ (0xc00c_1e00 | idx as u64),
         ];
-        ((t as u32 & 0x3f) << 26) | (idx << 24) | (siphash(key, [ips, ports]) as u32 & 0xff_ffff)
+        ((t as u32 & 1) << 31) | (idx << 29) | (siphash(key, [ips, ports]) as u32 & 0x1fff_ffff)
     }
 
-    /// The half-open state a valid cookie ACK stands for: issued this period or the last, for this SYN.
+    /// The half-open state a valid cookie ACK stands for: issued this period or the last, for this SYN, while
+    /// this listener has sent cookies within that time (no flood, no cookie to guess).
     fn cookie_in(&self, s: &Seg, mac: Mac, now: u64) -> Option<HalfOpen> {
+        self.tcp
+            .cookie_at
+            .filter(|&t| now.saturating_sub(t) < 2 * COOKIE_PERIOD)?;
         let (iss, irs) = (s.ack.wrapping_sub(1), s.seq.wrapping_sub(1));
-        let idx = (iss >> 24) & 3;
+        let idx = (iss >> 29) & 3;
         let t = [now / COOKIE_PERIOD, (now / COOKIE_PERIOD).saturating_sub(1)];
         t.iter()
             .any(|&t| self.cookie(s.port, s.from, irs, t, idx) == iss)

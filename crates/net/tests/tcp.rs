@@ -1596,3 +1596,64 @@ fn syn_cookies_take_over_when_the_half_open_table_is_full() {
     );
     assert_eq!(a.accept(listener), None);
 }
+
+#[test]
+fn a_valid_cookie_opens_nothing_on_a_listener_that_sent_no_cookies() {
+    // Twin stacks with the same key and address compute the same cookie; only `flooded` has sent any.
+    let (mut mf, mut mq) = (Mem::new(2, 4096, 4096, 0, 4), Mem::new(2, 4096, 4096, 4, 4));
+    host!(flooded, mf, IP_A, [9, 9]);
+    host!(quiet, mq, IP_A, [9, 9]);
+    let (lf, lq) = (flooded.listen(PORT).unwrap(), quiet.listen(PORT).unwrap());
+    let mut tap = Tap::new(MAC_A);
+    let cookie = cookie_syn(&mut flooded, &mut tap, 0, 3000);
+    let q = Peer {
+        port: 3000,
+        to: PORT,
+        seq: 7001,
+        ack: cookie.seq + 1,
+    };
+    let out = feed(&mut quiet, &mut tap, MS, [q.now(ACK, &[])]);
+    assert_eq!(
+        out[0].flags, RST,
+        "a listener that sent no cookie accepts none"
+    );
+    assert_eq!((quiet.accept(lq), quiet.counters.bad_cookies), (None, 1));
+
+    let out = feed(&mut flooded, &mut tap, MS, [q.now(SYN | ACK, &[])]);
+    assert_eq!(out[0].flags, RST, "a SYN-ACK is never a cookie's ACK");
+    assert_eq!(flooded.accept(lf), None);
+    feed(&mut flooded, &mut tap, MS, [q.now(ACK, &[])]);
+    assert!(flooded.accept(lf).is_some(), "the cookie itself is good");
+}
+
+#[test]
+fn a_time_wait_takeover_iss_is_unpredictable() {
+    let mut gaps = Vec::new();
+    for key in [[1, 1], [2, 2]] {
+        let mut m = Mem::new(2, 4096, 4096, 4, 4);
+        host!(a, m, IP_A, key);
+        let mut tap = Tap::new(MAC_A);
+        let (c, mut p) = accepted(&mut a, &mut tap);
+        a.tcp_close(c);
+        feed(&mut a, &mut tap, 0, []);
+        p.ack += 1;
+        feed(&mut a, &mut tap, 0, [p.now(FIN | ACK, &[])]);
+        let synack = feed(
+            &mut a,
+            &mut tap,
+            SEC,
+            [p.seg(p.seq + 10, 0, SYN, 65535, &[], &[])],
+        );
+        assert_eq!(synack[0].flags, SYN | ACK, "the SYN takes TIME_WAIT over");
+        gaps.push(synack[0].seq.wrapping_sub(p.ack));
+    }
+    assert!(
+        gaps.iter()
+            .all(|&g| (65537..65537 + (1 << 24)).contains(&g)),
+        "{gaps:?}"
+    );
+    assert_ne!(
+        gaps[0], gaps[1],
+        "the new ISS is keyed, not old snd_nxt + a constant"
+    );
+}
