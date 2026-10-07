@@ -1,4 +1,4 @@
-use kernel::handle::{DUPLICATE, Handles, KILL, MAX_HANDLES, Object, READ, WRITE};
+use kernel::handle::{DUPLICATE, Handles, KILL, MAP, MAX_HANDLES, Object, WRITE};
 use kernel::syscall::{EACCES, EBADF, EMFILE};
 
 #[test]
@@ -38,7 +38,7 @@ fn dup_fails_when_the_table_is_full() {
 #[test]
 fn dup_rights_must_be_a_subset_and_need_duplicate() {
     let mut handles = Handles::init(1, 1);
-    assert_eq!(handles.dup(0, WRITE | READ), Err(EACCES));
+    assert_eq!(handles.dup(0, WRITE | MAP), Err(EACCES));
     assert_eq!(handles.dup(0, 1 << 40), Err(EACCES));
     let no_write = handles.dup(0, DUPLICATE).unwrap().0;
     assert_eq!(handles.get(no_write, WRITE), Err(EACCES));

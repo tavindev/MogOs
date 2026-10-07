@@ -7,15 +7,13 @@ const GICC_PMR: u64 = 0x004;
 const GICC_IAR: u64 = 0x00c;
 const GICC_EOIR: u64 = 0x010;
 
-/// Turns on the GICv2 distributor at `dist` and CPU interface at `cpu`, and enables interrupt `irq`.
+/// Turns on the GICv2 distributor at `dist` and CPU interface at `cpu`, letting every priority through.
 ///
 /// # Safety
 ///
 /// `dist` and `cpu` must be a GICv2's distributor and CPU interface, mapped as Device memory.
-pub unsafe fn enable(dist: PhysAddr, cpu: PhysAddr, irq: u32) {
-    let isenabler = dist.0 + GICD_ISENABLER + 4 * (irq / 32) as u64;
+pub unsafe fn enable(dist: PhysAddr, cpu: PhysAddr) {
     let writes = [
-        (isenabler, 1 << (irq % 32)),
         (dist.0 + GICD_CTLR, 1),
         (cpu.0 + GICC_PMR, 0xff),
         (cpu.0 + GICC_CTLR, 1),
@@ -24,6 +22,17 @@ pub unsafe fn enable(dist: PhysAddr, cpu: PhysAddr, irq: u32) {
         // SAFETY: the caller guarantees these are this GIC's registers.
         unsafe { (addr as *mut u32).write_volatile(value) };
     }
+}
+
+/// Unmasks interrupt `irq` in the GICv2 distributor at `dist`.
+///
+/// # Safety
+///
+/// `dist` must be a GICv2 distributor, mapped as Device memory.
+pub unsafe fn unmask(dist: PhysAddr, irq: u32) {
+    let isenabler = dist.0 + GICD_ISENABLER + 4 * (irq / 32) as u64;
+    // SAFETY: the caller guarantees `dist` is a GICv2 distributor.
+    unsafe { (isenabler as *mut u32).write_volatile(1 << (irq % 32)) };
 }
 
 /// Acknowledges the highest-priority pending interrupt and returns its `GICC_IAR` (1023 if spurious).
