@@ -22,6 +22,7 @@ use mm::{FrameAllocator, PhysAddr};
 /// What the kernel needs from the hardware; each board implements it.
 pub trait Board {
     type Console: Write;
+    type Disk: Disk;
 
     fn console(&mut self) -> &mut Self::Console;
     fn exception_level(&self) -> u8;
@@ -58,6 +59,19 @@ pub trait Board {
     fn spawn_archived(&mut self, name: &str, budget: usize) -> Result<(), i64>;
     /// Tasks in the run queue, the boot context included.
     fn tasks(&self) -> usize;
+    /// The first block device in `dtb`, set up with memory from the frame allocator; call once, after `init_frames`.
+    fn disk(&mut self, dtb: &Dtb) -> Option<Self::Disk>;
+}
+
+/// Bytes per disk block.
+pub const BLOCK: usize = 4096;
+
+/// A block device of `BLOCK`-byte blocks; each call returns once the device completed it. A failed request is `EIO`.
+pub trait Disk {
+    fn read(&mut self, block: u64, data: &mut [u8; BLOCK]) -> Result<(), i64>;
+    fn write(&mut self, block: u64, data: &[u8; BLOCK]) -> Result<(), i64>;
+    /// Makes every completed write durable.
+    fn flush(&mut self) -> Result<(), i64>;
 }
 
 /// Hand-written asm user programs the board provides; newer ones are ELF files in the boot archive.
@@ -83,6 +97,8 @@ pub enum Program {
 const BENCH_YIELDS: u64 = 100_000;
 /// Round trips the boot archive's `ping` makes with `pong` under `test=bench-pipe`; must equal its `ROUND_TRIPS`.
 const PIPE_ROUND_TRIPS: u64 = 100_000;
+/// Blocks `test=bench-disk` writes and reads (8 MiB); the disk must hold at least this many.
+const DISK_BENCH_BLOCKS: u64 = 2048;
 
 /// Bitmap capacity in 64-frame words: 512 words cover 128 MiB.
 pub const FRAME_WORDS: usize = 512;
@@ -133,6 +149,10 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
     let boot_us = board.uptime_us();
     let _ = writeln!(board.console(), "boot: {boot_us} us");
 
+    let mut disk = board.disk(&dtb);
+    let found = if disk.is_some() { "found" } else { "none" };
+    let _ = writeln!(board.console(), "disk: {found}");
+
     for arg in bootargs.split_whitespace() {
         match arg {
             "test=yield" => yield_demo(board),
@@ -158,6 +178,8 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
                     "budget: free frames {before} before, {after} after"
                 );
             }
+            "test=disk" => disk_test(board, disk.as_mut().expect("no disk")),
+            "test=bench-disk" => disk_bench(board, disk.as_mut().expect("no disk")),
             _ => {}
         }
     }
@@ -282,4 +304,43 @@ fn yield_forever<B: Board>(board: &mut B, _: usize) -> ! {
     loop {
         board.yield_now();
     }
+}
+
+/// Reads block 1 and prints `disk: read ok` if it holds the test pattern; otherwise writes the pattern, flushes and
+/// prints `disk: wrote`. So the first boot on a zeroed image writes, and the next one reads it back.
+fn disk_test<B: Board>(board: &mut B, disk: &mut B::Disk) {
+    let pattern: [u8; BLOCK] = core::array::from_fn(|i| (i % 251) as u8);
+    let mut block = [0; BLOCK];
+    disk.read(1, &mut block).expect("read");
+    let done = if block == pattern {
+        "read ok"
+    } else {
+        disk.write(1, &pattern).expect("write");
+        disk.flush().expect("flush");
+        "wrote"
+    };
+    let _ = writeln!(board.console(), "disk: {done}");
+}
+
+/// Writes `DISK_BENCH_BLOCKS` blocks in order and flushes, then reads them back; prints each throughput in MiB/s.
+fn disk_bench<B: Board>(board: &mut B, disk: &mut B::Disk) {
+    let mut block = [0x5a; BLOCK];
+    let start = board.uptime_us();
+    for n in 0..DISK_BENCH_BLOCKS {
+        disk.write(n, &block).expect("write");
+    }
+    disk.flush().expect("flush");
+    let write_us = board.uptime_us() - start;
+    let start = board.uptime_us();
+    for n in 0..DISK_BENCH_BLOCKS {
+        disk.read(n, &mut block).expect("read");
+    }
+    let read_us = board.uptime_us() - start;
+    let mib_s = |us: u64| ((DISK_BENCH_BLOCKS * BLOCK as u64) >> 20) * 1_000_000 / us;
+    let _ = writeln!(
+        board.console(),
+        "disk: write+flush {} MiB/s",
+        mib_s(write_us)
+    );
+    let _ = writeln!(board.console(), "disk: read {} MiB/s", mib_s(read_us));
 }

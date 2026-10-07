@@ -1,5 +1,5 @@
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
@@ -22,6 +22,8 @@ fn boot(extra: &[&str]) -> (ExitStatus, Vec<String>) {
             "cortex-a72",
             "-m",
             "128M",
+            "-global",
+            "virtio-mmio.force-legacy=false",
             "-nographic",
             "-kernel",
         ])
@@ -71,6 +73,7 @@ fn boots_and_powers_off() {
         "ram: 0x40000000..0x48000000",
         "mmu: on",
         "heap: ok",
+        "disk: none",
     ] {
         assert!(
             lines.iter().any(|l| l == expected),
@@ -400,5 +403,71 @@ fn pipe_bench_reports_round_trip() {
         .expect("missing pipe line")
         .parse::<u64>()
         .unwrap();
+    assert!(status.success(), "QEMU exited with {status}");
+}
+
+/// A zeroed raw disk image of `blocks` 4 KiB blocks in the temp dir, unique to `test`.
+fn disk_image(test: &str, blocks: u64) -> PathBuf {
+    let path = std::env::temp_dir().join(format!("mogos-{test}-{}.img", std::process::id()));
+    let file = std::fs::File::create(&path).unwrap();
+    file.set_len(blocks * 4096).unwrap();
+    path
+}
+
+/// Boots with `image` attached as a virtio-blk device and `test` as the boot argument.
+fn boot_with_disk(image: &Path, test: &str) -> (ExitStatus, Vec<String>) {
+    let drive = format!("file={},if=none,format=raw,id=d0", image.display());
+    boot(&[
+        "-drive",
+        &drive,
+        "-device",
+        "virtio-blk-device,drive=d0",
+        "-append",
+        test,
+    ])
+}
+
+#[test]
+fn a_flushed_block_survives_a_reboot() {
+    let image = disk_image("disk", 16);
+    let (status, lines) = boot_with_disk(&image, "test=disk");
+    assert!(status.success(), "QEMU exited with {status}");
+    let disk: Vec<_> = lines.iter().filter(|l| l.starts_with("disk: ")).collect();
+    assert_eq!(disk, ["disk: found", "disk: wrote"]);
+    // Block 1 is bytes 4096..8192: a driver addressing 512-byte sectors by block number would miss it.
+    let bytes = std::fs::read(&image).unwrap();
+    let expected: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+    assert!(
+        bytes[4096..8192] == expected[..],
+        "block 1 not on the image"
+    );
+
+    let (status, lines) = boot_with_disk(&image, "test=disk");
+    std::fs::remove_file(&image).unwrap();
+    assert!(status.success(), "QEMU exited with {status}");
+    let disk: Vec<_> = lines.iter().filter(|l| l.starts_with("disk: ")).collect();
+    assert_eq!(disk, ["disk: found", "disk: read ok"]);
+}
+
+#[test]
+fn disk_bench_reports_throughput() {
+    let image = disk_image("bench-disk", 2048);
+    let (status, lines) = boot_with_disk(&image, "test=bench-disk");
+    std::fs::remove_file(&image).unwrap();
+    assert!(
+        !lines.iter().any(|l| l.starts_with("panic:")),
+        "kernel panicked"
+    );
+    for op in ["write+flush", "read"] {
+        lines
+            .iter()
+            .find_map(|l| {
+                l.strip_prefix(&format!("disk: {op} "))?
+                    .strip_suffix(" MiB/s")
+            })
+            .unwrap_or_else(|| panic!("missing disk {op} line"))
+            .parse::<u64>()
+            .unwrap();
+    }
     assert!(status.success(), "QEMU exited with {status}");
 }

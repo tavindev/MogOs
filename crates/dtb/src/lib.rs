@@ -48,17 +48,23 @@ impl<'a> Dtb<'a> {
 
     /// Base address of the first top-level node compatible with `arm,pl011`.
     pub fn uart(&self) -> Option<PhysAddr> {
-        Some(PhysAddr(self.reg_of(b"arm,pl011")?.reg(0)?.0))
+        self.reg_of(b"arm,pl011", |reg| Some(PhysAddr(reg.reg(0)?.0)))
     }
 
     /// Distributor and CPU interface bases of the first top-level GICv2 (`arm,cortex-a15-gic`).
     pub fn gic(&self) -> Option<(PhysAddr, PhysAddr)> {
-        let reg = self.reg_of(b"arm,cortex-a15-gic")?;
-        Some((PhysAddr(reg.reg(0)?.0), PhysAddr(reg.reg(1)?.0)))
+        self.reg_of(b"arm,cortex-a15-gic", |reg| {
+            Some((PhysAddr(reg.reg(0)?.0), PhysAddr(reg.reg(1)?.0)))
+        })
     }
 
-    /// `reg` property of the first top-level node compatible with `compatible`.
-    fn reg_of(&self, compatible: &[u8]) -> Option<Prop<'a>> {
+    /// The first `Some` from `f` over the bases of the top-level `virtio,mmio` transports.
+    pub fn virtio_mmio<T>(&self, mut f: impl FnMut(PhysAddr) -> Option<T>) -> Option<T> {
+        self.reg_of(b"virtio,mmio", |reg| f(PhysAddr(reg.reg(0)?.0)))
+    }
+
+    /// The first `Some` from `f` over the `reg` properties of top-level nodes compatible with `compatible`.
+    fn reg_of<T>(&self, compatible: &[u8], mut f: impl FnMut(&Prop<'a>) -> Option<T>) -> Option<T> {
         let (mut node, mut reg, mut found) = (0, None, false);
         self.find(|p| {
             if p.node_offset != node {
@@ -67,9 +73,9 @@ impl<'a> Dtb<'a> {
             match p.name {
                 b"reg" if p.depth == 2 => reg = Some(*p),
                 b"compatible" => found = p.value.split(|&b| b == 0).any(|c| c == compatible),
-                _ => {}
+                _ => return None,
             }
-            reg.filter(|_| found)
+            f(&reg.filter(|_| found)?)
         })
     }
 

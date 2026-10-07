@@ -36,3 +36,5 @@ Speed is a primary goal, so performance is tested like behavior: measured, recor
 | Syscall round trip from EL0, `test=bench-syscall`, 100000 `io_submit_wait(console, write, sp, 0)` timed in user space (ns) | QEMU hvf (`-cpu cortex-a72`), dev build, 21 boots | 28 | 29 | phase 3 step 16 |
 | Pipe round trip, `test=bench-pipe`: one byte to `pong` and back over two pipes, 100000 trips, timed by the kernel from spawn to exit (ns) | QEMU TCG, dev build, 11 boots | 14180 | 14556 | phase 3 step 15 |
 | Pipe round trip, `test=bench-pipe` (ns) | QEMU hvf (`-cpu cortex-a72`), dev build, 21 boots | 370 | 374 | phase 3 step 16 |
+| Disk throughput, `test=bench-disk`: 2048 sequential 4 KiB virtio-blk writes then a flush, then 2048 reads, polled, one request in flight, 8 MiB raw image (MiB/s, higher is better; write+flush / read) | QEMU TCG, dev build, 1 boot | - | 151 / 118 | phase 4 step 20 |
+| Disk throughput, `test=bench-disk` (MiB/s, write+flush / read; machine busy with three parallel builds, spread 45-216) | QEMU hvf (`-cpu cortex-a72`), dev build, 21 boots | 45 / 17 | 147 / 136 | phase 4 step 20 |

@@ -4,6 +4,7 @@
 extern crate alloc;
 
 mod uart;
+mod virtio_blk;
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::arch::global_asm;
@@ -26,6 +27,7 @@ use kernel::{Event, FRAME_WORDS, Full, Memory, PRIORITIES, Program, Scheduler};
 use linked_list_allocator::Heap;
 use mm::{Budget, FrameAllocator, PhysAddr};
 use uart::Uart;
+use virtio_blk::VirtioBlk;
 
 /// Panic- and trap-path console; normal output uses the PL011 from the DTB.
 const UART0: PhysAddr = PhysAddr(0x0900_0000);
@@ -577,6 +579,7 @@ struct QemuVirt {
 
 impl kernel::Board for QemuVirt {
     type Console = Uart;
+    type Disk = VirtioBlk;
 
     fn console(&mut self) -> &mut Uart {
         &mut self.uart
@@ -707,6 +710,19 @@ impl kernel::Board for QemuVirt {
         let count = unsafe { &(*KERNEL.0.get()).sched }.count();
         arch::irq::restore(irq);
         count
+    }
+
+    fn disk(&mut self, dtb: &Dtb) -> Option<VirtioBlk> {
+        let alloc = || {
+            let irq = arch::irq::disable();
+            // SAFETY: IRQs are masked on the only core, so this is the sole reference.
+            let frames = unsafe { &mut (*KERNEL.0.get()).frames }.alloc_contiguous(2);
+            arch::irq::restore(irq);
+            frames
+        };
+        // SAFETY: the DTB's virtio-mmio transports, in the device-mapped GiB 0, driven only here; frames from the
+        // allocator are identity-mapped RAM nobody else uses.
+        dtb.virtio_mmio(|base| unsafe { VirtioBlk::new(base, alloc) })
     }
 }
 
