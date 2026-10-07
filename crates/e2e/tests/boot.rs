@@ -364,7 +364,8 @@ fn priority_inheritance_lets_the_mutex_owner_outrun_a_middle_priority_spinner() 
         })
         .collect();
     // The timer is on, yet M never runs: something outranks it at every switch. L (priority 1) unlocks only while
-    // H's block lends it priority 3; without that, M (2) spins forever and the boot never powers off.
+    // H's block lends it priority 3; without that, M (2) spins forever and the boot never powers off. Unlocking hands
+    // the mutex to H at once, so L relocks only after H is done and M is killed.
     assert_eq!(
         pi,
         [
@@ -376,6 +377,7 @@ fn priority_inheritance_lets_the_mutex_owner_outrun_a_middle_priority_spinner() 
             "H: acquired",
             "P: high exited",
             "P: mid killed",
+            "L: relocked",
             "P: low exited",
         ]
     );

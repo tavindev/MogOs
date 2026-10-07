@@ -63,7 +63,8 @@ const _: () = assert!(MAX_TASKS <= 256);
 /// Kernel stack per task: 16 KiB.
 const TASK_STACK_FRAMES: usize = 4;
 const MAX_PIPES: usize = 16;
-const MAX_MUTEXES: usize = 16;
+/// Each live mutex has a handle, so the handle tables are the per-process quota.
+const MAX_MUTEXES: usize = MAX_TASKS * MAX_HANDLES;
 
 #[global_allocator]
 static HEAP: KernelHeap = KernelHeap(UnsafeCell::new(Heap::empty()));
@@ -262,16 +263,26 @@ fn kill(
     slot: usize,
     generation: u64,
 ) -> i64 {
-    let (handles, l1, stack) = match sched.kill(slot, generation) {
+    let (handles, l1, stack, blocked) = match sched.kill(slot, generation) {
         Ok(Some(ended)) => ended,
         Ok(None) => return 0,
         Err(error) => return error,
+    };
+    let owner = match blocked {
+        Some(Event::Lock(index)) => mutexes.owner(index),
+        _ => None,
     };
     for index in mutexes.release(slot) {
         sched.wake(Event::Lock(index));
     }
     for object in handles.objects() {
         release(sched, frames, pipes, mutexes, object);
+    }
+    if let Some(owner) = owner {
+        sched.unboost(
+            owner,
+            |e| matches!(e, Event::Lock(i) if mutexes.owner(i) == Some(owner)),
+        );
     }
     arch::flush_asid(slot);
     // SAFETY: the process is not current, so TTBR0 is not `l1`, and its tables hold only its frames.
@@ -871,9 +882,20 @@ unsafe extern "C" fn board_syscall(frame: &mut arch::TrapFrame) -> usize {
             let slot = sched.current().0;
             match mutexes.unlock(mutex, slot) {
                 Ok(()) => {
-                    sched.wake(Event::Lock(mutex.index as usize));
-                    sched
-                        .unboost(|e| matches!(e, Event::Lock(i) if mutexes.owner(i) == Some(slot)));
+                    // With no waiter woken, the caller's boost is unchanged and nothing new is ready.
+                    if sched.wake(Event::Lock(mutex.index as usize)) {
+                        sched.unboost(
+                            slot,
+                            |e| matches!(e, Event::Lock(i) if mutexes.owner(i) == Some(slot)),
+                        );
+                        if sched.outranked() {
+                            frame.x[0] = 0;
+                            // SAFETY: the caller masked IRQs, and `frame` is the current process's.
+                            return unsafe {
+                                switch(sched, frame as *mut arch::TrapFrame as usize)
+                            };
+                        }
+                    }
                     0
                 }
                 Err(error) => error as u64,
