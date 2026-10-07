@@ -1,11 +1,17 @@
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
-use std::thread::sleep;
+use std::sync::{Arc, Mutex};
+use std::thread::{self, sleep};
 use std::time::{Duration, Instant};
 
 /// Builds the kernel, boots it in QEMU with `extra` arguments, and returns the exit status and serial lines.
 fn boot(extra: &[&str]) -> (ExitStatus, Vec<String>) {
+    boot_with_input(extra, None)
+}
+
+/// As `boot`; with `input` = (`ready`, `bytes`), writes `bytes` to QEMU's stdin once the output contains `ready`.
+fn boot_with_input(extra: &[&str], mut input: Option<(&str, &[u8])>) -> (ExitStatus, Vec<String>) {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let build = Command::new(env!("CARGO"))
         .args(["build", "-p", "qemu-virt"])
@@ -27,10 +33,25 @@ fn boot(extra: &[&str]) -> (ExitStatus, Vec<String>) {
         ])
         .arg(root.join("target/aarch64-unknown-none-softfloat/debug/mog_os"))
         .args(extra)
-        .stdin(Stdio::null())
+        .stdin(match input {
+            Some(_) => Stdio::piped(),
+            None => Stdio::null(),
+        })
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
+
+    let out = Arc::new(Mutex::new(Vec::new()));
+    let mut stdout = qemu.stdout.take().unwrap();
+    let reader = thread::spawn({
+        let out = out.clone();
+        move || {
+            let mut buf = [0; 4096];
+            while let Ok(n @ 1..) = stdout.read(&mut buf) {
+                out.lock().unwrap().extend_from_slice(&buf[..n]);
+            }
+        }
+    });
 
     let deadline = Instant::now() + Duration::from_secs(30);
     let status = loop {
@@ -41,15 +62,17 @@ fn boot(extra: &[&str]) -> (ExitStatus, Vec<String>) {
             qemu.kill().unwrap();
             panic!("QEMU timed out");
         }
+        if let Some((ready, bytes)) = input
+            && String::from_utf8_lossy(&out.lock().unwrap()).contains(ready)
+        {
+            let _ = qemu.stdin.as_mut().unwrap().write_all(bytes);
+            input = None;
+        }
         sleep(Duration::from_millis(50));
     };
 
-    let mut out = String::new();
-    qemu.stdout
-        .take()
-        .unwrap()
-        .read_to_string(&mut out)
-        .unwrap();
+    reader.join().unwrap();
+    let out = String::from_utf8_lossy(&out.lock().unwrap()).into_owned();
     println!("{out}");
     let lines = out
         .lines()
@@ -364,7 +387,8 @@ fn priority_inheritance_lets_the_mutex_owner_outrun_a_middle_priority_spinner() 
         })
         .collect();
     // The timer is on, yet M never runs: something outranks it at every switch. L (priority 1) unlocks only while
-    // H's block lends it priority 3; without that, M (2) spins forever and the boot never powers off.
+    // H's block lends it priority 3; without that, M (2) spins forever and the boot never powers off. Unlocking hands
+    // the mutex to H at once, so L relocks only after H is done and M is killed.
     assert_eq!(
         pi,
         [
@@ -376,6 +400,7 @@ fn priority_inheritance_lets_the_mutex_owner_outrun_a_middle_priority_spinner() 
             "H: acquired",
             "P: high exited",
             "P: mid killed",
+            "L: relocked",
             "P: low exited",
         ]
     );
@@ -400,5 +425,33 @@ fn pipe_bench_reports_round_trip() {
         .expect("missing pipe line")
         .parse::<u64>()
         .unwrap();
+    assert!(status.success(), "QEMU exited with {status}");
+}
+
+#[test]
+fn console_reads_edited_lines_typed_ahead() {
+    // Both lines in one write once `E: ready` is out, when the first read is already blocked.
+    let input = Some(("E: ready", &b"hel\x7flo\rbye\r"[..]));
+    let (status, lines) = boot_with_input(&["-append", "test=echo"], input);
+    assert!(
+        !lines.iter().any(|l| l.starts_with("panic:")),
+        "kernel panicked"
+    );
+    let start = lines
+        .iter()
+        .position(|l| l == "E: ready")
+        .expect("missing ready line");
+    let console: Vec<_> = lines[start..].iter().take(5).collect();
+    assert_eq!(
+        console,
+        [
+            "E: ready",
+            "hel\u{8} \u{8}lo",
+            "bye",
+            "got: helo",
+            "got: bye"
+        ]
+    );
+    assert_no_leak(&lines, "echo");
     assert!(status.success(), "QEMU exited with {status}");
 }

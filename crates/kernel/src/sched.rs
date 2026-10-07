@@ -34,9 +34,14 @@ pub enum Event {
     Exit(usize),
     /// The mutex at this table index being unlocked.
     Lock(usize),
+    /// A console line being entered.
+    Console,
     /// Nothing: the boot context, which runs only once no other task is ready.
     Idle,
 }
+
+/// What `kill` hands back: handles, address space, kernel stack, and the event the task was blocked on.
+pub type Killed = (Handles, PhysAddr, PhysAddr, Option<Event>);
 
 #[derive(Clone, Copy, PartialEq)]
 enum State {
@@ -127,12 +132,16 @@ impl<const N: usize> Scheduler<N> {
         self.state[self.current] = State::Blocked(event);
     }
 
-    pub fn wake(&mut self, event: Event) {
+    /// True if a task was waiting for `event`.
+    pub fn wake(&mut self, event: Event) -> bool {
+        let mut woke = false;
         for state in &mut self.state[..self.end] {
             if *state == State::Blocked(event) {
                 *state = State::Ready;
+                woke = true;
             }
         }
+        woke
     }
 
     /// Ends the current task (never slot 0) with `code` and wakes its waiters; returns the next task's frame and the
@@ -146,22 +155,25 @@ impl<const N: usize> Scheduler<N> {
     }
 
     /// Ends the process in `slot` with `generation`, not the current task, as a fault would (`KILLED`) and wakes its
-    /// waiters; returns its handles (for the caller to release), address space and kernel stack (to free), or `None` if
-    /// it already exited; `EBADF` once a newer task took the slot.
-    pub fn kill(
-        &mut self,
-        slot: usize,
-        generation: u64,
-    ) -> Result<Option<(Handles, PhysAddr, PhysAddr)>, i64> {
+    /// waiters; returns its handles (for the caller to release), address space, kernel stack (to free) and the event it
+    /// was blocked on, or `None` if it already exited; `EBADF` once a newer task took the slot.
+    pub fn kill(&mut self, slot: usize, generation: u64) -> Result<Option<Killed>, i64> {
         if self.generation[slot] != generation {
             return Err(EBADF);
         }
-        if !matches!(self.state[slot], State::Ready | State::Blocked(_)) {
-            return Ok(None);
-        }
+        let blocked = match self.state[slot] {
+            State::Ready => None,
+            State::Blocked(event) => Some(event),
+            _ => return Ok(None),
+        };
         let handles = core::mem::take(&mut self.handles[slot]);
         self.end(slot, KILLED);
-        Ok(Some((handles, self.tasks[slot].1, self.memory[slot].stack)))
+        Ok(Some((
+            handles,
+            self.tasks[slot].1,
+            self.memory[slot].stack,
+            blocked,
+        )))
     }
 
     /// Marks the task in `slot` exited with `code`, kept as a zombie while another task holds a handle to it, and wakes
@@ -230,10 +242,11 @@ impl<const N: usize> Scheduler<N> {
         self.effective[slot] = self.effective[slot].max(self.effective[self.current]);
     }
 
-    /// The current task unlocked a mutex: it drops back to its own priority, raised by tasks still waiting for one it
-    /// owns (`owns(event)`). One level: a waiter's boost does not pass on to the owner of a mutex that owner waits for.
-    pub fn unboost(&mut self, owns: impl Fn(Event) -> bool) {
-        let mut priority = self.priority[self.current];
+    /// `slot` lost a waiter (unlock or kill): it drops back to its own priority, raised by tasks still waiting for a
+    /// mutex it owns (`owns(event)`). One level: a waiter's boost does not pass on to the owner of a mutex that owner
+    /// waits for.
+    pub fn unboost(&mut self, slot: usize, owns: impl Fn(Event) -> bool) {
+        let mut priority = self.priority[slot];
         for (state, &effective) in self.state[..self.end].iter().zip(&self.effective) {
             if let State::Blocked(event) = *state
                 && owns(event)
@@ -241,7 +254,13 @@ impl<const N: usize> Scheduler<N> {
                 priority = priority.max(effective);
             }
         }
-        self.effective[self.current] = priority;
+        self.effective[slot] = priority;
+    }
+
+    /// A ready task's effective priority beats the current task's.
+    pub fn outranked(&self) -> bool {
+        let current = self.effective[self.current];
+        (0..self.end).any(|s| self.state[s] == State::Ready && self.effective[s] > current)
     }
 
     /// The current task's generation.

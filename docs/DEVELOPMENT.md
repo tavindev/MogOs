@@ -58,6 +58,7 @@ cargo run -- -append test=spawn      # spawner (from the boot archive) checks fa
 cargo run -- -append test=pipe       # reader blocks on an empty pipe until its child writer writes, reads EOF, waits for exit code 7, respawns into the reused slot; a stale process handle is EBADF; 8 KiB I/O moves 4 KiB (R: and W: lines); free frames before/after match
 cargo run -- -append test=wait       # waiter's child A exits before child B is spawned; wait still returns both codes and budgets; closing a third, exited child's handle returns its budget too (P: and C: lines); free frames before/after match
 cargo run -- -append test=pi         # timer on: L (priority 1) holds a mutex H (3) blocks on while Mid (2) is ready to spin forever; H acquires only through priority inheritance, then init kills Mid (L:, H:, P: lines; no M: line); free frames before/after match
+cargo run -- -append test=echo       # echo prints E: ready, reads two lines typed on the console (echoed, backspace erases), prints got: <line> for each
 cargo run -- -append test=bench-pipe # ping and pong echo one byte over two pipes 100000 times; prints the round trip in ns
 cargo run -p mogfs --example mkfs --target aarch64-apple-darwin -- disk.img 16384  # empty 64 MiB MogFS image
 cargo run -- -s -S     # boot halted, gdbstub on localhost:1234; attach lldb/gdb
@@ -74,7 +75,7 @@ Quit a hung QEMU with `Ctrl-A` then `X`.
 - `cargo run` must still boot and print the hello line.
 - Do not raise the `jobs` or linker `--threads` caps.
 - New crates use `[lints] workspace = true`. Never opt a crate out of `unsafe_code = "forbid"` unless it is an arch/board crate; put `unsafe` behind a safe API there.
-- Hot-path changes report before/after benchmark numbers; >5% regression needs justification (`docs/BENCHMARKS.md`).
+- Hot-path changes report before/after benchmark numbers; any regression fails unless no safe faster form exists (`docs/BENCHMARKS.md`).
 - Do not add dependencies without a stated reason.
 - Keep linker and profile settings unless a measurement (before/after `time cargo build`) justifies a change; record it in this file.
 - Do not touch the toolchain pin, `~/.rustup`, or global rustup config.

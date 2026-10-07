@@ -23,7 +23,10 @@ AGENTS.md
     └── docs/phases/phase-N-*.md      steps, done-when, what was done
 ```
 
-Every new `.md` file must be linked from its parent so it stays reachable from this root, and this tree must be updated when one is added.
+Each crate carries a `CLAUDE.md` ownership contract (what it is and is not, boundaries, invariants, how it is
+tested), auto-loaded when an agent works in that crate and linked from Layout below. A new crate gets one when it lands.
+
+Every new `.md` file must be linked from its parent so it stays reachable from this root, and this tree (or Layout, for crate docs) must be updated when one is added.
 
 ## Target
 
@@ -45,14 +48,14 @@ Every new `.md` file must be linked from its parent so it stays reachable from t
 
 ## Layout
 
-- `crates/kernel` — OS logic, `#![no_std]`, **no `unsafe`** (`forbid`). Defines ports (traits) like `Board`, the scheduler, handles, pipes, mutexes, syscall decoding and the boot archive's cpio and ELF parsers.
-- `crates/mm` — arch-independent memory management (`PhysAddr`, frame allocator). Safe, host-tested.
-- `crates/dtb` — minimal FDT parser. Safe, host-tested.
-- `crates/mogfs` — MogFS: checksummed copy-on-write file system over a `Disk` trait (format at the top of `src/lib.rs`). Safe, `no_std`, host-tested; `examples/mkfs.rs` writes an empty image.
-- `crates/arch` — the only arch-specific crate, `unsafe` allowed; AArch64 code in `src/aarch64/` (boot, traps, MMU and page tables, GICv2, timer).
-- `crates/board/qemu-virt` — board crate, `unsafe` allowed: drivers, memory map, `linker.ld`, `#[global_allocator]`, trap hooks (switch, syscall, fault), process setup and ELF loading, asm user programs (`user.s`); builds the `mog_os` binary. Its `build.rs` builds `crates/user` and bundles the programs as the boot archive (cpio).
-- `crates/user` — user programs (`src/bin/*.rs`, static ELFs at 4 GiB via `link.ld`) and their syscall stubs (`src/lib.rs`); user space, outside the workspace, `unsafe` only for `svc`.
-- `crates/e2e` — host-only QEMU boot tests (`tests/boot.rs`).
+- `crates/kernel` ([CLAUDE.md](crates/kernel/CLAUDE.md)) — OS logic, `#![no_std]`, **no `unsafe`** (`forbid`). Defines ports (traits) like `Board`, the scheduler, handles, pipes, mutexes, the console line discipline, syscall decoding and the boot archive's cpio and ELF parsers.
+- `crates/mm` ([CLAUDE.md](crates/mm/CLAUDE.md)) — arch-independent memory management (`PhysAddr`, frame allocator). Safe, host-tested.
+- `crates/dtb` ([CLAUDE.md](crates/dtb/CLAUDE.md)) — minimal FDT parser. Safe, host-tested.
+- `crates/mogfs` ([CLAUDE.md](crates/mogfs/CLAUDE.md)) — MogFS: checksummed copy-on-write file system over a `Disk` trait (format at the top of `src/lib.rs`). Safe, `no_std`, host-tested; `examples/mkfs.rs` writes an empty image.
+- `crates/arch` ([CLAUDE.md](crates/arch/CLAUDE.md)) — the only arch-specific crate, `unsafe` allowed; AArch64 code in `src/aarch64/` (boot, traps, MMU and page tables, GICv2, timer).
+- `crates/board/qemu-virt` ([CLAUDE.md](crates/board/qemu-virt/CLAUDE.md)) — board crate, `unsafe` allowed: drivers, memory map, `linker.ld`, `#[global_allocator]`, trap hooks (switch, syscall, fault), process setup and ELF loading, asm user programs (`user.s`); builds the `mog_os` binary. Its `build.rs` builds `crates/user` and bundles the programs as the boot archive (cpio).
+- `crates/user` ([CLAUDE.md](crates/user/CLAUDE.md)) — user programs (`src/bin/*.rs`, static ELFs at 4 GiB via `link.ld`) and their syscall stubs (`src/lib.rs`); user space, outside the workspace, `unsafe` only for `svc`.
+- `crates/e2e` ([CLAUDE.md](crates/e2e/CLAUDE.md)) — host-only QEMU boot tests (`tests/boot.rs`).
 - `.cargo/config.toml` — default target, build/link thread caps, QEMU runners.
 
 ## Architecture
@@ -74,7 +77,7 @@ Every new `.md` file must be linked from its parent so it stays reachable from t
 
 - Speed is a feature, so it is measured, not assumed. Details and baselines: `docs/BENCHMARKS.md`.
 - Every hot path gets a benchmark when it lands. Every change to a hot path reports before/after numbers.
-- A tracked benchmark slowing down by more than 5% (hvf or host medians, never TCG) needs an explicit justification; otherwise treat it as a failure.
+- Speed with complete safety is the moat. A tracked benchmark slowing down (hvf or host medians, never TCG) is a failure: an explanation does not excuse it. Remove it, or show with numbers that no safe faster form exists.
 
 ## Code rules
 

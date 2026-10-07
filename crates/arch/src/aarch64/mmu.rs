@@ -96,7 +96,7 @@ pub unsafe fn enable_mmu(l1: &[u64], mair: u64) {
     let sctlr: u64 = 1 << 0 | 1 << 2 | 1 << 12 // M, C, I: MMU, data and instruction caches on
         | 1 << 3 | 1 << 4 // SA, SA0: SP alignment checks at EL1 and EL0
         | 1 << 16 | 1 << 18 // nTWI, nTWE: EL0 wfi/wfe not trapped; EL0 cannot mask IRQs (UMA = 0), so a tick ends them
-        | 1 << 23 // SPAN: PAN untouched on exception entry (print_user reads user memory directly)
+        | 1 << 23 // SPAN: PAN untouched on exception entry (the kernel reads checked user pages directly)
         | 1 << 11 | 1 << 20 | 1 << 22 | 1 << 28 | 1 << 29; // RES1 on ARMv8.0
     // UMA, DZE, UCT, UCI = 0: EL0 cannot mask interrupts, zero or query caches, or maintain them; E0E, EE = 0: little endian.
     // SAFETY: the table is written and the caller guarantees it maps everything in use.

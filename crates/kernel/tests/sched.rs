@@ -191,13 +191,13 @@ fn highest_priority_runs_round_robin_within_a_level_and_a_waiter_lends_its_prior
     sched.block(Event::Lock(5));
     assert_eq!(sched.switch(0x400), 0x100, "low runs at high's priority");
 
-    sched.unboost(|e| e == Event::Lock(5));
+    sched.unboost(low, |e| e == Event::Lock(5));
     assert_eq!(
         sched.switch(0x100),
         0x100,
         "high still waits on a mutex low owns"
     );
-    sched.unboost(|e| e == Event::Lock(6));
+    sched.unboost(low, |e| e == Event::Lock(6));
     assert_eq!(sched.switch(0x100), 0x200, "back to 1: the 2s run");
     assert_eq!(sched.switch(0x200), 0x300, "round robin");
     assert_eq!(sched.switch(0x300), 0x200);
@@ -205,4 +205,36 @@ fn highest_priority_runs_round_robin_within_a_level_and_a_waiter_lends_its_prior
     sched.wake(Event::Lock(5));
     assert_eq!(sched.switch(0x200), 0x400);
     assert_eq!(sched.current().0, high);
+}
+
+#[test]
+fn killing_a_waiter_reports_its_event_so_the_owner_drops_its_boost_and_is_outranked() {
+    let mut sched = Scheduler::<4>::new();
+    let mut add_at = |frame, priority| {
+        let slot = sched.free_slot().unwrap();
+        sched.add(
+            slot,
+            frame,
+            PhysAddr(frame as u64),
+            MEMORY,
+            Handles::new(),
+            priority,
+        );
+        slot
+    };
+    let low = add_at(0x100, 1);
+    add_at(0x200, 2);
+    let high = add_at(0x300, 3);
+
+    assert_eq!(sched.switch(0x10), 0x300);
+    sched.boost(low.0);
+    sched.block(Event::Lock(5));
+    assert_eq!(sched.switch(0x300), 0x100);
+    assert!(!sched.outranked(), "low runs at high's priority");
+
+    let (.., event) = sched.kill(high.0, high.1).unwrap().unwrap();
+    assert_eq!(event, Some(Event::Lock(5)));
+    sched.unboost(low.0, |e| e == Event::Lock(5));
+    assert!(sched.outranked(), "back to 1, below the 2");
+    assert_eq!(sched.switch(0x100), 0x200);
 }
