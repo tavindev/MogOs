@@ -44,7 +44,7 @@ Every new `.md` file must be linked from its parent so it stays reachable from t
 - Run in a QEMU window: `cargo window` (mouse stays free; Ctrl+Option+G releases a grab)
 - Quit a hung QEMU: `Ctrl-A` then `X`
 - Test: `cargo test-host` (host tests, `crates/user`'s included, plus the QEMU boot tests in `crates/e2e`; must pass)
-- Benchmarks: `cargo bench-host` (host); kernel boot time is the `boot: <N> us` line; per-call and per-command A/B under hvf: `scripts/bench.sh` (`docs/BENCHMARKS.md`)
+- Benchmarks: `cargo bench-host` (host, criterion); kernel boot time is the `boot: <N> us` line; per-call and per-command A/B under hvf: `scripts/bench.sh` (`docs/BENCHMARKS.md`)
 - Debug: `cargo run -- -s -S`, then attach `lldb` / `gdb` to `localhost:1234`
 - Lint/format: `cargo clippy`, `cargo fmt` (must be clean; `crates/user` is outside the workspace, see `docs/DEVELOPMENT.md`). Settings, rules for agents: `docs/DEVELOPMENT.md`
 - Roadmap and current phase: `docs/ROADMAP.md` (one doc per phase in `docs/phases/`; update "What was done" when a step lands)
@@ -63,7 +63,7 @@ Every new `.md` file must be linked from its parent so it stays reachable from t
 - `crates/e2e` ([CLAUDE.md](crates/e2e/CLAUDE.md)) — host-only QEMU boot tests (`tests/boot.rs`).
 - `c` ([CLAUDE.md](c/CLAUDE.md)) — the C userland: musl with the MogOs syscall layer (`c/musl`), busybox, C test programs; `c/Makefile`, run by the board's `build.rs`, fetches the pinned sources and builds into one cache shared by every worktree (the main checkout's `target/c-cache`, keyed by a hash of the inputs); `target/c` links to it.
 - `.cargo/config.toml` — default target, build/link thread caps, QEMU runners.
-- `scripts/bench.sh` — boots kernels under hvf and prints each `bench` line's median and min, base vs new interleaved.
+- `scripts/bench.sh` — boots kernels under hvf and prints each `bench` line's median and min, base vs new interleaved; `host` mode does the same A/B for a crate's criterion benches.
 
 ## Architecture
 
