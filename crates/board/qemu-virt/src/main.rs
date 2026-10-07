@@ -29,6 +29,7 @@ use kernel::console::Line;
 use kernel::elf::Segment;
 use kernel::handle::{Handles, INIT_ARCHIVE, MAX_HANDLES, Rights};
 use kernel::mutex::Mutexes;
+use kernel::network::Network;
 use kernel::pipe::Pipes;
 use kernel::syscall::ENOENT;
 use kernel::{Event, FRAME_WORDS, Full, Memory, PRIORITIES, Program, Scheduler};
@@ -306,7 +307,7 @@ impl kernel::Board for QemuVirt {
     }
 
     fn tasks(&self) -> usize {
-        KERNEL.lock().sched.count()
+        KERNEL.lock().sched.count() - net::STARTED.load(Relaxed) as usize
     }
 
     fn disk(&mut self) -> Option<VirtioBlk> {
@@ -336,14 +337,19 @@ impl kernel::Board for QemuVirt {
         mounted
     }
 
-    fn start_net(&mut self, stack: ::net::Stack<'static>) -> bool {
-        net::start(self, stack)
+    fn nic(&mut self) -> Option<VirtioNet> {
+        net::nic()
     }
 
-    fn with_net<R>(
-        &mut self,
-        f: impl FnOnce(&mut ::net::Stack<'static>, &mut VirtioNet, u64) -> R,
-    ) -> R {
+    fn memory(&mut self, frames: usize) -> Option<&'static mut [u8]> {
+        net::memory(frames)
+    }
+
+    fn start_net(&mut self, network: &'static mut Network, nic: Option<VirtioNet>) {
+        net::start(self, network, nic)
+    }
+
+    fn with_net<R>(&mut self, f: impl FnOnce(&mut Network, Option<&mut VirtioNet>, u64) -> R) -> R {
         net::with(f)
     }
 

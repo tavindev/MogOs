@@ -24,7 +24,8 @@ const MAX_BUFFER: u64 = 4096;
 const MAX_MAP: u64 = 16 * PAGE;
 /// Bytes mapped above `STACK_TOP`, the scratch memory included, after which `map` gets only bad lengths.
 const MAPS: u64 = 32 * PAGE;
-const LAST_SYSCALL: u64 = 17;
+/// The socket calls (18-23) see no NetStack under `test=fuzz`, so they only reach their handle checks.
+const LAST_SYSCALL: u64 = 23;
 const POOL: usize = 48;
 
 const ERRNOS: [i64; 25] = [
@@ -383,8 +384,19 @@ impl Fuzzer {
             20 => 3,
             18 | 19 => {
                 let any = self.rng.next();
-                self.rng
-                    .pick(&[18, 19, 64, 255, 1 << 32 | 1, 1 << 32 | 6, u64::MAX, any])
+                self.rng.pick(&[
+                    18,
+                    19,
+                    21,
+                    22,
+                    24,
+                    64,
+                    255,
+                    1 << 32 | 1,
+                    1 << 32 | 6,
+                    u64::MAX,
+                    any,
+                ])
             }
             nr => nr.max(1),
         };

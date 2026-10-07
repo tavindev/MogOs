@@ -25,10 +25,18 @@ touches memory through raw addresses: the board reads user buffers, copies pages
 - `syscall::dispatch` (`src/syscall.rs`): decodes `x8`/`x0`-`x5`, checks handles and rights, returns a `Call` for the
   board to execute. Syscall numbers and error constants are defined here.
 - `cpio::find`, `cpio::entries`, `elf::Elf::parse` (`src/cpio.rs`, `src/elf.rs`).
-- `network` (`src/network.rs`): the `net=<ip>/<prefix>[,gw=<ip>]` bootarg (`config`), the stack's tables on the heap
-  (`stack`, fallible), and `test=net` / `test=bench-net`. `run` calls `Board::start_net` only with that bootarg, before
-  `start_cpus`, and prints `net: no nic` if there is none; `Board::with_net` runs a closure on the stack and the NIC
-  and wakes the board's net task (`Event::Net`).
+- `network` (`src/network.rs`, design notes at its top): `Network`, up to three `net::Stack`s (`ETH` on the NIC,
+  the loopback pair `LO` 127.0.0.1 and `PEER` 127.0.0.2 over a `Wire`, since a stack never sends to itself) and the
+  socket table; `config` parses `net=<ip>/<prefix>[,gw=<ip>]`; `test=net` / `test=bench-net`. `run` probes the NIC
+  (`Board::nic`) only with that bootarg (`net: no nic` without one) and starts the network (`Board::memory` for the
+  rings, `Network::new` with the DTB's `rng_seed` as the TCP key, `Board::start_net`) with a NIC or for
+  `test=sockets` / `test=bench-sockets`, before `start_cpus`. A socket is an entry reached by index and generation,
+  counted by handles like a pipe, charged `SOCKET_FRAMES` (8) to its creator's budget (`Budget::charge`; the memory is
+  the fixed pool, so the charge is accounting) and refunded by the board with the last handle if the owner runs.
+  Ops run in the submitter's context (its buffers are mapped only there): tried at submit (not an accept) and by every
+  `complete` (`io_wait`); the board's net task only polls and wakes `Event::NetIo`. One receive-side op (receive,
+  accept, connect) and one send per socket: the ops a process has in flight are bounded by its sockets, so by its
+  budget (the step's "bounded queue charged to the budget"). A dead submitter's op slot is taken over (`alive`).
 
 ## Boundaries (hard)
 
@@ -68,6 +76,9 @@ touches memory through raw addresses: the board reads user buffers, copies pages
 - `MAX_BUFFER` (4 KiB) and `MAX_MAP` (16 pages) bound the work a syscall does under the board's big lock (IRQs masked); `user_buffer` checks
   every user range lies in `USER` (4 GiB..512 GiB).
 - Errors are negated musl errno values; `KILLED` (256) sits outside `exit`'s 0..=255.
+- Syscalls 18-23 (phase 8 step 50): socket, bind, listen, io_submit, io_wait (result in x0, tag in x1), shutdown. A
+  `NetStack` handle (`CONNECT`, `LISTEN`) makes sockets, which remember which of the two it held; socket handles carry
+  read and write; `io_submit` checks read (receive, accept) or write (send, connect) at submit.
 - Syscalls 0-17 (`src/syscall.rs` docs): exit, io_submit_wait, dup, close, map, open, spawn, pipe, wait, mutex, lock,
   unlock, kill, mkdir, readdir, sync, unlink, rename. `io_submit_wait` takes a file offset in x4 (files need it, the console and pipes
   ignore it; offsets live in libc, not in handles, so `Object` stays `Copy`). `open` takes flags in x3; the opened
@@ -99,6 +110,8 @@ touches memory through raw addresses: the board reads user buffers, copies pages
 
 ## How it's tested
 
+- Host: `tests/network.rs` drives `Network` over loopback (data both ways, stale socket generations, budget charge,
+  rights, ports, op slots).
 - Host: `cargo test --target aarch64-apple-darwin -p kernel` runs `tests/sched.rs`, `tests/handle.rs`,
   `tests/pipe.rs`, `tests/exec.rs` (cpio, ELF, archive listing), `tests/args.rs` (`spawn`'s argument checks), `tests/dispatch.rs` (`unlink`, `rename`, `sync` handle checks), `tests/file.rs` (path walk limits, `readdir` at
   tight buffer sizes, over an in-memory disk); `file` also end to end (`test=shell`, `test=bench-fs`).

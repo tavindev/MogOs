@@ -12,6 +12,15 @@ pub const WRITE: u64 = 1 << 1;
 pub const DUPLICATE: u64 = 1 << 3;
 pub const TRANSFER: u64 = 1 << 4;
 pub const EXEC: u64 = 1 << 5;
+/// A NetStack handle's: open connections, and listen.
+pub const CONNECT: u64 = 1 << 8;
+pub const LISTEN: u64 = 1 << 9;
+
+/// `io_submit` ops.
+pub const OP_RECEIVE: u64 = 0;
+pub const OP_SEND: u64 = 1;
+pub const OP_ACCEPT: u64 = 2;
+pub const OP_CONNECT: u64 = 3;
 
 /// `open` flags: create a missing file; empty the file.
 pub const CREATE: u64 = 1 << 0;
@@ -47,6 +56,15 @@ pub const EDEADLK: i64 = -35;
 pub const ENAMETOOLONG: i64 = -36;
 pub const ENOSYS: i64 = -38;
 pub const ENOTEMPTY: i64 = -39;
+pub const EADDRINUSE: i64 = -98;
+pub const ENETUNREACH: i64 = -101;
+pub const ECONNRESET: i64 = -104;
+pub const ENOBUFS: i64 = -105;
+pub const EISCONN: i64 = -106;
+pub const ENOTCONN: i64 = -107;
+pub const ETIMEDOUT: i64 = -110;
+pub const ECONNREFUSED: i64 = -111;
+pub const EHOSTUNREACH: i64 = -113;
 
 /// The exit code `wait` reports for a killed process.
 pub const KILLED: i64 = 256;
@@ -277,6 +295,103 @@ pub fn rename(from_dir: u64, from: &[u8], to_dir: u64, to: &[u8]) -> i64 {
             in("x3") to_dir, in("x4") to.as_ptr(), in("x5") to.len(), in("x8") 17, options(nostack))
     };
     result
+}
+
+/// A new TCP socket on the NetStack `net`, with its `CONNECT` and `LISTEN` rights.
+pub fn socket(net: u64) -> i64 {
+    syscall(18, [net, 0, 0, 0])
+}
+
+/// Sets the local port.
+pub fn bind(socket: u64, port: u16) -> i64 {
+    syscall(19, [socket, port.into(), 0, 0])
+}
+
+/// Listens on the bound port.
+pub fn listen(socket: u64) -> i64 {
+    syscall(20, [socket, 0, 0, 0])
+}
+
+/// Starts `op` on `socket`; `io_wait` reports its result with `tag`. `ptr` and `len` are its buffer (`OP_CONNECT`:
+/// the IPv4 address as a big-endian `u32` and the port).
+///
+/// # Safety
+///
+/// For `OP_RECEIVE` the kernel writes, and for `OP_SEND` reads, the `len` bytes at `ptr` until `io_wait` reports
+/// `tag`: they must stay mapped and, for a receive, unreferenced until then.
+pub unsafe fn io_submit(socket: u64, op: u64, ptr: u64, len: usize, tag: u64) -> i64 {
+    let result;
+    // SAFETY: as in `syscall`; the caller keeps the buffer as the kernel needs it.
+    unsafe {
+        asm!("svc #0", inlateout("x0") socket => result, in("x1") op, in("x2") ptr, in("x3") len,
+            in("x4") tag, in("x8") 21, options(nostack))
+    };
+    result
+}
+
+/// Starts a connection from `socket` to `ip`:`port`; `io_wait` reports 0 with `tag` once it is established.
+pub fn connect(socket: u64, ip: [u8; 4], port: u16, tag: u64) -> i64 {
+    let ip = u32::from_be_bytes(ip).into();
+    // SAFETY: a connect has no buffer.
+    unsafe { io_submit(socket, OP_CONNECT, ip, port.into(), tag) }
+}
+
+/// Starts an accept on the listening `socket`; `io_wait` reports a handle to the connection with `tag`.
+pub fn accept(socket: u64, tag: u64) -> i64 {
+    // SAFETY: an accept has no buffer.
+    unsafe { io_submit(socket, OP_ACCEPT, 0, 0, tag) }
+}
+
+/// Waits for the next op this process submitted to finish; returns its result and tag.
+pub fn io_wait() -> (i64, u64) {
+    let (result, tag);
+    // SAFETY: as in `syscall`; `io_wait` writes only x0 and x1.
+    unsafe {
+        asm!("svc #0", lateout("x0") result, lateout("x1") tag, in("x8") 22, options(nostack))
+    };
+    (result, tag)
+}
+
+/// Waits for the op with `tag`, dropping any other completion: for a process with nothing else in flight.
+pub fn wait_for(tag: u64) -> i64 {
+    loop {
+        match io_wait() {
+            (result, t) if t == tag => return result,
+            (result, _) if result == EINVAL => return result,
+            _ => {}
+        }
+    }
+}
+
+/// Receives into `buf`; 0 at the end of the stream. With nothing else in flight.
+pub fn receive(socket: u64, buf: &mut [u8]) -> i64 {
+    // SAFETY: `buf` stays borrowed until `wait_for` reports the op.
+    match unsafe { io_submit(socket, OP_RECEIVE, buf.as_mut_ptr() as u64, buf.len(), 0) } {
+        0 => wait_for(0),
+        error => error,
+    }
+}
+
+/// Sends all of `data`. With nothing else in flight.
+pub fn send(socket: u64, mut data: &[u8]) -> i64 {
+    while !data.is_empty() {
+        // SAFETY: `data` stays borrowed until `wait_for` reports the op.
+        let sent = match unsafe { io_submit(socket, OP_SEND, data.as_ptr() as u64, data.len(), 0) }
+        {
+            0 => wait_for(0),
+            error => error,
+        };
+        if sent < 0 {
+            return sent;
+        }
+        data = &data[sent as usize..];
+    }
+    0
+}
+
+/// Ends the send side of `socket`'s connection.
+pub fn shutdown(socket: u64) -> i64 {
+    syscall(23, [socket, 0, 0, 0])
 }
 
 /// Nanoseconds on the virtual counter.

@@ -114,6 +114,7 @@ fn release(
     let end = match object {
         Object::Pipe(end) => end,
         Object::Mutex(mutex) => return mutexes.close(mutex),
+        Object::Socket(sock) => return net::close(sched, sock),
         Object::Process { slot, generation } => {
             let limit = sched.close(slot, generation);
             let held = pipes.charged_to((slot, generation));
@@ -303,6 +304,7 @@ unsafe extern "C" fn board_syscall(frame: &mut arch::TrapFrame) -> usize {
             match object {
                 Object::Pipe(end) => pipes.open(end),
                 Object::Mutex(mutex) => mutexes.open(mutex),
+                Object::Socket(sock) => net::open(sock),
                 _ => {}
             }
             handle
@@ -448,6 +450,11 @@ unsafe extern "C" fn board_syscall(frame: &mut arch::TrapFrame) -> usize {
             return unsafe { task_exit(kernel, frame as *mut arch::TrapFrame as usize, KILLED) };
         }
         Ok(Call::Kill { slot, generation }) => kill(kernel, slot, generation) as u64,
+        Ok(Call::Net(call)) => match net::syscall(sched, call, &mut frame.x[1]) {
+            Some(result) => result as u64,
+            // SAFETY: the caller masked IRQs, and `frame` is the current process's.
+            None => return unsafe { block(sched, frame, Event::NetIo) },
+        },
         Err(error) => error as u64,
     };
     frame as *mut arch::TrapFrame as usize

@@ -113,6 +113,8 @@ cargo run -- -drive file=disk.img,if=none,format=raw,id=d0 -device virtio-blk-de
 scripts/oscompare.sh [runs]  # same C benchmarks (c/oscb.c) on MogOs, Linux and macOS, interleaved; docs/BENCHMARKS.md "Cross-OS comparison"
 cargo run -- -netdev user,id=n0 -device virtio-net-device,netdev=n0 -append "test=net net=10.0.2.15/24,gw=10.0.2.2 udp=7777"  # needs a UDP echo on the host's 127.0.0.1:7777; pings 10.0.2.2 (ping: reply from ...), echoes mog over UDP (udp: echo ...), prints the frame counters; a net= bootarg without a NIC prints net: no nic
 QEMU_ARGS="-netdev user,id=n0 -device virtio-net-device,netdev=n0" scripts/bench.sh "bench-net net=10.0.2.15/24,gw=10.0.2.2 udp=7777" 21 <mog_os>  # UDP round trip, burst send and 16-in-flight stream to the host echo (docs/BENCHMARKS.md)
+cargo run -- -append test=sockets   # loopback only: C tcpecho server and client on musl's BSD sockets, nettest serving 8 connections at once through io_wait, a child without the NetStack handle (EBADF), a listen-only one (EACCES), one whose budget holds 3 sockets (ENOBUFS); free frames before/after match
+cargo run -- -append test=bench-sockets  # loopback TCP: 64-byte round trip, connect + close, 4 KiB stream sends (bench lines)
 cargo run -- -s -S     # boot halted, gdbstub on localhost:1234; attach lldb/gdb
 cargo build --release  # LTO release image
 ```

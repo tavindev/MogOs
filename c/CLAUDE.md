@@ -27,8 +27,14 @@ kernel's ABI is `crates/kernel/src/syscall.rs`, mirrored here by hand (numbers, 
 
 ## The libc ABI (invariants)
 
-- Handles at start: 0-2 stdin, stdout, stderr; 3 the root directory; 4 the boot archive. An absent one fails on
-  use. libc spawns children with the same five (a transfer-only placeholder for an absent slot).
+- Handles at start: 0-2 stdin, stdout, stderr; 3 the root directory; 4 the boot archive; 5 the NetStack. An absent
+  one fails on use. libc spawns children with the same six (a transfer-only placeholder for an absent slot; an absent
+  NetStack, the last, is left out, so a process without one spends no handle on it).
+- Sockets: `AF_INET` `SOCK_STREAM` only. `socket` makes a native socket on handle 5; `bind` takes the port (the
+  address is not checked: a socket listens on every interface); `connect`, `accept`, `read`/`write`,
+  `send`/`recv`(`to`/`from`) submit one native op and wait for it at once (one thread, so it is the only one in
+  flight); `shutdown` ends the send side (`SHUT_RD` alone does nothing); `setsockopt(SO_REUSEADDR)` succeeds (ports
+  rebind once closed), other options are `ENOPROTOOPT`; `accept` does not report the peer's address.
 - Arguments: when the first string is `<argc> <stdin> <stdout> <stderr> /<cwd>` (each stdio fd `t` console, `p`
   pipe, `d` directory, `f<offset>` a file, `a<offset>` a file opened to append; msh's `Grant::Posix` writes
   `<argc> /<cwd>`, stdio on the console), the next `argc` are argv and the rest envp, and the process starts in
@@ -60,7 +66,8 @@ kernel's ABI is `crates/kernel/src/syscall.rs`, mirrored here by hand (numbers, 
 
 - End to end in `crates/e2e/tests/boot.rs`: `a_c_program_on_musl_prints_gets_enosys_and_exits_with_its_code`,
   `busybox_sh_changes_files_that_survive_a_reboot_once_synced`, `musl_bench_reports_round_trips` (`cbench`),
-  `oscb_runs_the_cross_os_benchmarks`.
+  `oscb_runs_the_cross_os_benchmarks`, and `tcpecho` (server and client on BSD sockets) in
+  `sockets_echo_over_loopback_wait_for_any_and_need_the_net_handle_and_budget`.
 - `make -C c` alone builds everything; it is a no-op once the key is built. A new input file in `c/` must join
   `INPUTS` in the Makefile, or a change to it reuses a stale build.
 

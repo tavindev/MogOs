@@ -8,7 +8,8 @@ use core::slice;
 use arch::{UserAccess, user_page};
 use kernel::elf::{Elf, Segment};
 use kernel::handle::{
-    DUPLICATE, Handles, KILL, MAX_HANDLES, Object, READ, Rights, TRANSFER, WAIT, WRITE,
+    CONNECT, DUPLICATE, Handles, KILL, LISTEN, MAX_HANDLES, Object, READ, Rights, TRANSFER, WAIT,
+    WRITE,
 };
 use kernel::syscall::{EAGAIN, EFAULT, ENOEXEC, ENOMEM};
 use kernel::{FRAME_WORDS, Memory, Program, Scheduler};
@@ -217,6 +218,10 @@ pub(crate) fn spawn_init(
         let mut handles = Handles::init(slot.0, slot.1, archive);
         if *mounted {
             handles.insert(Object::Dir(ROOT), READ | WRITE | DUPLICATE | TRANSFER)?;
+        }
+        if crate::net::STARTED.load(core::sync::atomic::Ordering::Relaxed) {
+            let rights = CONNECT | LISTEN | DUPLICATE | TRANSFER;
+            handles.insert(Object::NetStack, rights)?;
         }
         let init = (slot, handles, priority);
         spawn_process(

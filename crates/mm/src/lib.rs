@@ -139,6 +139,20 @@ impl Budget {
         self.used -= 1;
     }
 
+    /// Charges `count` frames the kernel holds outside the allocator for the owner; false, charging nothing, over budget.
+    pub fn charge(&mut self, count: usize) -> bool {
+        let fits = count <= self.remaining();
+        if fits {
+            self.used += count;
+        }
+        fits
+    }
+
+    /// Refunds `count` frames `charge` took.
+    pub fn refund(&mut self, count: usize) {
+        self.used -= count;
+    }
+
     /// Lowers the limit by `frames`, which moved to a child's budget; panics if fewer remain.
     pub fn shrink(&mut self, frames: usize) {
         assert!(frames <= self.remaining(), "budget overdrawn");

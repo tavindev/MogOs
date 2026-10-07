@@ -4,8 +4,11 @@ use core::ops::Range;
 
 use mogfs::Inode;
 
-use crate::handle::{EXEC, Handles, KILL as KILL_RIGHT, MAX_HANDLES, Object, READ, WRITE};
+use crate::handle::{
+    CONNECT, EXEC, Handles, KILL as KILL_RIGHT, LISTEN, MAX_HANDLES, Object, READ, Rights, WRITE,
+};
 use crate::mutex::Mutex;
+use crate::network::{OP_ACCEPT, OP_CONNECT, OP_RECEIVE, OP_SEND, Sock};
 use crate::pipe::End;
 
 /// `exit(code)`: ends the calling process; `wait` reports the low 8 bits of `code`.
@@ -76,6 +79,31 @@ const UNLINK: u64 = 16;
 /// to the path `to` under `to_dir` (both write right), resolved as by `open`; returns 0. `EEXIST` if `to` exists,
 /// `EINVAL` if a directory would move below itself, `EROFS` on the boot archive.
 const RENAME: u64 = 17;
+/// `socket(net)`: returns a handle (read, write, duplicate, transfer) to a new TCP socket on the NetStack `net`, which
+/// needs `CONNECT` or `LISTEN` and passes the socket those of the two it holds. Its buffers are charged to the
+/// caller's budget until the last handle closes (`ENOBUFS`); `ENFILE` when the socket table is full.
+const SOCKET: u64 = 18;
+/// `bind(socket, port)`: sets the local port `listen` and `connect` use (0, the default, picks an ephemeral one for
+/// `connect`); returns 0. `EINVAL` once listening or connected.
+const BIND: u64 = 19;
+/// `listen(socket)`: listens on the bound port (`EINVAL` without one) on every interface (`LISTEN`, else `EACCES`;
+/// `EADDRINUSE`); returns 0.
+const LISTEN_CALL: u64 = 20;
+/// `io_submit(socket, op, ptr, len, tag)`: starts `op` and returns 0 at once; `io_wait` reports its result with `tag`.
+/// `OP_RECEIVE` reads at most `len` bytes into `ptr` (read right; 0 is the end of the stream), `OP_SEND` queues up to
+/// `len` bytes from `ptr` (write right) and reports how many, `OP_ACCEPT` (read right) reports a handle to the next
+/// connection on a listening socket (its buffers charged to the caller's budget), `OP_CONNECT` (write right and
+/// `CONNECT`) opens a connection to the IPv4 address `ptr` (a big-endian `u32`), port `len`, and reports 0 once it is
+/// established. A buffer must lie in user space and stays the caller's until the result is reported; `len` over
+/// `MAX_BUFFER` moves at most `MAX_BUFFER`. A socket takes one op that receives (receive, accept, connect) and one send
+/// at a time (`EBUSY`). Closing the last handle drops its ops unreported.
+const IO_SUBMIT: u64 = 21;
+/// `io_wait()`: waits until an op the caller submitted finishes; returns its result, and its tag in x1. `EINVAL` if
+/// none is in flight.
+const IO_WAIT: u64 = 22;
+/// `shutdown(socket)`: ends the send side (write right): a FIN follows the queued data; returns 0. `ENOTCONN` unless
+/// connected.
+const SHUTDOWN: u64 = 23;
 
 /// Most arguments a `spawn` passes.
 pub const MAX_ARGS: usize = 32;
@@ -144,6 +172,24 @@ pub const ENAMETOOLONG: i64 = -36;
 const ENOSYS: i64 = -38;
 /// Unlinking a directory that has entries.
 pub const ENOTEMPTY: i64 = -39;
+/// Listening on a port that is taken.
+pub const EADDRINUSE: i64 = -98;
+/// Connecting off the loopback network without a NIC, or with no route.
+pub const ENETUNREACH: i64 = -101;
+/// The peer reset the connection.
+pub const ECONNRESET: i64 = -104;
+/// A socket's buffers are over the budget.
+pub const ENOBUFS: i64 = -105;
+/// Connecting a socket that is connected or listening.
+pub const EISCONN: i64 = -106;
+/// Using a socket that is not connected.
+pub const ENOTCONN: i64 = -107;
+/// The peer stopped answering.
+pub const ETIMEDOUT: i64 = -110;
+/// The peer refused the connection.
+pub const ECONNREFUSED: i64 = -111;
+/// An ICMP error answered the connection request.
+pub const EHOSTUNREACH: i64 = -113;
 
 /// User virtual addresses: 4 GiB up to the 39-bit VA limit.
 const USER: Range<u64> = 1 << 32..1 << 39;
@@ -257,6 +303,28 @@ pub enum Call {
         slot: usize,
         generation: u64,
     },
+    /// A socket call: one variant, so the board handles them all out of its hot path.
+    Net(NetCall),
+}
+
+pub enum NetCall {
+    /// Create a socket with these NetStack rights.
+    Socket(Rights),
+    Bind {
+        sock: Sock,
+        port: u16,
+    },
+    Listen(Sock),
+    /// Submit `op` on `sock`; for a receive or send `ptr..ptr + len` is in `USER` unless empty, but may be unmapped.
+    Submit {
+        sock: Sock,
+        op: u8,
+        ptr: u64,
+        len: u32,
+        tag: u64,
+    },
+    IoWait,
+    Shutdown(Sock),
 }
 
 const _: () = assert!(size_of::<Call>() == 56, "every syscall returns a Call");
@@ -397,7 +465,57 @@ pub fn dispatch(nr: u64, args: &[u64; 7], handles: &mut Handles) -> Result<Call,
             Object::Dir(_) | Object::Node(_) => Ok(Call::Sync),
             _ => Err(ENOTDIR),
         },
+        SOCKET => match handles.entry(args[0])? {
+            (Object::NetStack, rights) if rights & (CONNECT | LISTEN) != 0 => {
+                Ok(Call::Net(NetCall::Socket(rights)))
+            }
+            _ => Err(EACCES),
+        },
+        BIND => {
+            let port = u16::try_from(args[1]).map_err(|_| EINVAL)?;
+            Ok(Call::Net(NetCall::Bind {
+                sock: socket(handles, args[0], 0)?,
+                port,
+            }))
+        }
+        LISTEN_CALL => Ok(Call::Net(NetCall::Listen(socket(handles, args[0], 0)?))),
+        IO_SUBMIT => {
+            let (op, ptr, len, tag) = (args[1], args[2], args[3], args[4]);
+            let need = match op {
+                OP_RECEIVE | OP_ACCEPT => READ,
+                OP_SEND | OP_CONNECT => WRITE,
+                _ => return Err(EINVAL),
+            };
+            let sock = socket(handles, args[0], need)?;
+            let len = match op {
+                OP_RECEIVE | OP_SEND => {
+                    let len = len.min(MAX_BUFFER);
+                    user_buffer(ptr, len)?;
+                    len
+                }
+                _ => len.min(u32::MAX.into()),
+            };
+            Ok(Call::Net(NetCall::Submit {
+                sock,
+                op: op as u8,
+                ptr,
+                len: len as u32,
+                tag,
+            }))
+        }
+        IO_WAIT => Ok(Call::Net(NetCall::IoWait)),
+        SHUTDOWN => Ok(Call::Net(NetCall::Shutdown(socket(
+            handles, args[0], WRITE,
+        )?))),
         _ => Err(ENOSYS),
+    }
+}
+
+/// The socket `handle` reaches, if it holds the rights in `need`.
+fn socket(handles: &Handles, handle: u64, need: Rights) -> Result<Sock, i64> {
+    match handles.get(handle, need)? {
+        Object::Socket(sock) => Ok(sock),
+        _ => Err(EACCES),
     }
 }
 

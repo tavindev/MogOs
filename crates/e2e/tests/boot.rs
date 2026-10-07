@@ -1215,3 +1215,34 @@ fn a_net_bootarg_without_a_nic_boots_as_before() {
     assert!(lines.iter().any(|l| l == "net: no nic"), "missing line");
     assert!(status.success(), "QEMU exited with {status}");
 }
+
+#[test]
+fn sockets_echo_over_loopback_wait_for_any_and_need_the_net_handle_and_budget() {
+    let (status, lines) = boot(&["-append", "test=sockets"]);
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.starts_with("panic:") || l.starts_with("fault:")),
+        "kernel panicked or a process faulted"
+    );
+    for expected in [
+        // Two C processes on musl's BSD sockets.
+        "tcpecho: served 5 bytes",
+        "tcpecho: hello",
+        // One process serves 8 connections at once through `io_wait`; another drives 8 clients the same way.
+        "nettest: served 8",
+        "nettest: 8 echoes",
+        // A child spawned without the NetStack handle, then one with a listen-only duplicate.
+        "nettest: no handle: EBADF",
+        "nettest: listen-only connect: EACCES",
+        // Socket buffers are charged to the budget.
+        "nettest: ENOBUFS after 3 sockets",
+    ] {
+        assert!(
+            lines.iter().any(|l| l == expected),
+            "missing line: {expected}"
+        );
+    }
+    assert_no_leak(&lines, "sockets");
+    assert!(status.success(), "QEMU exited with {status}");
+}

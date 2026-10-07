@@ -100,3 +100,26 @@ Decision: write `crates/net` fresh. smoltcp is a host-only dev-dependency of `cr
   (the host test runs the echo) and `a_net_bootarg_without_a_nic_boots_as_before`. Deviation: the net task runs at
   priority 0, so a spinning top-priority process starves it until the fair class (phase 5 step 29). Benchmarks
   (`test=bench-net`, `scripts/bench.sh` with `QEMU_ARGS`) in `docs/BENCHMARKS.md`.
+- **50.** Without phase 7 step 42 (no general non-blocking submit yet) and step 28: the completion ops are socket
+  ops only. `kernel::network` (design notes at its top): a NetStack handle (`CONNECT`, `LISTEN`) makes sockets, which
+  are kernel table entries reached by index and generation and counted by handles (a stale value never reaches a
+  later socket; the stack's bare `TcpId` is never used after its socket closes). Syscalls 18-23: `socket`, `bind`,
+  `listen`, `io_submit` (receive, send, accept, connect), `io_wait` (result in x0, tag in x1; wait-any) and
+  `shutdown`, the one typed option. Buffers can be touched only in the submitter's address space, so an op is tried at
+  submit (an accept only in `io_wait`, which makes its handle at once) and again by each `io_wait` until it finishes;
+  the net task only polls and wakes `Event::NetIo`. One receive-side op and one send per socket, so a process's
+  in-flight ops are bounded by its sockets and so by its budget: that is the step's bounded queue charged to the
+  budget, without a separate queue. The rings (16 KiB each way, 16 TCP slots per stack) are a pool taken from the
+  frame allocator once when the network starts; a socket charges `SOCKET_FRAMES` (8) to its creator's budget as
+  accounting (`Budget::charge`, `ENOBUFS`) and refunds it with the last handle if the creator still runs. The
+  loopback `Nic` is a wire between two stacks, `LO` (127.0.0.1, listeners) and `PEER` (127.0.0.2, connections to
+  127/8), since a stack never routes to its own address; a listener listens on `LO` and, with a NIC, `ETH`. The TCP key
+  is the DTB's `/chosen/rng-seed` (`Dtb::rng_seed`). musl maps `AF_INET` stream sockets (`c/CLAUDE.md`), handle 5
+  is the NetStack. e2e `sockets_echo_over_loopback_wait_for_any_and_need_the_net_handle_and_budget`: the C `tcpecho`
+  pair on musl, one process serving 8 connections at once through `io_wait` and another driving 8 clients the same
+  way, a child without the handle (`EBADF`), one with a listen-only duplicate (`EACCES`), one whose budget holds 3
+  sockets (`ENOBUFS`), no frame leaked; host `crates/kernel/tests/network.rs`. The socket calls are one `Call::Net`
+  handled out of line (`net::syscall`), which kept `board_syscall` unchanged for other calls: with them inline, an
+  A/B showed `wait` +4% and `kill` +33% (the latter from `free_table`'s loop moving across a cache line; it moved
+  back). Deviations: `bind` takes only a port (a socket listens on every interface), `accept` reports no peer
+  address, and the fuzzer reaches the socket calls only without a NetStack.

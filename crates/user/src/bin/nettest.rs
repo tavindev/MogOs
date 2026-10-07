@@ -1,0 +1,362 @@
+//! `test=sockets`'s init and its children. As init (no arguments): runs the C `tcpecho` server and client on musl's
+//! BSD sockets, then `nettest serve` (one process serving 8 connections at once through `io_wait`) with
+//! `nettest connect` (8 clients, the same way), then children that must fail: one without the NetStack handle, one
+//! with a listen-only duplicate, one whose budget holds 3 sockets. `nettest bench` (`test=bench-sockets`) times
+//! loopback TCP against `nettest benchserve`.
+#![no_std]
+#![no_main]
+
+use user::*;
+
+/// init's boot-archive directory handle.
+const DIR: u64 = 2;
+/// A child's NetStack: after its console.
+const CHILD_NET: u64 = 1;
+const CONNECTIONS: usize = 8;
+const ECHO_PORT: u16 = 7;
+/// The kernel's per-socket charge (`SOCKET_FRAMES`).
+const SOCKET_FRAMES: usize = 8;
+/// `nettest`'s own frames, measured: 14 with a `map`'s page and table, 12 without (the budget child's 3 sockets fit either way).
+const OWN_BUDGET: usize = 14;
+/// A C program on musl: its image, the 128 KiB stack `__mog_start` maps, heap, and one socket.
+const C_BUDGET: usize = 128;
+const ACCEPT: u64 = u64::MAX;
+/// Tags: connection `i`'s receive is `i`, its send `SEND + i`, its connect `CONNECT_TAG + i`.
+const SEND: u64 = 100;
+const CONNECT_TAG: u64 = 200;
+
+#[unsafe(no_mangle)]
+extern "C" fn _start(argc: usize, _: usize, len: usize) -> ! {
+    // SAFETY: x0 and x2 as the kernel started this process.
+    unsafe { start(argc, len, main) }
+}
+
+fn main(args: &[&[u8]]) -> u64 {
+    match arg(args, 1) {
+        b"serve" => serve(),
+        b"bench" => bench(),
+        b"benchserve" => bench_serve(),
+        b"connect" => connect_all(),
+        b"nonet" => report(b"no handle", socket(CHILD_NET)),
+        b"listenonly" => {
+            let sock = socket(CHILD_NET);
+            report(
+                b"listen-only connect",
+                connect(sock as u64, [127, 0, 0, 1], 1, 0),
+            )
+        }
+        b"budget" => {
+            let mut n = 0;
+            loop {
+                match socket(CHILD_NET) {
+                    s if s >= 0 => n += 1,
+                    ENOBUFS => break,
+                    error => return status(error),
+                }
+            }
+            write(CONSOLE, b"nettest: ENOBUFS after ");
+            write_u64(CONSOLE, n);
+            write(CONSOLE, b" sockets\n");
+            0
+        }
+        _ => init(),
+    }
+}
+
+/// Prints `nettest: <what>: <errno name>` for an expected failure; exits on anything else.
+fn report(what: &[u8], result: i64) -> u64 {
+    let name: &[u8] = match result {
+        EBADF => b"EBADF",
+        EACCES => b"EACCES",
+        _ => return 1,
+    };
+    write(CONSOLE, b"nettest: ");
+    write(CONSOLE, what);
+    write(CONSOLE, b": ");
+    write(CONSOLE, name);
+    write(CONSOLE, b"\n");
+    0
+}
+
+fn init() -> u64 {
+    let c = open(DIR, b"tcpecho", 0) as u64;
+    let posix = |net: u64| {
+        let console = || dup(CONSOLE, WRITE | READ | TRANSFER) as u64;
+        // Handles 3 and 4 (root, archive) are transfer-only placeholders: `tcpecho` needs neither.
+        let placeholder = || dup(CONSOLE, TRANSFER) as u64;
+        [
+            console(),
+            console(),
+            console(),
+            placeholder(),
+            placeholder(),
+            net,
+        ]
+    };
+    let server = spawn_at(c, &posix(net()), C_BUDGET, u64::MAX, b"tcpecho\0s\0");
+    let client = spawn_at(c, &posix(net()), C_BUDGET, u64::MAX, b"tcpecho\0c\0");
+    if server < 0 || client < 0 || wait(server as u64) != 0 || wait(client as u64) != 0 {
+        return 1;
+    }
+    let me = open(DIR, b"nettest", 0) as u64;
+    let child = |args: &[u8], handles: &[u64], sockets: usize| {
+        let budget = OWN_BUDGET + sockets * SOCKET_FRAMES;
+        spawn_at(me, handles, budget, u64::MAX, args)
+    };
+    let server = child(b"nettest\0serve\0", &[console(), net()], 1 + CONNECTIONS);
+    let client = child(b"nettest\0connect\0", &[console(), net()], CONNECTIONS);
+    if server < 0 || client < 0 || wait(server as u64) != 0 || wait(client as u64) != 0 {
+        return 2;
+    }
+    let listen_only = dup(init_net(), LISTEN | TRANSFER) as u64;
+    for (args, handles, sockets) in [
+        (&b"nettest\0nonet\0"[..], &[console()][..], 0),
+        (b"nettest\0listenonly\0", &[console(), listen_only], 1),
+        (b"nettest\0budget\0", &[console(), net()], 3),
+    ] {
+        let process = child(args, handles, sockets);
+        if process < 0 || wait(process as u64) != 0 {
+            return 3;
+        }
+    }
+    0
+}
+
+fn console() -> u64 {
+    dup(CONSOLE, WRITE | TRANSFER) as u64
+}
+
+fn net() -> u64 {
+    dup(init_net(), CONNECT | LISTEN | TRANSFER) as u64
+}
+
+/// init's NetStack: after the console, itself, the archive and, if a disk is mounted, the root directory, which a
+/// duplicate with `CONNECT` tells apart (it lacks the right).
+fn init_net() -> u64 {
+    let net = |h| {
+        let d = dup(h, CONNECT | TRANSFER);
+        d >= 0 && close(d as u64) == 0
+    };
+    [3, 4]
+        .into_iter()
+        .find(|&h| net(h))
+        .unwrap_or_else(|| exit(8))
+}
+
+/// `bench`'s rounds: 64-byte round trips, connect + close pairs, and 4 KiB sends streamed (16 MiB).
+const ROUND_TRIPS: u64 = 10_000;
+const CONNECTS: u64 = 1000;
+const CHUNKS: u64 = 4096;
+const BENCH_PORT: u16 = 9;
+
+/// Times, against `benchserve`: a 64-byte send + receive round trip, a connect + close, and a 4 KiB send of a
+/// stream; prints each as a `bench` line.
+fn bench() -> u64 {
+    let me = open(DIR, b"nettest", 0) as u64;
+    let budget = OWN_BUDGET + 2 * SOCKET_FRAMES;
+    let server = spawn_at(
+        me,
+        &[console(), net()],
+        budget,
+        u64::MAX,
+        b"nettest\0benchserve\0",
+    );
+    let buf = map(4096).unwrap_or_else(|| exit(7));
+    let net = init_net();
+    let sock = dial(net);
+    let start = now_ns();
+    for _ in 0..ROUND_TRIPS {
+        if send(sock, &buf[..64]) != 0 || !fill(sock, &mut buf[..64]) {
+            return 1;
+        }
+    }
+    report_ns(b"tcp-rtt", start, ROUND_TRIPS);
+    close(sock);
+    let start = now_ns();
+    for _ in 0..CONNECTS {
+        close(dial(net));
+    }
+    report_ns(b"tcp-connect", start, CONNECTS);
+    let sock = dial(net);
+    let start = now_ns();
+    for _ in 0..CHUNKS {
+        if send(sock, buf) != 0 {
+            return 2;
+        }
+    }
+    shutdown(sock);
+    // The server's one byte says it read the whole stream.
+    if receive(sock, &mut buf[..1]) != 1 {
+        return 3;
+    }
+    report_ns(b"tcp-stream-4k", start, CHUNKS);
+    close(sock);
+    if server < 0 || wait(server as u64) != 0 {
+        return 4;
+    }
+    0
+}
+
+/// A connection to `BENCH_PORT`, retrying while refused (the server may not listen yet).
+fn dial(net: u64) -> u64 {
+    loop {
+        let sock = socket(net) as u64;
+        match connect(sock, [127, 0, 0, 1], BENCH_PORT, 0) {
+            0 => match wait_for(0) {
+                0 => return sock,
+                ECONNREFUSED => close(sock),
+                _ => exit(5),
+            },
+            _ => exit(6),
+        };
+    }
+}
+
+/// Receives exactly `buf.len()` bytes; false at the end of the stream or on an error.
+fn fill(sock: u64, buf: &mut [u8]) -> bool {
+    let mut got = 0;
+    while got < buf.len() {
+        match receive(sock, &mut buf[got..]) {
+            n if n > 0 => got += n as usize,
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn report_ns(name: &[u8], start: u64, n: u64) {
+    write(CONSOLE, b"bench ");
+    write(CONSOLE, name);
+    write(CONSOLE, b": ");
+    write_u64(CONSOLE, (now_ns() - start) / n);
+    write(CONSOLE, b" ns\n");
+}
+
+/// `bench`'s other end: echoes the first connection, accepts and closes `CONNECTS`, then reads a stream to its end
+/// and answers one byte.
+fn bench_serve() -> u64 {
+    let listener = socket(CHILD_NET) as u64;
+    if bind(listener, BENCH_PORT) != 0 || listen(listener) != 0 {
+        return 1;
+    }
+    let next = || match accept(listener, 0) {
+        0 => wait_for(0),
+        error => error,
+    };
+    let buf = map(4096).unwrap_or_else(|| exit(4));
+    let sock = next() as u64;
+    loop {
+        match receive(sock, buf) {
+            0 => break,
+            n if n > 0 && send(sock, &buf[..n as usize]) == 0 => {}
+            _ => return 2,
+        }
+    }
+    close(sock);
+    for _ in 0..CONNECTS {
+        close(next() as u64);
+    }
+    let sock = next() as u64;
+    while receive(sock, buf) > 0 {}
+    if send(sock, b"!") != 0 {
+        return 3;
+    }
+    close(sock);
+    0
+}
+
+/// Receive buffers, one per connection, in memory nothing else references.
+fn buffers() -> &'static mut [u8] {
+    map(CONNECTIONS * 64).unwrap_or_else(|| exit(10))
+}
+
+/// Accepts `CONNECTIONS` connections on `ECHO_PORT`, all served at once: each received chunk is sent back, and a
+/// connection closes at its end of stream.
+fn serve() -> u64 {
+    let listener = socket(CHILD_NET) as u64;
+    if bind(listener, ECHO_PORT) != 0 || listen(listener) != 0 || accept(listener, ACCEPT) != 0 {
+        return 1;
+    }
+    let buf = buffers().as_mut_ptr() as u64;
+    let (mut conns, mut accepted, mut closed) = ([0; CONNECTIONS], 0, 0);
+    while closed < CONNECTIONS {
+        let (result, tag) = io_wait();
+        if result < 0 {
+            return 2;
+        }
+        let i = (tag % SEND) as usize;
+        // Connection `i`'s 64 bytes of `buf` are only ever in its one op in flight.
+        let at = |i: usize| buf + 64 * i as u64;
+        // SAFETY: as above.
+        let receive = |sock, i: usize| unsafe { io_submit(sock, OP_RECEIVE, at(i), 64, i as u64) };
+        let submitted = match tag {
+            ACCEPT => {
+                conns[accepted] = result as u64;
+                accepted += 1;
+                let more = if accepted < CONNECTIONS {
+                    accept(listener, ACCEPT)
+                } else {
+                    0
+                };
+                more | receive(result as u64, accepted - 1)
+            }
+            _ if tag >= SEND => receive(conns[i], i),
+            _ if result == 0 => {
+                closed += 1;
+                close(conns[i])
+            }
+            // SAFETY: as above.
+            _ => unsafe { io_submit(conns[i], OP_SEND, at(i), result as usize, SEND + i as u64) },
+        };
+        if submitted != 0 {
+            return 3;
+        }
+    }
+    write(CONSOLE, b"nettest: served 8\n");
+    0
+}
+
+/// Opens `CONNECTIONS` connections to `ECHO_PORT` at once (retrying refused ones: the server may not listen yet),
+/// sends each `echo <i>` and checks the reply, all through `io_wait`; then ends each stream.
+fn connect_all() -> u64 {
+    let buf = buffers();
+    let mut socks = [0; CONNECTIONS];
+    for (i, sock) in socks.iter_mut().enumerate() {
+        *sock = socket(CHILD_NET) as u64;
+        if connect(*sock, [127, 0, 0, 1], ECHO_PORT, CONNECT_TAG + i as u64) != 0 {
+            return 1;
+        }
+    }
+    let message = |i: usize| [b'e', b'c', b'h', b'o', b' ', b'0' + i as u8];
+    let mut echoes = 0;
+    while echoes < CONNECTIONS {
+        let (result, tag) = io_wait();
+        let i = (tag % SEND) as usize;
+        let at = buf.as_mut_ptr() as u64 + 64 * i as u64;
+        let submitted = match tag {
+            _ if tag >= CONNECT_TAG && result == ECONNREFUSED => {
+                close(socks[i]);
+                socks[i] = socket(CHILD_NET) as u64;
+                connect(socks[i], [127, 0, 0, 1], ECHO_PORT, tag)
+            }
+            _ if result < 0 => return 2,
+            _ if tag >= CONNECT_TAG => {
+                buf[64 * i..64 * i + 6].copy_from_slice(&message(i));
+                // SAFETY: connection `i`'s 64 bytes of `buf` are only touched between its ops.
+                unsafe { io_submit(socks[i], OP_SEND, at, 6, SEND + i as u64) }
+            }
+            // SAFETY: as above.
+            _ if tag >= SEND => unsafe { io_submit(socks[i], OP_RECEIVE, at, 64, i as u64) },
+            _ if buf[64 * i..64 * i + result as usize] == message(i) => {
+                echoes += 1;
+                shutdown(socks[i]) | close(socks[i])
+            }
+            _ => return 3,
+        };
+        if submitted != 0 {
+            return 4;
+        }
+    }
+    write(CONSOLE, b"nettest: 8 echoes\n");
+    0
+}

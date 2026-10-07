@@ -71,21 +71,27 @@ pub trait Board {
         archive: Rights,
         args: &[u8],
     ) -> Result<(), i64>;
-    /// Tasks in the run queue, the boot context included.
+    /// Tasks in the run queue, the boot context included and the net task not.
     fn tasks(&self) -> usize;
     /// The board's block device, set up with memory from the frame allocator; call once, after `init_frames`.
     fn disk(&mut self) -> Option<Self::Disk>;
     /// Mounts the MogFS on `disk` as the board's file system; once it is mounted, every process spawned from boot
     /// context also gets its root directory (read, write, duplicate, transfer) as handle 3. Never formats.
     fn mount(&mut self, disk: Self::Disk) -> Result<(), mogfs::Error>;
-    /// Runs `stack` on the NIC the probe found, in a kernel net task woken by the NIC's interrupt, by the timer tick
-    /// once the stack's next deadline passed, and by `with_net`; starts the timer. False, starting nothing, without a
-    /// NIC. Call once, after `disk`.
-    fn start_net(&mut self, stack: net::Stack<'static>) -> bool;
-    /// Runs `f` with the stack, the NIC and the time in ns, then wakes the net task. After `start_net` returned true.
+    /// The board's NIC, set up with frames from the frame allocator; call once, after `init_frames`.
+    fn nic(&mut self) -> Option<Self::Nic>;
+    /// `frames` contiguous frames from the frame allocator for the kernel's lifetime, as bytes; call after
+    /// `init_frames`.
+    fn memory(&mut self, frames: usize) -> Option<&'static mut [u8]>;
+    /// Runs `network` (its `ETH` stack on `nic`) in a kernel net task woken by the NIC's interrupt, by the timer tick
+    /// once the next deadline passed, by socket calls and by `with_net`; starts the timer. Every process spawned from
+    /// boot context from then on also gets a NetStack handle (connect, listen, duplicate, transfer) after its other
+    /// handles. Call once.
+    fn start_net(&mut self, network: &'static mut network::Network, nic: Option<Self::Nic>);
+    /// Runs `f` with the network, the NIC and the time in ns, then wakes the net task. After `start_net`.
     fn with_net<R>(
         &mut self,
-        f: impl FnOnce(&mut net::Stack<'static>, &mut Self::Nic, u64) -> R,
+        f: impl FnOnce(&mut network::Network, Option<&mut Self::Nic>, u64) -> R,
     ) -> R;
     /// Makes `n` uncontended acquire + release round trips on a ticket lock like the board's kernel lock (`ticket`),
     /// or on a test-and-set lock.
@@ -148,6 +154,8 @@ const PI_BUDGET: usize = 38;
 /// `fuzz`'s own frames, its scratch memory and `map`s, its pipes and its `nop` children: a child whose handle closes
 /// before it exits gives its frames back to the system, not to `fuzz`, so a million calls spend a few thousand.
 const FUZZ_BUDGET: usize = 8192;
+/// `nettest`'s own frames and its children's: two C programs on musl at once, then its own copies with their sockets.
+const NET_BUDGET: usize = 512;
 /// `sysbench`'s own frames, its 11 batches of 64 `map`ped pages that it never returns, its pipes and 4 `nop` children.
 const SYSBENCH_BUDGET: usize = 1024;
 /// Times msh runs `SHELL_BENCH` under `test=bench-shell`.
@@ -200,8 +208,19 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
     let config = bootargs
         .split_whitespace()
         .find_map(|a| network::config(a.strip_prefix("net=")?));
-    // Without a `net=` bootarg nothing is set up and nothing is printed.
-    let net = config.is_none_or(|c| board.start_net(network::stack(c).expect("net heap")));
+    // The NIC is probed only for a `net=` bootarg; loopback alone starts only for `test=sockets`.
+    let nic = config.and_then(|_| board.nic());
+    let no_nic = config.is_some() && nic.is_none();
+    let loopback = |a| a == "test=sockets" || a == "test=bench-sockets";
+    if nic.is_some() || bootargs.split_whitespace().any(loopback) {
+        let eth = config.filter(|_| nic.is_some());
+        let memory = board
+            .memory(network::frames(eth.is_some()))
+            .expect("net memory");
+        let key = dtb.rng_seed().expect("no rng-seed in DTB");
+        let network = network::Network::new(eth, key, memory).expect("net heap");
+        board.start_net(network::leak_one(network).expect("net heap"), nic);
+    }
 
     board.start_cpus(bootargs.split_whitespace().any(|a| a == "test=smp"));
     let boot_us = board.uptime_us();
@@ -214,7 +233,7 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
     if let Some(Err(error)) = mounted {
         let _ = writeln!(board.console(), "fs: {error:?}");
     }
-    if !net {
+    if no_nic {
         let _ = writeln!(board.console(), "net: no nic");
     }
 
@@ -249,6 +268,13 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
             "test=smp" => smp_test(board),
             "test=fuzz" => fuzz(board, bootargs),
             "test=bench-shell" => shell_bench(board),
+            "test=sockets" => run_archived(board, "sockets", "nettest", (NET_BUDGET, INIT_ARCHIVE)),
+            "test=bench-sockets" => run_checked(board, "bench-sockets", |board| {
+                let args = b"nettest\0bench\0";
+                board
+                    .spawn_archived("nettest", NET_BUDGET, INIT_ARCHIVE, args)
+                    .expect("spawn")
+            }),
             "test=bench-syscalls" => run_archived(
                 board,
                 "bench-syscalls",

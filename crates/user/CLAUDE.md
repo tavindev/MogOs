@@ -16,7 +16,9 @@ board crate).
 - `#![no_std]` (the lib `cfg_attr(not(test))`), `#![no_main]`, no dependencies. `unsafe` only in `src/lib.rs` for
   `svc`, `map`'s slice and `start`'s argument slice, and in bins for `#[unsafe(no_mangle)]`, the one call to the
   `unsafe fn start`, and `fuzz`'s and `sysbench`'s calls to `unsafe fn raw` (any syscall, all seven arguments; the caller keeps what the
-  kernel may write unreferenced); each block with a `// SAFETY:`.
+  kernel may write unreferenced), and `nettest`'s calls to `unsafe fn io_submit` (a receive buffer stays unreferenced
+  until `io_wait` reports it; `receive` and `send` wrap it safely for a process with one op in flight); each block with
+  a `// SAFETY:`.
 - A program that takes arguments defines `_start(argc, _, len)` and calls `unsafe { start(argc, len, main) }` with
   its x0 and x2, which hands `main` the arguments as `&[&[u8]]` (the kernel puts them at the end of the top stack page,
   `STACK_TOP`) and exits with its result; boot-spawned programs get none, except `fuzz` and msh under
@@ -63,7 +65,9 @@ board crate).
   (`shell_files_survive_a_reboot_only_once_synced`, `sync_reports_a_failed_flush`), and `sh` (the musl tests in `c/CLAUDE.md`),
   `fsbench` (`fs_bench_reports_round_trips`), `spawnbench` / `nop` (`spawn_bench_reports_round_trip`), `fuzz` / `nop`
   (`fuzzer_never_crashes_the_kernel_or_leaks_frames`), `sysbench` / `nop` (`syscall_benches_report_every_call`),
-  `shellsetup` / `msh` with arguments (`shell_bench_times_each_command_from_spawn_to_reap`), all in `crates/e2e/tests/boot.rs`.
+  `shellsetup` / `msh` with arguments (`shell_bench_times_each_command_from_spawn_to_reap`), `nettest` and the C
+  `tcpecho` (`sockets_echo_over_loopback_wait_for_any_and_need_the_net_handle_and_budget`), all in
+  `crates/e2e/tests/boot.rs`.
 - Clippy and fmt via the `crates/user` commands in `docs/DEVELOPMENT.md` must be clean.
 
 ---
