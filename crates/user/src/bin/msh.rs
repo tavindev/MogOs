@@ -45,51 +45,76 @@ struct Cwd {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn _start() -> ! {
+extern "C" fn _start(argc: usize, _: usize, len: usize) -> ! {
+    // SAFETY: `argc` and `len` are the x0 and x2 this process started with.
+    unsafe { start(argc, len, main) }
+}
+
+/// Without arguments (boot), reads command lines from the console. With them (`test=bench-shell`), runs each argument
+/// as a command line and prints `bench <line>: <ns> ns`, the time from spawning its program until reaping it.
+fn main(args: &[&[u8]]) -> u64 {
     let mut cwd = Cwd {
         path: [0; PATH],
         len: 0,
     };
+    if let [_, lines @ ..] = args {
+        let per_s = ticks_per_s() as u128;
+        for line in lines {
+            let mut spent = 0;
+            command(&mut cwd, line, &mut spent);
+            write(CONSOLE, b"bench ");
+            write(CONSOLE, line);
+            write(CONSOLE, b": ");
+            write_u64(CONSOLE, (spent as u128 * 1_000_000_000 / per_s) as u64);
+            write(CONSOLE, b" ns\n");
+        }
+        return 0;
+    }
     let mut buf = [0; 256];
     loop {
         write(CONSOLE, b"msh> ");
         let len = read(CONSOLE, &mut buf).max(0) as usize;
-        let mut words: [&[u8]; MAX_ARGS] = [&[]; MAX_ARGS];
-        let mut count = 0;
-        for word in buf[..len].split(|&b| b == b' ' || b == b'\n') {
-            if !word.is_empty() && count < MAX_ARGS {
-                words[count] = word;
-                count += 1;
-            }
+        command(&mut cwd, &buf[..len], &mut 0);
+    }
+}
+
+/// Runs the command `line`, adding the counter ticks from spawning its program until reaping it to `spent`.
+fn command(cwd: &mut Cwd, line: &[u8], spent: &mut u64) {
+    let mut words: [&[u8]; MAX_ARGS] = [&[]; MAX_ARGS];
+    let mut count = 0;
+    for word in line.split(|&b| b == b' ' || b == b'\n') {
+        if !word.is_empty() && count < MAX_ARGS {
+            words[count] = word;
+            count += 1;
         }
-        let words = &words[..count];
-        let Some(&command) = words.first() else {
-            continue;
-        };
-        let result = match command {
-            b"cd" => cd(&mut cwd, arg(words, 1)),
-            b"pwd" => {
-                write(CONSOLE, b"/");
-                write(CONSOLE, &cwd.path[..cwd.len]);
-                write(CONSOLE, b"\n");
-                0
-            }
-            b"exit" => exit(0),
-            b"help" => help(),
-            _ => run(&cwd, words),
-        };
-        if result < 0 {
-            write(CONSOLE, b"msh: ");
-            write(CONSOLE, command);
-            write(CONSOLE, b": ");
-            match ERRORS.iter().find(|e| e.0 == result) {
-                Some((_, name)) => {
-                    write(CONSOLE, name);
-                }
-                None => write_u64(CONSOLE, result.unsigned_abs()),
-            }
+    }
+    let words = &words[..count];
+    let Some(&command) = words.first() else {
+        return;
+    };
+    let result = match command {
+        b"cd" => cd(cwd, arg(words, 1)),
+        b"pwd" => {
+            write(CONSOLE, b"/");
+            write(CONSOLE, &cwd.path[..cwd.len]);
             write(CONSOLE, b"\n");
+            0
         }
+        b"exit" => exit(0),
+        b"help" => help(),
+        _ => run(cwd, words, spent),
+    };
+    if result < 0 {
+        write(CONSOLE, b"msh: ");
+        write(CONSOLE, command);
+        write(CONSOLE, b": ");
+        match ERRORS.iter().find(|e| e.0 == result) {
+            Some((_, name)) => {
+                write(CONSOLE, name);
+            }
+            None => write_u64(CONSOLE, result.unsigned_abs()),
+        }
+        write(CONSOLE, b"\n");
     }
 }
 
@@ -173,8 +198,9 @@ fn help() -> i64 {
 }
 
 /// Runs the command `words[0]` from msh's table, a program in the boot archive, with the console as handle 0 and then
-/// the handles its `Grant` names, and waits for it; its exit code is an errno.
-fn run(cwd: &Cwd, words: &[&[u8]]) -> i64 {
+/// the handles its `Grant` names, and waits for it, adding the ticks from its spawn to its reaping to `spent`; its exit
+/// code is an errno.
+fn run(cwd: &Cwd, words: &[&[u8]], spent: &mut u64) -> i64 {
     let Some(grant) = grant(words[0]) else {
         write(CONSOLE, b"msh: ");
         write(CONSOLE, words[0]);
@@ -187,6 +213,7 @@ fn run(cwd: &Cwd, words: &[&[u8]]) -> i64 {
     }
     let (mut handles, mut granted, mut args) = ([0; 3], 0, [0; PATH]);
     let result = give(cwd, words, grant, (&mut handles, &mut granted), &mut args).and_then(|len| {
+        let start = ticks();
         let process = spawn_at(
             exe as u64,
             &handles[..granted],
@@ -199,6 +226,7 @@ fn run(cwd: &Cwd, words: &[&[u8]]) -> i64 {
         }
         granted = 0;
         let code = wait(process as u64);
+        *spent += ticks() - start;
         close(process as u64);
         Ok(-code)
     });

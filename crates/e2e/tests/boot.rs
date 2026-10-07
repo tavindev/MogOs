@@ -844,6 +844,95 @@ fn spawn_bench_reports_round_trip() {
     assert!(status.success(), "QEMU exited with {status}");
 }
 
+/// The `bench <name>: <ns> ns` lines' times by name, in boot order.
+fn bench_lines(lines: &[String]) -> Vec<(String, f64)> {
+    lines
+        .iter()
+        .filter_map(|l| {
+            let (name, ns) = l.strip_prefix("bench ")?.rsplit_once(": ")?;
+            Some((name.to_string(), ns.strip_suffix(" ns")?.parse().ok()?))
+        })
+        .collect()
+}
+
+#[test]
+fn syscall_benches_report_every_call() {
+    let image = mogfs_image("bench-syscalls", 1024);
+    let (status, lines) = boot_with_disk(&image, "test=bench-syscalls");
+    std::fs::remove_file(&image).unwrap();
+    assert!(
+        !lines.iter().any(|l| l.starts_with("panic:")),
+        "kernel panicked"
+    );
+    let names: Vec<_> = bench_lines(&lines).into_iter().map(|b| b.0).collect();
+    assert_eq!(
+        names,
+        [
+            "console-write",
+            "console-read",
+            "pipe-write",
+            "pipe-read",
+            "file-write",
+            "file-read",
+            "dup",
+            "close",
+            "open",
+            "open-create",
+            "open-trunc",
+            "mkdir",
+            "readdir",
+            "unlink",
+            "rename",
+            "sync",
+            "sync-change",
+            "map",
+            "pipe",
+            "spawn",
+            "spawn-args",
+            "wait",
+            "kill",
+            "mutex",
+            "lock",
+            "unlock",
+            "enosys",
+        ]
+    );
+    assert_no_leak(&lines, "bench-syscalls");
+    assert!(status.success(), "QEMU exited with {status}");
+}
+
+#[test]
+fn shell_bench_times_each_command_from_spawn_to_reap() {
+    let image = mogfs_image("bench-shell", 1024);
+    let (status, lines) = boot_with_disk(&image, "test=bench-shell");
+    std::fs::remove_file(&image).unwrap();
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.starts_with("panic:") || l.starts_with("msh: ")),
+        "kernel panicked or a command failed"
+    );
+    let commands = [
+        "ls d1",
+        "ls d100",
+        "ls d390",
+        "cat small",
+        "cat big",
+        "write w hello",
+        "mkdir m",
+        "rm m",
+        "mv a b",
+        "mv b a",
+        "echo hi",
+    ];
+    let names: Vec<_> = bench_lines(&lines).into_iter().map(|b| b.0).collect();
+    // Five rounds; the 390 entries are the most MogFS v1 has inodes for beside the other fixtures.
+    assert_eq!(names, commands.repeat(5));
+    assert_eq!(lines.iter().filter(|l| *l == "hi").count(), 5);
+    assert_no_leak(&lines, "bench-shell");
+    assert!(status.success(), "QEMU exited with {status}");
+}
+
 /// Calls the fuzzer makes per seed, sized to the test-host time budget under TCG.
 const FUZZ_CALLS: u64 = 20000;
 

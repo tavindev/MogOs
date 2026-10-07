@@ -112,6 +112,14 @@ const PI_BUDGET: usize = 38;
 /// `fuzz`'s own frames, its scratch memory and `map`s, its pipes and its `nop` children: a child whose handle closes
 /// before it exits gives its frames back to the system, not to `fuzz`, so a million calls spend a few thousand.
 const FUZZ_BUDGET: usize = 8192;
+/// `sysbench`'s own frames, its 11 batches of 64 `map`ped pages that it never returns, its pipes and 4 `nop` children.
+const SYSBENCH_BUDGET: usize = 1024;
+/// msh's budget with its argument page.
+const SHELL_BENCH_BUDGET: usize = BOOT_BUDGET + 1;
+/// Times msh runs `SHELL_BENCH` under `test=bench-shell`.
+const SHELL_ROUNDS: usize = 5;
+/// msh's arguments under `test=bench-shell`: the command lines it times, on the fixtures `shellsetup` makes.
+const SHELL_BENCH: &[u8] = b"msh\0ls d1\0ls d100\0ls d390\0cat small\0cat big\0write w hello\0mkdir m\0rm m\0mv a b\0mv b a\0echo hi\0";
 
 /// `reserved` lists physical ranges in use (kernel image, DTB).
 pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> ! {
@@ -188,6 +196,10 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
             }
             "test=bench-pipe" => pipe_bench(board),
             "test=fuzz" => fuzz(board, bootargs),
+            "test=bench-shell" => shell_bench(board),
+            "test=bench-syscalls" => {
+                run_archived(board, "bench-syscalls", "sysbench", SYSBENCH_BUDGET)
+            }
             "test=budget" => {
                 let before = board.free_frames();
                 run_alone(board, Program::Budget);
@@ -310,6 +322,22 @@ fn fuzz<B: Board>(board: &mut B, bootargs: &str) {
         board
             .spawn_archived("fuzz", FUZZ_BUDGET, &args)
             .expect("spawn")
+    });
+}
+
+/// `shellsetup` makes the fixtures, then msh runs `SHELL_BENCH`'s command lines `SHELL_ROUNDS` times, timing each.
+fn shell_bench<B: Board>(board: &mut B) {
+    run_checked(board, "bench-shell", |board| {
+        board
+            .spawn_archived("shellsetup", BOOT_BUDGET, &[])
+            .expect("spawn");
+        wait(board);
+        for _ in 0..SHELL_ROUNDS {
+            board
+                .spawn_archived("msh", SHELL_BENCH_BUDGET, SHELL_BENCH)
+                .expect("spawn");
+            wait(board);
+        }
     });
 }
 

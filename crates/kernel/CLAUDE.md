@@ -84,7 +84,7 @@ touches memory through raw addresses: the board reads user buffers, copies pages
   the whole tree: about 500 requests, about 10.5 ms with IRQs masked, on a well-formed image (each directory read
   once), and about 7000, about 150 ms, on a crafted one (504 directories of 14 blocks each).
 - `Elf::parse` accepts only page-aligned, address-ordered, in-region `PT_LOAD`s, never W+X, entry in an executable one.
-- `BOOT_BUDGET`, `WAITER_BUDGET`, `PI_BUDGET`, `FUZZ_BUDGET` are sized to the user programs' frame needs: too small and `run`'s
+- `BOOT_BUDGET`, `WAITER_BUDGET`, `PI_BUDGET`, `FUZZ_BUDGET`, `SYSBENCH_BUDGET`, `SHELL_BENCH_BUDGET` are sized to the user programs' frame needs: too small and `run`'s
   `expect("spawn")` panics. `PIPE_ROUND_TRIPS` must equal `ROUND_TRIPS` in `crates/user/src/bin/ping.rs`; a mismatch
   only prints a wrong `pipe:` number, nothing fails.
 - Performance is the moat: a slowdown is never accepted because it has an explanation; it is removed, or shown to

@@ -289,6 +289,21 @@ pub fn now_ns() -> u64 {
     (count as u128 * 1_000_000_000 / freq as u128) as u64
 }
 
+/// The virtual counter: unlike `now_ns`, no division, so cheap enough inside a timed loop; `ticks_per_s` converts.
+pub fn ticks() -> u64 {
+    let count;
+    // SAFETY: as in `now_ns`.
+    unsafe { asm!("isb", "mrs {}, cntvct_el0", out(reg) count, options(nomem, nostack)) };
+    count
+}
+
+pub fn ticks_per_s() -> u64 {
+    let freq;
+    // SAFETY: as in `now_ns`.
+    unsafe { asm!("mrs {}, cntfrq_el0", out(reg) freq, options(nomem, nostack)) };
+    freq
+}
+
 /// A panic exits 255, outside the errno range a shell program's exit code uses.
 #[cfg(not(test))]
 #[panic_handler]

@@ -43,7 +43,7 @@ Every new `.md` file must be linked from its parent so it stays reachable from t
 - Run in a QEMU window: `cargo window` (mouse stays free; Ctrl+Option+G releases a grab)
 - Quit a hung QEMU: `Ctrl-A` then `X`
 - Test: `cargo test-host` (host tests, `crates/user`'s included, plus the QEMU boot tests in `crates/e2e`; must pass)
-- Benchmarks: `cargo bench-host` (host); kernel boot time is the `boot: <N> us` line
+- Benchmarks: `cargo bench-host` (host); kernel boot time is the `boot: <N> us` line; per-call and per-command A/B under hvf: `scripts/bench.sh` (`docs/BENCHMARKS.md`)
 - Debug: `cargo run -- -s -S`, then attach `lldb` / `gdb` to `localhost:1234`
 - Lint/format: `cargo clippy`, `cargo fmt` (must be clean; `crates/user` is outside the workspace, see `docs/DEVELOPMENT.md`). Settings, rules for agents: `docs/DEVELOPMENT.md`
 - Roadmap and current phase: `docs/ROADMAP.md` (one doc per phase in `docs/phases/`; update "What was done" when a step lands)
@@ -59,6 +59,7 @@ Every new `.md` file must be linked from its parent so it stays reachable from t
 - `crates/user` ([CLAUDE.md](crates/user/CLAUDE.md)) — user programs (`src/bin/*.rs`, static ELFs at 4 GiB via `link.ld`) and their syscall stubs (`src/lib.rs`); user space, outside the workspace, `unsafe` only for `svc`.
 - `crates/e2e` ([CLAUDE.md](crates/e2e/CLAUDE.md)) — host-only QEMU boot tests (`tests/boot.rs`).
 - `.cargo/config.toml` — default target, build/link thread caps, QEMU runners.
+- `scripts/bench.sh` — boots kernels under hvf and prints each `bench` line's median and min, base vs new interleaved.
 
 ## Architecture
 

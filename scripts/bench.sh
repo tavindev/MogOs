@@ -1,0 +1,72 @@
+#!/bin/sh
+# Usage: scripts/bench.sh <test> <rounds> <kernel> [<base kernel>]
+# Boots the kernel <rounds> times under hvf with -append test=<test>, each boot on a fresh 1024-block MogFS image, and
+# prints the median and min of every `bench <name>: <ns> ns` line. With a base kernel, each round boots both, the order
+# alternating, and prints the base, the new and the delta of each; `SLOWER` marks a call whose median and min both rose.
+set -eu
+[ $# -ge 3 ] || { sed -n '2,5s/^# //p' "$0"; exit 2; }
+test=$1 rounds=$2 new=$3 base=${4:-}
+root=$(cd "$(dirname "$0")/.." && pwd)
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+cargo run -q --manifest-path "$root/Cargo.toml" -p mogfs --example mkfs --target aarch64-apple-darwin -- \
+    "$tmp/clean.img" 1024 >/dev/null
+
+# boot <label> <kernel>: appends `<label> <tab> <name> <tab> <ns>` per bench line to $tmp/results.
+boot() {
+    cp "$tmp/clean.img" "$tmp/disk.img"
+    qemu-system-aarch64 -M virt -accel hvf -cpu cortex-a72 -m 128M -global virtio-mmio.force-legacy=false \
+        -global virtio-mmio.ioeventfd=off -nographic -kernel "$2" \
+        -drive file="$tmp/disk.img",if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0 \
+        -append "test=$test" </dev/null | tr -d '\r' >"$tmp/out"
+    if grep -qE '^(panic|fault):' "$tmp/out" || ! grep -q '^bench ' "$tmp/out"; then
+        cat "$tmp/out" >&2
+        echo "bench.sh: $2 failed" >&2
+        exit 1
+    fi
+    sed -n "s/^bench \(.*\): \([0-9.]*\) ns$/$1	\1	\2/p" "$tmp/out" >>"$tmp/results"
+}
+
+i=0
+while [ "$i" -lt "$rounds" ]; do
+    if [ -z "$base" ]; then
+        boot new "$new"
+    elif [ $((i % 2)) -eq 0 ]; then
+        boot base "$base"
+        boot new "$new"
+    else
+        boot new "$new"
+        boot base "$base"
+    fi
+    i=$((i + 1))
+done
+
+awk -F'\t' -v ab="${base:+1}" '
+function stats(key,    n, i, j, v, a) {
+    n = count[key]
+    for (i = 1; i <= n; i++) a[i] = values[key, i]
+    for (i = 2; i <= n; i++) { v = a[i]; for (j = i - 1; j > 0 && a[j] > v; j--) a[j + 1] = a[j]; a[j + 1] = v }
+    median = n % 2 ? a[(n + 1) / 2] : (a[n / 2] + a[n / 2 + 1]) / 2
+    min = a[1]
+}
+{
+    if (!(($2) in seen)) { seen[$2] = 1; names[++names_len] = $2 }
+    values[$1 SUBSEP $2, ++count[$1 SUBSEP $2]] = $3
+}
+END {
+    if (!ab) {
+        printf "%-16s %12s %12s %6s\n", "bench", "median ns", "min ns", "boots"
+        for (k = 1; k <= names_len; k++) {
+            stats("new" SUBSEP names[k])
+            printf "%-16s %12.1f %12.1f %6d\n", names[k], median, min, count["new" SUBSEP names[k]]
+        }
+        exit
+    }
+    printf "%-16s %12s %12s %8s %12s %12s %8s\n", "bench", "base median", "new median", "delta", "base min", "new min", "delta"
+    for (k = 1; k <= names_len; k++) {
+        stats("base" SUBSEP names[k]); bm = median; bn = min
+        stats("new" SUBSEP names[k]); nm = median; nn = min
+        printf "%-16s %12.1f %12.1f %+7.1f%% %12.1f %12.1f %+7.1f%%%s\n", names[k], bm, nm, (nm - bm) * 100 / bm, \
+            bn, nn, (nn - bn) * 100 / bn, (nm > bm && nn > bn) ? "  SLOWER" : ""
+    }
+}' "$tmp/results"
