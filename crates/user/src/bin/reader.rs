@@ -24,7 +24,7 @@ fn check(ok: bool, line: &[u8]) {
 #[unsafe(no_mangle)]
 extern "C" fn _start() -> ! {
     let (read_end, write_end) = pipe();
-    let exe = open(DIR, b"writer", EXEC) as u64;
+    let exe = open(DIR, b"writer", 0) as u64;
     let console = dup(CONSOLE, WRITE | TRANSFER) as u64;
     let writer_end = dup(write_end, WRITE | TRANSFER) as u64;
     let child = spawn(exe, &[console, writer_end], CHILD_BUDGET);

@@ -20,13 +20,15 @@ use arch::{MemoryType, UserAccess, l1_block, user_page};
 use dtb::Dtb;
 use kernel::console::Line;
 use kernel::elf::{Elf, Segment};
+use kernel::file;
 use kernel::handle::{DUPLICATE, Handles, KILL, MAX_HANDLES, Object, READ, TRANSFER, WAIT, WRITE};
 use kernel::mutex::Mutexes;
 use kernel::pipe::{self, End, Pipes};
 use kernel::syscall::{Call, EAGAIN, EBADF, EFAULT, ENFILE, ENOENT, ENOEXEC, ENOMEM, KILLED};
-use kernel::{Event, FRAME_WORDS, Full, Memory, PRIORITIES, Program, Scheduler};
+use kernel::{BLOCK_SIZE, Disk, Event, FRAME_WORDS, Full, Memory, PRIORITIES, Program, Scheduler};
 use linked_list_allocator::Heap;
 use mm::{Budget, FrameAllocator, PhysAddr};
+use mogfs::{Error, Fs, ROOT};
 use uart::Uart;
 use virtio_blk::VirtioBlk;
 
@@ -109,13 +111,16 @@ unsafe impl GlobalAlloc for KernelHeap {
     }
 }
 
-/// Task contexts, free frames, pipes, mutexes and console input; touched only with IRQs masked on the only core.
+/// Task contexts, free frames, pipes, mutexes, console input and the file system; touched only with IRQs masked on the
+/// only core. File system calls do their disk I/O inside a syscall, so a `sync` holds the core for its flushes.
 static KERNEL: Global = Global(UnsafeCell::new(Kernel {
     sched: Scheduler::new(),
     frames: FrameAllocator::empty(),
     pipes: Pipes::new(),
     mutexes: Mutexes::new(),
     line: Line::new(),
+    fs: Fs::new(FsDisk),
+    mounted: false,
 }));
 
 struct Kernel {
@@ -124,12 +129,54 @@ struct Kernel {
     pipes: Pipes<MAX_PIPES>,
     mutexes: Mutexes<MAX_MUTEXES>,
     line: Line,
+    fs: Fs<FsDisk>,
+    /// `fs` is mounted: boot-spawned processes get its root as handle 3.
+    mounted: bool,
 }
 
 struct Global(UnsafeCell<Kernel>);
 
 // SAFETY: one core, and the kernel state is only touched with IRQs masked, so accesses never overlap.
 unsafe impl Sync for Global {}
+
+/// The file system's block device, set by `Board::mount`; touched only with IRQs masked, through `FsDisk`.
+static FS_DISK: DiskSlot = DiskSlot(UnsafeCell::new(None));
+
+struct DiskSlot(UnsafeCell<Option<VirtioBlk>>);
+
+// SAFETY: one core, and the slot is only touched with IRQs masked, so accesses never overlap.
+unsafe impl Sync for DiskSlot {}
+
+/// `KERNEL.fs`'s disk: `FS_DISK`, so the const `Fs::new` builds the static before the device exists (mogfs has no
+/// way to replace an `Fs`'s disk); `Io` while there is none.
+struct FsDisk;
+
+impl FsDisk {
+    /// Valid only until the calling `Disk` method returns.
+    fn get<'a>() -> Option<&'a mut VirtioBlk> {
+        // SAFETY: only `KERNEL.fs` holds an `FsDisk`, and it and `FS_DISK` are touched only with IRQs masked on the only
+        // core, so this is the sole reference.
+        unsafe { (*FS_DISK.0.get()).as_mut() }
+    }
+}
+
+impl Disk for FsDisk {
+    fn read(&mut self, block: u64, bufs: &mut [[u8; BLOCK_SIZE]]) -> Result<(), Error> {
+        Self::get().ok_or(Error::Io)?.read(block, bufs)
+    }
+
+    fn write(&mut self, block: u64, bufs: &[[u8; BLOCK_SIZE]]) -> Result<(), Error> {
+        Self::get().ok_or(Error::Io)?.write(block, bufs)
+    }
+
+    fn flush(&mut self) -> Result<(), Error> {
+        Self::get().ok_or(Error::Io)?.flush()
+    }
+
+    fn blocks(&self) -> u64 {
+        Self::get().map_or(0, |disk| disk.blocks())
+    }
+}
 
 /// # Safety
 /// IRQs must be masked (trap context), so this is the only reference to the scheduler.
@@ -456,9 +503,18 @@ fn spawn_init(
 ) -> Result<(), i64> {
     let irq = arch::irq::disable();
     // SAFETY: IRQs are masked on the only core, so this is the sole reference.
-    let Kernel { sched, frames, .. } = unsafe { &mut *KERNEL.0.get() };
+    let Kernel {
+        sched,
+        frames,
+        mounted,
+        ..
+    } = unsafe { &mut *KERNEL.0.get() };
     let added = sched.free_slot().ok_or(EAGAIN).and_then(|slot| {
-        let init = (slot, Handles::init(slot.0, slot.1), priority);
+        let mut handles = Handles::init(slot.0, slot.1);
+        if *mounted {
+            handles.insert(Object::Dir(ROOT), READ | WRITE | DUPLICATE | TRANSFER)?;
+        }
+        let init = (slot, handles, priority);
         spawn_process(sched, frames, executable, Budget::new(budget), init)
     });
     arch::irq::restore(irq);
@@ -758,6 +814,18 @@ impl kernel::Board for QemuVirt {
         }
         None
     }
+
+    fn mount(&mut self, disk: VirtioBlk) -> Result<(), Error> {
+        let irq = arch::irq::disable();
+        // SAFETY: IRQs are masked on the only core, so this is the sole reference.
+        unsafe { *FS_DISK.0.get() = Some(disk) };
+        // SAFETY: as above.
+        let kernel = unsafe { &mut *KERNEL.0.get() };
+        let mounted = kernel.fs.mount();
+        kernel.mounted = mounted.is_ok();
+        arch::irq::restore(irq);
+        mounted
+    }
 }
 
 unsafe extern "C" {
@@ -843,6 +911,8 @@ unsafe extern "C" fn board_syscall(frame: &mut arch::TrapFrame) -> usize {
         pipes,
         mutexes,
         line,
+        fs,
+        ..
     } = kernel;
     let args = frame.x.first_chunk().unwrap();
     frame.x[0] = match kernel::syscall::dispatch(frame.x[8], args, sched.handles()) {
@@ -904,14 +974,64 @@ unsafe extern "C" fn board_syscall(frame: &mut arch::TrapFrame) -> usize {
             0
         }
         Ok(Call::Map { pages }) => map(sched, frames, pages).unwrap_or(ENOMEM as u64),
-        Ok(Call::Open { ptr, len, rights }) => user_bytes(ptr, len)
+        Ok(Call::File {
+            inode,
+            write: true,
+            offset,
+            ptr,
+            len,
+        }) => user_bytes(ptr, len)
             .ok_or(EFAULT)
-            .and_then(|name| kernel::cpio::find(ARCHIVE, name).ok_or(ENOENT))
-            .and_then(|file| {
-                let (start, end) = (file.start, file.end);
-                sched.handles().insert(Object::File { start, end }, rights)
+            .and_then(|data| fs.write(inode, offset, data).map_err(file::errno))
+            .map_or_else(|error| error as u64, |()| len as u64),
+        Ok(Call::File {
+            inode,
+            offset,
+            ptr,
+            len,
+            ..
+        }) => user_bytes_mut(ptr, len)
+            .ok_or(EFAULT)
+            .and_then(|buf| fs.read(inode, offset, buf).map_err(file::errno))
+            .map_or_else(|error| error as u64, |n| n as u64),
+        Ok(Call::Open {
+            dir,
+            ptr,
+            len,
+            flags,
+            rights,
+        }) => user_bytes(ptr, len)
+            .ok_or(EFAULT)
+            .and_then(|path| match dir {
+                Object::Dir(dir) => file::open(fs, dir, path, flags),
+                _ => kernel::cpio::find(ARCHIVE, path)
+                    .map(|file| Object::File {
+                        start: file.start,
+                        end: file.end,
+                    })
+                    .ok_or(ENOENT),
             })
+            .and_then(|object| sched.handles().insert(object, rights))
             .unwrap_or_else(|error| error as u64),
+        Ok(Call::Mkdir { dir, ptr, len }) => user_bytes(ptr, len)
+            .ok_or(EFAULT)
+            .and_then(|path| file::mkdir(fs, dir, path))
+            .map_or_else(|error| error as u64, |()| 0),
+        Ok(Call::Readdir {
+            dir,
+            ptr,
+            len,
+            start,
+        }) => user_bytes_mut(ptr, len)
+            .ok_or(EFAULT)
+            .and_then(|out| match dir {
+                Object::Dir(dir) => file::readdir(fs, dir, start, out),
+                _ => file::list_archive(ARCHIVE, start, out),
+            })
+            .map_or_else(|error| error as u64, |n| n as u64),
+        Ok(Call::Sync) => fs
+            .commit()
+            .map_or_else(|error| file::errno(error) as u64, |()| 0),
         Ok(Call::Spawn {
             file,
             ptr,

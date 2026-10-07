@@ -13,7 +13,11 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
 ## Responsibilities
 
 - `kmain`: reads the DTB at RAM base, builds `QemuVirt`, calls `kernel::run` with the image and DTB reserved.
-- `KERNEL` (`Scheduler`, `FrameAllocator`, `Pipes`, `Mutexes`) and `HEAP` statics.
+- `KERNEL` (`Scheduler`, `FrameAllocator`, `Pipes`, `Mutexes`, console `Line`, the MogFS `Fs<FsDisk>` and whether it
+  is mounted) and `HEAP` statics. `Fs::new` is const, so the 48 KiB file system is built in the static; its disk is
+  `FsDisk`, which forwards to `FS_DISK` (the `VirtioBlk` `Board::mount` stores, `Io` before), because mogfs cannot
+  replace an `Fs`'s disk. File syscalls run their disk I/O inside the trap with IRQs masked: a `sync` holds the core
+  for its writes and two flushes. Boot-spawned processes get the root directory as handle 3 once mounted (`spawn_init`).
 - Trap hooks `task_switch`, `board_irq`, `board_syscall`, `board_user_fault`: execute the `kernel::syscall::Call`
   that `dispatch` returns (user buffers, pages, frames, wake/block).
 - Processes: `spawn_process`, `spawn`, `task_exit`, `kill`, `map`, `release`, `enter` (TTBR0/ASID switch).

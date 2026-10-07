@@ -1,4 +1,4 @@
-//! Read-only lookup in a cpio archive in the newc format (`cpio -H newc`).
+//! Read-only lookup and listing in a cpio archive in the newc format (`cpio -H newc`).
 
 use core::ops::Range;
 
@@ -6,8 +6,13 @@ const HEADER: usize = 110;
 
 /// Where the data of the file named `name` lies in `archive`; `None` if it is absent or the archive is malformed.
 pub fn find(archive: &[u8], name: &[u8]) -> Option<Range<usize>> {
+    entries(archive).find(|e| e.0 == name).map(|e| e.1)
+}
+
+/// Each file's name and where its data lies, up to the trailer or the first malformed entry.
+pub fn entries(archive: &[u8]) -> impl Iterator<Item = (&[u8], Range<usize>)> {
     let mut pos = 0;
-    loop {
+    core::iter::from_fn(move || {
         let header = archive.get(pos..pos + HEADER)?;
         if &header[..6] != b"070701" {
             return None;
@@ -26,9 +31,7 @@ pub fn find(archive: &[u8], name: &[u8]) -> Option<Range<usize>> {
         if entry == b"TRAILER!!!" {
             return None;
         }
-        if entry == name {
-            return Some(data..data + size);
-        }
         pos = (data + size).next_multiple_of(4);
-    }
+        Some((entry, data..data + size))
+    })
 }

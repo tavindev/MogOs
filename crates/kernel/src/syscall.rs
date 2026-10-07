@@ -2,16 +2,19 @@
 
 use core::ops::Range;
 
+use mogfs::Inode;
+
 use crate::handle::{EXEC, Handles, KILL as KILL_RIGHT, MAX_HANDLES, Object, READ, WRITE};
 use crate::mutex::Mutex;
 use crate::pipe::End;
 
 /// `exit(code)`: ends the calling process; `wait` reports the low 8 bits of `code`.
 const EXIT: u64 = 0;
-/// `io_submit_wait(handle, op, ptr, len)`: submits I/O on `handle` and waits for it to complete; returns the bytes
-/// moved. `op` is `IO_READ` (into `ptr`, read right) or `IO_WRITE` (from `ptr`, write right). libc's `read` and `write`.
-/// A `len` over `MAX_BUFFER` moves at most `MAX_BUFFER` bytes (a short read or write). Reading the console waits for a
-/// line (`console::Line`); with two readers, whichever runs first gets it.
+/// `io_submit_wait(handle, op, ptr, len, offset)`: submits I/O on `handle` and waits for it to complete; returns the
+/// bytes moved. `op` is `IO_READ` (into `ptr`, read right) or `IO_WRITE` (from `ptr`, write right). libc's `pread` and
+/// `pwrite`; a file is read or written at `offset` (a read at or past its end returns 0), which the console and pipes
+/// ignore. A `len` over `MAX_BUFFER` moves at most `MAX_BUFFER` bytes (a short read or write). Reading the console
+/// waits for a line (`console::Line`); with two readers, whichever runs first gets it.
 const IO: u64 = 1;
 /// `dup(handle, rights)`: returns a new handle to the same object with `rights`, a subset of `handle`'s (duplicate right).
 const DUP: u64 = 2;
@@ -21,8 +24,10 @@ const CLOSE: u64 = 3;
 /// charged to the caller's budget; returns the address. The kernel picking the address leaves nothing to overlap, and
 /// it is what musl's `mmap(NULL, ...)` needs (its malloc falls back from `brk` to `mmap`).
 const MAP: u64 = 4;
-/// `open(dir, name_ptr, name_len, rights)`: returns a handle with `rights` to the file `name` in directory `dir`, which
-/// needs read and every right in `rights`. Names resolve only relative to a directory handle.
+/// `open(dir, path_ptr, path_len, flags)`: returns a handle with `dir`'s rights to the file or directory at `path`
+/// under the directory `dir` (read right). `flags`: `CREATE` makes a missing file, `TRUNC` empties the file; either
+/// needs the write right, and on the boot archive is `EROFS`. Paths resolve only below a directory handle: each
+/// `/`-separated component must be a name, so `..`, `.`, an empty component (`/x`, `a//b`) is `EINVAL`.
 const OPEN: u64 = 5;
 /// `spawn(exe, handles_ptr, handles_len, budget, priority)`: starts the executable `exe` (exec right) as a new process
 /// at `priority`, capped at the caller's own (so no process escalates), moving it the `handles_len` handles at
@@ -48,6 +53,16 @@ const LOCK: u64 = 10;
 const UNLOCK: u64 = 11;
 /// `kill(process)`: ends the process (kill right) as a fault would; `wait` reports `KILLED`. 0 if it already exited.
 const KILL: u64 = 12;
+/// `mkdir(dir, path_ptr, path_len)`: makes a directory at `path` under `dir` (write right), resolved as by `open`;
+/// returns 0. `EROFS` on the boot archive.
+const MKDIR: u64 = 13;
+/// `readdir(dir, ptr, len, start)`: fills `ptr` with whole `name\n` entries (`name/\n` for a directory) of `dir` (read
+/// right) from entry `start` on, in creation order; returns the bytes written, 0 past the last entry. The caller
+/// advances `start` by the newlines it got. `EINVAL` if the next entry does not fit in `len`.
+const READDIR: u64 = 14;
+/// `sync(dir)`: makes every change to the file system `dir` (write right) is on durable, atomically; it holds the core
+/// for its writes and two flushes. `EIO` means unknown: the changes may or may not be durable.
+const SYNC: u64 = 15;
 
 /// The exit code `wait` reports for a process a fault killed: outside `exit`'s 0..=255.
 pub const KILLED: u64 = 256;
@@ -55,13 +70,17 @@ pub const KILLED: u64 = 256;
 pub const IO_READ: u64 = 0;
 pub const IO_WRITE: u64 = 1;
 
+/// `open` flags.
+pub const CREATE: u64 = 1 << 0;
+pub const TRUNC: u64 = 1 << 1;
+
 // Errors are negated musl errno values.
 
 /// Unlocking a mutex the caller does not own.
 pub const EPERM: i64 = -1;
 /// No such file in the directory.
 pub const ENOENT: i64 = -2;
-/// The disk failed a request.
+/// The disk failed a request, or the file system is corrupt.
 pub const EIO: i64 = -5;
 /// Not a valid executable.
 pub const ENOEXEC: i64 = -8;
@@ -76,13 +95,25 @@ pub const ENOMEM: i64 = -12;
 pub const EACCES: i64 = -13;
 /// Bad address: outside user space, unmapped, or (except for `io_submit_wait`) longer than `MAX_BUFFER`.
 pub const EFAULT: i64 = -14;
+/// The name exists.
+pub const EEXIST: i64 = -17;
+/// A path component, or a handle a call needs to be a directory, is a file.
+pub const ENOTDIR: i64 = -20;
+/// Reading, writing or truncating a directory.
+pub const EISDIR: i64 = -21;
 /// Invalid argument: a `map` of zero bytes or more than `MAX_MAP`, a `spawn` of more than `MAX_HANDLES` handles, an
-/// unknown I/O op.
-const EINVAL: i64 = -22;
+/// unknown I/O op or `open` flag, a path component that is not a name.
+pub const EINVAL: i64 = -22;
 /// The pipe or mutex table is full.
 pub const ENFILE: i64 = -23;
 /// The handle table is full.
 pub const EMFILE: i64 = -24;
+/// Past the largest file or directory.
+pub const EFBIG: i64 = -27;
+/// The file system is full.
+pub const ENOSPC: i64 = -28;
+/// Changing the boot archive.
+pub const EROFS: i64 = -30;
 /// Writing a pipe with no read end left.
 pub const EPIPE: i64 = -32;
 /// Locking a mutex the caller owns.
@@ -139,12 +170,38 @@ pub enum Call {
     Map {
         pages: usize,
     },
-    /// Open the boot archive's file whose name is at `ptr..ptr + len` (in `USER` unless empty, maybe unmapped) with `rights`.
-    Open {
+    /// Read (or write) the file `inode` at `offset` into (from) `ptr..ptr + len`, as for `Write`.
+    File {
+        inode: Inode,
+        write: bool,
+        offset: u64,
         ptr: u64,
         len: usize,
+    },
+    /// Open the path at `ptr..ptr + len` (in `USER` unless empty, maybe unmapped) under `dir` (the boot archive, or a
+    /// directory, then with `flags`) with `rights`.
+    Open {
+        dir: Object,
+        ptr: u64,
+        len: usize,
+        flags: u64,
         rights: u64,
     },
+    /// Make a directory at the path at `ptr..ptr + len` (as for `Open`) under `dir`.
+    Mkdir {
+        dir: Inode,
+        ptr: u64,
+        len: usize,
+    },
+    /// List `dir` (the boot archive or a directory) from entry `start` into `ptr..ptr + len`, as for `Read`.
+    Readdir {
+        dir: Object,
+        ptr: u64,
+        len: usize,
+        start: u64,
+    },
+    /// Commit the file system.
+    Sync,
     /// Spawn the boot archive's file `file`, moving the `len` handles at `ptr` (in `USER` unless empty, maybe unmapped) and `budget`.
     Spawn {
         file: Range<usize>,
@@ -186,6 +243,14 @@ pub fn dispatch(nr: u64, args: &[u64; 6], handles: &mut Handles) -> Result<Call,
                 Object::Pipe(end) if end.write == (op == IO_WRITE) => {
                     Ok(Call::Pipe { end, ptr, len })
                 }
+                Object::Node(inode) => Ok(Call::File {
+                    inode,
+                    write: op == IO_WRITE,
+                    offset: args[4],
+                    ptr,
+                    len,
+                }),
+                Object::Dir(_) => Err(EISDIR),
                 _ => Err(EACCES),
             }
         }
@@ -202,14 +267,25 @@ pub fn dispatch(nr: u64, args: &[u64; 6], handles: &mut Handles) -> Result<Call,
             }),
         },
         OPEN => {
-            let (dir, ptr, len, rights) = (args[0], args[1], args[2], args[3]);
-            let Object::Archive = handles.get(dir, READ | rights)? else {
+            let (ptr, len, flags) = (args[1], args[2], args[3]);
+            if flags & !(CREATE | TRUNC) != 0 {
+                return Err(EINVAL);
+            }
+            let (dir, rights) = handles.entry(args[0])?;
+            match dir {
+                Object::Archive if flags != 0 => return Err(EROFS),
+                Object::Archive | Object::Dir(_) => {}
+                _ => return Err(ENOTDIR),
+            }
+            if rights & READ == 0 || (flags != 0 && rights & WRITE == 0) {
                 return Err(EACCES);
-            };
+            }
             user_buffer(ptr, len)?;
             Ok(Call::Open {
+                dir,
                 ptr,
                 len: len as usize,
+                flags,
                 rights,
             })
         }
@@ -244,6 +320,39 @@ pub fn dispatch(nr: u64, args: &[u64; 6], handles: &mut Handles) -> Result<Call,
         KILL => match handles.get(args[0], KILL_RIGHT)? {
             Object::Process { slot, generation } => Ok(Call::Kill { slot, generation }),
             _ => Err(EACCES),
+        },
+        MKDIR => {
+            let (ptr, len) = (args[1], args[2]);
+            let dir = match handles.entry(args[0])? {
+                (Object::Archive, _) => return Err(EROFS),
+                (Object::Dir(_), rights) if rights & WRITE == 0 => return Err(EACCES),
+                (Object::Dir(dir), _) => dir,
+                _ => return Err(ENOTDIR),
+            };
+            user_buffer(ptr, len)?;
+            Ok(Call::Mkdir {
+                dir,
+                ptr,
+                len: len as usize,
+            })
+        }
+        READDIR => {
+            let (ptr, len) = (args[1], args[2]);
+            let dir = handles.get(args[0], READ)?;
+            let (Object::Archive | Object::Dir(_)) = dir else {
+                return Err(ENOTDIR);
+            };
+            user_buffer(ptr, len)?;
+            Ok(Call::Readdir {
+                dir,
+                ptr,
+                len: len as usize,
+                start: args[3],
+            })
+        }
+        SYNC => match handles.get(args[0], WRITE)? {
+            Object::Dir(_) => Ok(Call::Sync),
+            _ => Err(ENOTDIR),
         },
         _ => Err(ENOSYS),
     }

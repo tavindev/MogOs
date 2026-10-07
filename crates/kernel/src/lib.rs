@@ -5,6 +5,7 @@ extern crate alloc;
 pub mod console;
 pub mod cpio;
 pub mod elf;
+pub mod file;
 pub mod handle;
 pub mod mutex;
 pub mod pipe;
@@ -64,6 +65,9 @@ pub trait Board {
     fn tasks(&self) -> usize;
     /// The board's block device, set up with memory from the frame allocator; call once, after `init_frames`.
     fn disk(&mut self) -> Option<Self::Disk>;
+    /// Mounts the MogFS on `disk` as the board's file system; once it is mounted, every process spawned from boot
+    /// context also gets its root directory (read, write, duplicate, transfer) as handle 3. Never formats.
+    fn mount(&mut self, disk: Self::Disk) -> Result<(), mogfs::Error>;
 }
 
 /// Hand-written asm user programs the board provides; newer ones are ELF files in the boot archive.
@@ -141,14 +145,23 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
     board.init_frames(frames);
 
     let mut disk = board.disk();
+    let blocks = disk.as_ref().map(Disk::blocks);
+    // The raw disk tests keep the device to themselves.
+    let raw = bootargs
+        .split_whitespace()
+        .any(|a| a == "test=disk" || a == "test=bench-disk");
+    let mounted = disk.take_if(|_| !raw).map(|disk| board.mount(disk));
 
     let boot_us = board.uptime_us();
     let _ = writeln!(board.console(), "boot: {boot_us} us");
-    match &disk {
-        Some(disk) => writeln!(board.console(), "disk: {} blocks", disk.blocks()),
+    match blocks {
+        Some(blocks) => writeln!(board.console(), "disk: {blocks} blocks"),
         None => writeln!(board.console(), "disk: none"),
     }
     .ok();
+    if let Some(Err(error)) = mounted {
+        let _ = writeln!(board.console(), "fs: {error:?}");
+    }
 
     for arg in bootargs.split_whitespace() {
         match arg {
@@ -162,6 +175,8 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
             "test=pipe" => run_archived(board, "pipe", "reader", BOOT_BUDGET),
             "test=wait" => run_archived(board, "wait", "waiter", WAITER_BUDGET),
             "test=echo" => run_archived(board, "echo", "echo", BOOT_BUDGET),
+            "test=shell" => run_archived(board, "shell", "msh", BOOT_BUDGET),
+            "test=bench-fs" => run_archived(board, "bench-fs", "fsbench", BOOT_BUDGET),
             "test=pi" => {
                 board.start_timer();
                 run_archived(board, "pi", "pi", PI_BUDGET);

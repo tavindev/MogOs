@@ -15,7 +15,10 @@ board crate).
 - `#![no_std]`, `#![no_main]`, no dependencies. `unsafe` blocks only in `src/lib.rs` for `svc` and `map`'s slice
   (bins only use `#[unsafe(no_mangle)]`), each with a `// SAFETY:`.
 - Talks to the kernel only through `svc #0`; handles arrive at values 0, 1, ... as the spawner passed them
-  (init: 0 console, 1 itself, 2 boot archive).
+  (init: 0 console, 1 itself, 2 boot archive, 3 the MogFS root directory when a disk is mounted).
+- `read`/`write` are `read_at`/`write_at` at offset 0: `io_submit_wait` takes the file offset in x4, which the console
+  and pipes ignore (so the asm programs in `user.s` leave x4 as it is). `open` takes flags (`CREATE`, `TRUNC`), not
+  rights: the opened file gets the directory's.
 
 ## Invariants & rules
 
@@ -36,7 +39,8 @@ board crate).
 - Only end to end: `spawner` / `child` (`spawn_moves_handles_and_budget_to_the_child`), `reader` / `writer`
   (`parent_blocks_on_an_empty_pipe_until_the_child_writes`), `waiter` (`an_exited_child_keeps_its_slot_until_waited_for`),
   `pi` / `low` / `mid` / `high` (`priority_inheritance_lets_the_mutex_owner_outrun_a_middle_priority_spinner`),
-  `ping` / `pong` (`pipe_bench_reports_round_trip`), all in `crates/e2e/tests/boot.rs`.
+  `ping` / `pong` (`pipe_bench_reports_round_trip`), `msh` (`shell_files_survive_a_reboot_only_once_synced`),
+  `fsbench` (`fs_bench_reports_round_trips`), all in `crates/e2e/tests/boot.rs`.
 - Clippy and fmt via the `crates/user` commands in `docs/DEVELOPMENT.md` must be clean.
 
 ---

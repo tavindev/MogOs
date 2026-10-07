@@ -23,6 +23,7 @@
 | `-global virtio-mmio.ioeventfd=off` | same | QEMU handles a queue notify in the vCPU thread instead of handing it to the main loop: hvf 4 KiB requests +9% write+flush, +19% read (21 interleaved boots); 256 KiB unchanged. |
 | `test-host` alias | `.cargo/config.toml` | Runs tests for the host target, excluding the bare-metal-only `qemu-virt` and `arch`. A string, not an array, so a nested worktree's copy overrides it instead of concatenating. |
 | `bench-host` alias | `.cargo/config.toml` | Runs the host `benches/*.rs` targets (`--bench '*'`) for the same crates as `test-host`. |
+| `mkfs`, `shell` aliases | `.cargo/config.toml` | `cargo mkfs` writes an empty 64 MiB MogFS `disk.img` in the current directory; `cargo shell` boots into msh with it attached (`-drive`/`-device` after the runner's `-kernel <path>`). Strings, so a worktree's copy overrides them. |
 | `linked_list_allocator` (no features) | `crates/board/qemu-virt` | Kernel heap with `free` (phase 2 task stacks need it); a bare `Heap` with IRQs masked around each call (`arch::irq`), not its spinlock, which could deadlock on one core. In the board crate because it is the binary that owns `#[global_allocator]` and `unsafe` heap init. |
 | `panic = "abort"` | both profiles | No unwinding in a kernel. |
 | dev `opt-level = 1` | root `Cargo.toml` | Opt-level 0 kernel code has bloated stack frames and slow MMIO loops; measured build cost is zero. Trade-off: some locals show as optimized out in the debugger. |
@@ -65,6 +66,8 @@ cargo run -- -append test=bench-pipe # ping and pong echo one byte over two pipe
 cargo run -- -drive file=disk.img,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0 -append test=disk  # attach a raw image (`truncate -s 1M disk.img`); every boot prints `disk: <n> blocks` (`disk: none` without a disk); the first writes blocks 1-2 and flushes (disk: wrote), the next reads them back (disk: read ok); a failed flush prints disk: flush failed
 cargo run -- -drive file=disk.img,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0 -append test=bench-disk  # image of at least 8 MiB; sequential write+flush and read throughput in MiB/s, 4 KiB and 256 KiB per request
 cargo run -p mogfs --example mkfs --target aarch64-apple-darwin -- disk.img 16384  # empty 64 MiB MogFS image
+[ -f disk.img ] || cargo mkfs; cargo shell  # formats disk.img if missing, boots into msh with it: ls [dir], mkdir, touch, write <file> <text>, cat, sync, exit; files survive a reboot once synced
+cargo run -- -drive file=disk.img,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0 -append test=bench-fs  # MogFS image; open(CREATE|TRUNC)+write+sync and open+close round trips in ns
 cargo run -- -s -S     # boot halted, gdbstub on localhost:1234; attach lldb/gdb
 cargo build --release  # LTO release image
 ```

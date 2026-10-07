@@ -9,5 +9,9 @@ license.workspace = true
 test = false
 doctest = false
 
+[dev-dependencies]
+# Formats the shell tests' disk images.
+mogfs = { path = "../mogfs" }
+
 [lints]
 workspace = true

@@ -16,7 +16,7 @@ const PONG_BUDGET: usize = 9;
 extern "C" fn _start() -> ! {
     let (to_pong_read, to_pong) = pipe();
     let (from_pong, from_pong_write) = pipe();
-    let exe = open(DIR, b"pong", EXEC) as u64;
+    let exe = open(DIR, b"pong", 0) as u64;
     let pong = spawn(exe, &[to_pong_read as u64, from_pong_write], PONG_BUDGET);
     if to_pong_read < 0 || from_pong < 0 || pong < 0 {
         exit(1);

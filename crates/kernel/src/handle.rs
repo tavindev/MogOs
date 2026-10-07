@@ -2,6 +2,8 @@
 //! so a closed handle's value never reaches whatever reuses its entry. An entry is retired once its generation
 //! reaches 2^31, so handle values stay positive (never read as an error) and generations never wrap.
 
+use mogfs::Inode;
+
 use crate::mutex::Mutex;
 use crate::pipe::End;
 use crate::syscall::{EACCES, EBADF, EMFILE};
@@ -38,6 +40,10 @@ pub enum Object {
         start: usize,
         end: usize,
     },
+    /// A MogFS directory.
+    Dir(Inode),
+    /// A MogFS file.
+    Node(Inode),
     Pipe(End),
     Mutex(Mutex),
 }
@@ -117,7 +123,8 @@ impl Handles {
         self.0.iter().filter_map(|e| Some(e.1?.0))
     }
 
-    fn entry(&self, handle: u64) -> Result<(Object, Rights), i64> {
+    /// The object `handle` reaches and its rights.
+    pub fn entry(&self, handle: u64) -> Result<(Object, Rights), i64> {
         match self.0.get(handle as u32 as usize) {
             Some(&(generation, Some(entry))) if generation == (handle >> 32) as u32 => Ok(entry),
             _ => Err(EBADF),

@@ -26,7 +26,7 @@ extern "C" fn _start() -> ! {
     let (read_end, write_end) = pipe();
     let silent = dup(write_end, TRANSFER) as u64;
     close(write_end);
-    let writer = open(DIR, b"writer", EXEC) as u64;
+    let writer = open(DIR, b"writer", 0) as u64;
     let a = spawn(writer, &[silent], A_BUDGET);
     check(read_end >= 0 && a >= 0, b"P: spawned A\n");
     // A holds the only write end, without write: this read blocks until A's exit closes it.
@@ -36,7 +36,7 @@ extern "C" fn _start() -> ! {
         b"P: EOF once A exits\n",
     );
     close(read_end as u64);
-    let child = open(DIR, b"child", EXEC) as u64;
+    let child = open(DIR, b"child", 0) as u64;
     let b = spawn(child, &[console], B_BUDGET);
     check(b >= 0, b"P: spawned B\n");
     check(wait(a as u64) == 7, b"P: A exited with 7\n");

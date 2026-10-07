@@ -21,14 +21,14 @@ fn check(console: u64, ok: bool, line: &[u8]) {
 #[unsafe(no_mangle)]
 extern "C" fn _start() -> ! {
     let console = dup(CONSOLE, WRITE) as u64;
-    let missing = open(DIR, b"missing", EXEC);
+    let missing = open(DIR, b"missing", 0);
     check(console, missing == ENOENT, b"S: open missing: ENOENT\n");
     let empty = write(console, &[]);
     check(console, empty == 0, b"S: empty write: 0\n");
-    let bad = open(DIR, b"bad", EXEC) as u64;
+    let bad = open(DIR, b"bad", 0) as u64;
     let spawned = spawn(bad, &[CONSOLE], CHILD_BUDGET);
     check(console, spawned == ENOEXEC, b"S: spawn non-ELF: ENOEXEC\n");
-    let child = open(DIR, b"child", EXEC) as u64;
+    let child = open(DIR, b"child", 0) as u64;
     let spawned = spawn(child, &[CONSOLE], 1 << 20);
     check(
         console,

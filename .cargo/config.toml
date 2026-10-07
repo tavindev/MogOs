@@ -14,6 +14,10 @@ runner = "qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -global virtio-mmi
 test-host = "test --target aarch64-apple-darwin --workspace --exclude qemu-virt --exclude arch"
 # Host benchmarks (`benches/*.rs`, harness = false) for the same crates.
 bench-host = "bench --target aarch64-apple-darwin --workspace --exclude qemu-virt --exclude arch --bench *"
+# An empty 64 MiB MogFS image, `disk.img` in the current directory (overwrites it).
+mkfs = "run -p mogfs --example mkfs --target aarch64-apple-darwin -- disk.img"
+# Boots into msh with `disk.img` attached; `[ -f disk.img ] || cargo mkfs; cargo shell` formats it first if missing.
+shell = "run -- -drive file=disk.img,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0 -append test=shell"
 # Array alias (its quoted runner can't be a string), so it doesn't work inside nested worktrees.
 # Same as `cargo run`, but in a QEMU window that doesn't grab the mouse and stays open after power-off.
 window = ["run", "--config", "target.aarch64-unknown-none-softfloat.runner='qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -global virtio-mmio.force-legacy=false -global virtio-mmio.ioeventfd=off -device virtio-tablet-pci -display cocoa,show-cursor=on -serial vc -no-shutdown -kernel'"]

@@ -9,13 +9,25 @@ pub const CONSOLE: u64 = 0;
 
 pub const WRITE: u64 = 1 << 1;
 pub const TRANSFER: u64 = 1 << 4;
-pub const EXEC: u64 = 1 << 5;
+
+/// `open` flags: create a missing file; empty the file.
+pub const CREATE: u64 = 1 << 0;
+pub const TRUNC: u64 = 1 << 1;
 
 pub const EPERM: i64 = -1;
 pub const ENOENT: i64 = -2;
+pub const EIO: i64 = -5;
 pub const ENOEXEC: i64 = -8;
 pub const EBADF: i64 = -9;
 pub const ENOMEM: i64 = -12;
+pub const EACCES: i64 = -13;
+pub const EEXIST: i64 = -17;
+pub const ENOTDIR: i64 = -20;
+pub const EISDIR: i64 = -21;
+pub const EINVAL: i64 = -22;
+pub const EFBIG: i64 = -27;
+pub const ENOSPC: i64 = -28;
+pub const EROFS: i64 = -30;
 pub const EDEADLK: i64 = -35;
 
 /// The exit code `wait` reports for a killed process.
@@ -38,14 +50,49 @@ pub fn exit(code: u64) -> ! {
     }
 }
 
-/// `io_submit_wait(handle, IO_READ, ...)`: 0 at end of file.
-pub fn read(handle: u64, buf: &mut [u8]) -> i64 {
-    syscall(1, [handle, 0, buf.as_mut_ptr() as u64, buf.len() as u64])
+/// `io_submit_wait(handle, op, ptr, len, offset)`; files need `offset`, the console and pipes ignore it.
+fn io(handle: u64, op: u64, (ptr, len): (u64, usize), offset: u64) -> i64 {
+    let result;
+    // SAFETY: as in `syscall`; the kernel reads or writes only the `len` bytes at `ptr`.
+    unsafe {
+        asm!("svc #0", inlateout("x0") handle => result, in("x1") op, in("x2") ptr, in("x3") len,
+            in("x4") offset, in("x8") 1, options(nostack))
+    };
+    result
 }
 
-/// `io_submit_wait(handle, IO_WRITE, ...)`.
+/// `read_at` offset 0.
+pub fn read(handle: u64, buf: &mut [u8]) -> i64 {
+    read_at(handle, buf, 0)
+}
+
+/// Reads into `buf` from `offset`; 0 at end of file.
+pub fn read_at(handle: u64, buf: &mut [u8], offset: u64) -> i64 {
+    io(handle, 0, (buf.as_mut_ptr() as u64, buf.len()), offset)
+}
+
+/// `write_at` offset 0.
 pub fn write(handle: u64, bytes: &[u8]) -> i64 {
-    syscall(1, [handle, 1, bytes.as_ptr() as u64, bytes.len() as u64])
+    write_at(handle, bytes, 0)
+}
+
+pub fn write_at(handle: u64, bytes: &[u8], offset: u64) -> i64 {
+    io(handle, 1, (bytes.as_ptr() as u64, bytes.len()), offset)
+}
+
+/// Writes `n` in decimal.
+pub fn write_u64(handle: u64, mut n: u64) {
+    let mut digits = [0; 20];
+    let mut i = digits.len();
+    loop {
+        i -= 1;
+        digits[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    write(handle, &digits[i..]);
 }
 
 pub fn dup(handle: u64, rights: u64) -> i64 {
@@ -66,8 +113,10 @@ pub fn map(len: usize) -> Option<&'static mut [u8]> {
     Some(unsafe { core::slice::from_raw_parts_mut(addr as *mut u8, len) })
 }
 
-pub fn open(dir: u64, name: &[u8], rights: u64) -> i64 {
-    syscall(5, [dir, name.as_ptr() as u64, name.len() as u64, rights])
+/// Opens the file or directory at `path` (`/`-separated, relative to `dir`) with `dir`'s rights; `flags`: `CREATE`,
+/// `TRUNC`.
+pub fn open(dir: u64, path: &[u8], flags: u64) -> i64 {
+    syscall(5, [dir, path.as_ptr() as u64, path.len() as u64, flags])
 }
 
 /// `spawn_at` this process's own priority.
@@ -117,6 +166,32 @@ pub fn unlock(mutex: u64) -> i64 {
 
 pub fn kill(process: u64) -> i64 {
     syscall(12, [process, 0, 0, 0])
+}
+
+pub fn mkdir(dir: u64, path: &[u8]) -> i64 {
+    syscall(13, [dir, path.as_ptr() as u64, path.len() as u64, 0])
+}
+
+/// Fills `buf` with whole `name\n` entries (`name/\n` for a directory) from entry `start` on; returns the bytes
+/// written, 0 at the end.
+pub fn readdir(dir: u64, buf: &mut [u8], start: u64) -> i64 {
+    syscall(14, [dir, buf.as_mut_ptr() as u64, buf.len() as u64, start])
+}
+
+/// Makes every change to the file system durable; `EIO` leaves it unknown whether it did.
+pub fn sync(dir: u64) -> i64 {
+    syscall(15, [dir, 0, 0, 0])
+}
+
+/// Nanoseconds on the virtual counter.
+pub fn now_ns() -> u64 {
+    let (count, freq): (u64, u64);
+    // SAFETY: the kernel lets EL0 read the virtual counter and its frequency, which has no side effects.
+    unsafe {
+        asm!("isb", "mrs {}, cntvct_el0", "mrs {}, cntfrq_el0", out(reg) count, out(reg) freq,
+            options(nomem, nostack))
+    };
+    (count as u128 * 1_000_000_000 / freq as u128) as u64
 }
 
 #[panic_handler]

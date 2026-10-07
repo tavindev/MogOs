@@ -19,12 +19,7 @@ fn check(ok: bool, line: &[u8]) {
 }
 
 fn spawn_child(name: &[u8], handles: &[u64], priority: u64) -> u64 {
-    spawn_at(
-        open(DIR, name, EXEC) as u64,
-        handles,
-        CHILD_BUDGET,
-        priority,
-    ) as u64
+    spawn_at(open(DIR, name, 0) as u64, handles, CHILD_BUDGET, priority) as u64
 }
 
 #[unsafe(no_mangle)]

@@ -1,4 +1,5 @@
 use std::io::{Read, Write};
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
@@ -10,8 +11,9 @@ fn boot(extra: &[&str]) -> (ExitStatus, Vec<String>) {
     boot_with_input(extra, None)
 }
 
-/// As `boot`; with `input` = (`ready`, `bytes`), writes `bytes` to QEMU's stdin once the output contains `ready`.
-fn boot_with_input(extra: &[&str], mut input: Option<(&str, &[u8])>) -> (ExitStatus, Vec<String>) {
+/// As `boot`; with `input` = (`ready`, `chunks`), writes chunk `i` to QEMU's stdin once the output contains `ready`
+/// `i + 1` times.
+fn boot_with_input(extra: &[&str], input: Option<(&str, &[&[u8]])>) -> (ExitStatus, Vec<String>) {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let build = Command::new(env!("CARGO"))
         .args(["build", "-p", "qemu-virt"])
@@ -58,6 +60,7 @@ fn boot_with_input(extra: &[&str], mut input: Option<(&str, &[u8])>) -> (ExitSta
     });
 
     let deadline = Instant::now() + Duration::from_secs(30);
+    let mut sent = 0;
     let status = loop {
         if let Some(status) = qemu.try_wait().unwrap() {
             break status;
@@ -66,11 +69,15 @@ fn boot_with_input(extra: &[&str], mut input: Option<(&str, &[u8])>) -> (ExitSta
             qemu.kill().unwrap();
             panic!("QEMU timed out");
         }
-        if let Some((ready, bytes)) = input
-            && String::from_utf8_lossy(&out.lock().unwrap()).contains(ready)
+        if let Some((ready, chunks)) = input
+            && sent < chunks.len()
+            && String::from_utf8_lossy(&out.lock().unwrap())
+                .matches(ready)
+                .count()
+                > sent
         {
-            let _ = qemu.stdin.as_mut().unwrap().write_all(bytes);
-            input = None;
+            let _ = qemu.stdin.as_mut().unwrap().write_all(chunks[sent]);
+            sent += 1;
         }
         sleep(Duration::from_millis(50));
     };
@@ -436,7 +443,7 @@ fn pipe_bench_reports_round_trip() {
 #[test]
 fn console_reads_edited_lines_typed_ahead() {
     // Both lines in one write once `E: ready` is out, when the first read is already blocked.
-    let input = Some(("E: ready", &b"hel\x7flo\rbye\r"[..]));
+    let input = Some(("E: ready", &[&b"hel\x7flo\rbye\r"[..]][..]));
     let (status, lines) = boot_with_input(&["-append", "test=echo"], input);
     assert!(
         !lines.iter().any(|l| l.starts_with("panic:")),
@@ -548,5 +555,163 @@ fn disk_bench_reports_throughput() {
             .parse::<u64>()
             .unwrap();
     }
+    assert!(status.success(), "QEMU exited with {status}");
+}
+
+/// A raw image file as a `mogfs::Disk`, like `crates/mogfs/examples/mkfs.rs`.
+struct FileDisk(std::fs::File, u64);
+
+impl mogfs::Disk for FileDisk {
+    fn read(&mut self, block: u64, bufs: &mut [[u8; 4096]]) -> Result<(), mogfs::Error> {
+        self.0
+            .read_exact_at(bufs.as_flattened_mut(), block * 4096)
+            .map_err(|_| mogfs::Error::Io)
+    }
+
+    fn write(&mut self, block: u64, bufs: &[[u8; 4096]]) -> Result<(), mogfs::Error> {
+        self.0
+            .write_all_at(bufs.as_flattened(), block * 4096)
+            .map_err(|_| mogfs::Error::Io)
+    }
+
+    fn flush(&mut self) -> Result<(), mogfs::Error> {
+        self.0.sync_data().map_err(|_| mogfs::Error::Io)
+    }
+
+    fn blocks(&self) -> u64 {
+        self.1
+    }
+}
+
+/// As `disk_image`, formatted as an empty MogFS.
+fn mogfs_image(test: &str, blocks: u64) -> PathBuf {
+    let path = disk_image(test, blocks);
+    let file = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    mogfs::Fs::new(FileDisk(file, blocks)).format().unwrap();
+    path
+}
+
+/// Boots `test=shell` on `image`, typing each command once msh prompts for it; returns the exit status and each
+/// command with the lines msh printed for it.
+fn shell(image: &Path, commands: &[&str]) -> (ExitStatus, Vec<(String, Vec<String>)>) {
+    let drive = format!("file={},if=none,format=raw,id=d0", image.display());
+    let typed: Vec<Vec<u8>> = commands.iter().map(|c| format!("{c}\r").into()).collect();
+    let chunks: Vec<&[u8]> = typed.iter().map(Vec::as_slice).collect();
+    let (status, lines) = boot_with_input(
+        &[
+            "-drive",
+            &drive,
+            "-device",
+            "virtio-blk-device,drive=d0",
+            "-append",
+            "test=shell",
+        ],
+        Some(("msh> ", &chunks)),
+    );
+    assert!(
+        !lines.iter().any(|l| l.starts_with("panic:")),
+        "kernel panicked"
+    );
+    assert_no_leak(&lines, "shell");
+    let mut session: Vec<(String, Vec<String>)> = Vec::new();
+    for line in lines.iter().take_while(|l| !l.starts_with("shell: ")) {
+        match line.strip_prefix("msh> ") {
+            Some(command) => session.push((command.into(), Vec::new())),
+            None => {
+                if let Some((_, out)) = session.last_mut() {
+                    out.push(line.clone());
+                }
+            }
+        }
+    }
+    (status, session)
+}
+
+fn session(expected: &[(&str, &[&str])]) -> Vec<(String, Vec<String>)> {
+    expected
+        .iter()
+        .map(|(c, out)| (c.to_string(), out.iter().map(|l| l.to_string()).collect()))
+        .collect()
+}
+
+#[test]
+fn shell_files_survive_a_reboot_only_once_synced() {
+    let image = mogfs_image("shell", 1024);
+    let (status, boot1) = shell(
+        &image,
+        &[
+            "mkdir docs",
+            "write docs/a.txt hello",
+            "sync",
+            "write docs/b.txt late",
+            "ls docs",
+            "exit",
+        ],
+    );
+    assert!(status.success(), "QEMU exited with {status}");
+    assert_eq!(
+        boot1,
+        session(&[
+            ("mkdir docs", &[]),
+            ("write docs/a.txt hello", &[]),
+            ("sync", &[]),
+            ("write docs/b.txt late", &[]),
+            ("ls docs", &["a.txt", "b.txt"]),
+            ("exit", &[]),
+        ])
+    );
+
+    // b.txt was written but never synced, so the reboot drops it.
+    let (status, boot2) = shell(
+        &image,
+        &[
+            "ls",
+            "ls docs",
+            "cat docs/a.txt",
+            "cat ../x",
+            "cat /x",
+            "exit",
+        ],
+    );
+    std::fs::remove_file(&image).unwrap();
+    assert!(status.success(), "QEMU exited with {status}");
+    assert_eq!(
+        boot2,
+        session(&[
+            ("ls", &["docs/"]),
+            ("ls docs", &["a.txt"]),
+            ("cat docs/a.txt", &["hello"]),
+            ("cat ../x", &["msh: cat: EINVAL"]),
+            ("cat /x", &["msh: cat: EINVAL"]),
+            ("exit", &[]),
+        ])
+    );
+}
+
+#[test]
+fn fs_bench_reports_round_trips() {
+    let image = mogfs_image("bench-fs", 1024);
+    let (status, lines) = boot_with_disk(&image, "test=bench-fs");
+    std::fs::remove_file(&image).unwrap();
+    assert!(
+        !lines.iter().any(|l| l.starts_with("panic:")),
+        "kernel panicked"
+    );
+    for op in ["open+write+sync", "open+close"] {
+        lines
+            .iter()
+            .find_map(|l| {
+                l.strip_prefix(&format!("{op}: "))?
+                    .strip_suffix(" ns/round-trip")
+            })
+            .unwrap_or_else(|| panic!("missing {op} line"))
+            .parse::<u64>()
+            .unwrap();
+    }
+    assert_no_leak(&lines, "bench-fs");
     assert!(status.success(), "QEMU exited with {status}");
 }
