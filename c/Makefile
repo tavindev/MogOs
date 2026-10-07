@@ -6,7 +6,7 @@
 
 ROOT := $(abspath $(CURDIR)/..)
 MAIN := $(abspath $(dir $(shell git -C $(CURDIR) rev-parse --path-format=absolute --git-common-dir)))
-INPUTS := Makefile mog-cc link.ld busybox.config hello.c cbench.c $(sort $(shell find musl -type f))
+INPUTS := Makefile mog-cc link.ld busybox.config hello.c cbench.c oscb.c oscnop.c $(sort $(shell find musl -type f))
 KEY := $(shell { cat $(INPUTS); rustc --version; } | shasum -a 256 | cut -c1-16)
 CACHE := $(MAIN)/target/c-cache
 OUT := $(CACHE)/$(KEY)
@@ -39,7 +39,7 @@ HOSTPATH := $(OUT)/host:$(PATH)
 BUSYBOX_VARS := HOSTCC=cc CC=$(CC) AR=$(LLVM)/llvm-ar NM=$(LLVM)/llvm-nm STRIP=$(LLVM)/llvm-strip \
 	OBJCOPY=$(LLVM)/llvm-objcopy
 
-PROGRAMS := hello cbench
+PROGRAMS := hello cbench oscb oscnop
 BINS := $(OUT)/bin/busybox $(PROGRAMS:%=$(OUT)/bin/%)
 
 # One C build at a time across worktrees (lockf), so two agents never build into the same key.
