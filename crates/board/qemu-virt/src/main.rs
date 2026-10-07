@@ -359,7 +359,26 @@ fn map_zeroed(
     va: u64,
     access: UserAccess,
 ) -> Option<PhysAddr> {
-    let page = zeroed(frames, budget)?;
+    map_filled(frames, budget, (l1, va, access), (0, &[]))
+}
+
+/// As `map_zeroed`, with `bytes` at offset `at` of the frame (`at + bytes.len()` at most a page); only the rest is
+/// zeroed.
+fn map_filled(
+    frames: &mut FrameAllocator<FRAME_WORDS>,
+    budget: &mut Budget,
+    (l1, va, access): (PhysAddr, u64, UserAccess),
+    (at, bytes): (usize, &[u8]),
+) -> Option<PhysAddr> {
+    let page = budget.alloc(frames)?;
+    let base = page.0 as *mut u8;
+    let end = at + bytes.len();
+    // SAFETY: a fresh frame from the allocator: identity-mapped RAM that nothing else uses, and `end <= PAGE`.
+    unsafe { ptr::write_bytes(base, 0, at) };
+    // SAFETY: as above; `bytes` is kernel or user memory, never this frame.
+    unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), base.wrapping_add(at), bytes.len()) };
+    // SAFETY: as above.
+    unsafe { ptr::write_bytes(base.wrapping_add(end), 0, PAGE - end) };
     let leaf = user_page(page, access);
     // SAFETY: `l1` is a process's table built from zeroed frames like these, and `va` is a user address it leaves unmapped;
     // map's `next` only grows, by at most the budget, and budgets stay within RAM, so `va` stays far below 512 GiB.
@@ -441,21 +460,19 @@ fn spawn_process(
             };
             for offset in (0..segment.size as usize).step_by(PAGE) {
                 let va = segment.vaddr + offset as u64;
-                let page = map_zeroed(frames, &mut budget, l1, va, access)?;
                 let bytes = data.get(offset..).unwrap_or_default();
                 let bytes = &bytes[..bytes.len().min(PAGE)];
-                // SAFETY: `bytes` fits in the fresh frame `page`.
-                unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), page.0 as *mut u8, bytes.len()) };
-                // SAFETY: `page` is identity-mapped RAM.
-                unsafe { arch::sync_icache(page.0 as usize, PAGE) };
+                let page = map_filled(frames, &mut budget, (l1, va, access), (0, bytes))?;
+                if !segment.writable {
+                    // SAFETY: `page` is identity-mapped RAM.
+                    unsafe { arch::clean_dcache(page.0 as usize, PAGE) };
+                }
             }
         }
         let stack_page = USER_STACK_TOP - PAGE as u64;
-        let top = map_zeroed(frames, &mut budget, l1, stack_page, UserAccess::ReadWrite)?;
+        let top = (l1, stack_page, UserAccess::ReadWrite);
+        map_filled(frames, &mut budget, top, (PAGE - args.len(), args))?;
         if !args.is_empty() {
-            let at = top.0 as usize + PAGE - args.len();
-            // SAFETY: `args` is at most a page, so it fits at the end of the fresh frame `top`.
-            unsafe { ptr::copy_nonoverlapping(args.as_ptr(), at as *mut u8, args.len()) };
             map_zeroed(
                 frames,
                 &mut budget,
@@ -471,6 +488,7 @@ fn spawn_process(
         unsafe { arch::free_space(l1, |f| frames.free(f)) };
         return Err(ENOMEM);
     };
+    arch::invalidate_icache();
     let at = USER_STACK_TOP - args.len() as u64;
     let x = [argc as u64, at, args.len() as u64];
     // SAFETY: the kernel stack below `stack.end` is fresh and owned by the new process.

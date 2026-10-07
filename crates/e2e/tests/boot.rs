@@ -829,12 +829,17 @@ fn spawn_bench_reports_round_trip() {
         !lines.iter().any(|l| l.starts_with("panic:")),
         "kernel panicked"
     );
-    lines
-        .iter()
-        .find_map(|l| l.strip_prefix("spawn: ")?.strip_suffix(" ns/round-trip"))
-        .expect("missing spawn line")
-        .parse::<u64>()
-        .unwrap();
+    for op in ["spawn", "spawn+args"] {
+        lines
+            .iter()
+            .find_map(|l| {
+                l.strip_prefix(&format!("{op}: "))?
+                    .strip_suffix(" ns/round-trip")
+            })
+            .unwrap_or_else(|| panic!("missing {op} line"))
+            .parse::<u64>()
+            .unwrap();
+    }
     assert_no_leak(&lines, "bench-spawn");
     assert!(status.success(), "QEMU exited with {status}");
 }

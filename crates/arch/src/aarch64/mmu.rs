@@ -286,12 +286,13 @@ pub fn user_writable(va: u64) -> bool {
     par & 1 == 0
 }
 
-/// Makes instructions written to `start..start + len` visible to instruction fetch.
+/// Cleans `start..start + len` to the point of unification, the first half of making instructions written there
+/// visible to instruction fetch; `invalidate_icache` completes it for every range cleaned before it.
 ///
 /// # Safety
 ///
 /// The range must be mapped.
-pub unsafe fn sync_icache(start: usize, len: usize) {
+pub unsafe fn clean_dcache(start: usize, len: usize) {
     let ctr: usize;
     // SAFETY: reading CTR_EL0 has no side effects.
     unsafe { asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack, preserves_flags)) };
@@ -300,6 +301,10 @@ pub unsafe fn sync_icache(start: usize, len: usize) {
         // SAFETY: cleaning a mapped line to the point of unification does not change memory contents.
         unsafe { asm!("dc cvau, {}", in(reg) addr, options(nostack, preserves_flags)) };
     }
+}
+
+/// Waits for the cleans before it, then discards every stale instruction in the I-cache.
+pub fn invalidate_icache() {
     // SAFETY: barriers and an I-cache invalidate only discard stale instructions.
     unsafe {
         asm!(
