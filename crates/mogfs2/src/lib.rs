@@ -229,9 +229,11 @@ pub struct Fs<'a, D> {
     height: usize,
     /// The live root's bitmap index as of the last commit; its entries stay in `cache[0]`.
     index: (u64, u64),
-    /// Bitmap pages changed since the last commit, and in the one before.
+    /// Bitmap pages changed since the last commit.
     dirty: [u64; 4],
-    prev_dirty: [u64; 4],
+    /// The live bitmap's words changed since the last commit (`lo..hi`), and those the last commit changed.
+    span: (usize, usize),
+    prev_span: (usize, usize),
     changed: bool,
     free: u64,
     /// Every block below it is in use.
@@ -274,7 +276,8 @@ impl<'a, D: Disk> Fs<'a, D> {
             height: 1,
             index: (0, 0),
             dirty: [0; 4],
-            prev_dirty: [0; 4],
+            span: (usize::MAX, 0),
+            prev_span: (usize::MAX, 0),
             changed: false,
             free: 0,
             hint: 0,
@@ -401,7 +404,7 @@ impl<'a, D: Disk> Fs<'a, D> {
             }
             self.index = s.index;
             self.dirty = [0; 4];
-            self.prev_dirty = [!0; 4];
+            self.prev_span = (0, w);
             self.changed = false;
             let used: u64 = (0..w)
                 .map(|i| (self.bits[i] | self.bits[COMMITTED * w + i]).count_ones() as u64)
@@ -754,21 +757,20 @@ impl<'a, D: Disk> Fs<'a, D> {
         self.flush()?;
         self.generation = generation;
         self.clean();
+        // Elsewhere the live, newest and older bitmaps agree, so the committed one (newest | older) is unchanged.
         let w = self.words;
-        for p in (0..self.pages).filter(|&p| bit(&self.dirty, p) || bit(&self.prev_dirty, p)) {
-            for i in p * PAGE_WORDS..min((p + 1) * PAGE_WORDS, words) {
-                let (l, n, c) = (
-                    self.bits[i],
-                    self.bits[NEWEST * w + i],
-                    &mut self.bits[2 * w + i],
-                );
-                let before = (l | *c).count_ones();
-                *c = n | l;
-                self.free = self.free + before as u64 - (l | *c).count_ones() as u64;
-                self.bits[NEWEST * w + i] = l;
-            }
+        for i in min(self.span.0, self.prev_span.0)..self.span.1.max(self.prev_span.1) {
+            let (l, n, c) = (
+                self.bits[i],
+                self.bits[NEWEST * w + i],
+                &mut self.bits[2 * w + i],
+            );
+            let before = (l | *c).count_ones();
+            *c = n | l;
+            self.free = self.free + before as u64 - (l | *c).count_ones() as u64;
+            self.bits[NEWEST * w + i] = l;
         }
-        self.prev_dirty = self.dirty;
+        (self.prev_span, self.span) = (self.span, (usize::MAX, 0));
         self.dirty = [0; 4];
         self.hint = 0;
         self.changed = false;
@@ -789,7 +791,8 @@ impl<'a, D: Disk> Fs<'a, D> {
         self.blk.fill(EMPTY);
         self.dirt.fill(false);
         self.ndirty = 0;
-        (self.dirty, self.prev_dirty) = ([0; 4], [0; 4]);
+        self.dirty = [0; 4];
+        (self.span, self.prev_span) = ((usize::MAX, 0), (0, pages * PAGE_WORDS));
         self.cached = None;
         Ok(())
     }
@@ -1213,10 +1216,16 @@ impl<'a, D: Disk> Fs<'a, D> {
 
     fn mark(&mut self, b: u64) {
         self.bits[(b / 64) as usize] |= 1 << (b % 64);
-        let p = (b / PAGE_BITS) as usize;
-        self.dirty[p / 64] |= 1 << (p % 64);
+        self.touch(b);
         self.free -= 1;
         self.changed = true;
+    }
+
+    /// Notes that `b`'s live bit changed.
+    fn touch(&mut self, b: u64) {
+        let (p, i) = ((b / PAGE_BITS) as usize, (b / 64) as usize);
+        self.dirty[p / 64] |= 1 << (p % 64);
+        self.span = (min(self.span.0, i), self.span.1.max(i + 1));
     }
 
     fn alloc(&mut self) -> Result<u64, Error> {
@@ -1267,8 +1276,7 @@ impl<'a, D: Disk> Fs<'a, D> {
             return Err(Error::Corrupt);
         }
         self.bits[(b / 64) as usize] &= !(1 << (b % 64));
-        let p = (b / PAGE_BITS) as usize;
-        self.dirty[p / 64] |= 1 << (p % 64);
+        self.touch(b);
         if !self.has(COMMITTED, b) {
             self.free += 1;
             self.hint = min(self.hint, b);
