@@ -19,8 +19,8 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
   for its writes and two flushes. Boot-spawned processes get the root directory as handle 3 once mounted (`spawn_init`).
 - Trap hooks `task_switch`, `board_irq`, `board_syscall`, `board_user_fault`: execute the `kernel::syscall::Call`
   that `dispatch` returns (user buffers, pages, frames, wake/block). `board_unlock`, called by the trap exit, releases `KERNEL`.
-- `Board::console` writes (`Console`) hold `CONSOLE` for a whole `write_fmt`, so a line is never split; it is the DTB's
-  PL011, installed by `enable_mmu`. `test=bench-lock`'s `lock_round_trips` (ticket vs test-and-set) and `add_locked`.
+- `Board::console` writes (`Console`) hold `CONSOLE` for a whole `write_fmt`, so a line is never split; it is the PL011
+  at `UART0`, like every other UART access. `test=bench-lock`'s `lock_round_trips` (ticket vs test-and-set) and `add_locked`.
 - Processes: `spawn_process`, `spawn`, `task_exit`, `kill`, `map`, `release`, `enter` (TTBR0/ASID switch).
 - `VirtioBlk` (`src/virtio_blk.rs`) implements `kernel::Disk` (`mogfs::Disk`): modern (version 2) virtio-mmio only,
   one 4-entry queue in one frame, one request in flight, completion polled (no IRQ), DMA straight to the caller's
@@ -37,8 +37,8 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
 - `#![no_std]`, `#![no_main]`. Deps: `arch`, `dtb`, `kernel`, `mm`, `mogfs` (its `Error`), `linked_list_allocator` (no features).
 - Opts out of `forbid(unsafe_code)` (lints: `docs/DEVELOPMENT.md` settings table); every `unsafe` block has a one-line
   `// SAFETY:` and every `unsafe fn` a `# Safety` section.
-- Depends on `kernel`, never the reverse. UART, GIC and RAM come from the DTB; board constants fix the rest:
-  `UART0` (user `write`, panic and fault output), `DTB` (RAM base), `KERNEL_L1` (GiB 0 device, GiB 1 RAM),
+- Depends on `kernel`, never the reverse. GIC and RAM come from the DTB; board constants fix the rest:
+  `UART0` (the PL011 at `0x0900_0000`: all console output and input, never read from the DTB), `DTB` (RAM base), `KERNEL_L1` (GiB 0 device, GiB 1 RAM),
   `UNMAPPED`, `TIMER_IRQ` (27), `VIRTIO`, `VIRTIO_STRIDE`, `VIRTIO_COUNT` (32 virtio-mmio transports from `0x0a00_0000`, `0x200` apart), the PSCI call. QEMU runs with
   `-global virtio-mmio.force-legacy=false` (the driver rejects legacy) and `-global virtio-mmio.ioeventfd=off`
   (`docs/DEVELOPMENT.md` settings table).
