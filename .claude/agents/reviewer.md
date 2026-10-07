@@ -16,7 +16,7 @@ Checklist, in priority order:
 2. Tests: the change has a test that states its behavior, preferring the QEMU boot test (`crates/e2e/tests/boot.rs`, extended when boot output changes), then a crate's public API. A test that cannot fail, duplicates what e2e already covers, or unit-tests trivial code is a finding — propose deleting it.
 3. Simplicity: code the task did not ask for; abstractions, traits, generics, or helpers with one caller; config or parameters nobody varies; dead code; defensive checks for states that cannot occur; comments that restate the code or tell a story; a larger form where a smaller one does the same job. Each finding names the deletion or the smaller form.
 4. Guidelines: `unsafe` only in `arch` and board crates (`crates/board/*`), behind a safe API, one operation per block, with a `// SAFETY:` line that states the actual invariant (not "this is safe"); no `dyn`, `Arc`, or heap in hot paths (exception entry, context switch, page faults); dependencies point inward; new crates use `[lints] workspace = true`; no new dependency without a stated reason; `PhysAddr`/`VirtAddr` newtypes, never bare `usize` addresses; phase doc "What was done" updated when a step lands; new `.md` files linked into the AGENTS.md tree.
-5. Performance: a hot path changed or added without a benchmark or before/after numbers; a >5% regression without justification (`docs/BENCHMARKS.md`); wasted work in a hot path.
+5. Performance: a hot path changed or added without a benchmark or before/after numbers; any regression beyond noise, even a justified one (`docs/BENCHMARKS.md`); every way a hot path could be faster without giving up safety.
 
 Rules:
 - Read `AGENTS.md` and `docs/DEVELOPMENT.md` first — their rules define what counts as a defect here.
