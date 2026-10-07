@@ -349,6 +349,41 @@ fn an_exited_child_keeps_its_slot_until_waited_for() {
 }
 
 #[test]
+fn priority_inheritance_lets_the_mutex_owner_outrun_a_middle_priority_spinner() {
+    let (status, lines) = boot(&["-append", "test=pi"]);
+    assert!(
+        !lines.iter().any(|l| l.starts_with("panic:")),
+        "kernel panicked"
+    );
+    let pi: Vec<_> = lines
+        .iter()
+        .filter(|l| {
+            ["L: ", "M: ", "H: ", "P: "]
+                .iter()
+                .any(|p| l.starts_with(p))
+        })
+        .collect();
+    // The timer is on, yet M never runs: something outranks it at every switch. L (priority 1) unlocks only while
+    // H's block lends it priority 3; without that, M (2) spins forever and the boot never powers off.
+    assert_eq!(
+        pi,
+        [
+            "L: locked",
+            "L: relock: EDEADLK",
+            "H: unlock while L owns it: EPERM",
+            "H: locking",
+            "L: unlocking",
+            "H: acquired",
+            "P: high exited",
+            "P: mid killed",
+            "P: low exited",
+        ]
+    );
+    assert_no_leak(&lines, "pi");
+    assert!(status.success(), "QEMU exited with {status}");
+}
+
+#[test]
 fn pipe_bench_reports_round_trip() {
     let (status, lines) = boot(&["-append", "test=bench-pipe"]);
     assert!(

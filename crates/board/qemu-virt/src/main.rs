@@ -19,9 +19,10 @@ use arch::{MemoryType, UserAccess, l1_block, user_page};
 use dtb::Dtb;
 use kernel::elf::{Elf, Segment};
 use kernel::handle::{DUPLICATE, Handles, KILL, MAX_HANDLES, Object, READ, TRANSFER, WAIT, WRITE};
+use kernel::mutex::Mutexes;
 use kernel::pipe::{self, End, Pipes};
 use kernel::syscall::{Call, EAGAIN, EBADF, EFAULT, ENFILE, ENOENT, ENOEXEC, ENOMEM, KILLED};
-use kernel::{Event, FRAME_WORDS, Full, Memory, Program, Scheduler};
+use kernel::{Event, FRAME_WORDS, Full, Memory, PRIORITIES, Program, Scheduler};
 use linked_list_allocator::Heap;
 use mm::{Budget, FrameAllocator, PhysAddr};
 use uart::Uart;
@@ -62,6 +63,7 @@ const _: () = assert!(MAX_TASKS <= 256);
 /// Kernel stack per task: 16 KiB.
 const TASK_STACK_FRAMES: usize = 4;
 const MAX_PIPES: usize = 16;
+const MAX_MUTEXES: usize = 16;
 
 #[global_allocator]
 static HEAP: KernelHeap = KernelHeap(UnsafeCell::new(Heap::empty()));
@@ -95,17 +97,19 @@ unsafe impl GlobalAlloc for KernelHeap {
     }
 }
 
-/// Task contexts, free frames and pipes; touched only with IRQs masked on the only core.
+/// Task contexts, free frames, pipes and mutexes; touched only with IRQs masked on the only core.
 static KERNEL: Global = Global(UnsafeCell::new(Kernel {
     sched: Scheduler::new(),
     frames: FrameAllocator::empty(),
     pipes: Pipes::new(),
+    mutexes: Mutexes::new(),
 }));
 
 struct Kernel {
     sched: Scheduler<MAX_TASKS>,
     frames: FrameAllocator<FRAME_WORDS>,
     pipes: Pipes<MAX_PIPES>,
+    mutexes: Mutexes<MAX_MUTEXES>,
 }
 
 struct Global(UnsafeCell<Kernel>);
@@ -147,10 +151,14 @@ unsafe fn task_exit(frame: usize, code: u64) -> usize {
         sched,
         frames,
         pipes,
+        mutexes,
     } = unsafe { &mut *KERNEL.0.get() };
-    // Before `exit` picks the next task, so a reader this wakes (end of file) can be it.
+    // Before `exit` picks the next task, so a reader or locker this wakes can be it.
+    for index in mutexes.release(sched.current().0) {
+        sched.wake(Event::Lock(index));
+    }
     for object in core::mem::take(sched.handles()).objects() {
-        release(sched, frames, pipes, object);
+        release(sched, frames, pipes, mutexes, object);
     }
     let (asid, l1) = sched.current();
     let (next, stack) = sched.exit(code);
@@ -182,15 +190,17 @@ unsafe fn block(
 
 /// Drops one handle to `object`: an exited process frees its slot and, as `wait` does, moves its budget to the
 /// current task; a pipe wakes its waiters and, once no handle reaches it, frees its page, refunding its creator if that
-/// still runs.
+/// still runs; the last handle to a mutex frees it.
 fn release(
     sched: &mut Scheduler<MAX_TASKS>,
     frames: &mut FrameAllocator<FRAME_WORDS>,
     pipes: &mut Pipes<MAX_PIPES>,
+    mutexes: &mut Mutexes<MAX_MUTEXES>,
     object: Object,
 ) {
     let end = match object {
         Object::Pipe(end) => end,
+        Object::Mutex(mutex) => return mutexes.close(mutex),
         Object::Process { slot, generation } => {
             let limit = sched.close(slot, generation);
             let held = pipes.charged_to((slot, generation));
@@ -238,6 +248,36 @@ fn pipe_io(pipes: &mut Pipes<MAX_PIPES>, end: End, ptr: u64, len: usize) -> Opti
         true => user_bytes(ptr, len).map_or(Some(EFAULT), |data| pipe.write(page, data)),
         false => user_bytes_mut(ptr, len).map_or(Some(EFAULT), |out| pipe.read(page, out)),
     }
+}
+
+/// Ends the process in `slot` with `generation`, not the current one, as a fault would, and returns all its frames;
+/// 0, or `EBADF` once a newer task took the slot.
+fn kill(
+    Kernel {
+        sched,
+        frames,
+        pipes,
+        mutexes,
+    }: &mut Kernel,
+    slot: usize,
+    generation: u64,
+) -> i64 {
+    let (handles, l1, stack) = match sched.kill(slot, generation) {
+        Ok(Some(ended)) => ended,
+        Ok(None) => return 0,
+        Err(error) => return error,
+    };
+    for index in mutexes.release(slot) {
+        sched.wake(Event::Lock(index));
+    }
+    for object in handles.objects() {
+        release(sched, frames, pipes, mutexes, object);
+    }
+    arch::flush_asid(slot);
+    // SAFETY: the process is not current, so TTBR0 is not `l1`, and its tables hold only its frames.
+    unsafe { arch::free_space(l1, |f| frames.free(f)) };
+    free_stack(frames, stack);
+    0
 }
 
 fn free_stack(frames: &mut FrameAllocator<FRAME_WORDS>, stack: PhysAddr) {
@@ -321,13 +361,14 @@ unsafe fn enter(sched: &Scheduler<MAX_TASKS>, frame: usize, next: usize) {
 }
 
 /// Builds a process from `file`'s `segments` (entered at `entry`): address space, pages and kernel stack, all charged
-/// to `budget`, and queues it in the free `slot` with `handles`; on failure (`ENOMEM`) returns every frame it took.
+/// to `budget`, and queues it in the free `slot` with `handles` at `priority`; on failure (`ENOMEM`) returns every
+/// frame it took.
 fn spawn_process(
     sched: &mut Scheduler<MAX_TASKS>,
     frames: &mut FrameAllocator<FRAME_WORDS>,
     (file, segments, entry): (&[u8], impl Iterator<Item = Segment>, u64),
     mut budget: Budget,
-    (slot, handles): ((usize, u64), Handles),
+    (slot, handles, priority): ((usize, u64), Handles, u8),
 ) -> Result<(), i64> {
     let l1 = zeroed(frames, &mut budget).ok_or(ENOMEM)?;
     // SAFETY: `l1` is a fresh, zeroed frame.
@@ -367,7 +408,7 @@ fn spawn_process(
         budget,
         next: MAP_BASE,
     };
-    sched.add(slot, frame, l1, memory, handles);
+    sched.add(slot, frame, l1, memory, handles, priority);
     Ok(())
 }
 
@@ -381,16 +422,17 @@ fn executable(
     Ok((file, elf.segments(), entry))
 }
 
-/// Queues `executable` from boot context with init's handles and a budget of `budget` frames.
+/// Queues `executable` from boot context with init's handles, a budget of `budget` frames and `priority`.
 fn spawn_init(
     executable: (&[u8], impl Iterator<Item = Segment>, u64),
     budget: usize,
+    priority: u8,
 ) -> Result<(), i64> {
     let irq = arch::irq::disable();
     // SAFETY: IRQs are masked on the only core, so this is the sole reference.
     let Kernel { sched, frames, .. } = unsafe { &mut *KERNEL.0.get() };
     let added = sched.free_slot().ok_or(EAGAIN).and_then(|slot| {
-        let init = (slot, Handles::init(slot.0, slot.1));
+        let init = (slot, Handles::init(slot.0, slot.1), priority);
         spawn_process(sched, frames, executable, Budget::new(budget), init)
     });
     arch::irq::restore(irq);
@@ -398,14 +440,15 @@ fn spawn_init(
 }
 
 /// Spawns the boot archive's executable at `file` with the `len` handles at user address `ptr` and `budget` frames
-/// moved from the current process, which gets a handle to the child; on failure nothing moves.
+/// moved from the current process, which gets a handle to the child, at `priority` capped at the current process's
+/// own; on failure nothing moves.
 fn spawn(
     sched: &mut Scheduler<MAX_TASKS>,
     frames: &mut FrameAllocator<FRAME_WORDS>,
     file: Range<usize>,
-    ptr: u64,
-    len: usize,
+    (ptr, len): (u64, usize),
     budget: usize,
+    priority: u64,
 ) -> Result<u64, i64> {
     let executable = executable(file)?;
     let bytes = user_bytes(ptr, len * 8).ok_or(EFAULT)?;
@@ -419,7 +462,8 @@ fn spawn(
     }
     let (slot, generation) = sched.free_slot().ok_or(EAGAIN)?;
     let process = parent.insert(Object::Process { slot, generation }, WAIT | KILL)?;
-    let child = ((slot, generation), child);
+    let priority = priority.min(sched.priority().into()) as u8;
+    let child = ((slot, generation), child, priority);
     spawn_process(sched, frames, executable, Budget::new(budget), child)?;
     sched.memory().budget.shrink(budget);
     *sched.handles() = parent;
@@ -607,7 +651,7 @@ impl kernel::Board for QemuVirt {
                 budget: Budget::new(0),
                 next: 0,
             };
-            sched.add(slot, frame, PhysAddr(0), memory, Handles::new());
+            sched.add(slot, frame, PhysAddr(0), memory, Handles::new(), 0);
             Ok(())
         });
         arch::irq::restore(irq);
@@ -649,12 +693,12 @@ impl kernel::Board for QemuVirt {
             size: code.len() as u64,
             writable: false,
         };
-        spawn_init((code, [segment].into_iter(), entry), budget)
+        spawn_init((code, [segment].into_iter(), entry), budget, 0)
     }
 
     fn spawn_archived(&mut self, name: &str, budget: usize) -> Result<(), i64> {
         let file = kernel::cpio::find(ARCHIVE, name.as_bytes()).ok_or(ENOENT)?;
-        spawn_init(executable(file)?, budget)
+        spawn_init(executable(file)?, budget, PRIORITIES - 1)
     }
 
     fn tasks(&self) -> usize {
@@ -727,11 +771,13 @@ unsafe extern "C" fn board_irq(frame: usize) -> usize {
 #[unsafe(no_mangle)]
 unsafe extern "C" fn board_syscall(frame: &mut arch::TrapFrame) -> usize {
     // SAFETY: the caller masked IRQs on the only core, so this is the sole reference.
+    let kernel = unsafe { &mut *KERNEL.0.get() };
     let Kernel {
         sched,
         frames,
         pipes,
-    } = unsafe { &mut *KERNEL.0.get() };
+        mutexes,
+    } = kernel;
     let args = frame.x.first_chunk().unwrap();
     frame.x[0] = match kernel::syscall::dispatch(frame.x[8], args, sched.handles()) {
         Ok(Call::Exit(code)) => {
@@ -774,13 +820,15 @@ unsafe extern "C" fn board_syscall(frame: &mut arch::TrapFrame) -> usize {
             Err(error) => error as u64,
         },
         Ok(Call::Dup { handle, object }) => {
-            if let Object::Pipe(end) = object {
-                pipes.open(end);
+            match object {
+                Object::Pipe(end) => pipes.open(end),
+                Object::Mutex(mutex) => mutexes.open(mutex),
+                _ => {}
             }
             handle
         }
         Ok(Call::Close(object)) => {
-            release(sched, frames, pipes, object);
+            release(sched, frames, pipes, mutexes, object);
             0
         }
         Ok(Call::Map { pages }) => map(sched, frames, pages).unwrap_or(ENOMEM as u64),
@@ -797,7 +845,47 @@ unsafe extern "C" fn board_syscall(frame: &mut arch::TrapFrame) -> usize {
             ptr,
             len,
             budget,
-        }) => spawn(sched, frames, file, ptr, len, budget).unwrap_or_else(|error| error as u64),
+            priority,
+        }) => spawn(sched, frames, file, (ptr, len), budget, priority)
+            .unwrap_or_else(|error| error as u64),
+        Ok(Call::NewMutex) => match mutexes.create() {
+            Some(mutex) => sched
+                .handles()
+                .insert(Object::Mutex(mutex), DUPLICATE | TRANSFER)
+                .unwrap_or_else(|error| {
+                    mutexes.close(mutex);
+                    error as u64
+                }),
+            None => ENFILE as u64,
+        },
+        Ok(Call::Lock(mutex)) => match mutexes.lock(mutex, sched.current().0) {
+            Ok(None) => 0,
+            Ok(Some(owner)) => {
+                sched.boost(owner);
+                // SAFETY: the caller masked IRQs, and `frame` is the current process's.
+                return unsafe { block(sched, frame, Event::Lock(mutex.index as usize)) };
+            }
+            Err(error) => error as u64,
+        },
+        Ok(Call::Unlock(mutex)) => {
+            let slot = sched.current().0;
+            match mutexes.unlock(mutex, slot) {
+                Ok(()) => {
+                    sched.wake(Event::Lock(mutex.index as usize));
+                    sched
+                        .unboost(|e| matches!(e, Event::Lock(i) if mutexes.owner(i) == Some(slot)));
+                    0
+                }
+                Err(error) => error as u64,
+            }
+        }
+        Ok(Call::Kill { slot, generation })
+            if (slot, generation) == (sched.current().0, sched.generation()) =>
+        {
+            // SAFETY: the caller masked IRQs, and `frame` is the current process's.
+            return unsafe { task_exit(frame as *mut arch::TrapFrame as usize, KILLED) };
+        }
+        Ok(Call::Kill { slot, generation }) => kill(kernel, slot, generation) as u64,
         Err(error) => error as u64,
     };
     frame as *mut arch::TrapFrame as usize

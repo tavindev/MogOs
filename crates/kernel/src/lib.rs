@@ -5,11 +5,12 @@ extern crate alloc;
 pub mod cpio;
 pub mod elf;
 pub mod handle;
+pub mod mutex;
 pub mod pipe;
 mod sched;
 pub mod syscall;
 
-pub use sched::{Event, Full, Memory, Scheduler};
+pub use sched::{Event, Full, Memory, PRIORITIES, Scheduler};
 
 use alloc::vec::Vec;
 use core::fmt::Write;
@@ -39,7 +40,7 @@ pub trait Board {
     /// Sleeps until an interrupt arrives and handles it. Boot context only: returns with IRQs masked.
     fn idle(&mut self);
     fn power_off(&mut self) -> !;
-    /// Queues a task that runs `entry(board, arg)` on its own stack with its own board handle.
+    /// Queues a task that runs `entry(board, arg)` on its own stack with its own board handle, at priority 0.
     fn spawn(&mut self, entry: fn(&mut Self, usize) -> !, arg: usize) -> Result<(), Full>;
     /// Runs the other tasks in turn; returns when this one is scheduled again.
     fn yield_now(&mut self);
@@ -49,9 +50,11 @@ pub trait Board {
     fn init_frames(&mut self, frames: FrameAllocator<FRAME_WORDS>);
     fn free_frames(&self) -> usize;
     /// Queues `program` as a process at EL0 in its own address space, with a budget of `budget` frames that pays for
-    /// its tables, pages and kernel stack, and init's handles (`Handles::init`); `ENOMEM` or `EAGAIN` (no free slot).
+    /// its tables, pages and kernel stack, and init's handles (`Handles::init`), at priority 0 like the boot context;
+    /// `ENOMEM` or `EAGAIN` (no free slot).
     fn spawn_user(&mut self, program: Program, budget: usize) -> Result<(), i64>;
-    /// As `spawn_user`, for the boot archive's executable `name`; `ENOENT` or `ENOEXEC` if it is missing or invalid.
+    /// As `spawn_user`, for the boot archive's executable `name`, at the top priority (`PRIORITIES - 1`); `ENOENT` or
+    /// `ENOEXEC` if it is missing or invalid.
     fn spawn_archived(&mut self, name: &str, budget: usize) -> Result<(), i64>;
     /// Tasks in the run queue, the boot context included.
     fn tasks(&self) -> usize;
@@ -89,6 +92,8 @@ const HEAP_FRAMES: usize = 256;
 const BOOT_BUDGET: usize = 25;
 /// `waiter`'s 9 frames and its two children's 9 and 10 at once.
 const WAITER_BUDGET: usize = 28;
+/// `pi`'s 9 frames, its two pipes' pages and its three children's 9 each.
+const PI_BUDGET: usize = 38;
 
 /// `reserved` lists physical ranges in use (kernel image, DTB).
 pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> ! {
@@ -139,6 +144,10 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
             "test=spawn" => run_archived(board, "spawn", "spawner", BOOT_BUDGET),
             "test=pipe" => run_archived(board, "pipe", "reader", BOOT_BUDGET),
             "test=wait" => run_archived(board, "wait", "waiter", WAITER_BUDGET),
+            "test=pi" => {
+                board.start_timer();
+                run_archived(board, "pi", "pi", PI_BUDGET);
+            }
             "test=bench-pipe" => pipe_bench(board),
             "test=budget" => {
                 let before = board.free_frames();
@@ -221,7 +230,7 @@ fn user_demo<B: Board>(board: &mut B) {
 }
 
 /// Runs the boot archive's `program` with `budget` frames until every task has exited; prints the free frames before
-/// and after as `<test>: free frames <n> before, <n> after`. The timer stays off.
+/// and after as `<test>: free frames <n> before, <n> after`.
 fn run_archived<B: Board>(board: &mut B, test: &str, program: &str, budget: usize) {
     let before = board.free_frames();
     board.spawn_archived(program, budget).expect("spawn");

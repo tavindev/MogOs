@@ -1,4 +1,4 @@
-//! Native syscalls (`x8` = number, `x0`-`x3` = arguments, `x0` = result, negative = error) and the panic handler.
+//! Native syscalls (`x8` = number, `x0`-`x4` = arguments, `x0` = result, negative = error) and the panic handler.
 #![no_std]
 
 use core::arch::asm;
@@ -11,10 +11,15 @@ pub const WRITE: u64 = 1 << 1;
 pub const TRANSFER: u64 = 1 << 4;
 pub const EXEC: u64 = 1 << 5;
 
+pub const EPERM: i64 = -1;
 pub const ENOENT: i64 = -2;
 pub const ENOEXEC: i64 = -8;
 pub const EBADF: i64 = -9;
 pub const ENOMEM: i64 = -12;
+pub const EDEADLK: i64 = -35;
+
+/// The exit code `wait` reports for a killed process.
+pub const KILLED: i64 = 256;
 
 fn syscall(nr: u64, args: [u64; 4]) -> i64 {
     let result;
@@ -65,15 +70,21 @@ pub fn open(dir: u64, name: &[u8], rights: u64) -> i64 {
     syscall(5, [dir, name.as_ptr() as u64, name.len() as u64, rights])
 }
 
-/// Moves `handles` to the child (at values 0, 1, ...) and `budget` frames of this process's budget.
+/// `spawn_at` this process's own priority.
 pub fn spawn(exe: u64, handles: &[u64], budget: usize) -> i64 {
-    let args = [
-        exe,
-        handles.as_ptr() as u64,
-        handles.len() as u64,
-        budget as u64,
-    ];
-    syscall(6, args)
+    spawn_at(exe, handles, budget, u64::MAX)
+}
+
+/// Moves `handles` to the child (at values 0, 1, ...) and `budget` frames of this process's budget; the child runs at
+/// `priority` (0 lowest), capped at this process's own.
+pub fn spawn_at(exe: u64, handles: &[u64], budget: usize, priority: u64) -> i64 {
+    let result;
+    // SAFETY: as in `syscall`; `spawn` reads only the handle list.
+    unsafe {
+        asm!("svc #0", inlateout("x0") exe => result, in("x1") handles.as_ptr(),
+            in("x2") handles.len(), in("x3") budget, in("x4") priority, in("x8") 6, options(nostack))
+    };
+    result
 }
 
 /// Returns the read end (or an error) and the write end.
@@ -89,6 +100,23 @@ pub fn pipe() -> (i64, u64) {
 /// Blocks until `process` exits; returns its exit code.
 pub fn wait(process: u64) -> i64 {
     syscall(8, [process, 0, 0, 0])
+}
+
+pub fn mutex() -> i64 {
+    syscall(9, [0, 0, 0, 0])
+}
+
+/// Blocks until `mutex` is free, then owns it.
+pub fn lock(mutex: u64) -> i64 {
+    syscall(10, [mutex, 0, 0, 0])
+}
+
+pub fn unlock(mutex: u64) -> i64 {
+    syscall(11, [mutex, 0, 0, 0])
+}
+
+pub fn kill(process: u64) -> i64 {
+    syscall(12, [process, 0, 0, 0])
 }
 
 #[panic_handler]

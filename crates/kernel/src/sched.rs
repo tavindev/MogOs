@@ -1,7 +1,10 @@
 use mm::{Budget, PhysAddr};
 
 use crate::handle::{Handles, Object};
-use crate::syscall::EBADF;
+use crate::syscall::{EBADF, KILLED};
+
+/// Priority levels: 0 (lowest; the boot context and kernel tasks) to `PRIORITIES - 1`.
+pub const PRIORITIES: u8 = 4;
 
 /// No room for the task: the run queue is full or its memory could not be allocated.
 #[derive(Debug)]
@@ -29,6 +32,8 @@ pub enum Event {
     Pipe(usize),
     /// The process in this slot exiting.
     Exit(usize),
+    /// The mutex at this table index being unlocked.
+    Lock(usize),
     /// Nothing: the boot context, which runs only once no other task is ready.
     Idle,
 }
@@ -43,9 +48,9 @@ enum State {
     Zombie(u64),
 }
 
-/// Round-robin run queue of up to `N` tasks, each known by its saved trap frame address and address space
-/// (its level-1 table; `PhysAddr(0)` is the boot table), its memory and its handle table. Blocked tasks are skipped;
-/// with none ready, the boot context (slot 0) runs.
+/// Run queue of up to `N` tasks, each known by its saved trap frame address and address space (its level-1 table;
+/// `PhysAddr(0)` is the boot table), its memory, its handle table and its priority. The highest-priority ready task
+/// runs, round robin within a level; blocked tasks are skipped; with none ready, the boot context (slot 0) runs.
 pub struct Scheduler<const N: usize> {
     /// Frame address and address space per slot.
     tasks: [(usize, PhysAddr); N],
@@ -55,6 +60,10 @@ pub struct Scheduler<const N: usize> {
     /// An exited task's budget stays here until `reap`.
     memory: [Memory; N],
     handles: [Handles; N],
+    /// Own priority per slot.
+    priority: [u8; N],
+    /// Own priority, raised while a higher-priority task waits for a mutex the slot owns.
+    effective: [u8; N],
     /// One past the highest slot ever used.
     end: usize,
     current: usize,
@@ -71,13 +80,15 @@ impl<const N: usize> Scheduler<N> {
             generation: [0; N],
             memory: [NO_MEMORY; N],
             handles: [Handles::new(); N],
+            priority: [0; N],
+            effective: [0; N],
             end: 1,
             current: 0,
         }
     }
 
     /// Queues a new task in `slot` with `generation` (from `free_slot`), its first frame at `frame` in address space
-    /// `space`, with `memory` and `handles`.
+    /// `space`, with `memory`, `handles` and `priority` (below `PRIORITIES`).
     pub fn add(
         &mut self,
         (slot, generation): (usize, u64),
@@ -85,12 +96,15 @@ impl<const N: usize> Scheduler<N> {
         space: PhysAddr,
         memory: Memory,
         handles: Handles,
+        priority: u8,
     ) {
         self.tasks[slot] = (frame, space);
         self.state[slot] = State::Ready;
         self.generation[slot] = generation;
         self.memory[slot] = memory;
         self.handles[slot] = handles;
+        self.priority[slot] = priority;
+        self.effective[slot] = priority;
         self.end = self.end.max(slot + 1);
     }
 
@@ -126,20 +140,45 @@ impl<const N: usize> Scheduler<N> {
     /// its handles; its budget stays for `reap`, and while another task holds a handle to it, so does its slot.
     pub fn exit(&mut self, code: u64) -> (usize, PhysAddr) {
         assert!(self.current != 0, "the boot context cannot exit");
+        let stack = self.memory[self.current].stack;
+        self.end(self.current, code);
+        (self.advance(), stack)
+    }
+
+    /// Ends the process in `slot` with `generation`, not the current task, as a fault would (`KILLED`) and wakes its
+    /// waiters; returns its handles (for the caller to release), address space and kernel stack (to free), or `None` if
+    /// it already exited; `EBADF` once a newer task took the slot.
+    pub fn kill(
+        &mut self,
+        slot: usize,
+        generation: u64,
+    ) -> Result<Option<(Handles, PhysAddr, PhysAddr)>, i64> {
+        if self.generation[slot] != generation {
+            return Err(EBADF);
+        }
+        if !matches!(self.state[slot], State::Ready | State::Blocked(_)) {
+            return Ok(None);
+        }
+        let handles = core::mem::take(&mut self.handles[slot]);
+        self.end(slot, KILLED);
+        Ok(Some((handles, self.tasks[slot].1, self.memory[slot].stack)))
+    }
+
+    /// Marks the task in `slot` exited with `code`, kept as a zombie while another task holds a handle to it, and wakes
+    /// its waiters.
+    fn end(&mut self, slot: usize, code: u64) {
         let process = Object::Process {
-            slot: self.current,
-            generation: self.generation[self.current],
+            slot,
+            generation: self.generation[slot],
         };
         let held = self.handles[..self.end]
             .iter()
             .any(|h| h.objects().any(|o| o == process));
-        self.state[self.current] = match held {
+        self.state[slot] = match held {
             true => State::Zombie(code),
             false => State::Exited(code),
         };
-        self.wake(Event::Exit(self.current));
-        let stack = self.memory[self.current].stack;
-        (self.advance(), stack)
+        self.wake(Event::Exit(slot));
     }
 
     /// For the process in `slot` with `generation`: `None` while it runs; once it exited, its code and its budget's
@@ -181,6 +220,30 @@ impl<const N: usize> Scheduler<N> {
         (self.current, self.tasks[self.current].1)
     }
 
+    /// The current task's own priority.
+    pub fn priority(&self) -> u8 {
+        self.priority[self.current]
+    }
+
+    /// The current task waits for a mutex `slot` owns: `slot` runs at least at the current task's priority.
+    pub fn boost(&mut self, slot: usize) {
+        self.effective[slot] = self.effective[slot].max(self.effective[self.current]);
+    }
+
+    /// The current task unlocked a mutex: it drops back to its own priority, raised by tasks still waiting for one it
+    /// owns (`owns(event)`). One level: a waiter's boost does not pass on to the owner of a mutex that owner waits for.
+    pub fn unboost(&mut self, owns: impl Fn(Event) -> bool) {
+        let mut priority = self.priority[self.current];
+        for (state, &effective) in self.state[..self.end].iter().zip(&self.effective) {
+            if let State::Blocked(event) = *state
+                && owns(event)
+            {
+                priority = priority.max(effective);
+            }
+        }
+        self.effective[self.current] = priority;
+    }
+
     /// The current task's generation.
     pub fn generation(&self) -> u64 {
         self.generation[self.current]
@@ -202,17 +265,21 @@ impl<const N: usize> Scheduler<N> {
         self.state[..self.end].iter().filter(queued).count()
     }
 
-    /// Moves to the next ready task after the current one (itself last); with none ready, to the boot context.
+    /// Moves to the highest-priority ready task, the first after the current one (itself last) among equals; with none
+    /// ready, to the boot context.
     fn advance(&mut self) -> usize {
+        let (mut slot, mut next) = (self.current, None);
         for _ in 0..self.end {
-            self.current = (self.current + 1) % self.end;
-            if self.state[self.current] == State::Ready {
-                return self.tasks[self.current].0;
+            slot = if slot + 1 == self.end { 0 } else { slot + 1 };
+            if matches!(self.state[slot], State::Ready)
+                && next.is_none_or(|n: usize| self.effective[slot] > self.effective[n])
+            {
+                next = Some(slot);
             }
         }
-        self.current = 0;
-        self.state[0] = State::Ready;
-        self.tasks[0].0
+        self.current = next.unwrap_or(0);
+        self.state[self.current] = State::Ready;
+        self.tasks[self.current].0
     }
 }
 

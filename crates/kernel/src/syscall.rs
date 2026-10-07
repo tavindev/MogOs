@@ -2,7 +2,8 @@
 
 use core::ops::Range;
 
-use crate::handle::{EXEC, Handles, MAX_HANDLES, Object, READ, WRITE};
+use crate::handle::{EXEC, Handles, KILL as KILL_RIGHT, MAX_HANDLES, Object, READ, WRITE};
+use crate::mutex::Mutex;
 use crate::pipe::End;
 
 /// `exit(code)`: ends the calling process; `wait` reports the low 8 bits of `code`.
@@ -22,9 +23,10 @@ const MAP: u64 = 4;
 /// `open(dir, name_ptr, name_len, rights)`: returns a handle with `rights` to the file `name` in directory `dir`, which
 /// needs read and every right in `rights`. Names resolve only relative to a directory handle.
 const OPEN: u64 = 5;
-/// `spawn(exe, handles_ptr, handles_len, budget)`: starts the executable `exe` (exec right) as a new process, moving
-/// it the `handles_len` handles at `handles_ptr` (transfer right; values 0, 1, ... in the child) and `budget` frames of
-/// the caller's budget; returns a handle to the process (wait, kill). On failure nothing moves.
+/// `spawn(exe, handles_ptr, handles_len, budget, priority)`: starts the executable `exe` (exec right) as a new process
+/// at `priority`, capped at the caller's own (so no process escalates), moving it the `handles_len` handles at
+/// `handles_ptr` (transfer right; values 0, 1, ... in the child) and `budget` frames of the caller's budget; returns a
+/// handle to the process (wait, kill). On failure nothing moves.
 const SPAWN: u64 = 6;
 /// `pipe()`: returns a handle to a new pipe's read end (read, duplicate, transfer), and in `x1` one to its write end
 /// (write, duplicate, transfer). Its one-page buffer is charged to the caller's budget until the last handle to it
@@ -35,6 +37,16 @@ const PIPE: u64 = 7;
 /// and moves what is left of its budget back to the caller. An exited process keeps its slot until waited for or its
 /// handle closes; after that, `EBADF` once a newer process took the slot.
 const WAIT: u64 = 8;
+/// `mutex()`: returns a handle (duplicate, transfer) to a new unlocked mutex; the table slot is fixed, so nothing is
+/// charged.
+const MUTEX: u64 = 9;
+/// `lock(mutex)`: waits until the mutex is free, then makes the caller its owner; meanwhile the owner runs at least
+/// at the caller's priority. `EDEADLK` if the caller owns it. Lock and unlock need no right.
+const LOCK: u64 = 10;
+/// `unlock(mutex)`: frees the mutex, which the caller must own (`EPERM`). An exiting owner frees what it holds.
+const UNLOCK: u64 = 11;
+/// `kill(process)`: ends the process (kill right) as a fault would; `wait` reports `KILLED`. 0 if it already exited.
+const KILL: u64 = 12;
 
 /// The exit code `wait` reports for a process a fault killed: outside `exit`'s 0..=255.
 pub const KILLED: u64 = 256;
@@ -44,6 +56,8 @@ pub const IO_WRITE: u64 = 1;
 
 // Errors are negated musl errno values.
 
+/// Unlocking a mutex the caller does not own.
+pub const EPERM: i64 = -1;
 /// No such file in the directory.
 pub const ENOENT: i64 = -2;
 /// Not a valid executable.
@@ -62,12 +76,14 @@ pub const EFAULT: i64 = -14;
 /// Invalid argument: a `map` of zero bytes or more than `MAX_MAP`, a `spawn` of more than `MAX_HANDLES` handles, an
 /// unknown I/O op.
 const EINVAL: i64 = -22;
-/// The pipe table is full.
+/// The pipe or mutex table is full.
 pub const ENFILE: i64 = -23;
 /// The handle table is full.
 pub const EMFILE: i64 = -24;
 /// Writing a pipe with no read end left.
 pub const EPIPE: i64 = -32;
+/// Locking a mutex the caller owns.
+pub const EDEADLK: i64 = -35;
 /// No such syscall.
 const ENOSYS: i64 = -38;
 
@@ -87,27 +103,56 @@ pub enum Call {
     /// End the caller with this code.
     Exit(u64),
     /// Write to the console; `ptr..ptr + len` lies in `USER` unless empty, but may be unmapped.
-    Write { ptr: u64, len: usize },
+    Write {
+        ptr: u64,
+        len: usize,
+    },
     /// Read from (or, for a write end, write to) the pipe `end` reaches; `ptr..ptr + len` as for `Write`.
-    Pipe { end: End, ptr: u64, len: usize },
+    Pipe {
+        end: End,
+        ptr: u64,
+        len: usize,
+    },
     /// Create a pipe.
     NewPipe,
     /// Wait for the process in `slot` with `generation`.
-    Wait { slot: usize, generation: u64 },
+    Wait {
+        slot: usize,
+        generation: u64,
+    },
     /// `handle` is a new handle to `object`.
-    Dup { handle: u64, object: Object },
+    Dup {
+        handle: u64,
+        object: Object,
+    },
     /// A handle to this object was closed.
     Close(Object),
     /// Map this many pages into the caller's address space.
-    Map { pages: usize },
+    Map {
+        pages: usize,
+    },
     /// Open the boot archive's file whose name is at `ptr..ptr + len` (in `USER` unless empty, maybe unmapped) with `rights`.
-    Open { ptr: u64, len: usize, rights: u64 },
+    Open {
+        ptr: u64,
+        len: usize,
+        rights: u64,
+    },
     /// Spawn the boot archive's file `file`, moving the `len` handles at `ptr` (in `USER` unless empty, maybe unmapped) and `budget`.
     Spawn {
         file: Range<usize>,
         ptr: u64,
         len: usize,
         budget: usize,
+        priority: u64,
+    },
+    /// Create a mutex.
+    NewMutex,
+    Lock(Mutex),
+    Unlock(Mutex),
+    /// Kill the process in `slot` with `generation`.
+    Kill {
+        slot: usize,
+        generation: u64,
     },
 }
 
@@ -173,11 +218,22 @@ pub fn dispatch(nr: u64, args: &[u64; 6], handles: &mut Handles) -> Result<Call,
                 ptr,
                 len: len as usize,
                 budget: budget as usize,
+                priority: args[4],
             })
         }
         PIPE => Ok(Call::NewPipe),
         WAIT => match handles.get(args[0], crate::handle::WAIT)? {
             Object::Process { slot, generation } => Ok(Call::Wait { slot, generation }),
+            _ => Err(EACCES),
+        },
+        MUTEX => Ok(Call::NewMutex),
+        LOCK | UNLOCK => match handles.get(args[0], 0)? {
+            Object::Mutex(mutex) if nr == LOCK => Ok(Call::Lock(mutex)),
+            Object::Mutex(mutex) => Ok(Call::Unlock(mutex)),
+            _ => Err(EACCES),
+        },
+        KILL => match handles.get(args[0], KILL_RIGHT)? {
+            Object::Process { slot, generation } => Ok(Call::Kill { slot, generation }),
             _ => Err(EACCES),
         },
         _ => Err(ENOSYS),

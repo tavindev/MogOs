@@ -11,7 +11,7 @@ const MEMORY: Memory = Memory {
 
 fn add<const N: usize>(sched: &mut Scheduler<N>, frame: usize, space: u64) -> (usize, u64) {
     let slot = sched.free_slot().unwrap();
-    sched.add(slot, frame, PhysAddr(space), MEMORY, Handles::new());
+    sched.add(slot, frame, PhysAddr(space), MEMORY, Handles::new(), 0);
     slot
 }
 
@@ -46,7 +46,14 @@ fn reap_reports_the_exit_once_and_a_reused_slot_is_ebadf() {
         budget: Budget::new(12),
         ..MEMORY
     };
-    sched.add((slot, old), 0x100, PhysAddr(0x1000), memory, Handles::new());
+    sched.add(
+        (slot, old),
+        0x100,
+        PhysAddr(0x1000),
+        memory,
+        Handles::new(),
+        0,
+    );
     assert_eq!(sched.reap(slot, old), Ok(None), "still running");
 
     sched.switch(0x10);
@@ -123,7 +130,7 @@ fn closing_the_handle_frees_an_exited_child_and_lets_a_running_one_free_at_exit(
         budget: Budget::new(12),
         ..MEMORY
     };
-    sched.add(child, 0x200, PhysAddr(0x2000), memory, Handles::new());
+    sched.add(child, 0x200, PhysAddr(0x2000), memory, Handles::new(), 0);
     assert_eq!(sched.switch(0x10), 0x100);
     let process = Object::Process {
         slot: child.0,
@@ -156,4 +163,46 @@ fn closing_the_handle_frees_an_exited_child_and_lets_a_running_one_free_at_exit(
         child.0,
         "closed first: freed at exit"
     );
+}
+
+#[test]
+fn highest_priority_runs_round_robin_within_a_level_and_a_waiter_lends_its_priority() {
+    let mut sched = Scheduler::<5>::new();
+    let add_at = |sched: &mut Scheduler<5>, frame, priority| {
+        let slot = sched.free_slot().unwrap();
+        sched.add(
+            slot,
+            frame,
+            PhysAddr(frame as u64),
+            MEMORY,
+            Handles::new(),
+            priority,
+        );
+        slot.0
+    };
+    let low = add_at(&mut sched, 0x100, 1);
+    add_at(&mut sched, 0x200, 2);
+    add_at(&mut sched, 0x300, 2);
+    let high = add_at(&mut sched, 0x400, 3);
+
+    assert_eq!(sched.switch(0x10), 0x400);
+    assert_eq!(sched.switch(0x400), 0x400, "alone at its level");
+    sched.boost(low);
+    sched.block(Event::Lock(5));
+    assert_eq!(sched.switch(0x400), 0x100, "low runs at high's priority");
+
+    sched.unboost(|e| e == Event::Lock(5));
+    assert_eq!(
+        sched.switch(0x100),
+        0x100,
+        "high still waits on a mutex low owns"
+    );
+    sched.unboost(|e| e == Event::Lock(6));
+    assert_eq!(sched.switch(0x100), 0x200, "back to 1: the 2s run");
+    assert_eq!(sched.switch(0x200), 0x300, "round robin");
+    assert_eq!(sched.switch(0x300), 0x200);
+
+    sched.wake(Event::Lock(5));
+    assert_eq!(sched.switch(0x200), 0x400);
+    assert_eq!(sched.current().0, high);
 }
