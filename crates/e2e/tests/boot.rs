@@ -20,7 +20,7 @@ fn boot(extra: &[&str]) -> (ExitStatus, Vec<String>) {
     boot_with_input(extra, None)
 }
 
-/// As `boot`, with a cap of `secs` instead of `CAP`.
+/// As `boot`, with a cap of `secs` instead of `CAP`, and a silence limit of a tenth of it if that is longer.
 fn boot_for(secs: u64, extra: &[&str]) -> (ExitStatus, Vec<String>) {
     boot_with(Duration::from_secs(secs), extra, None)
 }
@@ -95,7 +95,8 @@ fn boot_with(
             (seen, last) = (len, now);
         }
         silence = silence.max(now - last);
-        if now - last > SILENCE || now - start > cap {
+        // A longer cap (hundreds of TCG cores) allows a longer silence too: QEMU starts every vCPU before any output.
+        if now - last > SILENCE.max(cap / 10) || now - start > cap {
             qemu.kill().unwrap();
             qemu.wait().unwrap();
             break None;
