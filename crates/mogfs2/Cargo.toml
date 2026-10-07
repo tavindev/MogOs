@@ -1,0 +1,12 @@
+[package]
+name = "mogfs2"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "fs"
+harness = false

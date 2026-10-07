@@ -130,6 +130,10 @@ name = "mogfs"
 version = "0.1.0"
 
 [[package]]
+name = "mogfs2"
+version = "0.1.0"
+
+[[package]]
 name = "net"
 version = "0.1.0"
 dependencies = [

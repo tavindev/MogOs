@@ -8,6 +8,7 @@ members = [
     "crates/mm",
     "crates/mogfs",
     "crates/net",
+    "crates/mogfs2",
     "crates/board/*",
 ]
 # Built by the board's build.rs for the kernel target.
