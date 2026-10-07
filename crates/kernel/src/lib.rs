@@ -39,6 +39,8 @@ pub trait Board {
     fn breakpoint_self_test(&mut self);
     /// Reads an address the MMU leaves unmapped; the data abort panics.
     fn read_unmapped(&mut self);
+    /// Prints `wx: <address>` and commits `violation` there; the fault panics.
+    fn violate(&mut self, violation: Violation);
     /// Hands `region` (identity-mapped RAM, owned by nobody else) to the global allocator; call once.
     fn init_heap(&mut self, region: Range<PhysAddr>);
     /// Microseconds since the board entered the kernel.
@@ -115,6 +117,16 @@ pub trait Clamp {
     /// Each of `values` if below its limit, else the limit minus 1, also on a mispredicted path, behind one barrier;
     /// the caller still checks each value.
     fn clamp<const N: usize>(values: [u64; N], limits: [u64; N]) -> [u64; N];
+}
+
+/// What `Board::violate` does; the kernel map must fault on each.
+pub enum Violation {
+    /// A store to the kernel's text.
+    WriteText,
+    /// A branch to a word in the kernel's data.
+    ExecuteData,
+    /// Core 0's recursion past its stack, into the guard page below it.
+    OverflowStack,
 }
 
 /// Hand-written asm user programs the board provides; newer ones are ELF files in the boot archive.
@@ -339,6 +351,9 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
                     _ => network::net_bench(board, gateway, port),
                 }
             }
+            "test=wx-text" => board.violate(Violation::WriteText),
+            "test=wx-exec" => board.violate(Violation::ExecuteData),
+            "test=wx-guard" => board.violate(Violation::OverflowStack),
             "test=disk" => disk_test(board, disk.as_mut().expect("no disk")),
             "test=bench-disk" => disk_bench(board, disk.as_mut().expect("no disk")),
             _ => {}

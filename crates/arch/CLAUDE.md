@@ -22,7 +22,10 @@ It is **NOT** board-specific: no MMIO addresses, no memory map, no drivers, no s
   mitigation, before their first branch) and `aarch64_exception` routing: IRQ, EL0 `svc`, EL0 fault, EL1 `svc #0` (yield),
   EL1 `brk #0` (self-test); anything else panics with ESR/FAR/ELR.
 - `new_task`, `new_user_task`, `switch_el0_regs`, `TrapFrame::restart`.
-- Descriptor encoding (`l1_block`, `user_page`), `enable_mmu` (core 0 fills the boot table, then runs `aarch64_mmu_on`),
+- Descriptor encoding (the private `kernel`, `user_page`), `enable_mmu(&KernelMap)` (core 0 builds the boot tables: the
+  device GiB PXN; the RAM GiB's level-2 table of 2 MiB blocks, RW and PXN, the DTB's read-only; the image's 2 MiB by a
+  level-3 table, text RX, rodata RO and PXN, the rest RW and PXN, guard pages unmapped; all UXN and global; SCTLR's WXN
+  set; then `aarch64_mmu_on`),
   `secondary_entry` (PSCI `CPU_ON`'s entry: `aarch64_mmu_on` on the same table, the stack top from the context id),
   `map_page`, `unmap_page`, `free_space`, `set_ttbr0`, `flush_asid` (`tlbi aside1is`), `clamp` (each of N values bounded below its limit by `cmp`/`csel`, then one
   `csdb`), `user_readable` /
@@ -53,7 +56,8 @@ It is **NOT** board-specific: no MMIO addresses, no memory map, no drivers, no s
 
 - **Trap frame**: the 288-byte `TrapFrame` the vector asm pushes on the kernel stack; its address *is* the task's
   saved context, which the scheduler stores and returns.
-- **Boot table**: the static level-1 `L1` loaded by `enable_mmu`, ASID 0 (`boot_table`).
+- **Boot table**: the static level-1 `L1` (with `L2` and `L3`, shared by every address space) loaded by `enable_mmu`,
+  ASID 0 (`boot_table`).
 
 ## Invariants & rules
 
@@ -66,7 +70,9 @@ It is **NOT** board-specific: no MMIO addresses, no memory map, no drivers, no s
   own; `new_user_task` sets both).
 - No FP/SIMD state is saved (softfloat target, `docs/DEVELOPMENT.md`).
 - Descriptor bits are const-asserted in `mmu.rs` because TCG ignores cacheability attributes, so a wrong bit would
-  still boot. User pages are always `PXN` and not global (ASID-tagged); a page is RX or RW, never W+X.
+  still boot. User pages are always `PXN` and not global (ASID-tagged); a page is RX or RW, never W+X. No kernel
+  mapping is writable and executable (WXN backs it), and each stack the board's `KernelMap` names has an unmapped
+  guard page below it. `free_space` skips every level-1 index the boot table fills: those tables are shared.
 - `enable_mmu` runs once, on core 0, with the MMU off and before any atomic RMW (exclusives need Normal memory), so
   before any `Lock`. `aarch64_mmu_on` and the secondary entry up to its SCTLR write touch no memory (no load, store or
   atomic: constants by `movz`/`movk`, the table by `adrp`), and its `tlbi vmalle1` is local.
@@ -86,6 +92,7 @@ It is **NOT** board-specific: no MMIO addresses, no memory map, no drivers, no s
 - No host tests. `cargo build` and `cargo clippy` must be clean (they build it for the bare-metal target).
 - End to end, `crates/e2e/tests/boot.rs`: `boots_and_powers_off` (vectors, MMU, the `spec:` line),
   `spec_line_matches_the_cpu` (TCG `cortex-a72`, `cortex-a76` and `max` at `-smp 4`: each model's table on every core), `unmapped_access_reports_data_abort`,
+  `kernel_text_is_read_only_data_never_executes_and_the_boot_stack_has_a_guard` (W^X, the guard page),
   `tasks_alternate_on_yield`, `timer_preempts_spinning_task` (GIC, timer), `faulting_process_is_killed_and_others_keep_running`
   (EL0 faults, ASIDs), `syscall_bench_reports_round_trip`, `lock_bench_reports_round_trips_and_an_exact_count` (`Lock`),
   `every_core_comes_online_and_takes_a_timer_tick` and `console_input_reaches_core_0_on_four_cores` (`-smp 4`).

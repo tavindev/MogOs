@@ -210,3 +210,36 @@ Filled in as each step lands.
   +2, yield 0. At `opt-level = 1` the generic `dispatch` is instantiated in the board crate, so the handle lookups and
   `path`/`socket` are `#[inline(always)]` (without it each returned its `Object` through `memcpy`, 200 more
   instructions for `dup` and `close`).
+- Step 60c, kernel W^X: `arch::enable_mmu(&KernelMap)` builds the boot tables on core 0, MMU off, from the board's
+  linker symbols: GiB 0 a device block (PXN, UXN); GiB 1 a table of 2 MiB blocks, RW, PXN and UXN, the DTB's block
+  at RAM base read-only, and the image's block (`0x40200000`) a table of 4 KiB pages: text read-only and executable,
+  rodata read-only and PXN, the rest RW and PXN, and the guard pages unmapped; every entry global and UXN, and
+  `SCTLR_EL1.WXN` set. `linker.ld` page-aligns `__text_end` and `__rodata_end`, puts a 4 KiB guard page below core 0's
+  64 KiB stack (`__boot_guard`) and below each secondary's 16 KiB stack (so `SECONDARY_STACK` is `0x5000`), and
+  `ASSERT`s that the image starts and fits its 2 MiB block (it ends at `0x40324000` in a debug build). A process's
+  level 1 copies the boot table's two kernel entries (`KERNEL_ENTRIES`, from `arch::boot_table()`), and `free_table`
+  skips every level-1 index the boot table fills, after its valid check (checking the boot table first cost every
+  `kill` 4100 TCG instructions). `kmain` reserves the DTB's whole block (about 1 MiB more than the DTB), since it is
+  read-only. `Board::violate` (`Violation`) runs
+  `test=wx-text` (a store to `kmain`), `test=wx-exec` (a branch to a `ret` in `.data`) and `test=wx-guard` (core 0
+  recurses 512 bytes a call); e2e `kernel_text_is_read_only_data_never_executes_and_the_boot_stack_has_a_guard`
+  pins each fault: a level-3 permission fault at the address (`ESR` `0x9600004f`, a write, and `0x8600000f`, an
+  instruction abort) and a level-3 translation fault in the guard page. Open: the guard page catches the overflow,
+  but the exception entry then pushes its frame on the same stack, so the nested faults walk down through the guard
+  and the panic report runs on the 4 KiB below it (the tail of `.bss`) before powering off; a clean report needs an
+  overflow stack or a check at EL1 entry (Linux's `VMAP_STACK` check needs size-aligned stacks: phase 6). `spawn`,
+  `kill` and every `assert_no_leak` scenario pass, so teardown leaves the shared tables alone. Benchmarks (hvf, base
+  60b `f655152`, 63 interleaved boots; median/min before -> after; load 25 to 300 in the last run, so min is the
+  steadier number, and earlier runs of the same tables agree): syscall 63/57 -> 63/58 ns (`-smp 4`) and 68/61 ->
+  68/62 (`-smp 1`), yield 84/76 -> 84/76, pipe round trip 573/518 -> 588/536 (`-smp 4`; 527/519 -> 550/539 in a
+  quieter run), pipe write 96.3/87.8 -> 99.8/90.8, file read 111.1/101.8 -> 115.4/102.7, `spawn` 1904/1745 ->
+  1913/1753, boot 271/224 -> 293/230 us (`-smp 4`) and 291/221 -> 304/224 (`-smp 1`). Pre-declared 0: syscall, yield
+  and `spawn` hold. Boot pays `enable_mmu`'s 1536 descriptor stores with the MMU and caches off, 6 us under hvf
+  (timed in `kmain`; the old two-entry copy was under 1 us): a cheaper fill needs the RAM size, from the DTB, before
+  the MMU is on. The pipe round trip pays 15-20 ns, 2-3 ns per trap, for the image's 4 KiB pages under hvf: mapping
+  the image as one 2 MiB block instead measured 535 -> 521 ns min. The fallback, the contiguous hint on every uniform
+  64 KiB run of the image (and on 32 MiB runs of blocks), measured no gain (545 -> 545 ns, and +9), so it was not
+  kept: under hvf the stage-2 tables may cap what one TLB entry covers, so the real cost waits for hardware. Keeping
+  frames out of the page-mapped block measured no gain either. TCG instructions: syscall, pipe and yield 0; `map`
+  +25 and `spawn` +318 (the frame allocator's first-fit scan starts behind 1 MiB more of reserved frames), `kill`
+  +26; boot +25000 (the table fill).

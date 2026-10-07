@@ -177,6 +177,44 @@ fn unmapped_access_reports_data_abort() {
     assert!(status.success(), "QEMU exited with {status}");
 }
 
+/// `test=wx-<name>`: the kernel prints `wx: <address>`, then stores to its own text (`text`), branches to a `.data`
+/// word (`exec`) or recurses past core 0's stack into its guard page (`guard`); each ends in the fault report.
+#[test]
+fn kernel_text_is_read_only_data_never_executes_and_the_boot_stack_has_a_guard() {
+    // (scenario, exception class, fault status code: permission or translation fault, level 3)
+    for (name, class, status) in [
+        ("text", 0x25, 0x0f),
+        ("exec", 0x21, 0x0f),
+        ("guard", 0x25, 0x07),
+    ] {
+        let (status_code, lines) = boot(&["-append", &format!("test=wx-{name}")]);
+        let address = lines
+            .iter()
+            .find_map(|l| l.strip_prefix("wx: 0x"))
+            .map(|a| u64::from_str_radix(a, 16).unwrap())
+            .unwrap_or_else(|| panic!("{name}: missing wx line"));
+        let fault = lines
+            .iter()
+            .find(|l| l.starts_with("unhandled sync exception from current EL"))
+            .unwrap_or_else(|| panic!("{name}: missing fault report"));
+        let field = |key: &str| {
+            let hex = fault.split_once(key).unwrap().1.split(' ').next().unwrap();
+            u64::from_str_radix(hex.trim_start_matches("0x"), 16).unwrap()
+        };
+        let (esr, far) = (field("ESR_EL1="), field("FAR_EL1="));
+        assert_eq!(esr >> 26, class, "{name}: exception class: {fault}");
+        assert_eq!(esr & 0x3f, status, "{name}: fault status: {fault}");
+        match name {
+            "guard" => assert_eq!(far & !0xfff, address, "{name}: not the guard page: {fault}"),
+            _ => assert_eq!(far, address, "{name}: fault address: {fault}"),
+        }
+        assert!(
+            status_code.success(),
+            "{name}: QEMU exited with {status_code}"
+        );
+    }
+}
+
 #[test]
 fn tasks_alternate_on_yield() {
     let (status, lines) = boot(&["-append", "test=yield"]);

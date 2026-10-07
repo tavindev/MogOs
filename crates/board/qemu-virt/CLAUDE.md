@@ -66,8 +66,8 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
 - Opts out of `forbid(unsafe_code)` (lints: `docs/DEVELOPMENT.md` settings table); every `unsafe` block has a one-line
   `// SAFETY:` and every `unsafe fn` a `# Safety` section.
 - Depends on `kernel`, never the reverse. GIC and RAM come from the DTB; board constants fix the rest:
-  `UART0` (the PL011 at `0x0900_0000`: all console output and input, never read from the DTB), `DTB` (RAM base), `KERNEL_L1` (GiB 0 device, GiB 1 RAM),
-  `UNMAPPED`, `TIMER_IRQ` (27), `UART_IRQ` (33), `VIRTIO_IRQ` (48, transport `i`'s SPI is `48 + i`), `RESCHEDULE_SGI` (0), core `n`'s MPIDR (`n`), `SECONDARY_STACK` (16 KiB), `VIRTIO`, `VIRTIO_STRIDE`, `VIRTIO_COUNT` (32 virtio-mmio transports from `0x0a00_0000`, `0x200` apart), the PSCI calls (`SYSTEM_OFF`, `CPU_ON`, by HVC). QEMU runs with
+  `UART0` (the PL011 at `0x0900_0000`: all console output and input, never read from the DTB), `DTB` (RAM base; its whole 2 MiB block is reserved and read-only), `KERNEL_ENTRIES` (2: the boot table's GiB 0 device and GiB 1 RAM entries every address space copies),
+  `UNMAPPED`, `TIMER_IRQ` (27), `UART_IRQ` (33), `VIRTIO_IRQ` (48, transport `i`'s SPI is `48 + i`), `RESCHEDULE_SGI` (0), core `n`'s MPIDR (`n`), `SECONDARY_STACK` (`0x5000`: a 4 KiB guard page and a 16 KiB stack), `VIRTIO`, `VIRTIO_STRIDE`, `VIRTIO_COUNT` (32 virtio-mmio transports from `0x0a00_0000`, `0x200` apart), the PSCI calls (`SYSTEM_OFF`, `CPU_ON`, by HVC). QEMU runs with
   `-global virtio-mmio.force-legacy=false` (the driver rejects legacy) and `-global virtio-mmio.ioeventfd=off`
   (`docs/DEVELOPMENT.md` settings table).
 - Bare-metal only: excluded from `cargo test-host`.
@@ -117,10 +117,13 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
 - User layout: code at `USER_BASE` (4 GiB), ELF segments within `IMAGE` (below the top two pages and an unmapped guard page, so a stack overflow faults), one stack page
   below `USER_STACK_TOP`; a `spawn` with arguments copies them to the end of that page and adds a stack page below it
   (both charged to the child), and the child starts with x0-x2 = count, address, length,
-  `map` from `MAP_BASE` upward. Kernel blocks (`KERNEL_L1`) are EL1-only in every address space.
+  `map` from `MAP_BASE` upward. Kernel entries (`KERNEL_ENTRIES`, copied from `arch::boot_table()`) are EL1-only in every address space.
 - `MAX_MUTEXES = MAX_PROCESSES * MAX_HANDLES`: every live mutex holds a handle, so the handle tables are the quota.
-- `linker.ld` provides `__stack_top`, `__bss_start`, `__bss_end`, `__kernel_start`, `__kernel_end`, and above
-  `__stack_top` the secondaries' stacks (core `n`'s ends at `__stack_top + n * 0x4000`), inside the reserved image; its load address
+- `linker.ld` provides `__kernel_start` (2 MiB aligned), `__text_end`, `__rodata_end` (both page aligned: `kmain`'s
+  `KernelMap` maps text RX, rodata RO, the rest RW), `__bss_start`, `__bss_end`, `__boot_guard` (core 0's guard page
+  below its 64 KiB stack), `__stack_top`, `__kernel_end`, and above `__stack_top` each secondary's guard page and
+  stack (core `n`'s ends at `__stack_top + n * 0x5000`), inside the reserved image; it `ASSERT`s the image fits its
+  2 MiB block, the one mapped by pages; its load address
   is explained in `docs/DEVELOPMENT.md`.
 - Performance is the moat: a slowdown is never accepted because it has an explanation; it is removed, or shown to
   be unavoidable with before/after numbers (`docs/BENCHMARKS.md`).

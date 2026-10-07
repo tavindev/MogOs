@@ -84,6 +84,7 @@ for i in $(seq 50); do cargo test -q --target aarch64-apple-darwin -p e2e --test
 cargo bench-host       # host benchmarks (min/median); see docs/BENCHMARKS.md
 cargo run              # boot in QEMU; prints hello, exceptions, mmu, ram, frames, heap, boot, disk lines and powers off
 cargo run -- -append test=mmu-fault  # reads an unmapped address after MMU on; prints the data abort
+cargo run -- -append test=wx-text    # stores to kernel text (wx-exec: branches to a .data word; wx-guard: core 0's stack overflows into its guard page); prints the fault
 cargo run -- -append test=yield      # tasks a and b print 0..2 in turn via `svc` yield
 cargo run -- -append test=bench      # prints the yield round trip in ns
 cargo run -- -append test=preempt    # timer preempts spinning task a; task b prints 0..2
