@@ -23,6 +23,20 @@ AGENTS.md
     └── docs/phases/phase-N-*.md      steps, done-when, what was done
 ```
 
+Each crate carries a `CLAUDE.md` ownership contract (what it is and is not, boundaries, invariants, how it is
+tested), auto-loaded when an agent works in that crate. A new crate gets one when it lands.
+
+```
+AGENTS.md
+├── crates/kernel/CLAUDE.md
+├── crates/mm/CLAUDE.md
+├── crates/dtb/CLAUDE.md
+├── crates/arch/CLAUDE.md
+├── crates/board/qemu-virt/CLAUDE.md
+├── crates/user/CLAUDE.md
+└── crates/e2e/CLAUDE.md
+```
+
 Every new `.md` file must be linked from its parent so it stays reachable from this root, and this tree must be updated when one is added.
 
 ## Target
