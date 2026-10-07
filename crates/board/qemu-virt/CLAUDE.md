@@ -83,7 +83,7 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
 - Opts out of `forbid(unsafe_code)` (lints: `docs/DEVELOPMENT.md` settings table); every `unsafe` block has a one-line
   `// SAFETY:` and every `unsafe fn` a `# Safety` section.
 - Depends on `kernel`, never the reverse. GIC and RAM come from the DTB; board constants fix the rest:
-  `UART0` (the PL011 at `0x0900_0000`: all console output and input, never read from the DTB), `DTB` (RAM base; its whole 2 MiB block is reserved and read-only), `KERNEL_ENTRIES` (2: the boot table's GiB 0 device and GiB 1 RAM entries every address space copies),
+  `UART0` (the PL011 at `0x0900_0000`: all console output and input, never read from the DTB), `DTB` (RAM base; its pages read-only and reserved, core 0's boot stack at the top of its 2 MiB block), `KERNEL_ENTRIES` (2: the boot table's GiB 0 device and GiB 1 RAM entries every address space copies),
   `UNMAPPED`, `TIMER_IRQ` (27), `UART_IRQ` (33), `VIRTIO_IRQ` (48, transport `i`'s SPI is `48 + i`), `RESCHEDULE_SGI` (0), `PING_SGI` (1), `CPU_STACK` (16 KiB), `REDIST_STRIDE` (128 KiB), `VIRTIO`, `VIRTIO_STRIDE`, `VIRTIO_COUNT` (32 virtio-mmio transports from `0x0a00_0000`, `0x200` apart), the PSCI calls (`SYSTEM_OFF`, `CPU_ON`, by HVC). QEMU runs with
   `-M virt,gic-version=3`, `-global virtio-mmio.force-legacy=false` (the driver rejects legacy) and `-global virtio-mmio.ioeventfd=off`
   (`docs/DEVELOPMENT.md` settings table).
@@ -156,11 +156,12 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
   handle tables are full.
 - `PerCpu` statics are `#[unsafe(link_section = ".percpu")]`, built with `unsafe` `PerCpu::new`; none is touched
   before `init_cpus` (TPIDR_EL1 is 0 until then, which would reach the template).
-- `linker.ld` provides `__kernel_start` (2 MiB aligned), `__text_end`, `__rodata_end` (both page aligned: `kmain`'s
-  `KernelMap` maps text RX, rodata RO, the rest RW), `.percpu` (`__percpu_start`, `__percpu_end`: the per-CPU
-  template, loaded with the image, never written), `__bss_start`, `__bss_end`, `__boot_guard` (core 0's guard page
-  below its 64 KiB stack), `__stack_top`, `__kernel_end`; it `ASSERT`s the image fits its 2 MiB block, the one mapped
-  by pages; its load address
+- `linker.ld` provides `__kernel_start`, `__text_end` and `__rodata_end` (each 2 MiB aligned: `kmain`'s `KernelMap`
+  maps text, rodata and the rest as 2 MiB blocks, RX, RO and RW), `.percpu` (`__percpu_start`, `__percpu_end`: the
+  per-CPU template, loaded with the image, never written), `__bss_start`, `__bss_end`, `__kernel_end`, and below the
+  image, in RAM's first 2 MiB (mapped by pages, the DTB below): `__stack_top` (= `__kernel_start`, core 0's 64 KiB
+  stack ends there) and `__boot_guard` (its guard page, also `__stacks`); `kmain` reserves the DTB and `__stacks` up to
+  `__kernel_end` plus the cores' table (the text and rodata blocks' padding included); its load address
   is explained in `docs/DEVELOPMENT.md`.
 - Performance is the moat: a slowdown is never accepted because it has an explanation; it is removed, or shown to
   be unavoidable with before/after numbers (`docs/BENCHMARKS.md`).

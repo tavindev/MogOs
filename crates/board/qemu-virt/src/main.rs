@@ -127,8 +127,13 @@ struct Nospec;
 
 impl kernel::Clamp for Nospec {
     #[inline(always)]
-    fn clamp<const N: usize>(values: [u64; N], limits: [u64; N]) -> [u64; N] {
-        arch::clamp(values, limits)
+    fn clamp<const N: usize>(values: [u64; N], maxes: [u64; N]) -> [u64; N] {
+        arch::clamp(values, maxes)
+    }
+
+    #[inline(always)]
+    fn mask(value: u64, mask: u64) -> u64 {
+        arch::mask(value, mask)
     }
 }
 /// Kernel stack per task: 16 KiB.
@@ -530,29 +535,34 @@ unsafe extern "C" {
     static __text_end: u8;
     static __rodata_end: u8;
     static __boot_guard: u8;
+    static __stacks: u8;
     static __kernel_end: u8;
-    static __stack_top: u8;
 }
 
 #[unsafe(no_mangle)]
 extern "C" fn kmain() -> ! {
     let entry_us = arch::uptime_us();
+    // SAFETY: RAM base is RAM, read with the MMU off as Device memory; we only read the 8-byte FDT header there.
+    let header = unsafe { slice::from_raw_parts(DTB.0 as *const u8, 8) };
+    let size = dtb::total_size(header).expect("no DTB at RAM base");
+    let stacks = PhysAddr(&raw const __stacks as u64);
+    let dtb_range = DTB..PhysAddr(DTB.0 + size as u64);
+    assert!(
+        dtb_range.end.0 <= stacks.0,
+        "the DTB reaches the boot stacks"
+    );
     let map = KernelMap {
         device: PhysAddr(0),
         ram: PhysAddr(GIB),
-        dtb: DTB,
+        dtb: dtb_range.clone(),
         image: PhysAddr(&raw const __kernel_start as u64),
         text_end: PhysAddr(&raw const __text_end as u64),
         rodata_end: PhysAddr(&raw const __rodata_end as u64),
         guard: PhysAddr(&raw const __boot_guard as u64),
     };
-    // SAFETY: core 0, MMU off, before any atomic RMW; MMIO is in GiB 0, the image (`linker.ld` keeps it in its 2 MiB),
-    // stacks and DTB in RAM in GiB 1.
+    // SAFETY: core 0, MMU off, before any atomic RMW; MMIO is in GiB 0, the image, stacks and DTB in RAM in GiB 1.
     unsafe { arch::enable_mmu(&map) };
 
-    // SAFETY: RAM base is mapped RAM; we only read the 8-byte FDT header there.
-    let header = unsafe { slice::from_raw_parts(DTB.0 as *const u8, 8) };
-    let size = dtb::total_size(header).expect("no DTB at RAM base");
     // SAFETY: the magic matched, so QEMU loaded `size` bytes of DTB here and nothing writes them.
     let blob = unsafe { slice::from_raw_parts(DTB.0 as *const u8, size) };
 
@@ -616,15 +626,15 @@ extern "C" fn kmain() -> ! {
     unsafe { arch::gic::unmask(dist, UART_IRQ) };
     Uart::new(UART0).enable_rx_irq();
 
-    // The DTB's whole 2 MiB block is read-only, so no frame comes from it; the cores' table follows the image.
-    let reserved = DTB..PhysAddr(&raw const __kernel_end as u64 + len as u64 * 8);
+    // The cores' table follows the image, reserved with it.
+    let image_end = PhysAddr(&raw const __kernel_end as u64 + len as u64 * 8);
     kernel::run(
         &mut QemuVirt {
             console: Console,
             entry_us,
         },
         dtb,
-        &[reserved],
+        &[dtb_range, stacks..image_end],
     )
 }
 

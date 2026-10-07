@@ -298,21 +298,19 @@ fn smccc(conduit: Conduit, function: u32, arg: u32) -> i64 {
     result as i32 as i64
 }
 
-/// Each of `values` if below its limit, else the limit minus 1, by `cmp` and `csel`, then one `csdb`: no later
-/// instruction uses a value a mispredicted check let through.
+/// Each of `values` if at most its max, else the max, by `cmp` and `csel`, then one `csdb`: no later instruction uses
+/// a value a mispredicted check let through.
 #[inline(always)]
-pub fn clamp<const N: usize>(values: [u64; N], limits: [u64; N]) -> [u64; N] {
+pub fn clamp<const N: usize>(values: [u64; N], maxes: [u64; N]) -> [u64; N] {
     let mut out = values;
     for i in 0..N {
         // SAFETY: arithmetic only; not `pure`, so it stays before the `csdb` below.
         unsafe {
             asm!(
-                "sub {m}, {n}, #1",
-                "cmp {v}, {n}",
-                "csel {v}, {v}, {m}, lo",
+                "cmp {v}, {m}",
+                "csel {v}, {v}, {m}, ls",
                 v = inout(reg) out[i],
-                n = in(reg) limits[i],
-                m = out(reg) _,
+                m = in(reg) maxes[i],
                 options(nomem, nostack),
             )
         };
@@ -320,6 +318,17 @@ pub fn clamp<const N: usize>(values: [u64; N], limits: [u64; N]) -> [u64; N] {
     // SAFETY: `csdb` only; no `nomem`, so no load the compiler emits moves above it.
     unsafe { asm!("hint #20", options(nostack, preserves_flags)) };
     out
+}
+
+/// `value & mask`, which the compiler cannot see through: a bound by construction it never drops.
+#[inline(always)]
+pub fn mask(value: u64, mask: u64) -> u64 {
+    let masked: u64;
+    // SAFETY: arithmetic only.
+    unsafe {
+        asm!("and {o}, {v}, {m}", o = lateout(reg) masked, v = in(reg) value, m = in(reg) mask, options(pure, nomem, nostack, preserves_flags))
+    };
+    masked
 }
 
 fn vectors() -> u64 {

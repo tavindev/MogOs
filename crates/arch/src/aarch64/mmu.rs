@@ -1,4 +1,5 @@
 use core::arch::{asm, global_asm};
+use core::ops::Range;
 
 use mm::PhysAddr;
 
@@ -78,7 +79,7 @@ const _: () =
 struct Table([u64; 512]);
 
 static mut L1: Table = Table([0; 512]);
-/// The RAM GiB's 2 MiB blocks, and the image's 4 KiB pages.
+/// The RAM GiB's 2 MiB blocks, and its first block's 4 KiB pages.
 static mut L2: Table = Table([0; 512]);
 static mut L3: Table = Table([0; 512]);
 
@@ -133,17 +134,18 @@ aarch64_mmu_on:
 pub struct KernelMap {
     /// The GiB of device memory: PXN.
     pub device: PhysAddr,
-    /// The GiB of RAM: 2 MiB blocks, read-write and PXN, but for `dtb` and `image`.
+    /// The GiB of RAM: 2 MiB blocks, read-write and PXN, but for its first and the image's.
     pub ram: PhysAddr,
-    /// A 2 MiB block mapped read-only and PXN.
-    pub dtb: PhysAddr,
-    /// The image's 2 MiB block, by 4 KiB pages: read-only and executable below `text_end`, read-only and PXN below
-    /// `rodata_end`, read-write and PXN above, but for the unmapped `guards`.
+    /// In RAM's first 2 MiB, mapped by 4 KiB pages: read-only and PXN; the rest of that block read-write and PXN but
+    /// for the unmapped `guards`.
+    pub dtb: Range<PhysAddr>,
+    /// Core 0's boot-stack guard page (the other cores' stacks are in their per-CPU blocks).
+    pub guard: PhysAddr,
+    /// The image's 2 MiB blocks: read-only and executable below `text_end`, read-only and PXN below `rodata_end`,
+    /// read-write and PXN above.
     pub image: PhysAddr,
     pub text_end: PhysAddr,
     pub rodata_end: PhysAddr,
-    /// Core 0's boot-stack guard page.
-    pub guard: PhysAddr,
 }
 
 /// Builds the boot tables for `map` (4 KiB granule, 39-bit VA, attributes per `MAIR`) and turns on the MMU, caches
@@ -153,7 +155,8 @@ pub struct KernelMap {
 ///
 /// Call once, on core 0, with the MMU off (the tables are written in place, no break-before-make) and before any
 /// atomic read-modify-write (exclusives need Normal memory). `map` must map, at their current physical addresses,
-/// all code, data, stack and MMIO the program uses, with its text below `text_end`; the GiBs, `dtb` and `image` aligned.
+/// all code, data, stack and MMIO the program uses, with its text below `text_end`; the GiBs, `image`, `text_end` and
+/// `rodata_end` aligned, the image past RAM's first 2 MiB.
 pub unsafe fn enable_mmu(map: &KernelMap) {
     let (l1, l2, l3) = (&raw mut L1, &raw mut L2, &raw mut L3);
     // SAFETY: core 0 alone with the MMU off; nothing else references the tables.
@@ -164,27 +167,32 @@ pub unsafe fn enable_mmu(map: &KernelMap) {
     let l3 = unsafe { &mut (*l3).0 };
     l1[(map.device.0 / GIB) as usize] = kernel(map.device.0, Kernel::Device, VALID_BLOCK);
     l1[(map.ram.0 / GIB) as usize] = table_entry(PhysAddr(l2.as_ptr() as u64));
-    let block = |addr: PhysAddr| ((addr.0 - map.ram.0) / BLOCK_2M) as usize;
-    for (i, entry) in l2.iter_mut().enumerate() {
-        *entry = kernel(
-            map.ram.0 + i as u64 * BLOCK_2M,
-            Kernel::ReadWrite,
-            VALID_BLOCK,
-        );
-    }
-    l2[block(map.dtb)] = kernel(map.dtb.0, Kernel::ReadOnly, VALID_BLOCK);
-    l2[block(map.image)] = table_entry(PhysAddr(l3.as_ptr() as u64));
-    let page = |addr: PhysAddr| ((addr.0 - map.image.0) / PAGE) as usize;
-    let (text, rodata) = (page(map.text_end), page(map.rodata_end));
-    for (i, entry) in l3.iter_mut().enumerate() {
-        let access = match i {
-            _ if i < text => Kernel::Text,
-            _ if i < rodata => Kernel::ReadOnly,
-            _ => Kernel::ReadWrite,
-        };
-        *entry = kernel(map.image.0 + i as u64 * PAGE, access, VALID_TABLE_OR_PAGE);
-    }
-    l3[page(map.guard)] = 0;
+    // Plain stores of precomputed attributes: with the MMU off every access here is uncached.
+    let fill = |table: &mut [u64], (start, end): (u64, u64), base: u64, size: u64, attrs: u64| {
+        for i in start..end {
+            table[i as usize] = (base + i * size) | attrs;
+        }
+    };
+    let block = |addr: PhysAddr| (addr.0 - map.ram.0) / BLOCK_2M;
+    let (image, text, rodata) = (block(map.image), block(map.text_end), block(map.rodata_end));
+    let blocks = |access| kernel(0, access, VALID_BLOCK);
+    fill(l2, (0, 512), map.ram.0, BLOCK_2M, blocks(Kernel::ReadWrite));
+    fill(l2, (image, text), map.ram.0, BLOCK_2M, blocks(Kernel::Text));
+    fill(
+        l2,
+        (text, rodata),
+        map.ram.0,
+        BLOCK_2M,
+        blocks(Kernel::ReadOnly),
+    );
+    l2[0] = table_entry(PhysAddr(l3.as_ptr() as u64));
+    let page = |addr: u64| (addr - map.ram.0).div_ceil(PAGE);
+    let pages = |access| kernel(0, access, VALID_TABLE_OR_PAGE);
+    let dtb = (page(map.dtb.start.0), page(map.dtb.end.0));
+    fill(l3, (0, dtb.0), map.ram.0, PAGE, pages(Kernel::ReadWrite));
+    fill(l3, dtb, map.ram.0, PAGE, pages(Kernel::ReadOnly));
+    fill(l3, (dtb.1, 512), map.ram.0, PAGE, pages(Kernel::ReadWrite));
+    l3[page(map.guard.0) as usize] = 0;
     // SAFETY: the tables are written and the caller guarantees they map everything in use.
     unsafe { asm!("bl aarch64_mmu_on", out("x9") _, out("x10") _, out("x30") _) }
 }
