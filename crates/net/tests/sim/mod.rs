@@ -61,6 +61,11 @@ impl Link {
         }
     }
 
+    /// When the next frame in flight arrives.
+    pub fn next(&self) -> Option<u64> {
+        self.queues.iter().flatten().map(|q| q.0).min()
+    }
+
     /// The NIC on `side` (0 or 1).
     pub fn end(&mut self, side: usize) -> End<'_> {
         End { link: self, side }
@@ -163,4 +168,26 @@ impl Nic for End<'_> {
         link.spare.push(frame);
         true
     }
+}
+
+/// Applies one mutation; returns false if the Internet checksum may miss it (it cannot tell 0x0000 from 0xffff).
+pub fn mutate(rng: &mut Rng, frame: &mut Vec<u8>) -> bool {
+    let len = frame.len() as u64;
+    match rng.below(6) {
+        1 => frame[rng.below(len.min(64)) as usize] = rng.next() as u8,
+        2 => frame[rng.below(len) as usize] = [0, 0xff][rng.below(2) as usize],
+        3 => frame.truncate(rng.below(len) as usize),
+        4 => frame.extend((0..rng.below(64)).map(|_| rng.next() as u8)),
+        5 if len >= 2 => {
+            let i = rng.below(len.min(48) / 2) as usize * 2;
+            let v = [0u16, 1, 0x7fff, 0x8000, 0xffff][rng.below(5) as usize];
+            frame[i..i + 2].copy_from_slice(&v.to_be_bytes());
+            return false;
+        }
+        _ => {
+            let bit = rng.below(len * 8) as usize;
+            frame[bit / 8] ^= 1 << (bit % 8);
+        }
+    }
+    true
 }
