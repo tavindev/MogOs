@@ -6,7 +6,7 @@ use core::ptr;
 use core::slice;
 use core::sync::atomic::Ordering::Relaxed;
 
-use arch::{MemoryType, UserAccess, l1_block, user_page};
+use arch::{UserAccess, user_page};
 use kernel::elf::{Elf, Segment};
 use kernel::handle::{
     CONNECT, DUPLICATE, Handles, KILL, LISTEN, MAX_HANDLES, Object, READ, Rights, TRANSFER, WAIT,
@@ -19,8 +19,8 @@ use mogfs::ROOT;
 
 use crate::usermem::copy_in;
 use crate::{
-    ARCHIVE, IMAGE, KERNEL, KERNEL_L1, Kernel, MAP_BASE, PAGE, Sched, TASK_STACK_FRAMES, USER_BASE,
-    USER_END, USER_STACK_TOP, gic_gibs,
+    ARCHIVE, IMAGE, KERNEL, KERNEL_ENTRIES, Kernel, MAP_BASE, Nospec, PAGE, Sched,
+    TASK_STACK_FRAMES, USER_BASE, USER_END, USER_STACK_TOP, gic_gibs,
 };
 
 /// Returns a thread's kernel stack at `stack` to `frames`, refunding `budget`.
@@ -126,15 +126,20 @@ fn spawn_process(
     (args, argc): (&[u8], usize),
 ) -> Result<(), i64> {
     let l1 = zeroed(frames, &mut budget).ok_or(ENOMEM)?;
-    // SAFETY: `l1` is a fresh, zeroed frame.
-    unsafe { (l1.0 as *mut [u64; 2]).write(KERNEL_L1) };
-    for gib in gic_gibs() {
-        // SAFETY: as above; `gib` is below 512.
-        unsafe {
-            (l1.0 as *mut u64)
-                .wrapping_add(gib as usize)
-                .write(l1_block(PhysAddr(gib << 30), MemoryType::Device))
-        };
+    // SAFETY: `l1` is a fresh frame; the boot table's kernel entries stay fixed after `kmain`.
+    unsafe {
+        ptr::copy_nonoverlapping(
+            arch::boot_table().0 as *const u64,
+            l1.0 as *mut u64,
+            KERNEL_ENTRIES,
+        )
+    };
+    let boot = arch::boot_table().0 as *const u64;
+    for gib in gic_gibs().map(|g| g as usize) {
+        // SAFETY: a boot-table entry `kmain` added, below 512, fixed after `kmain`.
+        let entry = unsafe { boot.wrapping_add(gib).read() };
+        // SAFETY: as above, the fresh frame.
+        unsafe { (l1.0 as *mut u64).wrapping_add(gib).write(entry) };
     }
     let stack = (|| {
         for segment in segments {
@@ -257,7 +262,10 @@ pub(crate) fn spawn(
     for (handle, bytes) in list.iter_mut().zip(bytes.as_chunks::<8>().0) {
         *handle = u64::from_le_bytes(*bytes);
     }
-    let (mut parent, child) = sched.handles(cpu).split(&list[..len])?;
+    // `len` is at most `MAX_HANDLES` (`dispatch`); the modulo keeps the slice in bounds on a mispredicted path too.
+    let (mut parent, child) = sched
+        .handles(cpu)
+        .split::<Nospec>(&list[..len % (MAX_HANDLES + 1)])?;
     let current = sched.process(cpu);
     if budget > sched.memory(current).budget.remaining() {
         return Err(ENOMEM);

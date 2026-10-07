@@ -3,15 +3,16 @@
 ## What this crate is
 
 Reads the flattened device tree QEMU passes: `total_size`, then `Dtb::memory`, `gic` (the first `arm,gic-v3`: its distributor and `#redistributor-regions` regions), `cpus` (each `/cpus` child with `device_type = "cpu"`: its `reg`, the MPIDR affinity, decoded with `/cpus`' own
-`#address-cells`, in order, and the count) and
-`chosen` (`/chosen`'s `bootargs` and the first 16 bytes of `rng-seed`, the TCP key, in one walk). All in `src/lib.rs`. It is **NOT** a general device-tree library: no writing, no phandles, no
+`#address-cells`, in order, and the count),
+`chosen` (`/chosen`'s `bootargs` and the first 16 bytes of `rng-seed`, the TCP key, in one walk) and `psci_method`
+(`/psci`'s `method`: `hvc` or `smc`). All in `src/lib.rs`. It is **NOT** a general device-tree library: no writing, no phandles, no
 nested-bus address translation.
 
 ## Boundaries (hard)
 
 - `#![cfg_attr(not(test), no_std)]`, depends only on `mm` (`PhysAddr`), workspace `forbid(unsafe_code)`.
 - Works on a `&[u8]`; the board (`kmain` in `crates/board/qemu-virt`) builds that slice from RAM base.
-- Callers: `qemu-virt` (`gic`, `cpus`) and `kernel::run` (`memory`, `chosen`).
+- Callers: `qemu-virt` (`gic`, `cpus`, `psci_method`) and `kernel::run` (`memory`, `chosen`).
 
 ## Invariants & rules
 

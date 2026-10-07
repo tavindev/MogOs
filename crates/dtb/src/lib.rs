@@ -126,6 +126,16 @@ impl<'a> Dtb<'a> {
         (bootargs, seed)
     }
 
+    /// `/psci/method`: the conduit for PSCI and SMCCC calls, `hvc` or `smc`.
+    pub fn psci_method(&self) -> Option<&'a str> {
+        self.find(|p| {
+            if p.depth != 2 || p.node != b"psci" || p.name != b"method" {
+                return None;
+            }
+            core::str::from_utf8(p.value.strip_suffix(&[0])?).ok()
+        })
+    }
+
     /// Walks every property in order and returns the first `Some` from `f`.
     fn find<T>(&self, mut f: impl FnMut(&Prop<'a>) -> Option<T>) -> Option<T> {
         let (mut pos, mut depth, mut node, mut node_offset) = (0, 0, &[][..], 0);

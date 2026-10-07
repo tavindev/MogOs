@@ -14,21 +14,26 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
 
 ## Responsibilities
 
-- `kmain`: turns on the MMU (`arch::enable_mmu`, first), reads the DTB at RAM base and, in one walk of its cores,
-  writes the cores' table right after the image (reserved with it): the MPIDR of each core by dense index (0 the boot
-  core, the rest in DTB order), then the GIC's redistributor regions (base, frame count); maps any GiB of those
-  regions past `KERNEL_L1` into the boot table (`arch::map_device_gib`; spawned address spaces copy them too,
-  `gic_gibs`); enables the GICv3 distributor (affinity routing, Group 1; it panics without an `arm,gic-v3`), routes `UART_IRQ` to core 0 (Group 1, `GICD_IROUTER`), builds
-  `QemuVirt`, calls `kernel::run` with the image and DTB reserved. `Board::init_cpus`, called by `kernel::run` right after the frame
-  allocator is built, takes one `alloc_contiguous` of a block per core (a 16 KiB stack, then a copy of the `.percpu`
-  template whose start is the stack's top) and makes block 0's area core 0's (`arch::enter_percpu`). `Board::start_cpus`,
-  the last step of boot, starts core 1 with PSCI `CPU_ON` (target from the table, context id its area and index)
-  without waiting; core k starts 2k and 2k + 1 first thing (a tree: about log2 N levels; a refused `CPU_ON` panics). `kmain_secondary`: a started core enables its GIC CPU
-  interface (`enable_gic_cpu`: its redistributor, checked against its MPIDR, woken, SGIs and PPIs in Group 1, then the
-  ICC system registers), timer PPI, `RESCHEDULE_SGI` and `PING_SGI` (`GICR_ISENABLER0`), lets EL0 read the counter, and becomes its idle
-  context (`idle`, `wfi` in a loop); each counts itself in `ONLINE` once its GIC is up; only under `test=smp`
-  (`SMP_TEST`) does it arm its timer once. Core 0's idle context runs on block 0's stack (core 0 keeps its boot stack),
-  its first frame built by `init_frames`, which also gives the scheduler its cores (`Scheduler::start_cores`).
+- `kmain`: turns on the MMU (`arch::enable_mmu`, first), reads the DTB at RAM base, stores its PSCI `method` (`CONDUIT`)
+  and installs core 0's vectors with it (`arch::install_vectors`), and, in one walk of its cores, writes the cores'
+  table right after the image (reserved with it): the MPIDR of each core by dense index (0 the boot core, the rest in
+  DTB order), then the GIC's redistributor regions (base, frame count); maps any GiB of those regions past
+  `KERNEL_ENTRIES` into the boot table (`arch::map_device_gib`; spawned address spaces copy them too, `gic_gibs`);
+  enables the GICv3 distributor (affinity routing, Group 1; it panics without an `arm,gic-v3`), routes `UART_IRQ` to
+  core 0 (Group 1, `GICD_IROUTER`), builds `QemuVirt`, calls `kernel::run` with the DTB's block, the image and the
+  table reserved. `Board::init_cpus`, called by `kernel::run` right after the frame allocator is built, takes one
+  `alloc_contiguous` of a block per core (a 16 KiB stack, then a copy of the `.percpu` template whose start is the
+  stack's top; no guard page) and makes block 0's area core 0's (`arch::enter_percpu`). `Board::start_cpus`, the last
+  step of boot, starts core 1 with PSCI `CPU_ON` (target from the table, context id its area and index) without
+  waiting; core k starts 2k and 2k + 1 first thing (a tree: about log2 N levels; a refused `CPU_ON` panics).
+  `kmain_secondary`: a started core installs its own vectors and records them, enables its GIC CPU interface
+  (`enable_gic_cpu`: its redistributor, checked against its MPIDR, woken, SGIs and PPIs in Group 1, then the ICC
+  system registers), timer PPI, `RESCHEDULE_SGI` and `PING_SGI` (`GICR_ISENABLER0`), lets EL0 read the counter, and
+  becomes its idle context (`idle`, `wfi` in a loop); each counts itself in `ONLINE` once its GIC is up; only under
+  `test=smp` (`SMP_TEST`) does it arm its timer once. Core 0's idle context runs on block 0's stack (core 0 keeps its
+  boot stack), its first frame built by `init_frames`, which also gives the scheduler its cores
+  (`Scheduler::start_cores`).
+- `Nospec`, the `kernel::Clamp` `dispatch` and `split` use (`arch::clamp`).
 - `KERNEL: Lock<Kernel>` (`Scheduler` with its process table, `FrameAllocator`, `Pipes`, `Mutexes`, console `Line`,
   the MogFS `Fs<FsDisk>` and whether it is mounted, and `buf`, the 8 KiB a syscall copies user inputs into), `HEAP` and
   `CONSOLE: Lock<Uart>` statics. `Fs::new` is const, so the 48 KiB file system is built in the static with an empty
@@ -40,6 +45,8 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
   at `UART0`, like every other UART access. `test=bench-lock`'s `round_trips` (ticket vs test-and-set lock, `cpu()`, `PerCpu::with`) and `add_locked`; `test=bench-ipi`'s `ipi_round_trips` (`PING_SGI`, answered in `board_irq`);
   `test=smp`'s `cpus`, `cpu`, `online_cpus` (`ONLINE`) and `ticked_cpus` (`TICKED`, a count each core adds 1 to on
   its first tick, guarded by its `PerCpu<bool>` `TICK_COUNTED`, so no core reads another's per-CPU area).
+  `report_speculation` records core 0's vectors, waits until every started core has recorded its own
+  (`arch::speculation`), then prints `spec: ...`.
 - Processes and threads: `spawn_process`, `spawn`, `thread`, `map` (`src/process.rs`); `end_thread`, `end_process`,
   `exit_thread`, `exit_process`, `kill`, `release`, and `switch`, which moves SP_EL0 and TPIDR_EL0 on every switch with
   a user thread on either side and writes TTBR0 only when the process changes (`src/trap.rs`).
@@ -76,8 +83,8 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
 - Opts out of `forbid(unsafe_code)` (lints: `docs/DEVELOPMENT.md` settings table); every `unsafe` block has a one-line
   `// SAFETY:` and every `unsafe fn` a `# Safety` section.
 - Depends on `kernel`, never the reverse. GIC and RAM come from the DTB; board constants fix the rest:
-  `UART0` (the PL011 at `0x0900_0000`: all console output and input, never read from the DTB), `DTB` (RAM base), `KERNEL_L1` (GiB 0 device, GiB 1 RAM),
-  `UNMAPPED`, `TIMER_IRQ` (27), `UART_IRQ` (33), `VIRTIO_IRQ` (48, transport `i`'s SPI is `48 + i`), `RESCHEDULE_SGI` (0), `PING_SGI` (1), `CPU_STACK` (16 KiB), `REDIST_STRIDE` (128 KiB), `SECONDARY_STACK` (16 KiB), `VIRTIO`, `VIRTIO_STRIDE`, `VIRTIO_COUNT` (32 virtio-mmio transports from `0x0a00_0000`, `0x200` apart), the PSCI calls (`SYSTEM_OFF`, `CPU_ON`, by HVC). QEMU runs with
+  `UART0` (the PL011 at `0x0900_0000`: all console output and input, never read from the DTB), `DTB` (RAM base; its whole 2 MiB block is reserved and read-only), `KERNEL_ENTRIES` (2: the boot table's GiB 0 device and GiB 1 RAM entries every address space copies),
+  `UNMAPPED`, `TIMER_IRQ` (27), `UART_IRQ` (33), `VIRTIO_IRQ` (48, transport `i`'s SPI is `48 + i`), `RESCHEDULE_SGI` (0), `PING_SGI` (1), `CPU_STACK` (16 KiB), `REDIST_STRIDE` (128 KiB), `VIRTIO`, `VIRTIO_STRIDE`, `VIRTIO_COUNT` (32 virtio-mmio transports from `0x0a00_0000`, `0x200` apart), the PSCI calls (`SYSTEM_OFF`, `CPU_ON`, by HVC). QEMU runs with
   `-M virt,gic-version=3`, `-global virtio-mmio.force-legacy=false` (the driver rejects legacy) and `-global virtio-mmio.ioeventfd=off`
   (`docs/DEVELOPMENT.md` settings table).
 - Bare-metal only: excluded from `cargo test-host`.
@@ -111,8 +118,8 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
   `board_irq`, or in `block` if it blocks first; a marked caller gets `EAGAIN` from `thread`, so its process gains
   none. The last thread to end frees the address space (`exit_process`). IRQs dispatch on the INTID `ICC_IAR1_EL1` returns and EOI it
   (`ICC_EOIR1_EL1`), except the special IDs from 1020.
-- Everything a secondary reads (`GIC_DIST`, `CPU_TABLE`, `CPUS`, `REDIST_REGIONS`, `BLOCKS`, `BLOCK`, `SMP_TEST`) is
-  stored before core 1's `CPU_ON`, which `dsb ish` precedes; a core starts others only after its own entry.
+- Everything a secondary reads (`GIC_DIST`, `CPU_TABLE`, `CPUS`, `REDIST_REGIONS`, `BLOCKS`, `BLOCK`, `SMP_TEST`,
+  `CONDUIT`) is stored before core 1's `CPU_ON`, which `dsb ish` precedes; a core starts others only after its own entry.
 - Secondaries must set every per-core register core 0 sets (vectors, `CNTKCTL_EL1`): EL0 on a core without
   `allow_user_counter` traps its counter reads.
 - A process's index is its ASID (`MAX_PROCESSES <= 256`, const-asserted); index 0 is the kernel, whose boot table
@@ -131,7 +138,8 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
 - Every new `Process` or `Thread` handle is counted (`Scheduler::held`): the one `spawn_process` hands out (the
   spawner's, or init's own), `thread`'s, and each `dup`; `release` uncounts each closed one.
 - A blocking call rewinds its `svc` (`block` calls `TrapFrame::restart`) and reruns when woken.
-- User memory is reached only through `UserIn` / `UserOut` (`src/usermem.rs`), which probe every page with
+- User memory is reached only through `UserIn` / `UserOut` (`src/usermem.rs`), which take pointers `dispatch`
+  clamped into user space, then probe every page with
   `arch::user_readable` / `user_writable` once and then move bytes by raw copy, in the same trap, before any switch;
   never through a reference, since a sibling thread may write the memory meanwhile. Inputs the kernel parses (paths,
   spawn arguments and handle lists) are copied into `buf` (`copy_in`) once and validated there; bulk data goes straight
@@ -141,15 +149,18 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
   below `USER_STACK_TOP`; a `spawn` with arguments copies them to the end of that page and adds a stack page below it
   (both charged to the child), and the child starts with x0-x2 = count, address, length,
   `map` from `MAP_BASE` upward, never reaching `USER_END` (the lower of the first GiB from 4 GiB up that a DTB GIC
-  region occupies and 511 GiB; `ENOMEM` past it). Kernel blocks (`KERNEL_L1`) are EL1-only in every address space.
+  region occupies and 511 GiB; `ENOMEM` past it). Kernel entries (`KERNEL_ENTRIES`, copied from `arch::boot_table()`,
+  and any GIC GiB past them) are EL1-only in every address space.
 - Interim caps until step 31: `MAX_TASKS`, `MAX_PROCESSES`, `MAX_PIPES` 64 each; `MAX_MUTEXES` stays 8 processes'
   handle tables (128: each thread end scans it) until step 27 deletes mutexes, so `mutex` can be `ENFILE` before the
   handle tables are full.
 - `PerCpu` statics are `#[unsafe(link_section = ".percpu")]`, built with `unsafe` `PerCpu::new`; none is touched
   before `init_cpus` (TPIDR_EL1 is 0 until then, which would reach the template).
-- `linker.ld` provides `__stack_top` (core 0's boot stack, the image's end), `__bss_start`, `__bss_end`,
-  `__kernel_start`, `__kernel_end`, and `.percpu` (`__percpu_start`, `__percpu_end`: the per-CPU template, loaded with
-  the image, never written); its load address
+- `linker.ld` provides `__kernel_start` (2 MiB aligned), `__text_end`, `__rodata_end` (both page aligned: `kmain`'s
+  `KernelMap` maps text RX, rodata RO, the rest RW), `.percpu` (`__percpu_start`, `__percpu_end`: the per-CPU
+  template, loaded with the image, never written), `__bss_start`, `__bss_end`, `__boot_guard` (core 0's guard page
+  below its 64 KiB stack), `__stack_top`, `__kernel_end`; it `ASSERT`s the image fits its 2 MiB block, the one mapped
+  by pages; its load address
   is explained in `docs/DEVELOPMENT.md`.
 - Performance is the moat: a slowdown is never accepted because it has an explanation; it is removed, or shown to
   be unavoidable with before/after numbers (`docs/BENCHMARKS.md`).

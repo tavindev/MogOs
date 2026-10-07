@@ -2,10 +2,12 @@
 
 use core::ops::Range;
 
-use mogfs::Inode;
+use mogfs::{Inode, MAX_FILE_SIZE};
 
+use crate::Clamp;
 use crate::handle::{
-    CONNECT, EXEC, Handles, KILL as KILL_RIGHT, LISTEN, MAX_HANDLES, Object, READ, Rights, WRITE,
+    CONNECT, EXEC, Handle, Handles, KILL as KILL_RIGHT, LISTEN, MAX_HANDLES, Object, READ, Rights,
+    WRITE,
 };
 use crate::mutex::Mutex;
 use crate::network::{BACKLOG, OP_ACCEPT, OP_CONNECT, OP_RECEIVE, OP_SEND, Sock};
@@ -373,7 +375,67 @@ const _: () = assert!(size_of::<Call>() == 56, "every syscall returns a Call");
 
 /// Runs syscall `nr` with arguments `args` (`x0`-`x6`) against the caller's `handles`, leaving the board the parts
 /// that touch hardware or tasks; `Err` holds the result to return.
-pub fn dispatch(nr: u64, args: &[u64; 7], handles: &mut Handles) -> Result<Call, i64> {
+///
+/// Spectre v1: every argument that may index kernel memory is clamped to the capacity of what it indexes, all behind
+/// one barrier (`C`), before the first use, and only the clamped values go on: the number, the handles in x0 and x3,
+/// each user buffer (x1, x2, x4 or x5, with the length after it), a file offset (x4) and a `readdir` start (x3).
+pub fn dispatch<C: Clamp>(nr: u64, args: &[u64; 7], handles: &mut Handles) -> Result<Call, i64> {
+    if nr > SHUTDOWN {
+        return Err(ENOSYS);
+    }
+    let io_len = args[3].min(MAX_BUFFER);
+    // A buffer's offset in `USER` stays below its room, so a clamped buffer ends inside `USER` (or just past its top,
+    // where nothing translates, for a length a mispredicted check let through).
+    let offset = |ptr: u64| ptr.wrapping_sub(USER.start);
+    let room = |len: u64| USER.end - USER.start - (len & 0x1fff) + 1;
+    let [
+        nr,
+        h0,
+        h3,
+        p1,
+        p2,
+        p4,
+        p5,
+        l2,
+        l3,
+        l5,
+        l6,
+        file_offset,
+        start,
+    ] = C::clamp(
+        [
+            nr,
+            args[0] as u32 as u64,
+            args[3] as u32 as u64,
+            offset(args[1]),
+            offset(args[2]),
+            offset(args[4]),
+            offset(args[5]),
+            args[2],
+            io_len,
+            args[5],
+            args[6],
+            args[4],
+            args[3],
+        ],
+        [
+            SHUTDOWN + 1,
+            MAX_HANDLES as u64,
+            MAX_HANDLES as u64,
+            room(args[2]),
+            room(io_len),
+            room(args[5]),
+            room(args[6]),
+            MAX_BUFFER + 1,
+            MAX_BUFFER + 1,
+            MAX_BUFFER + 1,
+            MAX_BUFFER + 1,
+            MAX_FILE_SIZE + 2,
+            MAX_FILE_SIZE + 1,
+        ],
+    );
+    let [p1, p2, p4, p5] = [p1, p2, p4, p5].map(|offset| USER.start + offset);
+    let (h0, h3) = (Handle::clamped(args[0], h0), Handle::clamped(args[3], h3));
     match nr {
         EXIT => Ok(Call::Exit(args[0] & 0xff)),
         THREAD_EXIT => Ok(Call::ThreadExit(args[0] & 0xff)),
@@ -384,16 +446,15 @@ pub fn dispatch(nr: u64, args: &[u64; 7], handles: &mut Handles) -> Result<Call,
             arg: args[3],
         }),
         IO => {
-            let (handle, op, ptr, len) = (args[0], args[1], args[2], args[3]);
+            let op = args[1];
             let need = match op {
                 IO_READ => READ,
                 IO_WRITE => WRITE,
                 _ => return Err(EINVAL),
             };
-            let object = handles.get(handle, need)?;
-            let len = len.min(MAX_BUFFER);
-            user_buffer(ptr, len)?;
-            let len = len as usize;
+            let object = handles.get(h0, need)?;
+            user_buffer(args[2], io_len)?;
+            let (ptr, len) = (p2, l3 as usize);
             match object {
                 Object::Console if op == IO_WRITE => Ok(Call::Write { ptr, len }),
                 Object::Console => Ok(Call::Read { ptr, len }),
@@ -403,7 +464,7 @@ pub fn dispatch(nr: u64, args: &[u64; 7], handles: &mut Handles) -> Result<Call,
                 Object::Node(inode) => Ok(Call::File {
                     inode,
                     write: op == IO_WRITE,
-                    offset: args[4],
+                    offset: file_offset,
                     ptr,
                     len,
                 }),
@@ -412,10 +473,10 @@ pub fn dispatch(nr: u64, args: &[u64; 7], handles: &mut Handles) -> Result<Call,
             }
         }
         DUP => {
-            let (handle, object) = handles.dup(args[0], args[1])?;
+            let (handle, object) = handles.dup(h0, args[1])?;
             Ok(Call::Dup { handle, object })
         }
-        CLOSE => handles.close(args[0]).map(Call::Close),
+        CLOSE => handles.close(h0).map(Call::Close),
         MAP => match args[0] {
             0 => Err(EINVAL),
             len if len > MAX_MAP => Err(EINVAL),
@@ -424,11 +485,11 @@ pub fn dispatch(nr: u64, args: &[u64; 7], handles: &mut Handles) -> Result<Call,
             }),
         },
         OPEN => {
-            let (ptr, len, flags) = (args[1], args[2], args[3]);
+            let flags = args[3];
             if flags & !(CREATE | TRUNC) != 0 {
                 return Err(EINVAL);
             }
-            let (dir, rights) = handles.entry(args[0])?;
+            let (dir, rights) = handles.entry(h0)?;
             match dir {
                 Object::Archive if flags != 0 => return Err(EROFS),
                 Object::Archive | Object::Dir(_) => {}
@@ -437,93 +498,90 @@ pub fn dispatch(nr: u64, args: &[u64; 7], handles: &mut Handles) -> Result<Call,
             if rights & READ == 0 || (flags != 0 && rights & WRITE == 0) {
                 return Err(EACCES);
             }
-            user_buffer(ptr, len)?;
+            user_buffer(args[1], args[2])?;
             Ok(Call::Open {
                 dir,
-                ptr,
-                len: len as usize,
+                ptr: p1,
+                len: l2 as usize,
                 flags,
                 rights,
             })
         }
         SPAWN => {
-            let (exe, ptr, len, budget) = (args[0], args[1], args[2], args[3]);
-            let Object::File { start, end } = handles.get(exe, EXEC)? else {
+            let Object::File { start, end } = handles.get(h0, EXEC)? else {
                 return Err(EACCES);
             };
-            if len > MAX_HANDLES as u64 {
+            if args[2] > MAX_HANDLES as u64 {
                 return Err(EINVAL);
             }
-            user_buffer(ptr, len * 8)?;
-            let (argv, argv_len) = (args[5], args[6]);
-            if argv_len > MAX_BUFFER {
+            user_buffer(args[1], args[2] * 8)?;
+            if args[6] > MAX_BUFFER {
                 return Err(E2BIG);
             }
-            user_buffer(argv, argv_len)?;
+            user_buffer(args[5], args[6])?;
             Ok(Call::Spawn {
                 file: start..end,
-                ptr,
-                len: len as u8,
-                budget: budget as usize,
+                ptr: p1,
+                len: l2 as u8,
+                budget: args[3] as usize,
                 priority: args[4].min(u8::MAX.into()) as u8,
-                args: argv,
-                args_len: argv_len as u16,
+                args: p5,
+                args_len: l6 as u16,
             })
         }
         PIPE => Ok(Call::NewPipe),
-        WAIT => match handles.get(args[0], crate::handle::WAIT)? {
+        WAIT => match handles.get(h0, crate::handle::WAIT)? {
             Object::Process { index, generation } => Ok(Call::Wait { index, generation }),
             Object::Thread { slot, generation } => Ok(Call::Join { slot, generation }),
             _ => Err(EACCES),
         },
         MUTEX => Ok(Call::NewMutex),
-        LOCK | UNLOCK => match handles.get(args[0], 0)? {
+        LOCK | UNLOCK => match handles.get(h0, 0)? {
             Object::Mutex(mutex) if nr == LOCK => Ok(Call::Lock(mutex)),
             Object::Mutex(mutex) => Ok(Call::Unlock(mutex)),
             _ => Err(EACCES),
         },
-        KILL => match handles.get(args[0], KILL_RIGHT)? {
+        KILL => match handles.get(h0, KILL_RIGHT)? {
             Object::Process { index, generation } => Ok(Call::Kill { index, generation }),
             Object::Thread { slot, generation } => Ok(Call::KillThread { slot, generation }),
             _ => Err(EACCES),
         },
         MKDIR | UNLINK => {
-            let (dir, ptr, len) = path(handles, args[0], args[1], args[2])?;
+            let (dir, ptr, len) = path(handles, h0, (args[1], args[2]), (p1, l2))?;
             Ok(match nr {
                 MKDIR => Call::Mkdir { dir, ptr, len },
                 _ => Call::Unlink { dir, ptr, len },
             })
         }
         RENAME => Ok(Call::Rename {
-            from: path(handles, args[0], args[1], args[2])?,
-            to: path(handles, args[3], args[4], args[5])?,
+            from: path(handles, h0, (args[1], args[2]), (p1, l2))?,
+            to: path(handles, h3, (args[4], args[5]), (p4, l5))?,
         }),
         READDIR => {
-            let (ptr, len) = (args[1], args[2]);
-            let dir = handles.get(args[0], READ)?;
+            let dir = handles.get(h0, READ)?;
             let (Object::Archive | Object::Dir(_)) = dir else {
                 return Err(ENOTDIR);
             };
-            user_buffer(ptr, len)?;
+            user_buffer(args[1], args[2])?;
             Ok(Call::Readdir {
                 dir,
-                ptr,
-                len: len as usize,
-                start: args[3],
+                ptr: p1,
+                len: l2 as usize,
+                start,
             })
         }
-        SYNC => match handles.get(args[0], 0)? {
+        SYNC => match handles.get(h0, 0)? {
             Object::Dir(_) | Object::Node(_) => Ok(Call::Sync),
             _ => Err(ENOTDIR),
         },
-        SOCKET => match handles.entry(args[0])? {
+        SOCKET => match handles.entry(h0)? {
             (Object::NetStack, rights) if rights & (CONNECT | LISTEN) != 0 => {
                 Ok(Call::Net(NetCall::Socket(rights)))
             }
             _ => Err(EACCES),
         },
         BIND => {
-            let sock = socket(handles, args[0], WRITE)?;
+            let sock = socket(handles, h0, WRITE)?;
             let port = u16::try_from(args[1]).map_err(|_| EINVAL)?;
             let loopback = match args[2] {
                 0 => false,
@@ -537,25 +595,25 @@ pub fn dispatch(nr: u64, args: &[u64; 7], handles: &mut Handles) -> Result<Call,
             }))
         }
         LISTEN_CALL => Ok(Call::Net(NetCall::Listen {
-            sock: socket(handles, args[0], WRITE)?,
+            sock: socket(handles, h0, WRITE)?,
             backlog: args[1].clamp(1, BACKLOG as u64) as u8,
         })),
         IO_SUBMIT => {
-            let (op, ptr, len, tag) = (args[1], args[2], args[3], args[4]);
+            let (op, tag) = (args[1], args[4]);
             let need = match op {
                 OP_RECEIVE | OP_ACCEPT => READ,
                 OP_SEND | OP_CONNECT => WRITE,
                 _ => return Err(EINVAL),
             };
-            let sock = socket(handles, args[0], need)?;
-            let (_, rights) = handles.entry(args[0])?;
-            let len = match op {
+            let sock = socket(handles, h0, need)?;
+            let (_, rights) = handles.entry(h0)?;
+            // A connect's address and port are values, not buffers.
+            let (ptr, len) = match op {
                 OP_RECEIVE | OP_SEND => {
-                    let len = len.min(MAX_BUFFER);
-                    user_buffer(ptr, len)?;
-                    len
+                    user_buffer(args[2], io_len)?;
+                    (p2, l3)
                 }
-                _ => len.min(u32::MAX.into()),
+                _ => (args[2], args[3].min(u32::MAX.into())),
             };
             Ok(Call::Net(NetCall::Submit {
                 sock,
@@ -567,23 +625,29 @@ pub fn dispatch(nr: u64, args: &[u64; 7], handles: &mut Handles) -> Result<Call,
             }))
         }
         IO_WAIT => Ok(Call::Net(NetCall::IoWait)),
-        SHUTDOWN => Ok(Call::Net(NetCall::Shutdown(socket(
-            handles, args[0], WRITE,
-        )?))),
+        SHUTDOWN => Ok(Call::Net(NetCall::Shutdown(socket(handles, h0, WRITE)?))),
         _ => Err(ENOSYS),
     }
 }
 
 /// The socket `handle` reaches, if it holds the rights in `need`.
-fn socket(handles: &Handles, handle: u64, need: Rights) -> Result<Sock, i64> {
+#[inline(always)]
+fn socket(handles: &Handles, handle: Handle, need: Rights) -> Result<Sock, i64> {
     match handles.get(handle, need)? {
         Object::Socket(sock) => Ok(sock),
         _ => Err(EACCES),
     }
 }
 
-/// The directory `handle` (write right) and the path buffer `ptr..ptr + len` a call that changes it names.
-fn path(handles: &Handles, handle: u64, ptr: u64, len: u64) -> Result<(Inode, u64, usize), i64> {
+/// The directory `handle` (write right) and the path buffer `ptr..ptr + len` a call that changes it names, as
+/// `dispatch` clamped it (`clamped`).
+#[inline(always)]
+fn path(
+    handles: &Handles,
+    handle: Handle,
+    (ptr, len): (u64, u64),
+    clamped: (u64, u64),
+) -> Result<(Inode, u64, usize), i64> {
     let dir = match handles.entry(handle)? {
         (Object::Archive, _) => return Err(EROFS),
         (Object::Dir(_), rights) if rights & WRITE == 0 => return Err(EACCES),
@@ -591,7 +655,7 @@ fn path(handles: &Handles, handle: u64, ptr: u64, len: u64) -> Result<(Inode, u6
         _ => return Err(ENOTDIR),
     };
     user_buffer(ptr, len)?;
-    Ok((dir, ptr, len as usize))
+    Ok((dir, clamped.0, clamped.1 as usize))
 }
 
 /// The number of arguments in `args`, each ending in a NUL; `E2BIG` over `MAX_ARGS` or `MAX_BUFFER` bytes, `EINVAL`
@@ -607,6 +671,7 @@ pub fn argc(args: &[u8]) -> Result<usize, i64> {
 
 /// `EFAULT` unless `len` is 0 (any `ptr`, as Rust passes empty slices) or `ptr..ptr + len` lies in `USER` and `len`
 /// is at most `MAX_BUFFER`.
+#[inline]
 fn user_buffer(ptr: u64, len: u64) -> Result<(), i64> {
     if len == 0 {
         return Ok(());

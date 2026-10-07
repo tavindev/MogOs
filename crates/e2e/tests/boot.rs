@@ -14,7 +14,8 @@ use std::time::{Duration, Instant};
 const SILENCE: Duration = Duration::from_secs(30);
 const CAP: Duration = Duration::from_secs(300);
 
-/// Builds the kernel, boots it in QEMU with `extra` arguments, and returns the exit status and serial lines.
+/// Builds the kernel, boots it in QEMU with `extra` arguments (`-cpu cortex-a72` unless they name a `-cpu`), and
+/// returns the exit status and serial lines.
 fn boot(extra: &[&str]) -> (ExitStatus, Vec<String>) {
     boot_with_input(extra, None)
 }
@@ -47,12 +48,14 @@ fn boot_with(
         assert!(build.success(), "kernel build failed");
     });
 
+    let cpu = match extra.contains(&"-cpu") {
+        true => &[][..],
+        false => &["-cpu", "cortex-a72"][..],
+    };
     let mut qemu = Command::new("qemu-system-aarch64")
+        .args(["-M", "virt,gic-version=3"])
+        .args(cpu)
         .args([
-            "-M",
-            "virt,gic-version=3",
-            "-cpu",
-            "cortex-a72",
             "-m",
             "128M",
             "-global",
@@ -161,6 +164,7 @@ fn boots_and_powers_off() {
         "mmu: on",
         "heap: ok",
         "disk: none",
+        "spec: v1 mitigated, v2 vulnerable, bhb not mitigated (v2 vulnerable), ssb vulnerable, meltdown not affected, bse vulnerable, table plain on 4/4 cores",
     ] {
         assert!(
             lines.iter().any(|l| l == expected),
@@ -206,6 +210,44 @@ fn unmapped_access_reports_data_abort() {
         "not a level-1 translation fault: {fault}"
     );
     assert!(status.success(), "QEMU exited with {status}");
+}
+
+/// `test=wx-<name>`: the kernel prints `wx: <address>`, then stores to its own text (`text`), branches to a `.data`
+/// word (`exec`) or recurses past core 0's stack into its guard page (`guard`); each ends in the fault report.
+#[test]
+fn kernel_text_is_read_only_data_never_executes_and_the_boot_stack_has_a_guard() {
+    // (scenario, exception class, fault status code: permission or translation fault, level 3)
+    for (name, class, status) in [
+        ("text", 0x25, 0x0f),
+        ("exec", 0x21, 0x0f),
+        ("guard", 0x25, 0x07),
+    ] {
+        let (status_code, lines) = boot(&["-append", &format!("test=wx-{name}")]);
+        let address = lines
+            .iter()
+            .find_map(|l| l.strip_prefix("wx: 0x"))
+            .map(|a| u64::from_str_radix(a, 16).unwrap())
+            .unwrap_or_else(|| panic!("{name}: missing wx line"));
+        let fault = lines
+            .iter()
+            .find(|l| l.starts_with("unhandled sync exception from current EL"))
+            .unwrap_or_else(|| panic!("{name}: missing fault report"));
+        let field = |key: &str| {
+            let hex = fault.split_once(key).unwrap().1.split(' ').next().unwrap();
+            u64::from_str_radix(hex.trim_start_matches("0x"), 16).unwrap()
+        };
+        let (esr, far) = (field("ESR_EL1="), field("FAR_EL1="));
+        assert_eq!(esr >> 26, class, "{name}: exception class: {fault}");
+        assert_eq!(esr & 0x3f, status, "{name}: fault status: {fault}");
+        match name {
+            "guard" => assert_eq!(far & !0xfff, address, "{name}: not the guard page: {fault}"),
+            _ => assert_eq!(far, address, "{name}: fault address: {fault}"),
+        }
+        assert!(
+            status_code.success(),
+            "{name}: QEMU exited with {status_code}"
+        );
+    }
 }
 
 #[test]
@@ -306,6 +348,55 @@ fn syscall_bench_reports_round_trip() {
         .parse::<u64>()
         .unwrap();
     assert!(status.success(), "QEMU exited with {status}");
+}
+
+/// Lines from QEMU 9.2.1's models (`target/arm/tcg/cpu64.c`): cortex-a72 is r0p3 without CSV2 or firmware, cortex-a76
+/// has CSV2, CSV3 and SSBS but no SB, max has CSV2_3, CSV3, SSBS2 and SB.
+#[test]
+fn spec_line_counts_all_sixty_four_cores() {
+    let (status, lines) = boot(&["-smp", "64"]);
+    let expected = "spec: v1 mitigated, v2 vulnerable, bhb not mitigated (v2 vulnerable), ssb vulnerable, meltdown not affected, bse vulnerable, table plain on 64/64 cores";
+    assert!(
+        lines.iter().any(|l| l == expected),
+        "missing line: {expected}"
+    );
+    assert!(status.success(), "QEMU exited with {status}");
+}
+
+#[test]
+fn spec_line_matches_the_cpu() {
+    for (cpu, spec) in [
+        (
+            "cortex-a72",
+            "v2 vulnerable, bhb not mitigated (v2 vulnerable), ssb vulnerable, meltdown not affected, bse vulnerable, table plain",
+        ),
+        (
+            "cortex-a76",
+            "v2 not affected, bhb mitigated, ssb mitigated, meltdown not affected, bse not affected, table loop24-dsb",
+        ),
+        (
+            "max",
+            "v2 not affected, bhb not affected, ssb mitigated, meltdown not affected, bse not affected, table plain",
+        ),
+    ] {
+        let args = [
+            "-cpu",
+            cpu,
+            "-smp",
+            "4",
+            "-append",
+            "test=bench-syscall test=pipe",
+        ];
+        let (status, lines) = boot(&args);
+        let expected = format!("spec: v1 mitigated, {spec} on 4/4 cores");
+        assert!(lines.contains(&expected), "{cpu}: missing line: {expected}");
+        assert!(
+            lines.iter().any(|l| l.starts_with("syscall: ")),
+            "{cpu}: missing syscall line"
+        );
+        assert_no_leak(&lines, "pipe");
+        assert!(status.success(), "{cpu}: QEMU exited with {status}");
+    }
 }
 
 #[test]

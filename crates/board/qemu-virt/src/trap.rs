@@ -396,265 +396,270 @@ unsafe fn syscall(kernel: &mut Kernel, cpu: usize, frame: &mut arch::TrapFrame) 
     } = kernel;
     let args = frame.x.first_chunk().unwrap();
     let ok = |result: Result<(), i64>| result.map_or_else(|error| error as u64, |()| 0);
-    frame.x[0] = match kernel::syscall::dispatch(frame.x[8], args, sched.handles(cpu)) {
-        Ok(Call::Exit(code)) => {
-            // SAFETY: the caller masked IRQs, and `frame` is the current process's.
-            return unsafe {
-                exit_process(kernel, cpu, frame as *mut arch::TrapFrame as usize, code)
-            };
-        }
-        Ok(Call::ThreadExit(code)) => {
-            // SAFETY: as above.
-            return unsafe {
-                exit_thread(kernel, cpu, frame as *mut arch::TrapFrame as usize, code)
-            };
-        }
-        Ok(Call::Thread {
-            entry,
-            stack,
-            tls,
-            arg,
-        }) => thread(sched, cpu, frames, entry, (stack, tls), arg)
-            .unwrap_or_else(|error| error as u64),
-        Ok(Call::Write { ptr, len }) => match copy_in(ptr, len, buf) {
-            Some(bytes) => {
-                if !bytes.is_empty() {
-                    CONSOLE.lock_masked().write(bytes);
-                }
-                len as u64
-            }
-            None => EFAULT as u64,
-        },
-        Ok(Call::Read { ptr, len }) => match UserOut::new(ptr, len) {
-            None => EFAULT as u64,
-            Some(out) => match line.read(&mut buf[..len]) {
-                Some(n) => {
-                    out.write(0, &buf[..n]);
-                    n as u64
-                }
+    frame.x[0] =
+        match kernel::syscall::dispatch::<crate::Nospec>(frame.x[8], args, sched.handles(cpu)) {
+            Ok(Call::Exit(code)) => {
                 // SAFETY: the caller masked IRQs, and `frame` is the current process's.
-                None => return unsafe { block(kernel, cpu, frame, Event::Console) },
-            },
-        },
-        Ok(Call::Pipe { end, ptr, len }) => match pipe_io(pipes, end, ptr, len) {
-            Some(moved) => {
-                if moved > 0 {
-                    sched.wake(Event::Pipe(end.index as usize));
-                }
-                moved as u64
+                return unsafe {
+                    exit_process(kernel, cpu, frame as *mut arch::TrapFrame as usize, code)
+                };
             }
-            // SAFETY: the caller masked IRQs, and `frame` is the current process's.
-            None => return unsafe { block(kernel, cpu, frame, Event::Pipe(end.index as usize)) },
-        },
-        Ok(Call::NewPipe) => match new_pipe(sched, cpu, frames, pipes) {
-            Ok((read, write)) => {
-                frame.x[1] = write;
-                read
+            Ok(Call::ThreadExit(code)) => {
+                // SAFETY: as above.
+                return unsafe {
+                    exit_thread(kernel, cpu, frame as *mut arch::TrapFrame as usize, code)
+                };
             }
-            Err(error) => error as u64,
-        },
-        Ok(Call::Wait { index, generation }) => match sched.reap(index, generation) {
-            Ok(Some((code, limit))) => {
-                // Pipes it created that are still open keep their page; a repeated `wait` gets a limit of 0.
-                let held = pipes.charged_to((index, generation));
-                let current = sched.process(cpu);
-                sched
-                    .memory(current)
-                    .budget
-                    .grow(limit.saturating_sub(held));
-                code
-            }
-            // SAFETY: the caller masked IRQs, and `frame` is the current process's.
-            Ok(None) => return unsafe { block(kernel, cpu, frame, Event::Exit(index)) },
-            Err(error) => error as u64,
-        },
-        Ok(Call::Join { slot, generation }) => match sched.join(slot, generation) {
-            Ok(Some(code)) => code,
-            // SAFETY: the caller masked IRQs, and `frame` is the current process's.
-            Ok(None) => return unsafe { block(kernel, cpu, frame, Event::Join(slot)) },
-            Err(error) => error as u64,
-        },
-        Ok(Call::Dup { handle, object }) => {
-            match object {
-                Object::Pipe(end) => pipes.open(end),
-                Object::Mutex(mutex) => mutexes.open(mutex),
-                Object::Socket(sock) => net::open(sock),
-                object => sched.held(object),
-            }
-            handle
-        }
-        Ok(Call::Close(object)) => {
-            let current = sched.process(cpu);
-            release(sched, cpu, frames, pipes, mutexes, (object, current));
-            0
-        }
-        Ok(Call::Map { pages }) => map(sched, cpu, frames, pages).unwrap_or(ENOMEM as u64),
-        Ok(Call::File {
-            inode,
-            write: true,
-            offset,
-            ptr,
-            len,
-        }) => with_input((ptr, len), buf, |data| {
-            fs.write(inode, offset, data).map_err(file::errno)
-        })
-        .map_or_else(|error| error as u64, |()| len as u64),
-        Ok(Call::File {
-            inode,
-            offset,
-            ptr,
-            len,
-            ..
-        }) => with_output((ptr, len), buf, |out| {
-            fs.read(inode, offset, out).map_err(file::errno)
-        }),
-        Ok(Call::Open {
-            dir,
-            ptr,
-            len,
-            flags,
-            rights,
-        }) => with_input((ptr, len), buf, |path| match dir {
-            Object::Dir(dir) => file::open(fs, dir, path, flags),
-            _ => kernel::cpio::find(ARCHIVE, path)
-                .map(|file| Object::File {
-                    start: file.start,
-                    end: file.end,
-                })
-                .ok_or(ENOENT),
-        })
-        .and_then(|object| sched.handles(cpu).insert(object, rights))
-        .unwrap_or_else(|error| error as u64),
-        Ok(Call::Mkdir { dir, ptr, len }) => ok(with_input((ptr, len), buf, |path| {
-            file::mkdir(fs, dir, path)
-        })),
-        Ok(Call::Readdir {
-            dir,
-            ptr,
-            len,
-            start,
-        }) => with_output((ptr, len), buf, |out| match dir {
-            Object::Dir(dir) => file::readdir(fs, dir, start, out),
-            _ => file::list_archive(ARCHIVE, start, out),
-        }),
-        Ok(Call::Unlink { dir, ptr, len }) => ok(with_input((ptr, len), buf, |path| {
-            let held = |i| sched.holds(|o| o == Object::Dir(i) || o == Object::Node(i));
-            file::unlink(fs, dir, path, held)
-        })),
-        Ok(Call::Rename { from, to }) => {
-            let (from_buf, to_buf) = buf.split_at_mut(MAX_BUFFER as usize);
-            ok(with_input((from.1, from.2), from_buf, |f| {
-                with_input((to.1, to.2), to_buf, |t| {
-                    file::rename(fs, (from.0, f), (to.0, t))
-                })
-            }))
-        }
-        Ok(Call::Sync) => ok(fs.commit().map_err(file::errno)),
-        Ok(Call::Spawn {
-            file,
-            ptr,
-            len,
-            budget,
-            priority,
-            args,
-            args_len,
-        }) => spawn(
-            (sched, cpu),
-            frames,
-            buf,
-            file,
-            (ptr, len.into()),
-            (budget, priority),
-            (args, args_len.into()),
-        )
-        .unwrap_or_else(|error| error as u64),
-        Ok(Call::NewMutex) => match mutexes.create() {
-            Some(mutex) => sched
-                .handles(cpu)
-                .insert(Object::Mutex(mutex), DUPLICATE | TRANSFER)
-                .unwrap_or_else(|error| {
-                    mutexes.close(mutex);
-                    error as u64
-                }),
-            None => ENFILE as u64,
-        },
-        Ok(Call::Lock(mutex)) => match mutexes.lock(mutex, sched.current(cpu).0) {
-            Ok(None) => 0,
-            Ok(Some(owner)) => {
-                sched.boost(cpu, owner);
-                // SAFETY: the caller masked IRQs, and `frame` is the current process's.
-                return unsafe { block(kernel, cpu, frame, Event::Lock(mutex.index as usize)) };
-            }
-            Err(error) => error as u64,
-        },
-        Ok(Call::Unlock(mutex)) => {
-            let (slot, _) = sched.current(cpu);
-            match mutexes.unlock(mutex, slot) {
-                Ok(()) => {
-                    // With no waiter woken, the caller's boost is unchanged and nothing new is ready.
-                    if sched.wake(Event::Lock(mutex.index as usize)) > 0 {
-                        sched.unboost(
-                            slot,
-                            |e| matches!(e, Event::Lock(i) if mutexes.owner(i) == Some(slot)),
-                        );
-                        if sched.outranked(cpu) && sched.marked(cpu).is_none() {
-                            frame.x[0] = 0;
-                            // SAFETY: the caller masked IRQs, and `frame` is the current process's.
-                            return unsafe {
-                                switch(sched, cpu, frame as *mut arch::TrapFrame as usize)
-                            };
-                        }
+            Ok(Call::Thread {
+                entry,
+                stack,
+                tls,
+                arg,
+            }) => thread(sched, cpu, frames, entry, (stack, tls), arg)
+                .unwrap_or_else(|error| error as u64),
+            Ok(Call::Write { ptr, len }) => match copy_in(ptr, len, buf) {
+                Some(bytes) => {
+                    if !bytes.is_empty() {
+                        CONSOLE.lock_masked().write(bytes);
                     }
-                    0
+                    len as u64
+                }
+                None => EFAULT as u64,
+            },
+            Ok(Call::Read { ptr, len }) => match UserOut::new(ptr, len) {
+                None => EFAULT as u64,
+                Some(out) => match line.read(&mut buf[..len]) {
+                    Some(n) => {
+                        out.write(0, &buf[..n]);
+                        n as u64
+                    }
+                    // SAFETY: the caller masked IRQs, and `frame` is the current process's.
+                    None => return unsafe { block(kernel, cpu, frame, Event::Console) },
+                },
+            },
+            Ok(Call::Pipe { end, ptr, len }) => match pipe_io(pipes, end, ptr, len) {
+                Some(moved) => {
+                    if moved > 0 {
+                        sched.wake(Event::Pipe(end.index as usize));
+                    }
+                    moved as u64
+                }
+                None => {
+                    // SAFETY: the caller masked IRQs, and `frame` is the current process's.
+                    return unsafe { block(kernel, cpu, frame, Event::Pipe(end.index as usize)) };
+                }
+            },
+            Ok(Call::NewPipe) => match new_pipe(sched, cpu, frames, pipes) {
+                Ok((read, write)) => {
+                    frame.x[1] = write;
+                    read
                 }
                 Err(error) => error as u64,
-            }
-        }
-        Ok(Call::Kill { index, generation }) => match sched.process_live(index, generation) {
-            Ok(true) if index == sched.process(cpu) => {
-                let frame = frame as *mut arch::TrapFrame as usize;
+            },
+            Ok(Call::Wait { index, generation }) => match sched.reap(index, generation) {
+                Ok(Some((code, limit))) => {
+                    // Pipes it created that are still open keep their page; a repeated `wait` gets a limit of 0.
+                    let held = pipes.charged_to((index, generation));
+                    let current = sched.process(cpu);
+                    sched
+                        .memory(current)
+                        .budget
+                        .grow(limit.saturating_sub(held));
+                    code
+                }
                 // SAFETY: the caller masked IRQs, and `frame` is the current process's.
-                return unsafe { exit_process(kernel, cpu, frame, KILLED) };
+                Ok(None) => return unsafe { block(kernel, cpu, frame, Event::Exit(index)) },
+                Err(error) => error as u64,
+            },
+            Ok(Call::Join { slot, generation }) => match sched.join(slot, generation) {
+                Ok(Some(code)) => code,
+                // SAFETY: the caller masked IRQs, and `frame` is the current process's.
+                Ok(None) => return unsafe { block(kernel, cpu, frame, Event::Join(slot)) },
+                Err(error) => error as u64,
+            },
+            Ok(Call::Dup { handle, object }) => {
+                match object {
+                    Object::Pipe(end) => pipes.open(end),
+                    Object::Mutex(mutex) => mutexes.open(mutex),
+                    Object::Socket(sock) => net::open(sock),
+                    object => sched.held(object),
+                }
+                handle
             }
-            Ok(true) => {
-                kill(kernel, cpu, index);
+            Ok(Call::Close(object)) => {
+                let current = sched.process(cpu);
+                release(sched, cpu, frames, pipes, mutexes, (object, current));
                 0
             }
-            Ok(false) => 0,
+            Ok(Call::Map { pages }) => map(sched, cpu, frames, pages).unwrap_or(ENOMEM as u64),
+            Ok(Call::File {
+                inode,
+                write: true,
+                offset,
+                ptr,
+                len,
+            }) => with_input((ptr, len), buf, |data| {
+                fs.write(inode, offset, data).map_err(file::errno)
+            })
+            .map_or_else(|error| error as u64, |()| len as u64),
+            Ok(Call::File {
+                inode,
+                offset,
+                ptr,
+                len,
+                ..
+            }) => with_output((ptr, len), buf, |out| {
+                fs.read(inode, offset, out).map_err(file::errno)
+            }),
+            Ok(Call::Open {
+                dir,
+                ptr,
+                len,
+                flags,
+                rights,
+            }) => with_input((ptr, len), buf, |path| match dir {
+                Object::Dir(dir) => file::open(fs, dir, path, flags),
+                _ => kernel::cpio::find(ARCHIVE, path)
+                    .map(|file| Object::File {
+                        start: file.start,
+                        end: file.end,
+                    })
+                    .ok_or(ENOENT),
+            })
+            .and_then(|object| sched.handles(cpu).insert(object, rights))
+            .unwrap_or_else(|error| error as u64),
+            Ok(Call::Mkdir { dir, ptr, len }) => ok(with_input((ptr, len), buf, |path| {
+                file::mkdir(fs, dir, path)
+            })),
+            Ok(Call::Readdir {
+                dir,
+                ptr,
+                len,
+                start,
+            }) => with_output((ptr, len), buf, |out| match dir {
+                Object::Dir(dir) => file::readdir(fs, dir, start, out),
+                _ => file::list_archive(ARCHIVE, start, out),
+            }),
+            Ok(Call::Unlink { dir, ptr, len }) => ok(with_input((ptr, len), buf, |path| {
+                let held = |i| sched.holds(|o| o == Object::Dir(i) || o == Object::Node(i));
+                file::unlink(fs, dir, path, held)
+            })),
+            Ok(Call::Rename { from, to }) => {
+                let (from_buf, to_buf) = buf.split_at_mut(MAX_BUFFER as usize);
+                ok(with_input((from.1, from.2), from_buf, |f| {
+                    with_input((to.1, to.2), to_buf, |t| {
+                        file::rename(fs, (from.0, f), (to.0, t))
+                    })
+                }))
+            }
+            Ok(Call::Sync) => ok(fs.commit().map_err(file::errno)),
+            Ok(Call::Spawn {
+                file,
+                ptr,
+                len,
+                budget,
+                priority,
+                args,
+                args_len,
+            }) => spawn(
+                (sched, cpu),
+                frames,
+                buf,
+                file,
+                (ptr, len.into()),
+                (budget, priority),
+                (args, args_len.into()),
+            )
+            .unwrap_or_else(|error| error as u64),
+            Ok(Call::NewMutex) => match mutexes.create() {
+                Some(mutex) => sched
+                    .handles(cpu)
+                    .insert(Object::Mutex(mutex), DUPLICATE | TRANSFER)
+                    .unwrap_or_else(|error| {
+                        mutexes.close(mutex);
+                        error as u64
+                    }),
+                None => ENFILE as u64,
+            },
+            Ok(Call::Lock(mutex)) => match mutexes.lock(mutex, sched.current(cpu).0) {
+                Ok(None) => 0,
+                Ok(Some(owner)) => {
+                    sched.boost(cpu, owner);
+                    // SAFETY: the caller masked IRQs, and `frame` is the current process's.
+                    return unsafe { block(kernel, cpu, frame, Event::Lock(mutex.index as usize)) };
+                }
+                Err(error) => error as u64,
+            },
+            Ok(Call::Unlock(mutex)) => {
+                let (slot, _) = sched.current(cpu);
+                match mutexes.unlock(mutex, slot) {
+                    Ok(()) => {
+                        // With no waiter woken, the caller's boost is unchanged and nothing new is ready.
+                        if sched.wake(Event::Lock(mutex.index as usize)) > 0 {
+                            sched.unboost(
+                                slot,
+                                |e| matches!(e, Event::Lock(i) if mutexes.owner(i) == Some(slot)),
+                            );
+                            if sched.outranked(cpu) && sched.marked(cpu).is_none() {
+                                frame.x[0] = 0;
+                                // SAFETY: the caller masked IRQs, and `frame` is the current process's.
+                                return unsafe {
+                                    switch(sched, cpu, frame as *mut arch::TrapFrame as usize)
+                                };
+                            }
+                        }
+                        0
+                    }
+                    Err(error) => error as u64,
+                }
+            }
+            Ok(Call::Kill { index, generation }) => match sched.process_live(index, generation) {
+                Ok(true) if index == sched.process(cpu) => {
+                    let frame = frame as *mut arch::TrapFrame as usize;
+                    // SAFETY: the caller masked IRQs, and `frame` is the current process's.
+                    return unsafe { exit_process(kernel, cpu, frame, KILLED) };
+                }
+                Ok(true) => {
+                    kill(kernel, cpu, index);
+                    0
+                }
+                Ok(false) => 0,
+                Err(error) => error as u64,
+            },
+            Ok(Call::KillThread { slot, generation }) => {
+                match sched.thread_live(slot, generation) {
+                    Ok(true) if slot == sched.current(cpu).0 => {
+                        let frame = frame as *mut arch::TrapFrame as usize;
+                        // SAFETY: the caller masked IRQs, and `frame` is the current process's.
+                        return unsafe { exit_thread(kernel, cpu, frame, KILLED) };
+                    }
+                    // Not the current thread, so its last thread is in another process.
+                    Ok(true) if sched.threads(sched.process_of(slot)) == 1 => {
+                        let index = sched.process_of(slot);
+                        kill(kernel, cpu, index);
+                        0
+                    }
+                    Ok(true) if sched.core_of(slot).is_some() => {
+                        end_remote(sched, slot, KILLED);
+                        0
+                    }
+                    Ok(true) => {
+                        end_thread(sched, frames, mutexes, (cpu, slot), KILLED);
+                        0
+                    }
+                    Ok(false) => 0,
+                    Err(error) => error as u64,
+                }
+            }
+            Ok(Call::Net(call)) => {
+                match net::syscall(sched, cpu, call, (&mut frame.x[1..3]).try_into().unwrap()) {
+                    Some(result) => result as u64,
+                    // SAFETY: the caller masked IRQs, and `frame` is the current process's.
+                    None => return unsafe { block(kernel, cpu, frame, Event::NetIo) },
+                }
+            }
             Err(error) => error as u64,
-        },
-        Ok(Call::KillThread { slot, generation }) => match sched.thread_live(slot, generation) {
-            Ok(true) if slot == sched.current(cpu).0 => {
-                let frame = frame as *mut arch::TrapFrame as usize;
-                // SAFETY: the caller masked IRQs, and `frame` is the current process's.
-                return unsafe { exit_thread(kernel, cpu, frame, KILLED) };
-            }
-            // Not the current thread, so its last thread is in another process.
-            Ok(true) if sched.threads(sched.process_of(slot)) == 1 => {
-                let index = sched.process_of(slot);
-                kill(kernel, cpu, index);
-                0
-            }
-            Ok(true) if sched.core_of(slot).is_some() => {
-                end_remote(sched, slot, KILLED);
-                0
-            }
-            Ok(true) => {
-                end_thread(sched, frames, mutexes, (cpu, slot), KILLED);
-                0
-            }
-            Ok(false) => 0,
-            Err(error) => error as u64,
-        },
-        Ok(Call::Net(call)) => {
-            match net::syscall(sched, cpu, call, (&mut frame.x[1..3]).try_into().unwrap()) {
-                Some(result) => result as u64,
-                // SAFETY: the caller masked IRQs, and `frame` is the current process's.
-                None => return unsafe { block(kernel, cpu, frame, Event::NetIo) },
-            }
-        }
-        Err(error) => error as u64,
-    };
+        };
     frame as *mut arch::TrapFrame as usize
 }
 
