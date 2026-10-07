@@ -2,10 +2,12 @@ use core::arch::{asm, global_asm};
 
 pub mod gic;
 pub mod irq;
+mod lock;
 mod mmu;
 pub mod timer;
 mod trap;
 
+pub use lock::*;
 pub use mmu::*;
 pub use trap::*;
 

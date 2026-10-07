@@ -1,6 +1,7 @@
 .section .text.boot
 .global _start
 _start:
+    msr tpidr_el1, xzr
     ldr x1, =__stack_top
     mov sp, x1
     ldr x1, =__bss_start

@@ -8,10 +8,10 @@ Ordered by dependency: each phase builds on the previous one.
 | 2 | Time and concurrency: the kernel multitasks | [phase-2-time-concurrency.md](phases/phase-2-time-concurrency.md) | Done |
 | 3 | User space: isolated programs, capability-based native ABI | [phase-3-user-space.md](phases/phase-3-user-space.md) | Done |
 | 4 | Shell, async I/O, MogFS | [phase-4-io-storage.md](phases/phase-4-io-storage.md) | Done (step 23: musl, busybox; `^C` deferred) |
-| 5 | SMP, threads, fair scheduling, resource groups; the locking model fixed first | not written | Next |
+| 5 | SMP, threads, fair scheduling, resource groups; the locking model fixed first | [phase-5-smp-threads.md](phases/phase-5-smp-threads.md) | In progress (step 24 done) |
 | 6 | Virtual memory: demand paging under no-overcommit, page cache, file mmap, CoW fork in libc, kernel W^X/KASLR | not written | |
-| 7 | Storage that scales: MogFS v2 (extents, snapshots, scrub), async block path, multi-queue NVMe | not written | |
-| 8 | Networking: safe TCP/IP, sockets as handles, virtio-net | not written | |
+| 7 | Storage that scales: MogFS v2 (extents, snapshots, scrub), async block path, multi-queue NVMe | [phase-7-storage.md](phases/phase-7-storage.md) | |
+| 8 | Networking: safe TCP/IP, sockets as handles, virtio-net | [phase-8-networking.md](phases/phase-8-networking.md) | |
 | 9 | POSIX completeness and Linux binary compatibility; native ABI frozen | not written | |
 | 10 | Observability, debugging, security hardening | not written | |
 | 11 | Real hardware, boot, power | not written | |

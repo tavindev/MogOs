@@ -446,6 +446,38 @@ fn pipe_bench_reports_round_trip() {
 }
 
 #[test]
+fn lock_bench_reports_round_trips_and_an_exact_count() {
+    let (status, lines) = boot(&["-append", "test=bench-lock"]);
+    assert!(
+        !lines.iter().any(|l| l.starts_with("panic:")),
+        "kernel panicked"
+    );
+    for lock in ["ticket", "test-and-set"] {
+        lines
+            .iter()
+            .find_map(|l| {
+                l.strip_prefix(&format!("lock: {lock} "))?
+                    .strip_suffix(" ns/round-trip")
+            })
+            .unwrap_or_else(|| panic!("missing {lock} line"))
+            .parse::<f64>()
+            .unwrap();
+    }
+    let first = lines
+        .iter()
+        .find_map(|l| l.strip_prefix("lock: adder done at "))
+        .expect("missing adder line")
+        .parse::<u64>()
+        .unwrap();
+    assert!(first > 10_000_000, "the timer never interleaved the adders");
+    assert!(
+        lines.iter().any(|l| l == "lock: count 20000000"),
+        "the two adders' count is not exact"
+    );
+    assert!(status.success(), "QEMU exited with {status}");
+}
+
+#[test]
 fn console_reads_edited_lines_typed_ahead() {
     // Both lines in one write once `E: ready` is out, when the first read is already blocked.
     let input = Some(("E: ready", &[&b"hel\x7flo\rbye\r"[..]][..]));

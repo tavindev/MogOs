@@ -50,7 +50,7 @@ libcalls. Needs: Homebrew `llvm` (clang 19 or later for `-mabi=aapcs-soft`), `gs
 | `make -C c` in the board's `build.rs` | `crates/board/qemu-virt/build.rs`, `c/Makefile` | busybox and the C programs join the boot archive in the same one-command build; the Makefile's file dependencies make it a no-op (about 60 ms) when nothing in `c/` changed. |
 | soft-float C (`-march=armv8-a+nofp -mabi=aapcs-soft`) | `c/Makefile` | The kernel never enables FP/SIMD at EL0 (no `CPACR_EL1` FPEN), so traps and switches never save v-registers; C code follows the Rust programs. |
 | busybox `CONFIG_EXTRA_CFLAGS="-DBB_GLOBAL_CONST="` | `c/busybox.config` | clang 19 hoists the read of busybox's `const` globals pointer above its assignment (hush faulted at `0x140`); busybox's documented switch. |
-| `linked_list_allocator` (no features) | `crates/board/qemu-virt` | Kernel heap with `free` (phase 2 task stacks need it); a bare `Heap` with IRQs masked around each call (`arch::irq`), not its spinlock, which could deadlock on one core. In the board crate because it is the binary that owns `#[global_allocator]` and `unsafe` heap init. |
+| `linked_list_allocator` (no features) | `crates/board/qemu-virt` | Kernel heap with `free` (phase 2 task stacks need it); a bare `Heap` behind an `arch::Lock` (which masks IRQs), not its own spinlock, which could deadlock on one core. In the board crate because it is the binary that owns `#[global_allocator]` and `unsafe` heap init. |
 | `panic = "abort"` | both profiles | No unwinding in a kernel. |
 | dev `opt-level = 1` | root `Cargo.toml` | Opt-level 0 kernel code has bloated stack frames and slow MMIO loops; measured build cost is zero. Trade-off: some locals show as optimized out in the debugger. |
 | release `lto = true`, `codegen-units = 1` | root `Cargo.toml` | Smallest/fastest release image; release only, so the inner loop does not pay for it. |
@@ -91,6 +91,7 @@ cargo run -- -append test=pi         # timer on: L (priority 1) holds a mutex H 
 cargo run -- -append test=echo       # readlines prints E: ready, reads two lines typed on the console (echoed, backspace erases), prints got: <line> for each
 cargo run -- -append test=bench-spawn # spawnbench spawns nop, waits and closes it 1000 times without and then with two arguments; prints each round trip in ns
 cargo run -- -append test=bench-pipe # ping and pong echo one byte over two pipes 100000 times; prints the round trip in ns
+cargo run -- -append test=bench-lock # uncontended acquire + release of the ticket and a test-and-set lock in ns; two timer-preempted tasks add 10^7 each under the lock (lock: count 20000000)
 cargo run -- -drive file=disk.img,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0 -append test=disk  # attach a raw image (`truncate -s 1M disk.img`); every boot prints `disk: <n> blocks` (`disk: none` without a disk); the first writes blocks 1-2 and flushes (disk: wrote), the next reads them back (disk: read ok); a failed flush prints disk: flush failed
 cargo run -- -drive file=disk.img,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0 -append test=bench-disk  # image of at least 8 MiB; sequential write+flush and read throughput in MiB/s, 4 KiB and 256 KiB per request
 cargo run -p mogfs --example mkfs --target aarch64-apple-darwin -- disk.img 16384  # empty 64 MiB MogFS image
