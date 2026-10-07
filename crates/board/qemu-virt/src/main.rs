@@ -8,15 +8,16 @@ mod virtio_blk;
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::arch::global_asm;
-use core::cell::UnsafeCell;
-use core::fmt::Write;
+use core::fmt::{self, Write};
+use core::hint::spin_loop;
 use core::ops::Range;
 use core::panic::PanicInfo;
 use core::ptr::{self, NonNull};
 use core::slice;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+use core::sync::atomic::{AtomicBool, AtomicU64};
 
-use arch::{MemoryType, UserAccess, l1_block, user_page};
+use arch::{Guard, Lock, MemoryType, UserAccess, l1_block, user_page};
 use dtb::Dtb;
 use kernel::console::Line;
 use kernel::elf::{Elf, Segment};
@@ -80,40 +81,32 @@ const MAX_PIPES: usize = 16;
 const MAX_MUTEXES: usize = MAX_TASKS * MAX_HANDLES;
 
 #[global_allocator]
-static HEAP: KernelHeap = KernelHeap(UnsafeCell::new(Heap::empty()));
+static HEAP: KernelHeap = KernelHeap(Lock::new(Heap::empty()));
 
-struct KernelHeap(UnsafeCell<Heap>);
-
-// SAFETY: one core, and the heap is only touched with IRQs masked, so accesses never overlap.
-unsafe impl Sync for KernelHeap {}
+/// A leaf lock: nothing else is taken while it is held.
+struct KernelHeap(Lock<Heap>);
 
 // SAFETY: `Heap` hands out non-overlapping blocks of at least `layout` from the region `init_heap` gave it.
 unsafe impl GlobalAlloc for KernelHeap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let irq = arch::irq::disable();
-        // SAFETY: IRQs are masked on the only core, so this is the sole reference.
-        let ptr = unsafe { &mut *self.0.get() }
+        self.0
+            .lock()
             .allocate_first_fit(layout)
-            .map_or(ptr::null_mut(), NonNull::as_ptr);
-        arch::irq::restore(irq);
-        ptr
+            .map_or(ptr::null_mut(), NonNull::as_ptr)
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         // SAFETY: `GlobalAlloc` only passes pointers that `alloc` returned, which are non-null.
         let ptr = unsafe { NonNull::new_unchecked(ptr) };
-        let irq = arch::irq::disable();
-        // SAFETY: IRQs are masked on the only core, so this is the sole reference.
-        let heap = unsafe { &mut *self.0.get() };
         // SAFETY: `ptr` was allocated from this heap with `layout`.
-        unsafe { heap.deallocate(ptr, layout) }
-        arch::irq::restore(irq);
+        unsafe { self.0.lock().deallocate(ptr, layout) }
     }
 }
 
-/// Task contexts, free frames, pipes, mutexes, console input and the file system; touched only with IRQs masked on the
-/// only core. File system calls do their disk I/O inside a syscall, so a `sync` holds the core for its flushes.
-static KERNEL: Global = Global(UnsafeCell::new(Kernel {
+/// The big lock over task contexts, free frames, pipes, mutexes, console input and the file system. Every trap hook
+/// takes it and returns holding it, and the trap exit releases it (`board_unlock`). Lock order: `KERNEL`, then `HEAP`
+/// or `CONSOLE`. File system calls do their disk I/O under it, so a `sync` holds it for its flushes.
+static KERNEL: Lock<Kernel> = Lock::new(Kernel {
     sched: Scheduler::new(),
     frames: FrameAllocator::empty(),
     pipes: Pipes::new(),
@@ -121,7 +114,7 @@ static KERNEL: Global = Global(UnsafeCell::new(Kernel {
     line: Line::new(),
     fs: Fs::new(FsDisk(None)),
     mounted: false,
-}));
+});
 
 struct Kernel {
     sched: Scheduler<MAX_TASKS>,
@@ -134,10 +127,23 @@ struct Kernel {
     mounted: bool,
 }
 
-struct Global(UnsafeCell<Kernel>);
+/// `Board::console` output, a leaf lock; the DTB's PL011 from `enable_mmu` on. Panic, fault, echo and user `write`
+/// output go straight to `UART0`, so a panic under this lock still prints.
+static CONSOLE: Lock<Uart> = Lock::new(Uart::new(UART0));
 
-// SAFETY: one core, and the kernel state is only touched with IRQs masked, so accesses never overlap.
-unsafe impl Sync for Global {}
+/// `Board::console`: each formatted write holds `CONSOLE` for its whole line.
+#[derive(Clone)]
+struct Console;
+
+impl Write for Console {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        CONSOLE.lock().write_str(s)
+    }
+
+    fn write_fmt(&mut self, args: fmt::Arguments<'_>) -> fmt::Result {
+        CONSOLE.lock().write_fmt(args)
+    }
+}
 
 /// `KERNEL.fs`'s disk: `None` until `Board::mount` puts the device in, so the const `Fs::new` builds the static before
 /// the device exists; `Io` while there is none.
@@ -162,13 +168,22 @@ impl Disk for FsDisk {
 }
 
 /// # Safety
-/// IRQs must be masked (trap context), so this is the only reference to the scheduler.
+/// Trap context (IRQs masked), and `frame` the current task's trap frame. Returns holding `KERNEL`.
 #[unsafe(no_mangle)]
 unsafe extern "C" fn task_switch(frame: usize) -> usize {
-    // SAFETY: the caller masked IRQs on the only core, so this is the sole reference.
-    let sched = unsafe { &mut (*KERNEL.0.get()).sched };
+    let sched = &mut Guard::leak(KERNEL.lock_masked()).sched;
     // SAFETY: the caller masked IRQs, and `frame` came from the trap path.
     unsafe { switch(sched, frame) }
+}
+
+/// Releases `KERNEL`, once per trap, after the trap exit moved to the frame the hook returned.
+///
+/// # Safety
+/// Trap exit only: every trap hook returns holding `KERNEL` through a leaked guard it no longer uses.
+#[unsafe(no_mangle)]
+unsafe extern "C" fn board_unlock() {
+    // SAFETY: the caller's contract.
+    unsafe { KERNEL.unlock() }
 }
 
 /// Saves the current task's `frame` and enters the next ready one; returns its frame.
@@ -189,15 +204,14 @@ unsafe fn switch(sched: &mut Scheduler<MAX_TASKS>, frame: usize) -> usize {
 ///
 /// # Safety
 /// IRQs must be masked (trap context), the current task must be a process, and `frame` its trap frame.
-unsafe fn task_exit(frame: usize, code: u64) -> usize {
-    // SAFETY: the caller masked IRQs on the only core, so this is the sole reference.
+unsafe fn task_exit(kernel: &mut Kernel, frame: usize, code: u64) -> usize {
     let Kernel {
         sched,
         frames,
         pipes,
         mutexes,
         ..
-    } = unsafe { &mut *KERNEL.0.get() };
+    } = kernel;
     // Before `exit` picks the next task, so a reader or locker this wakes can be it.
     for index in mutexes.release(sched.current().0) {
         sched.wake(Event::Lock(index));
@@ -210,7 +224,7 @@ unsafe fn task_exit(frame: usize, code: u64) -> usize {
     // SAFETY: `frame` is the exiting process's trap frame and `next` came from the scheduler.
     unsafe { enter(sched, frame, next) };
     arch::flush_asid(asid);
-    // Frees the kernel stack this runs on: sound only while nothing allocates before the trap returns to `next`.
+    // Frees the kernel stack this runs on: no core can allocate it until the trap exit has left it and released `KERNEL`.
     // SAFETY: TTBR0 left `l1` above, and its tables hold only this process's frames.
     unsafe { arch::free_space(l1, |f| frames.free(f)) };
     free_stack(frames, stack);
@@ -518,15 +532,14 @@ fn spawn_init(
     budget: usize,
     priority: u8,
 ) -> Result<(), i64> {
-    let irq = arch::irq::disable();
-    // SAFETY: IRQs are masked on the only core, so this is the sole reference.
+    let mut kernel = KERNEL.lock();
     let Kernel {
         sched,
         frames,
         mounted,
         ..
-    } = unsafe { &mut *KERNEL.0.get() };
-    let added = sched.free_slot().ok_or(EAGAIN).and_then(|slot| {
+    } = &mut *kernel;
+    sched.free_slot().ok_or(EAGAIN).and_then(|slot| {
         let mut handles = Handles::init(slot.0, slot.1);
         if *mounted {
             handles.insert(Object::Dir(ROOT), READ | WRITE | DUPLICATE | TRANSFER)?;
@@ -540,9 +553,7 @@ fn spawn_init(
             init,
             (&[], 0),
         )
-    });
-    arch::irq::restore(irq);
-    added
+    })
 }
 
 /// Spawns the boot archive's executable at `file` with the `len` handles at user address `ptr` and `budget` frames
@@ -653,7 +664,7 @@ fn user_bytes<'a>(ptr: u64, len: usize) -> Option<&'a [u8]> {
         return None;
     }
     // SAFETY: EL0 may read every page of the range, so it is mapped in the current address space, which
-    // stays loaded and unchanged until the trap returns (IRQs masked, one core).
+    // stays loaded and unchanged until the trap returns (this core runs it and holds `KERNEL`).
     Some(unsafe { slice::from_raw_parts(ptr as *const u8, len) })
 }
 
@@ -684,18 +695,20 @@ extern "C" fn task_start(start: usize) -> ! {
 
 #[derive(Clone)]
 struct QemuVirt {
+    /// The DTB's PL011, `CONSOLE` once the MMU is on.
     uart: Uart,
+    console: Console,
     /// GICv2 distributor and CPU interface.
     gic: (PhysAddr, PhysAddr),
     entry_us: u64,
 }
 
 impl kernel::Board for QemuVirt {
-    type Console = Uart;
+    type Console = Console;
     type Disk = VirtioBlk;
 
-    fn console(&mut self) -> &mut Uart {
-        &mut self.uart
+    fn console(&mut self) -> &mut Console {
+        &mut self.console
     }
 
     fn exception_level(&self) -> u8 {
@@ -706,12 +719,15 @@ impl kernel::Board for QemuVirt {
     }
 
     fn breakpoint_self_test(&mut self) {
-        arch::breakpoint_self_test()
+        let _ = Guard::leak(KERNEL.lock());
+        // SAFETY: `KERNEL` is held through the guard leaked above, which the trap exit releases.
+        unsafe { arch::breakpoint_self_test() }
     }
 
     fn enable_mmu(&mut self) {
         // SAFETY: called at boot with the MMU off, before any atomic RMW; MMIO is in GiB 0, and the image, stack and DTB are in RAM in GiB 1.
         unsafe { arch::enable_mmu(&KERNEL_L1, arch::MAIR) }
+        *CONSOLE.lock() = self.uart.clone();
     }
 
     fn read_unmapped(&mut self) {
@@ -721,13 +737,10 @@ impl kernel::Board for QemuVirt {
 
     fn init_heap(&mut self, region: Range<PhysAddr>) {
         let size = (region.end.0 - region.start.0) as usize;
-        let irq = arch::irq::disable();
-        // SAFETY: IRQs are masked on the only core, so this is the sole reference.
-        let heap = unsafe { &mut *HEAP.0.get() };
+        let mut heap = HEAP.0.lock();
         assert!(heap.bottom().is_null(), "heap already initialized");
         // SAFETY: the heap is empty (checked above); `region` being unused, mapped RAM is the `Board::init_heap` contract the kernel upholds.
         unsafe { heap.init(region.start.0 as *mut u8, size) }
-        arch::irq::restore(irq);
     }
 
     fn uptime_us(&self) -> u64 {
@@ -750,10 +763,9 @@ impl kernel::Board for QemuVirt {
 
     fn spawn(&mut self, entry: fn(&mut Self, usize) -> !, arg: usize) -> Result<(), Full> {
         let board = self.clone();
-        let irq = arch::irq::disable();
-        // SAFETY: IRQs are masked on the only core, so this is the sole reference.
-        let Kernel { sched, frames, .. } = unsafe { &mut *KERNEL.0.get() };
-        let added = sched.free_slot().ok_or(Full).and_then(|slot| {
+        let mut kernel = KERNEL.lock();
+        let Kernel { sched, frames, .. } = &mut *kernel;
+        sched.free_slot().ok_or(Full).and_then(|slot| {
             let stack = frames.alloc_contiguous(TASK_STACK_FRAMES).ok_or(Full)?;
             let start = (stack.end.0 as usize - size_of::<Start>()) & !15;
             // SAFETY: `start` is 16-byte aligned and inside the fresh stack, which nothing else references.
@@ -767,9 +779,7 @@ impl kernel::Board for QemuVirt {
             };
             sched.add(slot, frame, PhysAddr(0), memory, Handles::new(), 0);
             Ok(())
-        });
-        arch::irq::restore(irq);
-        added
+        })
     }
 
     fn yield_now(&mut self) {
@@ -777,26 +787,16 @@ impl kernel::Board for QemuVirt {
     }
 
     fn run_others(&mut self) {
-        let irq = arch::irq::disable();
-        // SAFETY: IRQs are masked on the only core, so this is the sole reference.
-        unsafe { &mut (*KERNEL.0.get()).sched }.block(Event::Idle);
-        arch::irq::restore(irq);
+        KERNEL.lock().sched.block(Event::Idle);
         arch::yield_now()
     }
 
     fn init_frames(&mut self, frames: FrameAllocator<FRAME_WORDS>) {
-        let irq = arch::irq::disable();
-        // SAFETY: IRQs are masked on the only core, so this is the sole reference.
-        unsafe { (*KERNEL.0.get()).frames = frames };
-        arch::irq::restore(irq);
+        KERNEL.lock().frames = frames;
     }
 
     fn free_frames(&self) -> usize {
-        let irq = arch::irq::disable();
-        // SAFETY: IRQs are masked on the only core, so this is the sole reference.
-        let free = unsafe { &(*KERNEL.0.get()).frames }.free_count();
-        arch::irq::restore(irq);
-        free
+        KERNEL.lock().frames.free_count()
     }
 
     fn spawn_user(&mut self, program: Program, budget: usize) -> Result<(), i64> {
@@ -816,21 +816,11 @@ impl kernel::Board for QemuVirt {
     }
 
     fn tasks(&self) -> usize {
-        let irq = arch::irq::disable();
-        // SAFETY: IRQs are masked on the only core, so this is the sole reference.
-        let count = unsafe { &(*KERNEL.0.get()).sched }.count();
-        arch::irq::restore(irq);
-        count
+        KERNEL.lock().sched.count()
     }
 
     fn disk(&mut self) -> Option<VirtioBlk> {
-        let alloc = || {
-            let irq = arch::irq::disable();
-            // SAFETY: IRQs are masked on the only core, so this is the sole reference.
-            let frame = unsafe { &mut (*KERNEL.0.get()).frames }.alloc();
-            arch::irq::restore(irq);
-            frame
-        };
+        let alloc = || KERNEL.lock().frames.alloc();
         if DISK_TAKEN.swap(true, Relaxed) {
             return None;
         }
@@ -849,14 +839,36 @@ impl kernel::Board for QemuVirt {
     }
 
     fn mount(&mut self, disk: VirtioBlk) -> Result<(), Error> {
-        let irq = arch::irq::disable();
-        // SAFETY: IRQs are masked on the only core, so this is the sole reference.
-        let kernel = unsafe { &mut *KERNEL.0.get() };
+        let mut kernel = KERNEL.lock();
         *kernel.fs.disk() = FsDisk(Some(disk));
         let mounted = kernel.fs.mount();
         kernel.mounted = mounted.is_ok();
-        arch::irq::restore(irq);
         mounted
+    }
+
+    fn lock_round_trips(&mut self, n: u64, ticket: bool) {
+        static TICKET: Lock<()> = Lock::new(());
+        static TAS: AtomicBool = AtomicBool::new(false);
+        if ticket {
+            for _ in 0..n {
+                drop(TICKET.lock_masked());
+            }
+            return;
+        }
+        for _ in 0..n {
+            while TAS.swap(true, Acquire) {
+                spin_loop();
+            }
+            TAS.store(false, Release);
+        }
+    }
+
+    fn add_locked(&mut self, n: u64) -> u64 {
+        static COUNT: Lock<u64> = Lock::new(0);
+        for _ in 0..n {
+            *COUNT.lock() += 1;
+        }
+        *COUNT.lock()
     }
 }
 
@@ -894,6 +906,7 @@ extern "C" fn kmain() -> ! {
     kernel::run(
         &mut QemuVirt {
             uart: Uart::new(uart),
+            console: Console,
             gic,
             entry_us,
         },
@@ -903,9 +916,10 @@ extern "C" fn kmain() -> ! {
 }
 
 /// # Safety
-/// IRQs must be masked (trap context), as `task_switch` requires.
+/// IRQs must be masked (trap context), as `task_switch` requires; returns holding `KERNEL`.
 #[unsafe(no_mangle)]
 unsafe extern "C" fn board_irq(frame: usize) -> usize {
+    let Kernel { sched, line, .. } = Guard::leak(KERNEL.lock_masked());
     let cpu = PhysAddr(GIC_CPU.load(Relaxed));
     // SAFETY: IRQs are delivered only after `kmain` stored the DTB's GIC CPU interface.
     let iar = unsafe { arch::gic::ack(cpu) };
@@ -913,8 +927,6 @@ unsafe extern "C" fn board_irq(frame: usize) -> usize {
     if tick {
         arch::timer::arm(TICK_US);
     } else if iar == UART_IRQ {
-        // SAFETY: the caller masked IRQs on the only core, so this is the sole reference.
-        let Kernel { sched, line, .. } = unsafe { &mut *KERNEL.0.get() };
         let mut uart = Uart::new(UART0);
         while let Some(byte) = uart.get() {
             if line.push(byte, |echo| uart.write(echo)) {
@@ -927,16 +939,15 @@ unsafe extern "C" fn board_irq(frame: usize) -> usize {
     if !tick {
         return frame;
     }
-    // SAFETY: the caller masked IRQs.
-    unsafe { task_switch(frame) }
+    // SAFETY: the caller masked IRQs, and `frame` came from the trap path.
+    unsafe { switch(sched, frame) }
 }
 
 /// # Safety
-/// IRQs must be masked (trap context), and `frame` the current process's.
+/// Trap context (IRQs masked), and `frame` the current process's. Returns holding `KERNEL`.
 #[unsafe(no_mangle)]
 unsafe extern "C" fn board_syscall(frame: &mut arch::TrapFrame) -> usize {
-    // SAFETY: the caller masked IRQs on the only core, so this is the sole reference.
-    let kernel = unsafe { &mut *KERNEL.0.get() };
+    let kernel = Guard::leak(KERNEL.lock_masked());
     let Kernel {
         sched,
         frames,
@@ -950,7 +961,7 @@ unsafe extern "C" fn board_syscall(frame: &mut arch::TrapFrame) -> usize {
     frame.x[0] = match kernel::syscall::dispatch(frame.x[8], args, sched.handles()) {
         Ok(Call::Exit(code)) => {
             // SAFETY: the caller masked IRQs, and `frame` is the current process's.
-            return unsafe { task_exit(frame as *mut arch::TrapFrame as usize, code) };
+            return unsafe { task_exit(kernel, frame as *mut arch::TrapFrame as usize, code) };
         }
         Ok(Call::Write { ptr, len }) => match user_bytes(ptr, len) {
             Some(bytes) => {
@@ -1139,7 +1150,7 @@ unsafe extern "C" fn board_syscall(frame: &mut arch::TrapFrame) -> usize {
             if (slot, generation) == (sched.current().0, sched.generation()) =>
         {
             // SAFETY: the caller masked IRQs, and `frame` is the current process's.
-            return unsafe { task_exit(frame as *mut arch::TrapFrame as usize, KILLED) };
+            return unsafe { task_exit(kernel, frame as *mut arch::TrapFrame as usize, KILLED) };
         }
         Ok(Call::Kill { slot, generation }) => kill(kernel, slot, generation) as u64,
         Err(error) => error as u64,
@@ -1148,14 +1159,14 @@ unsafe extern "C" fn board_syscall(frame: &mut arch::TrapFrame) -> usize {
 }
 
 /// # Safety
-/// IRQs must be masked (trap context), and `frame` the current process's.
+/// Trap context (IRQs masked), and `frame` the current process's. Returns holding `KERNEL`.
 #[unsafe(no_mangle)]
 unsafe extern "C" fn board_user_fault(frame: usize, ec: u64, far: u64) -> usize {
-    // SAFETY: the caller masked IRQs on the only core, so this is the sole reference.
-    let (slot, _) = unsafe { &(*KERNEL.0.get()).sched }.current();
+    let kernel = Guard::leak(KERNEL.lock_masked());
+    let (slot, _) = kernel.sched.current();
     let _ = writeln!(Uart::new(UART0), "fault: {slot} ec={ec:#x} far={far:#x}");
-    // SAFETY: as above; `frame` is the current process's.
-    unsafe { task_exit(frame, KILLED) }
+    // SAFETY: the caller masked IRQs; `frame` is the current process's.
+    unsafe { task_exit(kernel, frame, KILLED) }
 }
 
 fn shutdown() -> ! {
