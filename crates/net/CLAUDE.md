@@ -165,10 +165,10 @@ kernel, step 50), DHCP, DNS or IPv6 (phase 9), or IPv4 fragment reassembly.
   the simulated link, each side opening in turn, 256 KiB each way for 20 seeds at 0%, 1% and 5% loss. smoltcp 0.12
   drops its retransmission timer when a FIN moves it to CLOSING or CLOSE-WAIT, so the test sends it a FIN only after
   its data has all arrived, and has it close only after ours has.
-- Benchmark: `cargo bench-host` runs `benches/net.rs` (includes `tests/sim/mod.rs`): UDP over the link and its
-  receive path; TCP goodput on the loss-free link (64 KiB and 1 MiB windows), the per-segment receive path, connect
-  plus close, and simulated goodput at 1% and 5% loss with 10 and 50 ms RTT (step 48's baseline). Rows in
-  `docs/BENCHMARKS.md`.
+- Benchmark: `cargo bench-host` runs `benches/net.rs` (includes `tests/sim/mod.rs`) on criterion: UDP over the link
+  and its receive path; TCP goodput on the loss-free link (64 KiB and 1 MiB windows), the per-segment receive path,
+  connect plus close. It first prints simulated goodput (virtual time, deterministic per seed) at 1% and 5% loss with
+  10 and 50 ms RTT (step 48's baseline). Rows in `docs/BENCHMARKS.md`.
 
 ---
 

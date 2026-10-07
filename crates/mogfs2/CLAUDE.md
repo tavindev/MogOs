@@ -76,7 +76,7 @@ or a device driver.
   on a write to a block a valid slot reaches, checking the tree and the live bitmap after every step and a fresh
   mount's free space after every commit; and the seeded mutation test (1 to 3 decoded fields changed and resealed up
   to the superblock, then mount and every operation; `MUTATION_SEEDS=n` runs more than the default 1500).
-- Benchmark: `cargo bench-host` runs `benches/fs.rs` (an argument filters rows); baselines in `docs/BENCHMARKS.md`.
+- Benchmark: `cargo bench-host` runs `benches/fs.rs` on criterion; baselines in `docs/BENCHMARKS.md`.
 
 ---
 
