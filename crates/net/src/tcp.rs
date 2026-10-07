@@ -22,7 +22,9 @@
 //!   source), never to a received frame's source; only a RST for an unknown connection and a SYN-ACK answer the
 //!   frame's source.
 //! - Congestion control is NewReno as plain code, with go-back-N after a timeout.
+use core::marker::PhantomData;
 use core::net::{Ipv4Addr, SocketAddrV4};
+use core::ops::{Add, Sub};
 
 use crate::{
     Counters, ETH, Error, IP, MAX_PACKET, Mac, Nic, Reason, SEC, Stack, TYPE_IPV4, fold, ip_at,
@@ -91,6 +93,8 @@ pub struct TcpId(usize);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TcpInfo {
+    /// The peer's address and port (unspecified for a listener).
+    pub remote: SocketAddrV4,
     pub state: State,
     pub error: Option<Error>,
     pub cwnd: u32,
@@ -133,23 +137,23 @@ pub struct TcpSocket<'a> {
     local: u16,
     remote: SocketAddrV4,
     mac: Mac,
-    iss: u32,
-    snd_una: u32,
-    snd_nxt: u32,
+    iss: Seq,
+    snd_una: Seq,
+    snd_nxt: Seq,
     /// The highest sequence number sent, plus one; `snd_nxt` falls back to `snd_una` on a timeout.
-    snd_max: u32,
+    snd_max: Seq,
     snd_wnd: u32,
     max_wnd: u32,
-    wl1: u32,
-    wl2: u32,
+    wl1: Seq,
+    wl2: Seq,
     snd_shift: u8,
     rcv_shift: u8,
     mss: u32,
     tx_head: usize,
     tx_len: usize,
-    rcv_nxt: u32,
+    rcv_nxt: Seq,
     /// The right edge of the window last advertised.
-    rcv_adv: u32,
+    rcv_adv: Seq,
     rx_head: usize,
     rx_len: usize,
     /// Out-of-order data as offsets from `rcv_nxt`; empty when start == end.
@@ -159,7 +163,7 @@ pub struct TcpSocket<'a> {
     /// Bytes acknowledged towards the next congestion-avoidance increase.
     acked: u32,
     dupacks: u8,
-    recover: u32,
+    recover: Seq,
     recovery: bool,
     /// Slow start after a timeout grows by at most one MSS per ACK (RFC 3465 2.3).
     after_rto: bool,
@@ -185,7 +189,7 @@ pub struct TcpSocket<'a> {
     /// When an ACK last answered an out-of-window segment.
     oow_at: Option<u64>,
     /// The segment timed for an RTT sample (Karn: never a retransmission) and when it was sent.
-    timed: Option<(u32, u64)>,
+    timed: Option<(Seq, u64)>,
     /// When the current second of challenge ACKs started, and how many were sent in it.
     challenges: (u64, u8),
 }
@@ -209,21 +213,21 @@ impl<'a> TcpSocket<'a> {
             local: 0,
             remote: SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
             mac: [0; 6],
-            iss: 0,
-            snd_una: 0,
-            snd_nxt: 0,
-            snd_max: 0,
+            iss: Seq(0),
+            snd_una: Seq(0),
+            snd_nxt: Seq(0),
+            snd_max: Seq(0),
             snd_wnd: 0,
             max_wnd: 0,
-            wl1: 0,
-            wl2: 0,
+            wl1: Seq(0),
+            wl2: Seq(0),
             snd_shift: 0,
             rcv_shift: 0,
             mss: DEFAULT_MSS as u32,
             tx_head: 0,
             tx_len: 0,
-            rcv_nxt: 0,
-            rcv_adv: 0,
+            rcv_nxt: Seq(0),
+            rcv_adv: Seq(0),
             rx_head: 0,
             rx_len: 0,
             ooo: [(0, 0); OOO],
@@ -231,7 +235,7 @@ impl<'a> TcpSocket<'a> {
             ssthresh: u32::MAX,
             acked: 0,
             dupacks: 0,
-            recover: 0,
+            recover: Seq(0),
             recovery: false,
             after_rto: false,
             srtt: 0,
@@ -290,14 +294,14 @@ impl<'a> TcpSocket<'a> {
         (self.space() >> self.rcv_shift).min(0xffff) as u16
     }
 
-    fn data_end(&self) -> u32 {
-        self.snd_una.wrapping_add(self.tx_len as u32)
+    fn data_end(&self) -> Seq {
+        self.snd_una + self.tx_len as u32
     }
 
     /// A pure ACK; it carries `snd_max`, not a go-back-N `snd_nxt` the peer has already received past.
     fn ack_out(&mut self) -> Out {
         // Receiver silly-window avoidance (RFC 9293 3.8.6.2.2): the right edge moves by a whole step or not at all.
-        let (full, held) = (self.space(), self.rcv_adv.wrapping_sub(self.rcv_nxt));
+        let (full, held) = (self.space(), self.rcv_adv - self.rcv_nxt);
         let step = (self.rx.len() as u32 / 2).min(self.mss);
         let wnd = if held <= full && full - held < step {
             held
@@ -305,7 +309,7 @@ impl<'a> TcpSocket<'a> {
             full
         };
         let win = (wnd >> self.rcv_shift).min(0xffff) as u16;
-        self.rcv_adv = self.rcv_nxt.wrapping_add((win as u32) << self.rcv_shift);
+        self.rcv_adv = self.rcv_nxt + ((win as u32) << self.rcv_shift);
         Out {
             seq: self.snd_max,
             ack: self.rcv_nxt,
@@ -339,9 +343,7 @@ impl<'a> TcpSocket<'a> {
             State::Established
         };
         self.cwnd = initial_window(self.mss);
-        self.rcv_adv = self
-            .rcv_nxt
-            .wrapping_add((self.window() as u32) << self.rcv_shift);
+        self.rcv_adv = self.rcv_nxt + ((self.window() as u32) << self.rcv_shift);
         (self.since, self.retries) = (now, 0);
     }
 
@@ -373,7 +375,7 @@ impl<'a> TcpSocket<'a> {
         }
         let len = s.data.len() as u32 + (s.flags & FIN != 0) as u32;
         let wnd = self.space();
-        let off = s.seq.wrapping_sub(self.rcv_nxt);
+        let off = s.seq - self.rcv_nxt;
         // A segment at rcv_nxt into a zero window still carries a valid ACK (RFC 9293 3.10.7.4).
         let ok = match (len, wnd) {
             (_, 0) => off == 0,
@@ -403,14 +405,14 @@ impl<'a> TcpSocket<'a> {
             return Err(Reason::Unacceptable);
         }
         if self.state == State::SynReceived {
-            if !(lt(self.snd_una, s.ack) && le(s.ack, self.snd_max)) {
+            if !(self.snd_una.lt(s.ack) && s.ack.le(self.snd_max)) {
                 *out = Some(rst_for(s));
                 return Err(Reason::Unacceptable);
             }
-            self.snd_una = self.iss.wrapping_add(1);
+            self.snd_una = self.iss + 1;
             self.establish(now);
         }
-        if gt(s.ack, self.snd_max) || lt(s.ack, self.snd_una.wrapping_sub(self.max_wnd)) {
+        if s.ack.gt(self.snd_max) || s.ack.lt(self.snd_una - self.max_wnd) {
             self.challenge(now, out, c);
             return Err(Reason::Unacceptable);
         }
@@ -427,7 +429,7 @@ impl<'a> TcpSocket<'a> {
                 // Data for a connection the caller closed cannot be delivered (RFC 9293 3.10.7.4, RFC 2525).
                 *out = Some(Out {
                     seq: self.snd_max,
-                    ack: 0,
+                    ack: Seq(0),
                     flags: RST,
                     win: 0,
                     syn: None,
@@ -437,9 +439,9 @@ impl<'a> TcpSocket<'a> {
             }
             self.store(s.seq, s.data);
         }
-        let end = s.seq.wrapping_add(s.data.len() as u32);
+        let end = s.seq + s.data.len() as u32;
         if s.flags & FIN != 0 && receiving && end == self.rcv_nxt {
-            self.rcv_nxt = self.rcv_nxt.wrapping_add(1);
+            self.rcv_nxt = self.rcv_nxt + 1;
             self.peer_fin = true;
             self.state = match self.state {
                 State::Established => State::CloseWait,
@@ -461,7 +463,7 @@ impl<'a> TcpSocket<'a> {
         out: &mut Option<Out>,
     ) -> Result<(), Reason> {
         let ack = s.flags & ACK != 0;
-        if ack && (le(s.ack, self.iss) || gt(s.ack, self.snd_max)) {
+        if ack && (s.ack.le(self.iss) || s.ack.gt(self.snd_max)) {
             if s.flags & RST == 0 {
                 *out = Some(rst_for(s));
             }
@@ -477,7 +479,7 @@ impl<'a> TcpSocket<'a> {
         if s.flags & SYN == 0 {
             return Err(Reason::Unacceptable);
         }
-        self.rcv_nxt = s.seq.wrapping_add(1);
+        self.rcv_nxt = s.seq + 1;
         self.options(s, mss);
         (self.snd_wnd, self.max_wnd) = (s.win as u32, s.win as u32);
         (self.wl1, self.wl2) = (s.seq, s.ack);
@@ -498,8 +500,8 @@ impl<'a> TcpSocket<'a> {
         let win = (s.win as u32) << self.snd_shift;
         let changed = win != self.snd_wnd;
         self.unanswered = 0;
-        let fresh = lt(self.wl1, s.seq) || (self.wl1 == s.seq && le(self.wl2, s.ack));
-        if le(self.snd_una, s.ack) && fresh {
+        let fresh = self.wl1.lt(s.seq) || (self.wl1 == s.seq && self.wl2.le(s.ack));
+        if self.snd_una.le(s.ack) && fresh {
             if changed {
                 self.probes = 0;
                 if self.snd_una == self.snd_max && self.tx_len > 0 {
@@ -509,17 +511,17 @@ impl<'a> TcpSocket<'a> {
             (self.snd_wnd, self.wl1, self.wl2) = (win, s.seq, s.ack);
             self.max_wnd = self.max_wnd.max(win);
         }
-        let acked = s.ack.wrapping_sub(self.snd_una);
-        if acked != 0 && le(s.ack, self.snd_max) && lt(self.snd_una, s.ack) {
+        let acked = s.ack - self.snd_una;
+        if acked != 0 && s.ack.le(self.snd_max) && self.snd_una.lt(s.ack) {
             self.sample(s.ack, now);
-            let fin_acked = self.shut && s.ack == self.data_end().wrapping_add(1);
+            let fin_acked = self.shut && s.ack == self.data_end() + 1;
             let bytes = (acked - fin_acked as u32) as usize;
             if bytes > 0 {
                 self.tx_head = (self.tx_head + bytes) % self.tx.len();
                 self.tx_len -= bytes;
             }
             self.snd_una = s.ack;
-            if lt(self.snd_nxt, self.snd_una) {
+            if self.snd_nxt.lt(self.snd_una) {
                 self.snd_nxt = self.snd_una;
             }
             self.grow(acked);
@@ -541,8 +543,8 @@ impl<'a> TcpSocket<'a> {
             self.dupacks = self.dupacks.saturating_add(1);
             if self.recovery {
                 self.cwnd = self.cwnd.saturating_add(self.mss);
-            } else if self.dupacks == 3 && gt(s.ack, self.recover) {
-                let flight = self.snd_max.wrapping_sub(self.snd_una);
+            } else if self.dupacks == 3 && s.ack.gt(self.recover) {
+                let flight = self.snd_max - self.snd_una;
                 self.ssthresh = (flight / 2).max(2 * self.mss);
                 self.cwnd = self.ssthresh + 3 * self.mss;
                 (self.recover, self.recovery, self.rexmit) = (self.snd_max, true, true);
@@ -555,8 +557,8 @@ impl<'a> TcpSocket<'a> {
     fn grow(&mut self, acked: u32) {
         let mss = self.mss;
         if self.recovery {
-            if le(self.recover, self.snd_una) {
-                let flight = self.snd_max.wrapping_sub(self.snd_una);
+            if self.recover.le(self.snd_una) {
+                let flight = self.snd_max - self.snd_una;
                 self.cwnd = self.ssthresh.min(flight.max(mss) + mss);
                 self.recovery = false;
             } else {
@@ -576,15 +578,15 @@ impl<'a> TcpSocket<'a> {
         }
         self.cwnd = self.cwnd.min(MAX_WINDOW as u32);
         self.dupacks = 0;
-        if self.after_rto && le(self.recover, self.snd_una) {
+        if self.after_rto && self.recover.le(self.snd_una) {
             self.after_rto = false;
         }
     }
 
     /// RFC 6298 2.2-2.4, for an ACK covering the timed segment.
-    fn sample(&mut self, ack: u32, now: u64) {
+    fn sample(&mut self, ack: Seq, now: u64) {
         let Some((seq, at)) = self.timed else { return };
-        if !gt(ack, seq) {
+        if !ack.gt(seq) {
             return;
         }
         self.timed = None;
@@ -599,8 +601,8 @@ impl<'a> TcpSocket<'a> {
     }
 
     /// Writes in-window data at its offset and moves `rcv_nxt` over whatever is now in order.
-    fn store(&mut self, seq: u32, data: &[u8]) {
-        let off = seq.wrapping_sub(self.rcv_nxt) as i32;
+    fn store(&mut self, seq: Seq, data: &[u8]) {
+        let off = seq.offset_from(self.rcv_nxt);
         let (off, data) = if off < 0 {
             (0, data.get(off.unsigned_abs() as usize..).unwrap_or(&[]))
         } else {
@@ -631,7 +633,7 @@ impl<'a> TcpSocket<'a> {
                 (r.0, r.1) = (r.0 - b, r.1 - b);
             }
         }
-        self.rcv_nxt = self.rcv_nxt.wrapping_add(b);
+        self.rcv_nxt = self.rcv_nxt + b;
         self.rx_len += b as usize;
     }
 
@@ -658,7 +660,6 @@ impl<'a> TcpSocket<'a> {
         Some(self.since + wait)
     }
 
-    /// Fires the deadline if it has come; true if it had, so the caller recomputes it.
     /// Recomputes the deadline at the end of an event. An obligation appearing with none before starts its timer
     /// now, so a timeout never counts against a segment that was owed but not yet sent.
     fn refresh(&mut self, now: u64) {
@@ -668,6 +669,7 @@ impl<'a> TcpSocket<'a> {
         (self.due, self.stale) = (self.deadline(), false);
     }
 
+    /// Fires the deadline if it has come; true if it had, so the caller recomputes it.
     fn on_timer(&mut self, now: u64) -> bool {
         if self.due.is_none_or(|d| now < d) {
             return false;
@@ -704,7 +706,7 @@ impl<'a> TcpSocket<'a> {
                 return true;
             }
             if self.synchronized() {
-                let flight = self.snd_max.wrapping_sub(self.snd_una);
+                let flight = self.snd_max - self.snd_una;
                 self.ssthresh = (flight / 2).max(2 * self.mss);
                 (self.cwnd, self.after_rto) = (self.mss, true);
             }
@@ -724,7 +726,7 @@ impl<'a> TcpSocket<'a> {
                 self.ack_now
                     || self.rexmit
                     || self.force
-                    || self.snd_nxt.wrapping_sub(self.snd_una) < self.tx_len as u32
+                    || self.snd_nxt - self.snd_una < self.tx_len as u32
                     || self.fin_after(0)
             }
         }
@@ -737,7 +739,7 @@ impl<'a> TcpSocket<'a> {
                 self.state,
                 State::FinWait1 | State::Closing | State::LastAck
             )
-            && self.snd_nxt.wrapping_add(n as u32) == self.data_end()
+            && self.snd_nxt + n as u32 == self.data_end()
     }
 
     /// The next segment to send, as its header and the length of data that follows it from `snd_una + offset`.
@@ -752,7 +754,7 @@ impl<'a> TcpSocket<'a> {
             let synack = self.state == State::SynReceived;
             let o = Out {
                 seq: self.iss,
-                ack: if synack { self.rcv_nxt } else { 0 },
+                ack: if synack { self.rcv_nxt } else { Seq(0) },
                 flags: if synack { SYN | ACK } else { SYN },
                 win: self.rx.len().min(0xffff) as u16,
                 syn: Some((
@@ -765,7 +767,7 @@ impl<'a> TcpSocket<'a> {
         }
         let n = if self.rexmit {
             self.rexmit = false;
-            let inflight = self.snd_max.wrapping_sub(self.snd_una) as usize;
+            let inflight = (self.snd_max - self.snd_una) as usize;
             let n = inflight.min(self.tx_len).min(self.mss as usize);
             let fin = self.shut && inflight == self.tx_len + 1 && n == self.tx_len;
             if n > 0 || fin {
@@ -776,7 +778,7 @@ impl<'a> TcpSocket<'a> {
             }
             0
         } else {
-            let inflight = self.snd_nxt.wrapping_sub(self.snd_una);
+            let inflight = self.snd_nxt - self.snd_una;
             let unsent = self.tx_len.saturating_sub(inflight as usize);
             let wnd = self.cwnd.min(self.snd_wnd);
             let usable = wnd.saturating_sub(inflight) as usize;
@@ -786,7 +788,7 @@ impl<'a> TcpSocket<'a> {
                 if n == 0 && self.tx_len > 0 {
                     // A zero-window probe: an old sequence number the peer must answer with its window.
                     let mut o = self.ack_out();
-                    o.seq = self.snd_una.wrapping_sub(1);
+                    o.seq = self.snd_una - 1;
                     return Some((o, 0));
                 }
             } else if n < self.mss as usize
@@ -819,8 +821,8 @@ impl<'a> TcpSocket<'a> {
             self.since = now;
         }
         let seq = self.snd_nxt;
-        self.snd_nxt = seq.wrapping_add(len);
-        if gt(self.snd_nxt, self.snd_max) {
+        self.snd_nxt = seq + len;
+        if self.snd_nxt.gt(self.snd_max) {
             if self.timed.is_none() && seq == self.snd_max {
                 self.timed = Some((seq, now));
             }
@@ -837,8 +839,8 @@ pub struct HalfOpen {
     /// Port 0 when the entry is free.
     remote: SocketAddrV4,
     mac: Mac,
-    iss: u32,
-    irs: u32,
+    iss: Seq,
+    irs: Seq,
     mss: u16,
     peer_shift: Option<u8>,
     shift: u8,
@@ -852,8 +854,8 @@ impl HalfOpen {
         local: 0,
         remote: SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
         mac: [0; 6],
-        iss: 0,
-        irs: 0,
+        iss: Seq(0),
+        irs: Seq(0),
         mss: 0,
         peer_shift: None,
         shift: 0,
@@ -865,7 +867,7 @@ impl HalfOpen {
     fn synack(&self, mss: u16) -> Out {
         Out {
             seq: self.iss,
-            ack: self.irs.wrapping_add(1),
+            ack: self.irs + 1,
             flags: SYN | ACK,
             win: self.win,
             syn: Some((mss, self.peer_shift.map(|_| self.shift))),
@@ -884,8 +886,8 @@ pub struct TimeWait {
     local: u16,
     remote: SocketAddrV4,
     mac: Mac,
-    snd_nxt: u32,
-    rcv_nxt: u32,
+    snd_nxt: Seq,
+    rcv_nxt: Seq,
     /// Free once `now` reaches it.
     until: u64,
 }
@@ -895,31 +897,105 @@ impl TimeWait {
         local: 0,
         remote: SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
         mac: [0; 6],
-        snd_nxt: 0,
-        rcv_nxt: 0,
+        snd_nxt: Seq(0),
+        rcv_nxt: Seq(0),
         until: 0,
     };
 }
 
-/// One key per use, each SipHash of the caller's seed and a label, so no use's output (least of all the
-/// half-open table's weak mix) tells anything about another's key.
+/// The caller's secret: it keys nothing itself, only the derivation of each `Key`.
+#[derive(Clone, Copy)]
+struct Seed([u64; 2]);
+
+/// A key for one purpose `P`, SipHash of the seed and `P`'s label; each purpose's hash is a method of its own key
+/// type, so no use can take another's key, and no output (least of all the weak half-open mix) says anything about
+/// another key.
+struct Key<P>([u64; 2], PhantomData<P>);
+
+trait Purpose {
+    const LABEL: u64;
+}
+
+struct Isn;
+struct Port;
+struct Cookie;
+struct Takeover;
+struct Slots;
+
+impl Purpose for Isn {
+    const LABEL: u64 = 1;
+}
+impl Purpose for Port {
+    const LABEL: u64 = 2;
+}
+impl Purpose for Cookie {
+    const LABEL: u64 = 3;
+}
+impl Purpose for Takeover {
+    const LABEL: u64 = 4;
+}
+impl Purpose for Slots {
+    const LABEL: u64 = 5;
+}
+
+impl<P: Purpose> Key<P> {
+    fn derive(seed: Seed) -> Self {
+        let [a, b] = [0, 1].map(|half| siphash(seed.0, [P::LABEL, half]));
+        Key([a, b], PhantomData)
+    }
+}
+
+impl Key<Isn> {
+    /// RFC 6528: a keyed hash of the connection plus a 4 us clock.
+    fn isn(&self, ips: u64, ports: u64, now: u64) -> Seq {
+        Seq((siphash(self.0, [ips, ports]) as u32).wrapping_add((now / 4000) as u32))
+    }
+}
+
+impl Key<Port> {
+    /// RFC 6056 algorithm 3's per-destination offset.
+    fn offset(&self, ips: u64, port: u16) -> u32 {
+        siphash(self.0, [ips, port as u64]) as u32
+    }
+}
+
+impl Key<Cookie> {
+    fn hash(&self, ips: u64, ports: u64, t: u64, idx: u32) -> u32 {
+        siphash(self.0, [ips, ports, t << 2 | idx as u64]) as u32
+    }
+}
+
+impl Key<Takeover> {
+    /// The 24 keyed bits a TIME_WAIT takeover's ISS adds above the old connection's.
+    fn bits(&self, ips: u64, ports: u64, old: Seq) -> u32 {
+        siphash(self.0, [ips, ports, old.0 as u64]) as u32 & 0xff_ffff
+    }
+}
+
+impl Key<Slots> {
+    /// A keyed mix, not SipHash: steering SYNs into one run only sends them to cookies.
+    fn mix(&self, ips: u64, ports: u64) -> usize {
+        let x = (ips ^ self.0[0]).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ (ports ^ self.0[1]);
+        (x.wrapping_mul(0xbf58_476d_1ce4_e5b9) >> 32) as usize
+    }
+}
+
 struct Keys {
-    isn: [u64; 2],
-    port: [u64; 2],
-    cookie: [u64; 2],
-    time_wait: [u64; 2],
-    slots: [u64; 2],
+    isn: Key<Isn>,
+    port: Key<Port>,
+    cookie: Key<Cookie>,
+    takeover: Key<Takeover>,
+    slots: Key<Slots>,
 }
 
 impl Keys {
-    fn derive(seed: [u64; 2]) -> Self {
-        let key = |label: u64| [siphash(seed, [label, 0]), siphash(seed, [label, 1])];
+    fn derive(seed: Seed) -> Self {
         Keys {
-            isn: key(1),
-            port: key(2),
-            cookie: key(3),
-            time_wait: key(4),
-            slots: key(5),
+            isn: Key::derive(seed),
+            port: Key::derive(seed),
+            cookie: Key::derive(seed),
+            takeover: Key::derive(seed),
+            slots: Key::derive(seed),
         }
     }
 }
@@ -945,7 +1021,7 @@ impl<'a> Tcp<'a> {
         time_wait: &'a mut [TimeWait],
     ) -> Self {
         Tcp {
-            keys: Keys::derive(seed),
+            keys: Keys::derive(Seed(seed)),
             sockets,
             half_open,
             time_wait,
@@ -960,8 +1036,8 @@ impl<'a> Tcp<'a> {
 struct Seg<'f> {
     from: SocketAddrV4,
     port: u16,
-    seq: u32,
-    ack: u32,
+    seq: Seq,
+    ack: Seq,
     flags: u8,
     win: u16,
     data: &'f [u8],
@@ -972,8 +1048,8 @@ struct Seg<'f> {
 /// A segment header to send; `syn` carries the MSS and window-shift options.
 #[derive(Clone, Copy)]
 struct Out {
-    seq: u32,
-    ack: u32,
+    seq: Seq,
+    ack: Seq,
     flags: u8,
     win: u16,
     syn: Option<(u16, Option<u8>)>,
@@ -1135,6 +1211,7 @@ impl<'a> Stack<'a> {
     pub fn tcp_info(&self, id: TcpId) -> Option<TcpInfo> {
         let s = self.tcp.sockets.get(id.0)?;
         Some(TcpInfo {
+            remote: s.remote,
             state: s.state,
             error: s.error,
             cwnd: s.cwnd,
@@ -1198,7 +1275,7 @@ impl<'a> Stack<'a> {
             let w = self.tcp.time_wait[t];
             // A new incarnation needs a SYN, a listener and room for its gap ISS; else TIME_WAIT answers.
             let takeover = s.flags & (SYN | ACK) == SYN
-                && gt(s.seq, w.rcv_nxt)
+                && s.seq.gt(w.rcv_nxt)
                 && self.listener(s.port).is_some()
                 && self
                     .slots(s.port, s.from)
@@ -1207,14 +1284,13 @@ impl<'a> Stack<'a> {
                 self.tcp.time_wait[t] = TimeWait::EMPTY;
                 let ips = (u32::from(self.config.ip) as u64) << 32 | u32::from(*s.from.ip()) as u64;
                 let ports = (s.port as u64) << 16 | s.from.port() as u64;
-                let keyed = siphash(self.tcp.keys.time_wait, [ips, ports, w.snd_nxt as u64]) as u32
-                    & 0xff_ffff;
-                iss = Some(w.snd_nxt.wrapping_add(TIME_WAIT_GAP + keyed));
+                let bits = self.tcp.keys.takeover.bits(ips, ports, w.snd_nxt);
+                iss = Some(w.snd_nxt + (TIME_WAIT_GAP + bits));
             } else if s.flags & RST != 0 {
                 // RFC 1337: a RST never cuts TIME_WAIT short.
                 return Err(Reason::Unacceptable);
             } else {
-                let fin_end = s.seq.wrapping_add(s.data.len() as u32 + 1);
+                let fin_end = s.seq + (s.data.len() as u32 + 1);
                 if s.flags & FIN != 0 && fin_end == w.rcv_nxt {
                     self.tcp.time_wait[t].until = now + TIME_WAIT;
                 }
@@ -1266,7 +1342,7 @@ impl<'a> Stack<'a> {
         macs: (Mac, Mac),
         now: u64,
         mss: u16,
-        (iss, mut slots): (Option<u32>, impl Iterator<Item = usize>),
+        (iss, mut slots): (Option<Seq>, impl Iterator<Item = usize>),
     ) -> Result<(), Reason> {
         if s.flags & RST != 0 {
             return Err(Reason::Unacceptable);
@@ -1294,7 +1370,7 @@ impl<'a> Stack<'a> {
             let idx = COOKIE_MSS.iter().rposition(|&m| m <= peer).unwrap_or(0);
             let o = Out {
                 seq: self.cookie(s.port, s.from, s.seq, now / COOKIE_PERIOD, idx as u32),
-                ack: s.seq.wrapping_add(1),
+                ack: s.seq + 1,
                 flags: SYN | ACK,
                 win,
                 syn: Some((mss, None)),
@@ -1323,11 +1399,11 @@ impl<'a> Stack<'a> {
 
     /// The cookie ISS for a SYN: the clock's low bit, the 2-bit MSS index and 29 bits of keyed hash over the whole
     /// clock, the index, the connection and the peer's ISN (so a cookie two periods old fails, low bit or not).
-    fn cookie(&self, local: u16, from: SocketAddrV4, irs: u32, t: u64, idx: u32) -> u32 {
+    fn cookie(&self, local: u16, from: SocketAddrV4, irs: Seq, t: u64, idx: u32) -> Seq {
         let ips = (u32::from(self.config.ip) as u64) << 32 | u32::from(*from.ip()) as u64;
-        let ports = (local as u64) << 48 | (from.port() as u64) << 32 | irs as u64;
-        let hash = siphash(self.tcp.keys.cookie, [ips, ports, t << 2 | idx as u64]) as u32;
-        ((t as u32 & 1) << 31) | (idx << 29) | (hash & 0x1fff_ffff)
+        let ports = (local as u64) << 48 | (from.port() as u64) << 32 | irs.0 as u64;
+        let hash = self.tcp.keys.cookie.hash(ips, ports, t, idx);
+        Seq(((t as u32 & 1) << 31) | (idx << 29) | (hash & 0x1fff_ffff))
     }
 
     /// The half-open state a valid cookie ACK stands for: issued this period or the last, for this SYN, while
@@ -1336,8 +1412,8 @@ impl<'a> Stack<'a> {
         self.tcp.sockets[l]
             .cookie_at
             .filter(|&t| now.saturating_sub(t) < 2 * COOKIE_PERIOD)?;
-        let (iss, irs) = (s.ack.wrapping_sub(1), s.seq.wrapping_sub(1));
-        let idx = (iss >> 29) & 3;
+        let (iss, irs) = (s.ack - 1, s.seq - 1);
+        let idx = (iss.0 >> 29) & 3;
         let t = [now / COOKIE_PERIOD, (now / COOKIE_PERIOD).saturating_sub(1)];
         t.iter()
             .any(|&t| self.cookie(s.port, s.from, irs, t, idx) == iss)
@@ -1363,7 +1439,7 @@ impl<'a> Stack<'a> {
     ) -> Result<(), Reason> {
         let e = self.tcp.half_open[h];
         if s.flags & RST != 0 {
-            if s.seq != e.irs.wrapping_add(1) {
+            if s.seq != e.irs + 1 {
                 return Err(Reason::Unacceptable);
             }
             self.tcp.half_open[h] = HalfOpen::EMPTY;
@@ -1376,7 +1452,7 @@ impl<'a> Stack<'a> {
             self.reply_tcp((e.mac, ours), s.from, s.port, &e.synack(mss));
             return Ok(());
         }
-        if s.flags & ACK == 0 || s.seq != e.irs.wrapping_add(1) {
+        if s.flags & ACK == 0 || s.seq != e.irs + 1 {
             return Err(Reason::Unacceptable);
         }
         let Some(l) = self.listener(e.local) else {
@@ -1384,7 +1460,7 @@ impl<'a> Stack<'a> {
             self.reply_tcp((e.mac, ours), s.from, s.port, &rst_for(s));
             return Err(Reason::NoSocket);
         };
-        if s.ack != e.iss.wrapping_add(1) {
+        if s.ack != e.iss + 1 {
             // The client may be answering a cookie SYN-ACK sent before this entry existed.
             if let Some(c) = self.cookie_in(l, s, e.mac, now) {
                 self.open(c, l, s, ours, now, mss)?;
@@ -1412,10 +1488,10 @@ impl<'a> Stack<'a> {
         let i = self.free_slot().map_err(|_| Reason::SocketFull)?;
         let c = &mut self.tcp.sockets[i];
         c.reset(State::SynReceived, e.local, e.remote);
-        let una = e.iss.wrapping_add(1);
+        let una = e.iss + 1;
         (c.parent, c.mac, c.iss, c.recover) = (Some(l), e.mac, e.iss, e.iss);
         (c.snd_una, c.snd_nxt, c.snd_max) = (una, una, una);
-        (c.rcv_nxt, c.wl1, c.wl2) = (e.irs.wrapping_add(1), e.irs, una);
+        (c.rcv_nxt, c.wl1, c.wl2) = (e.irs + 1, e.irs, una);
         c.mss = e.mss.min(mss).max(64) as u32;
         (c.snd_shift, c.rcv_shift) = match e.peer_shift {
             Some(peer) => (peer, e.shift),
@@ -1435,14 +1511,14 @@ impl<'a> Stack<'a> {
         let t = &q[ihl..];
         let remote = SocketAddrV4::new(ip_at(&q[16..20]), be16(&t[2..4]));
         let local = be16(&t[..2]);
-        let seq = u32::from_be_bytes([t[4], t[5], t[6], t[7]]);
+        let seq = Seq(u32::from_be_bytes([t[4], t[5], t[6], t[7]]));
         let c = self
             .tcp
             .sockets
             .iter_mut()
             .find(|c| c.matches(local, remote))
             .ok_or(Reason::Ignored)?;
-        if !(le(c.snd_una, seq) && lt(seq, c.snd_max)) {
+        if !(c.snd_una.le(seq) && seq.lt(c.snd_max)) {
             return Err(Reason::Unacceptable);
         }
         if hard && c.state == State::SynSent {
@@ -1498,9 +1574,9 @@ impl<'a> Stack<'a> {
             s.state,
             State::Established | State::FinWait1 | State::FinWait2
         ) {
-            let edge = s.rcv_nxt.wrapping_add((s.window() as u32) << s.rcv_shift);
+            let edge = s.rcv_nxt + ((s.window() as u32) << s.rcv_shift);
             let step = (s.rx.len() as u32 / 2).min(s.mss);
-            if edge.wrapping_sub(s.rcv_adv) as i32 >= step.max(1) as i32 {
+            if edge.offset_from(s.rcv_adv) >= step.max(1) as i32 {
                 s.ack_now = true;
             }
         }
@@ -1540,7 +1616,7 @@ impl<'a> Stack<'a> {
             let id = self.ip_id;
             let hl = TCP + if o.syn.is_some() { SYN_OPTIONS } else { 0 };
             let pos = if n > 0 {
-                (s.tx_head + o.seq.wrapping_sub(s.snd_una) as usize) % s.tx.len()
+                (s.tx_head + (o.seq - s.snd_una) as usize) % s.tx.len()
             } else {
                 0
             };
@@ -1604,10 +1680,7 @@ impl<'a> Stack<'a> {
         let n = self.tcp.half_open.len();
         let ips = (u32::from(self.config.ip) as u64) << 32 | u32::from(*from.ip()) as u64;
         let ports = (local as u64) << 16 | from.port() as u64;
-        // A keyed mix, not SipHash: steering SYNs into one run only sends them to cookies.
-        let k = self.tcp.keys.slots;
-        let x = (ips ^ k[0]).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ (ports ^ k[1]);
-        let h = (x.wrapping_mul(0xbf58_476d_1ce4_e5b9) >> 32) as usize;
+        let h = self.tcp.keys.slots.mix(ips, ports);
         (0..PROBES.min(n)).map(move |i| (h + i) % n)
     }
 
@@ -1639,7 +1712,7 @@ impl<'a> Stack<'a> {
     fn ephemeral(&mut self, to: SocketAddrV4, now: u64) -> Result<u16, Error> {
         let range = 65536 - EPHEMERAL;
         let ips = (u32::from(self.config.ip) as u64) << 32 | u32::from(*to.ip()) as u64;
-        let offset = siphash(self.tcp.keys.port, [ips, to.port() as u64]) as u32;
+        let offset = self.tcp.keys.port.offset(ips, to.port());
         for n in 0..range {
             let port = (EPHEMERAL + offset.wrapping_add(self.tcp.next_port.wrapping_add(n)) % range)
                 as u16;
@@ -1651,11 +1724,10 @@ impl<'a> Stack<'a> {
         Err(Error::InUse)
     }
 
-    /// RFC 6528: a keyed hash of the connection plus a 4 us clock.
-    fn isn(&self, local: u16, to: SocketAddrV4, now: u64) -> u32 {
+    fn isn(&self, local: u16, to: SocketAddrV4, now: u64) -> Seq {
         let ips = (u32::from(self.config.ip) as u64) << 32 | u32::from(*to.ip()) as u64;
         let ports = (local as u64) << 16 | to.port() as u64;
-        (siphash(self.tcp.keys.isn, [ips, ports]) as u32).wrapping_add((now / 4000) as u32)
+        self.tcp.keys.isn.isn(ips, ports, now)
     }
 }
 
@@ -1704,8 +1776,8 @@ fn parse<'f>(src: Ipv4Addr, dst: Ipv4Addr, seg: &'f [u8]) -> Result<Seg<'f>, Rea
     Ok(Seg {
         from: SocketAddrV4::new(src, sport),
         port,
-        seq: u32::from_be_bytes([h[4], h[5], h[6], h[7]]),
-        ack: u32::from_be_bytes([h[8], h[9], h[10], h[11]]),
+        seq: Seq(u32::from_be_bytes([h[4], h[5], h[6], h[7]])),
+        ack: Seq(u32::from_be_bytes([h[8], h[9], h[10], h[11]])),
         flags,
         win: be16(&h[14..16]),
         data: &seg[off..],
@@ -1720,15 +1792,15 @@ fn rst_for(s: &Seg) -> Out {
     if s.flags & ACK != 0 {
         Out {
             seq: s.ack,
-            ack: 0,
+            ack: Seq(0),
             flags: RST,
             win: 0,
             syn: None,
         }
     } else {
         Out {
-            seq: 0,
-            ack: s.seq.wrapping_add(len),
+            seq: Seq(0),
+            ack: s.seq + len,
             flags: RST | ACK,
             win: 0,
             syn: None,
@@ -1756,8 +1828,8 @@ fn frame(
     let (h, payload) = seg.split_at_mut(hl);
     h[..2].copy_from_slice(&local.to_be_bytes());
     h[2..4].copy_from_slice(&to.port().to_be_bytes());
-    h[4..8].copy_from_slice(&o.seq.to_be_bytes());
-    h[8..12].copy_from_slice(&o.ack.to_be_bytes());
+    h[4..8].copy_from_slice(&o.seq.0.to_be_bytes());
+    h[8..12].copy_from_slice(&o.ack.0.to_be_bytes());
     h[12..14].copy_from_slice(&[(hl as u8 / 4) << 4, o.flags]);
     h[14..16].copy_from_slice(&o.win.to_be_bytes());
     h[16..20].fill(0);
@@ -1794,16 +1866,52 @@ fn be16(b: &[u8]) -> u16 {
     u16::from_be_bytes([b[0], b[1]])
 }
 
-fn lt(a: u32, b: u32) -> bool {
-    (a.wrapping_sub(b) as i32) < 0
+/// A sequence number: ordered and subtracted modulo 2^32 (RFC 9293 3.4); only a byte count can be added to one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Seq(u32);
+
+impl Seq {
+    /// How far `self` is ahead of `base`; negative when behind.
+    fn offset_from(self, base: Seq) -> i32 {
+        (self - base) as i32
+    }
+
+    fn lt(self, other: Seq) -> bool {
+        self.offset_from(other) < 0
+    }
+
+    fn le(self, other: Seq) -> bool {
+        !other.lt(self)
+    }
+
+    fn gt(self, other: Seq) -> bool {
+        other.lt(self)
+    }
 }
 
-fn le(a: u32, b: u32) -> bool {
-    !lt(b, a)
+impl Add<u32> for Seq {
+    type Output = Seq;
+
+    fn add(self, n: u32) -> Seq {
+        Seq(self.0.wrapping_add(n))
+    }
 }
 
-fn gt(a: u32, b: u32) -> bool {
-    lt(b, a)
+impl Sub<u32> for Seq {
+    type Output = Seq;
+
+    fn sub(self, n: u32) -> Seq {
+        Seq(self.0.wrapping_sub(n))
+    }
+}
+
+/// The distance from `other` forward to `self`.
+impl Sub for Seq {
+    type Output = u32;
+
+    fn sub(self, other: Seq) -> u32 {
+        self.0.wrapping_sub(other.0)
+    }
 }
 
 /// SipHash-2-4 of a message given as little-endian words.
@@ -1875,25 +1983,25 @@ mod tests {
     fn each_use_gets_its_own_key_derived_from_the_seed() {
         let seed = [1, 2];
         let k = Tcp::new(seed, &mut [], &mut [], &mut []).keys;
-        let all = [seed, k.isn, k.port, k.cookie, k.time_wait, k.slots];
+        let all = [seed, k.isn.0, k.port.0, k.cookie.0, k.takeover.0, k.slots.0];
         for (i, a) in all.iter().enumerate() {
             for b in &all[i + 1..] {
                 assert_ne!(a, b, "two uses share a key");
             }
         }
         assert_ne!(
-            k.slots, k.cookie,
+            k.slots.0, k.cookie.0,
             "the weak half-open mix never sees the cookie key"
         );
         let other = Tcp::new([1, 3], &mut [], &mut [], &mut []).keys;
-        assert_ne!(other.cookie, k.cookie, "every key depends on the seed");
+        assert_ne!(other.cookie.0, k.cookie.0, "every key depends on the seed");
     }
 
     #[test]
     fn reassembly_merges_out_of_order_ranges() {
         let (mut rx, mut tx) = ([0u8; 64], [0u8; 0]);
         let mut s = TcpSocket::new(&mut rx, &mut tx);
-        let base = u32::MAX - 4;
+        let base = Seq(u32::MAX - 4);
         s.rcv_nxt = base;
         let stream: Vec<u8> = (0..40).collect();
         for (from, to) in [
@@ -1905,9 +2013,9 @@ mod tests {
             (8, 10),
             (25, 40),
         ] {
-            s.store(base.wrapping_add(from as u32), &stream[from..to]);
+            s.store(base + from as u32, &stream[from..to]);
         }
-        assert_eq!((s.rx_len, s.rcv_nxt), (40, 35));
+        assert_eq!((s.rx_len, s.rcv_nxt), (40, Seq(35)));
         assert!(s.ooo.iter().all(|r| r.0 == r.1));
         assert_eq!(&s.rx[..40], &stream[..]);
     }

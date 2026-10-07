@@ -2197,3 +2197,15 @@ fn a_clean_link_never_times_out_whatever_the_application_does() {
         }
     }
 }
+
+#[test]
+fn an_accepted_connection_reports_its_peer() {
+    let mut m = Mem::new(2, 4096, 4096, 4, 4);
+    host!(a, m, IP_A, [1, 1]);
+    let mut tap = Tap::new(MAC_A);
+    let (c, _) = accepted(&mut a, &mut tap);
+    assert_eq!(
+        a.tcp_info(c).unwrap().remote,
+        SocketAddrV4::new(IP_B, PEER_PORT)
+    );
+}
