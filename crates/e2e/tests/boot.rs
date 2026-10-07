@@ -489,6 +489,14 @@ fn boot_with_disk(image: &Path, test: &str) -> (ExitStatus, Vec<String>) {
     ])
 }
 
+/// A `-blockdev` value for `image` as drive `d0` behind blkdebug, which fails every host flush with EIO.
+fn flush_fails(image: &Path) -> String {
+    format!(
+        r#"{{"driver":"raw","node-name":"d0","file":{{"driver":"blkdebug","inject-error":[{{"event":"flush_to_disk","errno":5}}],"image":{{"driver":"file","filename":"{}"}}}}}}"#,
+        image.display()
+    )
+}
+
 #[test]
 fn a_flushed_block_survives_a_reboot() {
     let image = disk_image("disk", 16);
@@ -512,10 +520,7 @@ fn a_flushed_block_survives_a_reboot() {
 
     // A fresh image behind blkdebug, which fails every host flush with EIO: the kernel must see it, so it flushed.
     let image = disk_image("disk-flush", 16);
-    let blockdev = format!(
-        r#"{{"driver":"raw","node-name":"d0","file":{{"driver":"blkdebug","inject-error":[{{"event":"flush_to_disk","errno":5}}],"image":{{"driver":"file","filename":"{}"}}}}}}"#,
-        image.display()
-    );
+    let blockdev = flush_fails(&image);
     let (status, lines) = boot(&[
         "-blockdev",
         &blockdev,
@@ -599,19 +604,24 @@ fn mogfs_image(test: &str, blocks: u64) -> PathBuf {
 /// command with the lines msh printed for it.
 fn shell(image: &Path, commands: &[&str]) -> (ExitStatus, Vec<(String, Vec<String>)>) {
     let drive = format!("file={},if=none,format=raw,id=d0", image.display());
+    shell_on(&["-drive", &drive], commands)
+}
+
+/// As `shell`, with the drive `d0` given by `drive` (QEMU arguments).
+fn shell_on(drive: &[&str], commands: &[&str]) -> (ExitStatus, Vec<(String, Vec<String>)>) {
     let typed: Vec<Vec<u8>> = commands.iter().map(|c| format!("{c}\r").into()).collect();
     let chunks: Vec<&[u8]> = typed.iter().map(Vec::as_slice).collect();
-    let (status, lines) = boot_with_input(
+    let args = [
+        drive,
         &[
-            "-drive",
-            &drive,
             "-device",
             "virtio-blk-device,drive=d0",
             "-append",
             "test=shell",
         ],
-        Some(("msh> ", &chunks)),
-    );
+    ]
+    .concat();
+    let (status, lines) = boot_with_input(&args, Some(("msh> ", &chunks)));
     assert!(
         !lines.iter().any(|l| l.starts_with("panic:")),
         "kernel panicked"
@@ -674,10 +684,11 @@ fn shell_files_survive_a_reboot_only_once_synced() {
             "cat docs/a.txt",
             "cat ../x",
             "cat /x",
+            "write docs/c.txt again",
+            "sync",
             "exit",
         ],
     );
-    std::fs::remove_file(&image).unwrap();
     assert!(status.success(), "QEMU exited with {status}");
     assert_eq!(
         boot2,
@@ -687,7 +698,39 @@ fn shell_files_survive_a_reboot_only_once_synced() {
             ("cat docs/a.txt", &["hello"]),
             ("cat ../x", &["msh: cat: EINVAL"]),
             ("cat /x", &["msh: cat: EINVAL"]),
+            ("write docs/c.txt again", &[]),
+            ("sync", &[]),
             ("exit", &[]),
+        ])
+    );
+
+    // A commit right after mounting an existing image lands.
+    let (status, boot3) = shell(&image, &["ls docs", "cat docs/c.txt", "exit"]);
+    std::fs::remove_file(&image).unwrap();
+    assert!(status.success(), "QEMU exited with {status}");
+    assert_eq!(
+        boot3,
+        session(&[
+            ("ls docs", &["a.txt", "c.txt"]),
+            ("cat docs/c.txt", &["again"]),
+            ("exit", &[]),
+        ])
+    );
+}
+
+#[test]
+fn sync_reports_a_failed_flush() {
+    let image = mogfs_image("shell-flush", 1024);
+    let blockdev = flush_fails(&image);
+    let (status, got) = shell_on(&["-blockdev", &blockdev], &["mkdir x", "sync", "exit"]);
+    std::fs::remove_file(&image).unwrap();
+    assert!(status.success(), "QEMU exited with {status}");
+    assert_eq!(
+        got,
+        session(&[
+            ("mkdir x", &[]),
+            ("sync", &["msh: sync: EIO"]),
+            ("exit", &[])
         ])
     );
 }

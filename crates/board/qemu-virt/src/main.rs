@@ -119,7 +119,7 @@ static KERNEL: Global = Global(UnsafeCell::new(Kernel {
     pipes: Pipes::new(),
     mutexes: Mutexes::new(),
     line: Line::new(),
-    fs: Fs::new(FsDisk),
+    fs: Fs::new(FsDisk(None)),
     mounted: false,
 }));
 
@@ -139,42 +139,25 @@ struct Global(UnsafeCell<Kernel>);
 // SAFETY: one core, and the kernel state is only touched with IRQs masked, so accesses never overlap.
 unsafe impl Sync for Global {}
 
-/// The file system's block device, set by `Board::mount`; touched only with IRQs masked, through `FsDisk`.
-static FS_DISK: DiskSlot = DiskSlot(UnsafeCell::new(None));
-
-struct DiskSlot(UnsafeCell<Option<VirtioBlk>>);
-
-// SAFETY: one core, and the slot is only touched with IRQs masked, so accesses never overlap.
-unsafe impl Sync for DiskSlot {}
-
-/// `KERNEL.fs`'s disk: `FS_DISK`, so the const `Fs::new` builds the static before the device exists (mogfs has no
-/// way to replace an `Fs`'s disk); `Io` while there is none.
-struct FsDisk;
-
-impl FsDisk {
-    /// Valid only until the calling `Disk` method returns.
-    fn get<'a>() -> Option<&'a mut VirtioBlk> {
-        // SAFETY: only `KERNEL.fs` holds an `FsDisk`, and it and `FS_DISK` are touched only with IRQs masked on the only
-        // core, so this is the sole reference.
-        unsafe { (*FS_DISK.0.get()).as_mut() }
-    }
-}
+/// `KERNEL.fs`'s disk: `None` until `Board::mount` puts the device in, so the const `Fs::new` builds the static before
+/// the device exists; `Io` while there is none.
+struct FsDisk(Option<VirtioBlk>);
 
 impl Disk for FsDisk {
     fn read(&mut self, block: u64, bufs: &mut [[u8; BLOCK_SIZE]]) -> Result<(), Error> {
-        Self::get().ok_or(Error::Io)?.read(block, bufs)
+        self.0.as_mut().ok_or(Error::Io)?.read(block, bufs)
     }
 
     fn write(&mut self, block: u64, bufs: &[[u8; BLOCK_SIZE]]) -> Result<(), Error> {
-        Self::get().ok_or(Error::Io)?.write(block, bufs)
+        self.0.as_mut().ok_or(Error::Io)?.write(block, bufs)
     }
 
     fn flush(&mut self) -> Result<(), Error> {
-        Self::get().ok_or(Error::Io)?.flush()
+        self.0.as_mut().ok_or(Error::Io)?.flush()
     }
 
     fn blocks(&self) -> u64 {
-        Self::get().map_or(0, |disk| disk.blocks())
+        self.0.as_ref().map_or(0, VirtioBlk::blocks)
     }
 }
 
@@ -818,9 +801,8 @@ impl kernel::Board for QemuVirt {
     fn mount(&mut self, disk: VirtioBlk) -> Result<(), Error> {
         let irq = arch::irq::disable();
         // SAFETY: IRQs are masked on the only core, so this is the sole reference.
-        unsafe { *FS_DISK.0.get() = Some(disk) };
-        // SAFETY: as above.
         let kernel = unsafe { &mut *KERNEL.0.get() };
+        *kernel.fs.disk() = FsDisk(Some(disk));
         let mounted = kernel.fs.mount();
         kernel.mounted = mounted.is_ok();
         arch::irq::restore(irq);
@@ -1029,6 +1011,15 @@ unsafe extern "C" fn board_syscall(frame: &mut arch::TrapFrame) -> usize {
                 _ => file::list_archive(ARCHIVE, start, out),
             })
             .map_or_else(|error| error as u64, |n| n as u64),
+        Ok(Call::Unlink { dir, ptr, len }) => user_bytes(ptr, len)
+            .ok_or(EFAULT)
+            .and_then(|path| file::unlink(fs, dir, path))
+            .map_or_else(|error| error as u64, |()| 0),
+        Ok(Call::Rename { from, to }) => user_bytes(from.1, from.2)
+            .zip(user_bytes(to.1, to.2))
+            .ok_or(EFAULT)
+            .and_then(|(f, t)| file::rename(fs, (from.0, f), (to.0, t)))
+            .map_or_else(|error| error as u64, |()| 0),
         Ok(Call::Sync) => fs
             .commit()
             .map_or_else(|error| file::errno(error) as u64, |()| 0),

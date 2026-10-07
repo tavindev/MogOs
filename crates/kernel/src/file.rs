@@ -3,12 +3,13 @@
 //! reaches above its directory through a path. The walk is bounded by the path's length: a crafted image can point an
 //! entry at `ROOT` or an ancestor (a cycle), so nothing here recurses over the tree.
 
-use mogfs::{Disk, Error, Fs, Inode, Kind, ROOT};
+use mogfs::{Disk, Error, Fs, Inode, Kind};
 
 use crate::cpio;
 use crate::handle::Object;
 use crate::syscall::{
-    CREATE, EEXIST, EFBIG, EINVAL, EIO, EISDIR, ENAMETOOLONG, ENOENT, ENOSPC, ENOTDIR, TRUNC,
+    CREATE, EEXIST, EFBIG, EINVAL, EIO, EISDIR, ENAMETOOLONG, ENOENT, ENOSPC, ENOTDIR, ENOTEMPTY,
+    TRUNC,
 };
 
 /// Entries one `readdir` call lists at most.
@@ -25,6 +26,7 @@ pub fn errno(error: Error) -> i64 {
         Error::InvalidName => EINVAL,
         Error::TooBig => EFBIG,
         Error::NoSpace => ENOSPC,
+        Error::NotEmpty => ENOTEMPTY,
         Error::Io | Error::Corrupt => EIO,
     }
 }
@@ -47,13 +49,14 @@ fn parent<'a, D: Disk>(
     Ok((dir, name))
 }
 
-/// The file or directory at `path` under `dir`; with `CREATE` a missing file is made, with `TRUNC` the file is emptied.
+/// The file or directory at `path` under `dir`; with `CREATE` a missing file is made, with `TRUNC` the file is emptied
+/// (`EISDIR` for a directory).
 pub fn open<D: Disk>(fs: &mut Fs<D>, dir: Inode, path: &[u8], flags: u64) -> Result<Object, i64> {
     let (dir, name) = parent(fs, dir, path)?;
     let mut open = || {
-        let inode = match fs.lookup(dir, name) {
-            Err(Error::NotFound) if flags & CREATE != 0 => fs.create(dir, name)?,
-            found => found?,
+        let inode = match flags & CREATE {
+            0 => fs.lookup(dir, name)?,
+            _ => fs.create(dir, name)?,
         };
         if flags & TRUNC != 0 {
             fs.truncate(inode)?;
@@ -71,56 +74,53 @@ pub fn mkdir<D: Disk>(fs: &mut Fs<D>, dir: Inode, path: &[u8]) -> Result<(), i64
     fs.mkdir(dir, name).map(|_| ()).map_err(errno)
 }
 
+/// Removes the file or empty directory at `path` under `dir`.
+pub fn unlink<D: Disk>(fs: &mut Fs<D>, dir: Inode, path: &[u8]) -> Result<(), i64> {
+    let (dir, name) = parent(fs, dir, path)?;
+    fs.unlink(dir, name).map_err(errno)
+}
+
+/// Moves the entry at `from` under `from_dir` to `to` under `to_dir`; `EEXIST` if `to` exists.
+pub fn rename<D: Disk>(
+    fs: &mut Fs<D>,
+    (from_dir, from): (Inode, &[u8]),
+    (to_dir, to): (Inode, &[u8]),
+) -> Result<(), i64> {
+    let (from_dir, from) = parent(fs, from_dir, from)?;
+    let (to_dir, to) = parent(fs, to_dir, to)?;
+    fs.rename(from_dir, from, to_dir, to).map_err(errno)
+}
+
 /// Writes `dir`'s entries from index `start` on into `out`, as many whole `name\n` (`name/\n` for a directory) as fit
-/// up to `LIST`; returns the bytes written, `EINVAL` if the next entry does not fit.
+/// up to `LIST`; returns the bytes written, `EINVAL` if the first entry does not fit. Resuming by index can skip or
+/// repeat an entry if an unlink moved one between calls.
 pub fn readdir<D: Disk>(
     fs: &mut Fs<D>,
     dir: Inode,
     start: u64,
     out: &mut [u8],
 ) -> Result<usize, i64> {
-    // `fs.kind` cannot run inside `fs.readdir`, so names go in first, each keeping room for a `/` (`len + count`).
-    let mut found = [(ROOT, 0, false); LIST];
-    let (mut index, mut count, mut len, mut more) = (0, 0, 0, false);
-    fs.readdir(dir, |name, inode| {
-        index += 1;
-        if index <= start || more {
-            return;
-        }
-        if count == LIST || len + count + name.len() + 2 > out.len() {
-            more = true;
-            return;
+    let (mut len, mut count, mut full) = (0, 0, false);
+    fs.readdir(dir, start as usize, |name, _, kind| {
+        let slash = kind == Kind::Dir;
+        let end = len + name.len() + slash as usize + 1;
+        if count == LIST || end > out.len() {
+            full = true;
+            return true;
         }
         out[len..][..name.len()].copy_from_slice(name);
-        len += name.len() + 1;
-        out[len - 1] = b'\n';
-        found[count] = (inode, len, false);
-        count += 1;
+        if slash {
+            out[end - 2] = b'/';
+        }
+        out[end - 1] = b'\n';
+        (len, count) = (end, count + 1);
+        false
     })
     .map_err(errno)?;
-    if more && count == 0 {
-        return Err(EINVAL);
+    match (full, len) {
+        (true, 0) => Err(EINVAL),
+        _ => Ok(len),
     }
-    let mut shift = 0;
-    for (inode, _, dir) in &mut found[..count] {
-        *dir = fs.kind(*inode) == Ok(Kind::Dir);
-        shift += *dir as usize;
-    }
-    let written = len + shift;
-    // From the last entry back, each moves right by the `/`s before and in it.
-    for k in (0..count).rev() {
-        let (_, end, dir) = found[k];
-        let begin = if k == 0 { 0 } else { found[k - 1].1 };
-        if dir {
-            out.copy_within(begin..end - 1, begin + shift - 1);
-            out[end + shift - 2] = b'/';
-            out[end + shift - 1] = b'\n';
-            shift -= 1;
-        } else {
-            out.copy_within(begin..end, begin + shift);
-        }
-    }
-    Ok(written)
 }
 
 /// As `readdir`, for the boot archive, whose entries are all files.

@@ -1,6 +1,6 @@
-use kernel::file::{mkdir, open, readdir};
+use kernel::file::{mkdir, open, readdir, rename, unlink};
 use kernel::handle::Object;
-use kernel::syscall::{CREATE, EINVAL, ENAMETOOLONG, ENOENT};
+use kernel::syscall::{CREATE, EEXIST, EINVAL, EISDIR, ENAMETOOLONG, ENOENT, ENOTEMPTY, TRUNC};
 use mogfs::{BLOCK_SIZE, Disk, Error, Fs, ROOT};
 
 struct MemDisk(Vec<[u8; BLOCK_SIZE]>);
@@ -50,16 +50,18 @@ fn readdir_writes_whole_entries_and_never_overruns_a_tight_buffer() {
     let expected = [
         (2, Err(EINVAL)),
         (3, Ok("a/\n")),
-        (5, Ok("a/\n")),
-        (6, Ok("a/\nf\n")),
-        (8, Ok("a/\nf\n")),
-        (9, Ok("a/\nf\nb/\n")),
+        (4, Ok("a/\n")),
+        (5, Ok("a/\nf\n")),
+        (7, Ok("a/\nf\n")),
+        (8, Ok("a/\nf\nb/\n")),
         (64, Ok("a/\nf\nb/\n")),
     ];
     for (len, want) in expected {
         assert_eq!(list(&mut fs, 0, len).as_deref(), want.as_deref(), "{len}");
     }
     assert_eq!(list(&mut fs, 1, 64).as_deref(), Ok("f\nb/\n"));
+    // A file needs no room for a `/`.
+    assert_eq!(list(&mut fs, 1, 2).as_deref(), Ok("f\n"));
     assert_eq!(list(&mut fs, 3, 64).as_deref(), Ok(""));
     assert_eq!(list(&mut fs, u64::MAX, 64).as_deref(), Ok(""));
 }
@@ -94,4 +96,41 @@ fn paths_stay_below_their_directory_and_are_bounded() {
     assert_eq!(open(&mut fs, ROOT, &deep, 0), Err(ENAMETOOLONG));
     assert_eq!(mkdir(&mut fs, ROOT, &deep), Err(ENAMETOOLONG));
     assert_eq!(open(&mut fs, ROOT, &deep[..deep.len() - 2], 0), Err(ENOENT));
+}
+
+#[test]
+fn create_opens_an_existing_directory_and_trunc_refuses_it() {
+    let mut fs = fs();
+    mkdir(&mut fs, ROOT, b"d").unwrap();
+    assert!(matches!(
+        open(&mut fs, ROOT, b"d", CREATE),
+        Ok(Object::Dir(_))
+    ));
+    assert_eq!(open(&mut fs, ROOT, b"d", CREATE | TRUNC), Err(EISDIR));
+    assert_eq!(open(&mut fs, ROOT, b"d", TRUNC), Err(EISDIR));
+}
+
+#[test]
+fn unlink_and_rename_walk_paths_like_open() {
+    let mut fs = fs();
+    mkdir(&mut fs, ROOT, b"d").unwrap();
+    open(&mut fs, ROOT, b"d/a", CREATE).unwrap();
+    assert_eq!(unlink(&mut fs, ROOT, b"d"), Err(ENOTEMPTY));
+    assert_eq!(
+        rename(&mut fs, (ROOT, b"d/a"), (ROOT, b"d/../b")),
+        Err(EINVAL)
+    );
+    rename(&mut fs, (ROOT, b"d/a"), (ROOT, b"b")).unwrap();
+    open(&mut fs, ROOT, b"d/c", CREATE).unwrap();
+    assert_eq!(rename(&mut fs, (ROOT, b"b"), (ROOT, b"d/c")), Err(EEXIST));
+    assert_eq!(unlink(&mut fs, ROOT, b"d/a"), Err(ENOENT));
+    unlink(&mut fs, ROOT, b"d/c").unwrap();
+    unlink(&mut fs, ROOT, b"d").unwrap();
+    assert_eq!(list(&mut fs, 0, 64).as_deref(), Ok("b\n"));
+    let deep = [&b"x/"[..]; 16].concat();
+    assert_eq!(unlink(&mut fs, ROOT, &deep), Err(ENAMETOOLONG));
+    assert_eq!(
+        rename(&mut fs, (ROOT, b"b"), (ROOT, &deep)),
+        Err(ENAMETOOLONG)
+    );
 }

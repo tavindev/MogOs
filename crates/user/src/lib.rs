@@ -1,4 +1,4 @@
-//! Native syscalls (`x8` = number, `x0`-`x4` = arguments, `x0` = result, negative = error) and the panic handler.
+//! Native syscalls (`x8` = number, `x0`-`x5` = arguments, `x0` = result, negative = error) and the panic handler.
 #![no_std]
 
 use core::arch::asm;
@@ -29,6 +29,7 @@ pub const EFBIG: i64 = -27;
 pub const ENOSPC: i64 = -28;
 pub const EROFS: i64 = -30;
 pub const EDEADLK: i64 = -35;
+pub const ENOTEMPTY: i64 = -39;
 
 /// The exit code `wait` reports for a killed process.
 pub const KILLED: i64 = 256;
@@ -181,6 +182,22 @@ pub fn readdir(dir: u64, buf: &mut [u8], start: u64) -> i64 {
 /// Makes every change to the file system durable; `EIO` leaves it unknown whether it did.
 pub fn sync(dir: u64) -> i64 {
     syscall(15, [dir, 0, 0, 0])
+}
+
+/// Removes the file or empty directory at `path` under `dir`.
+pub fn unlink(dir: u64, path: &[u8]) -> i64 {
+    syscall(16, [dir, path.as_ptr() as u64, path.len() as u64, 0])
+}
+
+/// Moves the entry at `from` under `from_dir` to `to` under `to_dir`; `EEXIST` if `to` exists.
+pub fn rename(from_dir: u64, from: &[u8], to_dir: u64, to: &[u8]) -> i64 {
+    let result;
+    // SAFETY: as in `syscall`; `rename` reads only the two paths.
+    unsafe {
+        asm!("svc #0", inlateout("x0") from_dir => result, in("x1") from.as_ptr(), in("x2") from.len(),
+            in("x3") to_dir, in("x4") to.as_ptr(), in("x5") to.len(), in("x8") 17, options(nostack))
+    };
+    result
 }
 
 /// Nanoseconds on the virtual counter.

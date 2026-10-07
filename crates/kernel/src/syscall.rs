@@ -58,12 +58,20 @@ const KILL: u64 = 12;
 /// returns 0. `EROFS` on the boot archive.
 const MKDIR: u64 = 13;
 /// `readdir(dir, ptr, len, start)`: fills `ptr` with whole `name\n` entries (`name/\n` for a directory) of `dir` (read
-/// right) from entry `start` on, in creation order; returns the bytes written, 0 past the last entry. The caller
-/// advances `start` by the newlines it got. `EINVAL` if the next entry does not fit in `len`.
+/// right) from entry `start` on; returns the bytes written, 0 past the last entry. The caller advances `start` by the
+/// newlines it got; an unlink between calls moves an entry, so a resumed listing can skip or repeat one. `EINVAL` if
+/// the first entry does not fit in `len`.
 const READDIR: u64 = 14;
-/// `sync(dir)`: makes every change to the file system `dir` (write right) is on durable, atomically; it holds the core
+/// `sync(handle)`: makes every change to the file system the directory or file `handle` (write right) is on durable, atomically; it holds the core
 /// for its writes and two flushes. `EIO` means unknown: the changes may or may not be durable.
 const SYNC: u64 = 15;
+/// `unlink(dir, path_ptr, path_len)`: removes the file or empty directory (`ENOTEMPTY` otherwise) at `path` under `dir`
+/// (write right), resolved as by `open`; returns 0. `EROFS` on the boot archive.
+const UNLINK: u64 = 16;
+/// `rename(from_dir, from_ptr, from_len, to_dir, to_ptr, to_len)`: moves the entry at the path `from` under `from_dir`
+/// to the path `to` under `to_dir` (both write right), resolved as by `open`; returns 0. `EEXIST` if `to` exists,
+/// `EINVAL` if a directory would move below itself, `EROFS` on the boot archive.
+const RENAME: u64 = 17;
 
 /// The exit code `wait` reports for a process a fault killed: outside `exit`'s 0..=255.
 pub const KILLED: u64 = 256;
@@ -123,6 +131,8 @@ pub const EDEADLK: i64 = -35;
 pub const ENAMETOOLONG: i64 = -36;
 /// No such syscall.
 const ENOSYS: i64 = -38;
+/// Unlinking a directory that has entries.
+pub const ENOTEMPTY: i64 = -39;
 
 /// User virtual addresses: 4 GiB up to the 39-bit VA limit.
 const USER: Range<u64> = 1 << 32..1 << 39;
@@ -205,6 +215,17 @@ pub enum Call {
     },
     /// Commit the file system.
     Sync,
+    /// Unlink the path at `ptr..ptr + len` (as for `Open`) under `dir`.
+    Unlink {
+        dir: Inode,
+        ptr: u64,
+        len: usize,
+    },
+    /// Rename the path `from` to the path `to`, each a directory and a buffer as for `Unlink`.
+    Rename {
+        from: (Inode, u64, usize),
+        to: (Inode, u64, usize),
+    },
     /// Spawn the boot archive's file `file`, moving the `len` handles at `ptr` (in `USER` unless empty, maybe unmapped) and `budget`.
     Spawn {
         file: Range<usize>,
@@ -324,21 +345,17 @@ pub fn dispatch(nr: u64, args: &[u64; 6], handles: &mut Handles) -> Result<Call,
             Object::Process { slot, generation } => Ok(Call::Kill { slot, generation }),
             _ => Err(EACCES),
         },
-        MKDIR => {
-            let (ptr, len) = (args[1], args[2]);
-            let dir = match handles.entry(args[0])? {
-                (Object::Archive, _) => return Err(EROFS),
-                (Object::Dir(_), rights) if rights & WRITE == 0 => return Err(EACCES),
-                (Object::Dir(dir), _) => dir,
-                _ => return Err(ENOTDIR),
-            };
-            user_buffer(ptr, len)?;
-            Ok(Call::Mkdir {
-                dir,
-                ptr,
-                len: len as usize,
+        MKDIR | UNLINK => {
+            let (dir, ptr, len) = path(handles, args[0], args[1], args[2])?;
+            Ok(match nr {
+                MKDIR => Call::Mkdir { dir, ptr, len },
+                _ => Call::Unlink { dir, ptr, len },
             })
         }
+        RENAME => Ok(Call::Rename {
+            from: path(handles, args[0], args[1], args[2])?,
+            to: path(handles, args[3], args[4], args[5])?,
+        }),
         READDIR => {
             let (ptr, len) = (args[1], args[2]);
             let dir = handles.get(args[0], READ)?;
@@ -354,11 +371,23 @@ pub fn dispatch(nr: u64, args: &[u64; 6], handles: &mut Handles) -> Result<Call,
             })
         }
         SYNC => match handles.get(args[0], WRITE)? {
-            Object::Dir(_) => Ok(Call::Sync),
+            Object::Dir(_) | Object::Node(_) => Ok(Call::Sync),
             _ => Err(ENOTDIR),
         },
         _ => Err(ENOSYS),
     }
+}
+
+/// The directory `handle` (write right) and the path buffer `ptr..ptr + len` a call that changes it names.
+fn path(handles: &Handles, handle: u64, ptr: u64, len: u64) -> Result<(Inode, u64, usize), i64> {
+    let dir = match handles.entry(handle)? {
+        (Object::Archive, _) => return Err(EROFS),
+        (Object::Dir(_), rights) if rights & WRITE == 0 => return Err(EACCES),
+        (Object::Dir(dir), _) => dir,
+        _ => return Err(ENOTDIR),
+    };
+    user_buffer(ptr, len)?;
+    Ok((dir, ptr, len as usize))
 }
 
 /// `EFAULT` unless `len` is 0 (any `ptr`, as Rust passes empty slices) or `ptr..ptr + len` lies in `USER` and `len`
