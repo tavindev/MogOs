@@ -113,9 +113,11 @@ pub trait Board {
 
 /// Bounds a user-derived index under speculation; the board's ends in a barrier (`csdb`), host tests use `min`.
 pub trait Clamp {
-    /// Each of `values` if below its limit, else the limit minus 1, also on a mispredicted path, behind one barrier;
-    /// the caller still checks each value.
-    fn clamp<const N: usize>(values: [u64; N], limits: [u64; N]) -> [u64; N];
+    /// Each of `values` if at most its max, else the max, also on a mispredicted path, behind one barrier; the caller
+    /// still checks each value.
+    fn clamp<const N: usize>(values: [u64; N], maxes: [u64; N]) -> [u64; N];
+    /// `value & mask`, opaque to the compiler, so it never drops the mask for a bound it proved on another path.
+    fn mask(value: u64, mask: u64) -> u64;
 }
 
 /// What `Board::violate` does; the kernel map must fault on each.

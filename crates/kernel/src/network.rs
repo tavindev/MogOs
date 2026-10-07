@@ -464,12 +464,13 @@ impl Network {
     }
 
     /// Submits `op` with `tag` on `sock` for `submitter`, through a handle with `rights`; `ptr` and `len` are its
-    /// buffer, checked to lie in user space (`OP_CONNECT`: the address and port). Tries it at once, except an accept.
+    /// buffer, checked to lie in user space, and `peer` a connect's address and port. Tries it at once, except an
+    /// accept.
     /// `EBUSY` while an op of the same side is in flight for a process that still runs.
     pub fn submit(
         &mut self,
         sock: Sock,
-        (op, ptr, len, tag): (u64, u64, usize, u64),
+        ((op, ptr, len, tag), (ip, port)): ((u64, u64, usize, u64), (u32, u16)),
         rights: Rights,
         (submitter, now): (Owner, u64),
         budgets: &mut impl Budgets,
@@ -489,8 +490,7 @@ impl Network {
             return Err(EBUSY);
         }
         if op == OP_CONNECT {
-            let port = u16::try_from(len).map_err(|_| EINVAL)?;
-            let ip = Ipv4Addr::from(u32::try_from(ptr).map_err(|_| EINVAL)?);
+            let ip = Ipv4Addr::from(ip);
             if entry.allowed & CONNECT == 0 {
                 return Err(EACCES);
             }

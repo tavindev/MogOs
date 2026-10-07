@@ -6,8 +6,12 @@ use mogfs::ROOT;
 struct Min;
 
 impl kernel::Clamp for Min {
-    fn clamp<const N: usize>(values: [u64; N], limits: [u64; N]) -> [u64; N] {
-        core::array::from_fn(|i| values[i].min(limits[i] - 1))
+    fn clamp<const N: usize>(values: [u64; N], maxes: [u64; N]) -> [u64; N] {
+        core::array::from_fn(|i| values[i].min(maxes[i]))
+    }
+
+    fn mask(value: u64, mask: u64) -> u64 {
+        value & mask
     }
 }
 

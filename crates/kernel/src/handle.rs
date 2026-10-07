@@ -76,7 +76,7 @@ pub struct Handle {
 impl Handle {
     /// The handle `value`, its index clamped by `C` behind its own barrier.
     pub fn new<C: Clamp>(value: u64) -> Self {
-        let [index] = C::clamp([value as u32 as u64], [MAX_HANDLES as u64]);
+        let [index] = C::clamp([value as u32 as u64], [MAX_HANDLES as u64 - 1]);
         Self::clamped(value, index)
     }
 

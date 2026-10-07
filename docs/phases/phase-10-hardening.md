@@ -43,12 +43,13 @@ QEMU 9.2.1 `target/arm/hvf/hvf.c`). So e2e proves the decision per model, and hv
 - **60b.** Invariants:
   - Every user-derived array index goes through the clamp. The list in the step is exhaustive, and the reviewer checks
     it on every step that adds a syscall or a user-indexed table.
-  - Clamped at one choke point behind one `csdb`, bounded by array capacity (changed during implementation, see What
-    was done: a `csdb` costs about 9 ns on the M4). `dispatch` clamps every argument that may index kernel memory,
-    each with a `csel` to the capacity of what it indexes (never a run-time size such as a file's length), then runs
-    one `csdb`, and passes on only the clamped values. An index derived from them later is bounded by that capacity
-    by construction, with no `csel`. A value that only appears after `dispatch` and indexes memory keeps its own
-    clamp and barrier.
+  - At most one `csdb` per syscall, each value bounded by array capacity (changed during implementation, see What
+    was done: a `csdb` costs about 9 ns on the M4). `dispatch` jumps on the number masked to its 32-entry table (an
+    `and` the compiler cannot drop: in bounds by construction); each call then clamps only the arguments it indexes
+    kernel memory with, each with a `csel` to the capacity of what it indexes (never a run-time size such as a file's
+    length), runs one `csdb`, and passes on only the clamped values. A call that indexes nothing runs no barrier. An
+    index derived from them later is bounded by that capacity by construction, with no `csel`. A value that only
+    appears after `dispatch` and indexes memory keeps its own clamp and barrier.
 
   Avoids Linux's scattered `array_index_nospec` call sites; here the choke points already exist.
 
@@ -252,3 +253,45 @@ Filled in as each step lands.
   in the buffer's fields, so two mispredicted branches on the op could run a receive with them as a buffer (a
   speculative store); and the 4 KiB below core 0's guard page, where a stack overflow's report runs, holds live
   `.bss` (the boot level-3 table is one page lower).
+- Paying 60a-60c back (against main `78add1d`, before hardening, and `7565e10`, 60a-60c as merged; hvf, 63
+  interleaved boots per pair, load 33 to 57; TCG `-icount` instructions, `cortex-a72` unless named):
+  - 60b: `dispatch` no longer clamps 13 values on every call. The number indexes the jump table masked to its 32
+    entries (`Clamp::mask`, an `and` in `arch` the compiler cannot see through; a plain `& 31` was dropped by LLVM,
+    which proved the earlier `ENOSYS` check made it a no-op, and `26 | 27 | ... | 31` arms keep the table at 32
+    entries), and each call clamps only what it indexes with, behind its one `csdb`: `mutex`, `map`, `pipe`,
+    `thread`, `exit` and `io_wait` run no barrier. `Clamp::clamp` takes inclusive maxima (one `cmp`/`csel` a value,
+    the max precomputed), and the helpers are `#[inline(always)]` (an out-of-line `handle`/`offset`/`room` cost a
+    call each). Instructions per call, main -> `7565e10` -> now: null console write 218 -> 304 -> 245 (four values),
+    `dup` 296 -> 390 -> 310 (one), `mutex` 292 -> 384 -> 296 (none: the mask and two register saves), `enosys`
+    153 -> 155 -> 151, pipe round trip 2668 -> 3184 -> 2830. hvf against `7565e10`, min (median): syscall 57 -> 56
+    (68 -> 66) ns at `-smp 1`, 62 -> 59 at `-smp 4`; `mutex` 65.9 -> 55.1 (77.0 -> 64.6): its `csdb` gone; the other
+    calls kept their one `csdb` and moved 0-2 ns.
+  - 60c: text, rodata and the rest each start a 2 MiB block mapped whole (RX, RO and PXN, RW and PXN): no image page
+    takes a 4 KiB TLB entry. The boot stacks and their guard pages moved below the image, to the top of RAM's first
+    2 MiB, which is mapped by pages (the DTB's pages read-only, the guards unmapped, the rest RW and PXN); the DTB's
+    actual size (1 MiB under QEMU) is read with the MMU off before the fill, and its end is asserted below the
+    stacks. Pipe round trip against `7565e10`: 538 -> 524 ns min at `-smp 1`, 568 -> 555 at `-smp 4`. Padding: the
+    text block wastes 1.75 MiB (257 KiB of text) and the rodata block 1.31 MiB (727 KiB), 3.06 MiB of 128 MiB; the
+    896 KiB between the DTB and the stacks and the data block's tail go back to the frame allocator (keeping the
+    page-mapped 896 KiB out of it measured no difference: pipe round trip 742 -> 741 ns min). Free frames: main
+    32232, `7565e10` 31960, now 31433. Merging rodata into the text block would save up to 2 MiB more but makes
+    rodata executable (not writable), so it is not done. `spawn` pays +568 instructions (the frame allocator's
+    first-fit scans past the reserved image: 25078 -> 25856 -> 26424; hvf `spawn` 1841 -> 1844 ns min, within noise).
+  - 60c boot: the fill still writes 1024 entries (the RAM GiB's 512 blocks and the first block's 512 pages) with the
+    MMU and caches off. Its loop is now plain stores of precomputed attributes (6 instructions an entry, no lookup),
+    timed at 4-5 us in `kmain` (was 6); every uncached store costs about 4 ns under hvf. Removing it needs the RAM
+    size before the MMU is on (a DTB walk with the MMU off) or a first map with caches on and a switch, which takes
+    break-before-make on the running map; not done. Boot against main: 249 -> 249 us median, 197 -> 210 min at
+    `-smp 1`; 260 -> 263 (211 -> 229) at `-smp 4`; against `7565e10` within 4 us.
+  - 60a: core 0's boot path is the five trapped ID-register reads (about 3.5 us); the firmware query and the record
+    run after the `boot:` line. Against a kernel forced onto the plain table, the `loop8-dsb` table costs 13-15 ns
+    per EL0 trap (syscall 42 -> 56 ns min); the loop alone (no barrier) 1-2 ns, the `dsb nsh; isb` alone 13-14 ns. So
+    nearly all of it is the barrier Linux prescribes when FEAT_SB is absent (the hvf guest's ISAR1 shows no SB, so
+    `sb` would be undefined). TCG `cortex-a76`: syscall 218 (main) -> 320 (the 75-instruction loop and 27 for the
+    clamps).
+  - `io_submit`: a connect's address and port now travel in their own `NetCall::Submit` field (`peer`, checked to
+    fit `u32` and `u16` in `dispatch`), and the buffer fields always carry the clamped buffer, so no misprediction
+    on the op reads them as a buffer; `Network::submit` takes `peer`. `linker.ld` puts `.data.rel.ro` in the
+    read-only block (the current build has none).
+  - Against main overall (hvf min at `-smp 1`): syscall 30 -> 55 ns (BHB 13-15, one `csdb` 9), `enosys` 32.5 ->
+    46.8 (BHB only), pipe round trip 352 -> 519, yield and median boot hold.
