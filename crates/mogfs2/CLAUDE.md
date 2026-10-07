@@ -6,7 +6,10 @@ The v2 on-disk format (described at the top of `src/lib.rs`) and `Fs<'a, D: Disk
 (`cache_blocks`, `bitmap_words`): `new` (const), in-place `format(seed)` and `mount`, `disk`, `set_time`, `height`,
 `lookup`, `readdir` (from an opaque u64 cursor; returns the cursor of the entry its callback stopped at, `u64::MAX` past
 the end), `kind`, `stat`, `mkdir`, `create` (opens an existing name), `read`, `write`, `truncate`, `unlink`,
-`rename`, `map(file, page) -> (block, sum)` with the free function `verify`, and `commit`. Its `Disk` trait is v1's.
+`rename`, `map(file, Page) -> (Block, Sum)` with the free function `verify`, and `commit`. Its `Disk` trait is a copy
+of v1's (block numbers stay `u64` there; `Block` converts at that boundary), over `Buf` (one block's bytes). Inode,
+block, page, sum and key offset are `#[repr(transparent)]` newtypes; a tree key is built from its
+parts only by `Key::new(Inode, ItemKind, Offset)`.
 Phase 7 step 39; it replaces `crates/mogfs` (and takes back its name) in step 39b. All in `src/lib.rs`.
 
 It is **NOT** paths, handles or `..` handling (`crates/kernel`), a page cache, snapshots (step 40) or scrub (step 41),
@@ -64,11 +67,11 @@ or a device driver.
 
 - Host: `cargo test --target aarch64-apple-darwin -p mogfs2`. `tests/fs.rs`: round trip, v1's suite ported (unlink,
   rename, truncate, corruption and fallback, crafted superblocks, `Io` handling, limits, `NoSpace`), stat and times,
-  map and verify, colliding names filling a chain, 255-byte names, the readdir cursor across unlinks, crafted entries,
+  map and verify, colliding names filling a chain, a name in the last hash chain, 255-byte names, the readdir cursor across unlinks, crafted entries,
   the counter check, power cut at every write and flush with subsets of pending writes landing (three workloads, one
   writing nodes out early), the exact I/O table at height 2, 100k entries in one directory (each looked up; listing
   in about one read per leaf; nine in ten unlinked), and a 1 GiB file on a sparse host file with every byte checked
-  (about 7 s).
+  (about 7 s), and `image.bin` (written at 5b7d427 by a height-2 workload) mounted and rewritten bit for bit.
 - `src/tests.rs`: 200 seeds of random changes, commits and remounts with the smallest cache through a disk that panics
   on a write to a block a valid slot reaches, checking the tree and the live bitmap after every step and a fresh
   mount's free space after every commit; and the seeded mutation test (1 to 3 decoded fields changed and resealed up

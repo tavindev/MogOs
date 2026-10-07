@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use super::*;
 
 /// Blocks a valid slot reaches through references that verify, superblocks excluded; restates the format.
-pub(crate) fn reachable(disk: &[Block]) -> Vec<bool> {
+pub(crate) fn reachable(disk: &[Buf]) -> Vec<bool> {
     let mut reached = vec![false; disk.len()];
     for slot in 0..2 {
         for b in slot_blocks(disk, slot).into_iter().flatten() {
@@ -14,11 +14,11 @@ pub(crate) fn reachable(disk: &[Block]) -> Vec<bool> {
 }
 
 /// Slot `slot`'s superblock fields, if they keep the format's rules.
-fn superblock_fields(disk: &[Block], slot: u64) -> Option<[u64; 15]> {
+fn superblock_fields(disk: &[Buf], slot: u64) -> Option<[u64; 15]> {
     let sb = &disk[slot as usize];
     let f: [u64; 15] = std::array::from_fn(|i| le64(sb, 8 * i));
     let blocks = f[2];
-    let ok = le64(sb, END) == checksum(slot, &sb[..SB_LEN])
+    let ok = le64(sb, END) == checksum(Block(slot), &sb[..SB_LEN]).0
         && f[0] == MAGIC
         && f[1] % 2 == slot
         && (MIN_BLOCKS..=disk.len() as u64).contains(&blocks)
@@ -33,13 +33,13 @@ fn superblock_fields(disk: &[Block], slot: u64) -> Option<[u64; 15]> {
 }
 
 /// The bitmap index and page blocks of a slot, if its bitmap verifies, is well formed and marks them and the root.
-fn bitmap_blocks(disk: &[Block], f: &[u64; 15]) -> Option<Vec<u64>> {
+fn bitmap_blocks(disk: &[Buf], f: &[u64; 15]) -> Option<Vec<u64>> {
     let (blocks, ix) = (f[2], f[13]);
     let (pages, words) = (pages(blocks), blocks.div_ceil(64) as usize);
     let index = &disk[ix as usize];
     let len = 16 * pages;
     if le64(index, END) != f[14]
-        || checksum(ix, &index[..len]) != f[14]
+        || checksum(Block(ix), &index[..len]).0 != f[14]
         || index[len..END].iter().any(|&b| b != 0)
     {
         return None;
@@ -53,7 +53,7 @@ fn bitmap_blocks(disk: &[Block], f: &[u64; 15]) -> Option<Vec<u64>> {
         }
         let n = PAGE_WORDS.min(words - p * PAGE_WORDS);
         if !(2..blocks).contains(&b)
-            || checksum(b, &disk[b as usize][..8 * n]) != sum
+            || checksum(Block(b), &disk[b as usize][..8 * n]).0 != sum
             || disk[b as usize][8 * n..].iter().any(|&b| b != 0)
         {
             return None;
@@ -69,7 +69,7 @@ fn bitmap_blocks(disk: &[Block], f: &[u64; 15]) -> Option<Vec<u64>> {
 }
 
 /// Each node a root reaches through pointers that verify, with its parent node and entry (`None` for the root).
-fn tree_nodes(disk: &[Block], root: u64, sum: u64) -> Vec<(u64, Option<(u64, usize)>)> {
+fn tree_nodes(disk: &[Buf], root: u64, sum: u64) -> Vec<(u64, Option<(u64, usize)>)> {
     let (mut out, mut seen) = (vec![], HashSet::new());
     let mut stack = vec![(root, sum, None)];
     while let Some((b, sum, parent)) = stack.pop() {
@@ -77,7 +77,7 @@ fn tree_nodes(disk: &[Block], root: u64, sum: u64) -> Vec<(u64, Option<(u64, usi
             continue;
         }
         let n = &disk[b as usize];
-        if le64(n, END) != sum || checksum(b, &n[..END]) != sum {
+        if le64(n, END) != sum || checksum(Block(b), &n[..END]).0 != sum {
             continue;
         }
         out.push((b, parent));
@@ -85,7 +85,7 @@ fn tree_nodes(disk: &[Block], root: u64, sum: u64) -> Vec<(u64, Option<(u64, usi
         if n[0] > 0 && count(n) <= FANOUT {
             for i in 0..count(n) {
                 let e = eptr(n, i);
-                stack.push((e.block, e.sum, Some((b, i))));
+                stack.push((e.block.0, e.sum.0, Some((b, i))));
             }
         }
     }
@@ -94,18 +94,18 @@ fn tree_nodes(disk: &[Block], root: u64, sum: u64) -> Vec<(u64, Option<(u64, usi
 
 /// The extents (first block, pages, sums offset) a leaf's items hold; none if its items break the format's layout
 /// (bytes past the count, as a removed item leaves, are not items).
-fn extents(n: &Block) -> Vec<(u64, usize, usize)> {
+fn extents(n: &Buf) -> Vec<(u64, usize, usize)> {
     let (mut out, c, mut top) = (vec![], count(n), END);
     if n[0] != 0 || c * ITEM > CAP {
         return out;
     }
     for i in 0..c {
-        let (k, off, len) = (ikey(n, i), voff(n, i), vlen(n, i));
+        let (k, off, len) = (ikey(n, i).0, voff(n, i), vlen(n, i));
         if off + len != top || off < HDR + ITEM * c {
             return vec![];
         }
         top = off;
-        if (k as u64) >> 62 == EXTENT && len >= 16 {
+        if (k as u64) >> 62 == ItemKind::Extent as u64 && len >= 16 {
             out.push((le64(n, off), (len - 8) / 8, off + 8));
         }
     }
@@ -113,7 +113,7 @@ fn extents(n: &Block) -> Vec<(u64, usize, usize)> {
 }
 
 /// The blocks slot `slot` reaches, if it is valid: its bitmap, nodes and data pages that verify.
-fn slot_blocks(disk: &[Block], slot: u64) -> Option<HashSet<u64>> {
+fn slot_blocks(disk: &[Buf], slot: u64) -> Option<HashSet<u64>> {
     let f = superblock_fields(disk, slot)?;
     let mut set: HashSet<u64> = bitmap_blocks(disk, &f)?.into_iter().collect();
     for (b, _) in tree_nodes(disk, f[9], f[10]) {
@@ -122,7 +122,9 @@ fn slot_blocks(disk: &[Block], slot: u64) -> Option<HashSet<u64>> {
         for (start, pages, at) in extents(n) {
             for j in 0..pages {
                 let p = start.wrapping_add(j as u64);
-                if p < disk.len() as u64 && checksum(p, &disk[p as usize]) == le64(n, at + 8 * j) {
+                if p < disk.len() as u64
+                    && checksum(Block(p), &disk[p as usize]).0 == le64(n, at + 8 * j)
+                {
                     set.insert(p);
                 }
             }
@@ -133,7 +135,7 @@ fn slot_blocks(disk: &[Block], slot: u64) -> Option<HashSet<u64>> {
 
 /// An in-memory disk that refuses (and records) a write to a block a valid slot reaches.
 pub(crate) struct Guarded {
-    pub(crate) blocks: Vec<Block>,
+    pub(crate) blocks: Vec<Buf>,
     reached: Vec<bool>,
     pub(crate) violation: Option<u64>,
     /// Panic on a violation instead of failing the write.
@@ -141,7 +143,7 @@ pub(crate) struct Guarded {
 }
 
 impl Guarded {
-    pub(crate) fn new(blocks: Vec<Block>, strict: bool) -> Self {
+    pub(crate) fn new(blocks: Vec<Buf>, strict: bool) -> Self {
         let reached = reachable(&blocks);
         Self {
             blocks,
@@ -153,7 +155,7 @@ impl Guarded {
 }
 
 impl Disk for &mut Guarded {
-    fn read(&mut self, block: u64, bufs: &mut [Block]) -> Result<(), Error> {
+    fn read(&mut self, block: u64, bufs: &mut [Buf]) -> Result<(), Error> {
         let b = block as usize;
         if b + bufs.len() > self.blocks.len() {
             return Err(Error::Io);
@@ -162,7 +164,7 @@ impl Disk for &mut Guarded {
         Ok(())
     }
 
-    fn write(&mut self, block: u64, bufs: &[Block]) -> Result<(), Error> {
+    fn write(&mut self, block: u64, bufs: &[Buf]) -> Result<(), Error> {
         let b = block as usize;
         if b + bufs.len() > self.blocks.len() {
             return Err(Error::Io);
@@ -189,7 +191,7 @@ impl Disk for &mut Guarded {
 }
 
 pub(crate) struct Mem {
-    cache: Vec<Block>,
+    cache: Vec<Buf>,
     bits: Vec<u64>,
 }
 
@@ -219,10 +221,10 @@ fn items<D: Disk>(fs: &mut Fs<D>) -> (Vec<(u128, Vec<u8>)>, HashSet<u64>) {
     let (mut out, mut blocks) = (vec![], HashSet::new());
     let mut stack = vec![(fs.root, fs.height - 1)];
     while let Some((p, level)) = stack.pop() {
-        if p.block & TAG == 0 {
-            assert!(blocks.insert(p.block), "node {} reached twice", p.block);
+        if p.slot().is_none() {
+            assert!(blocks.insert(p.block.0), "node {} reached twice", p.block.0);
         }
-        let s = fs.node(p, level, 0, NONE).unwrap();
+        let s = fs.node(p, level, Key(0), NONE).unwrap();
         let n = fs.cache[s];
         if level > 0 {
             for i in (0..count(&n)).rev() {
@@ -231,8 +233,8 @@ fn items<D: Disk>(fs: &mut Fs<D>) -> (Vec<(u128, Vec<u8>)>, HashSet<u64>) {
             continue;
         }
         for i in 0..count(&n) {
-            let (k, v) = (ikey(&n, i), value(&n, i).to_vec());
-            if (k as u64) >> 62 == EXTENT {
+            let (k, v) = (ikey(&n, i).0, value(&n, i).to_vec());
+            if (k as u64) >> 62 == ItemKind::Extent as u64 {
                 for j in 0..(v.len() as u64 - 8) / 8 {
                     assert!(blocks.insert(le64(&v, 0) + j), "data block reached twice");
                 }
@@ -250,11 +252,14 @@ fn check<D: Disk>(fs: &mut Fs<D>, ctx: &str) {
     assert!(items.windows(2).all(|w| w[0].0 < w[1].0), "{ctx}: unsorted");
     let inodes: HashMap<u64, u8> = items
         .iter()
-        .filter(|(k, _)| (*k as u64) >> 62 == INODE)
+        .filter(|(k, _)| (*k as u64) >> 62 == ItemKind::Inode as u64)
         .map(|(k, v)| ((k >> 64) as u64, v[0]))
         .collect();
     let mut seen = HashSet::from([0]);
-    for (k, v) in items.iter().filter(|(k, _)| (*k as u64) >> 62 == DIRENT) {
+    for (k, v) in items
+        .iter()
+        .filter(|(k, _)| (*k as u64) >> 62 == ItemKind::Entry as u64)
+    {
         let (dir, child) = ((k >> 64) as u64, le64(v, 0));
         assert_eq!(
             inodes.get(&dir),
@@ -270,18 +275,22 @@ fn check<D: Disk>(fs: &mut Fs<D>, ctx: &str) {
         assert!(child < fs.next_inode, "{ctx}: inode past the counter");
     }
     assert_eq!(seen.len(), inodes.len(), "{ctx}: unnamed inode");
-    blocks.extend([0, 1, fs.index.0]);
+    blocks.extend([0, 1, fs.index.0.0]);
     blocks.extend(
         (0..fs.pages)
             .map(|p| le64(&fs.cache[0], 16 * p))
             .filter(|&b| b != 0),
     );
     for b in 0..fs.blocks {
-        assert_eq!(fs.has(LIVE, b), blocks.contains(&b), "{ctx}: live bit {b}");
+        assert_eq!(
+            fs.has(LIVE, Block(b)),
+            blocks.contains(&b),
+            "{ctx}: live bit {b}"
+        );
     }
-    let used = (0..fs.blocks).filter(|&b| fs.used(b)).count() as u64;
+    let used = (0..fs.blocks).filter(|&b| fs.used(Block(b))).count() as u64;
     assert_eq!(fs.free, fs.blocks - used, "{ctx}: free count");
-    assert!((0..fs.hint).all(|b| fs.used(b)), "{ctx}: hint");
+    assert!((0..fs.hint.0).all(|b| fs.used(Block(b))), "{ctx}: hint");
 }
 
 /// Whether `target` is `root` or below it, by a walk independent of `Fs::below`.
@@ -439,7 +448,7 @@ fn random_changes_keep_the_tree_and_free_space_consistent() {
 
 /// An image both slots reach parts of: a root of 150 long-named files (a tree of height 2), a directory with files, a
 /// 20-page file and a sparse one; the second commit overwrites a page, unlinks and renames.
-fn mutation_base() -> Vec<Block> {
+fn mutation_base() -> Vec<Buf> {
     let blocks = 700;
     let mut disk = Guarded::new(vec![[0; BLOCK_SIZE]; blocks], true);
     let mut mem = Mem::new(blocks);
@@ -468,27 +477,27 @@ fn mutation_base() -> Vec<Block> {
     disk.blocks
 }
 
-fn reseal_superblock(disk: &mut [Block], slot: usize) {
-    let sum = checksum(slot as u64, &disk[slot][..SB_LEN]);
-    disk[slot][END..].copy_from_slice(&sum.to_le_bytes());
+fn reseal_superblock(disk: &mut [Buf], slot: usize) {
+    let sum = checksum(Block(slot as u64), &disk[slot][..SB_LEN]);
+    disk[slot][END..].copy_from_slice(&sum.0.to_le_bytes());
 }
 
 /// Reseals node `b` and each parent up to slot `slot`'s superblock.
 fn reseal_up(
-    disk: &mut [Block],
+    disk: &mut [Buf],
     slot: usize,
     parents: &HashMap<u64, Option<(u64, usize)>>,
     mut b: u64,
 ) {
     loop {
-        let sum = seal(b, &mut disk[b as usize], END);
+        let sum = seal(Block(b), &mut disk[b as usize], END);
         match parents[&b] {
             None => {
-                disk[slot][80..88].copy_from_slice(&sum.to_le_bytes());
+                disk[slot][80..88].copy_from_slice(&sum.0.to_le_bytes());
                 return reseal_superblock(disk, slot);
             }
             Some((p, i)) => {
-                disk[p as usize][HDR + ENTRY * i + 24..][..8].copy_from_slice(&sum.to_le_bytes());
+                disk[p as usize][HDR + ENTRY * i + 24..][..8].copy_from_slice(&sum.0.to_le_bytes());
                 b = p;
             }
         }
@@ -496,9 +505,9 @@ fn reseal_up(
 }
 
 /// Reseals the bitmap index `ix` of slot `slot` and its superblock.
-fn reseal_index(disk: &mut [Block], slot: usize, ix: u64, blocks: u64) {
-    let sum = seal(ix, &mut disk[ix as usize], 16 * pages(blocks));
-    disk[slot][112..120].copy_from_slice(&sum.to_le_bytes());
+fn reseal_index(disk: &mut [Buf], slot: usize, ix: u64, blocks: u64) {
+    let sum = seal(Block(ix), &mut disk[ix as usize], 16 * pages(blocks));
+    disk[slot][112..120].copy_from_slice(&sum.0.to_le_bytes());
     reseal_superblock(disk, slot);
 }
 
@@ -521,13 +530,13 @@ fn mutated(old: u128, width: usize, rng: &mut u64) -> u128 {
     v & mask
 }
 
-fn read(disk: &[Block], b: u64, at: usize, width: usize) -> u128 {
+fn read(disk: &[Buf], b: u64, at: usize, width: usize) -> u128 {
     let mut v = [0; 16];
     v[..width].copy_from_slice(&disk[b as usize][at..at + width]);
     u128::from_le_bytes(v)
 }
 
-fn write(disk: &mut [Block], b: u64, at: usize, width: usize, rng: &mut u64) {
+fn write(disk: &mut [Buf], b: u64, at: usize, width: usize, rng: &mut u64) {
     let v = mutated(read(disk, b, at, width), width, rng);
     disk[b as usize][at..at + width].copy_from_slice(&v.to_le_bytes()[..width]);
 }
@@ -535,7 +544,7 @@ fn write(disk: &mut [Block], b: u64, at: usize, width: usize, rng: &mut u64) {
 /// Changes one decoded field of a slot's superblock, bitmap index, bitmap page or tree node, resealing every sum
 /// above it. Returns false, leaving the change out, for an extent moved onto blocks a slot reaches: catching that
 /// takes a walk of every root (step 41's scrub), not a check when decoded.
-fn mutate(disk: &mut [Block], rng: &mut u64) -> bool {
+fn mutate(disk: &mut [Buf], rng: &mut u64) -> bool {
     let slot = next(rng, 2) as usize;
     // A slot an earlier change already made invalid takes no more.
     let Some(f) = superblock_fields(disk, slot as u64).filter(|f| bitmap_blocks(disk, f).is_some())
@@ -565,8 +574,11 @@ fn mutate(disk: &mut [Block], rng: &mut u64) -> bool {
             let page = le64(&disk[ix as usize], 0) as usize;
             let bit = next(rng, f[2]);
             disk[page][(bit / 8) as usize] |= 1 << (bit % 8);
-            let sum = checksum(page as u64, &disk[page][..8 * f[2].div_ceil(64) as usize]);
-            disk[ix as usize][8..16].copy_from_slice(&sum.to_le_bytes());
+            let sum = checksum(
+                Block(page as u64),
+                &disk[page][..8 * f[2].div_ceil(64) as usize],
+            );
+            disk[ix as usize][8..16].copy_from_slice(&sum.0.to_le_bytes());
             reseal_index(disk, slot, ix, f[2]);
             true
         }
@@ -663,7 +675,7 @@ fn exercise<D: Disk>(fs: &mut Fs<D>) {
         for &f in files.iter().take(30) {
             let _ = fs.read(f, 0, &mut buf);
             for p in [0, 1, 5, 50] {
-                let _ = fs.map(f, p);
+                let _ = fs.map(f, Page(p));
             }
         }
         for (j, &f) in files.iter().take(10).enumerate() {
