@@ -78,13 +78,12 @@ kernel, step 50), DHCP, DNS or IPv6 (phase 9), or IPv4 fragment reassembly.
   size, 1.2 us at 4096 entries before). Still linear: the connection slots per `poll`, and the TIME_WAIT lookup.
 - TCP's attack surface, each with a test: a SYN flood fills only the half-open table and answers to the frame's
   source, so it never touches the ARP cache or a slot; a full table answers with SYN cookies (user-approved,
-  replacing oldest-first eviction; `syn_cookies`): the ISS is a 2-bit MSS index and 30 bits of SipHash over the
-  clock (16 s periods; the clock is not sent, so an ACK is checked against this period and the last, two hashes at
-  most, on the flood path only), the connection and the peer's ISN, and a cookie ACK is accepted only
+  replacing oldest-first eviction; `syn_cookies`): the ISS holds one clock bit (16 s periods, this one or the last),
+  a 2-bit MSS index and 29 bits of SipHash over the connection and the peer's ISN, and a cookie ACK is accepted only
   while that listener has sent cookies in the last two periods (Linux's per-listener overflow time), never with SYN
   set, also when it does not match a half-open entry for the same connection; failures are counted (`bad_cookies`)
-  and reset; a cookie connection runs without window scaling. Odds: a blind guess matches either period's cookie
-  with probability 2 x 2^-30 = 2^-29 per ACK, yet each cookie is 30 bits; about 36 s of guessing at 10 GbE line rate (14.9 M minimum frames per second) once the attacker floods that same
+  and reset; a cookie connection runs without window scaling. Odds: a blind guess succeeds with probability 2^-29,
+  about 36 s of guessing at 10 GbE line rate (14.9 M minimum frames per second) once the attacker floods that same
   listener to open its gate; a flood on one listener no longer opens guessing on another. Residual: a cookie ACK
   replayed after its connection closed without TIME_WAIT (an `abort`), within two periods, opens a connection
   again; it needs the original ACK, so the attacker is on-path, as with Linux's cookies. RFC 5961 challenge
