@@ -151,20 +151,7 @@ fn big_file(g: &mut Group) {
         let mut fs = Fs::new(&mut disk, &mut mem.cache, &mut mem.bits);
         fs.format(1).unwrap();
         let f = write(&mut fs);
-        g.bench_function("mount, 1 GiB file", |b| {
-            b.iter_custom(|iters| {
-                (0..iters)
-                    .map(|_| {
-                        let mut fs = Fs::new(&mut disk, &mut mem.cache, &mut mem.bits);
-                        let start = ThreadTime::now();
-                        fs.mount().unwrap();
-                        start.elapsed()
-                    })
-                    .sum()
-            })
-        });
-        let mut fs = Fs::new(&mut disk, &mut mem.cache, &mut mem.bits);
-        fs.mount().unwrap();
+        g.bench_function("mount, 1 GiB file", |b| b.iter(|| fs.mount().unwrap()));
         g.throughput(Throughput::Bytes(SIZE));
         g.bench_function("1 GiB sequential read", |b| {
             b.iter(|| read_all(&mut fs, f, SIZE, &mut out))
@@ -222,7 +209,7 @@ fn fs(c: &mut Criterion<thread_time::ThreadTime>) {
     let mut g = thread_time::group(c, "mogfs2");
     small_files(&mut g, 1024);
     small_files(&mut g, 16384);
-    // From here an iteration is 100k lookups or up to a GiB of I/O: criterion's minimum sample count.
+    // Rows from here have costly setup (100k creates, a GiB of writes): criterion's minimum sample count.
     g.sample_size(10);
     big_directory(&mut g);
     big_file(&mut g);

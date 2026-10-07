@@ -21,7 +21,7 @@ Speed is a primary goal, so performance is tested like behavior: measured, recor
   timed part of each run read with `cpu_time::ThreadTime`. Keep results alive with `std::hint::black_box`; add
   `Throughput::Bytes` to a row that reports MiB/s. `net`'s simulated goodput is virtual time, deterministic per seed,
   so its bench prints it before criterion runs. Host rows recorded before the move to criterion are wall-clock min
-  and median of 21-51 runs; later ones record criterion's estimate.
+  and median of 5-51 runs; later ones record criterion's estimate.
 - In-guest benchmarks (`test=bench-*`, `scripts/bench.sh <test>`, `scripts/oscompare.sh`) stay on the kernel's timer
   (`CNTVCT_EL0`): no framework runs in `no_std` under QEMU.
 - Exact instruction counts: under TCG with `-icount shift=0,sleep=off` the virtual counter advances 1 ns per instruction, so a kernel benchmark's `ns/round-trip` reads as instructions per round trip, the same on every run. It finds where a few ns come from; it never gates (hvf does), since a probe or TTBR0 write costs far more under hvf than its one instruction.
