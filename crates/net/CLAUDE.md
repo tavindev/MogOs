@@ -110,6 +110,9 @@ kernel, step 50), DHCP, DNS or IPv6 (phase 9), or IPv4 fragment reassembly.
   through one slot and four TIME_WAIT entries, and full tables. The mutation test replays 100k mutated copies of a
   recorded TCP exchange into the same connection (same keys and times, so the same ISNs). `src/tcp.rs` unit-tests
   SipHash against `std`'s and out-of-order reassembly across the wrap.
+- Interop (`tests/interop.rs`): our TCP against smoltcp 0.12's (pinned in `Cargo.lock`, a dev-dependency only) over
+  the simulated link, each side opening in turn, 256 KiB each way for 20 seeds at 0%, 1% and 5% loss. smoltcp 0.12
+  drops its retransmission timer on entering CLOSING, so the test has it close only after its data is acknowledged.
 - Benchmark: `cargo bench-host` runs `benches/net.rs` (includes `tests/sim/mod.rs`); baseline rows in
   `docs/BENCHMARKS.md`.
 
