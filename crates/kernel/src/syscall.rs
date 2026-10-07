@@ -27,7 +27,8 @@ const MAP: u64 = 4;
 /// `open(dir, path_ptr, path_len, flags)`: returns a handle with `dir`'s rights to the file or directory at `path`
 /// under the directory `dir` (read right). `flags`: `CREATE` makes a missing file, `TRUNC` empties the file; either
 /// needs the write right, and on the boot archive is `EROFS`. Paths resolve only below a directory handle: each
-/// `/`-separated component must be a name, so `..`, `.`, an empty component (`/x`, `a//b`) is `EINVAL`.
+/// `/`-separated component must be a name, so `..`, `.`, an empty component (`/x`, `a//b`) is `EINVAL`; more than
+/// `file::MAX_DEPTH` (16) components is `ENAMETOOLONG`.
 const OPEN: u64 = 5;
 /// `spawn(exe, handles_ptr, handles_len, budget, priority)`: starts the executable `exe` (exec right) as a new process
 /// at `priority`, capped at the caller's own (so no process escalates), moving it the `handles_len` handles at
@@ -118,6 +119,8 @@ pub const EROFS: i64 = -30;
 pub const EPIPE: i64 = -32;
 /// Locking a mutex the caller owns.
 pub const EDEADLK: i64 = -35;
+/// A path of more than `file::MAX_DEPTH` components.
+pub const ENAMETOOLONG: i64 = -36;
 /// No such syscall.
 const ENOSYS: i64 = -38;
 

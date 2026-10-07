@@ -69,8 +69,10 @@ touches memory through raw addresses: the board reads user buffers, copies pages
   object gets the directory handle's rights, so a child never has more. Changing the archive is `EROFS`.
 - Paths resolve only below a directory handle: each component goes through `mogfs::lookup`, which rejects `.`, `..`
   and empty names, so `../x` and `/x` are `EINVAL`. Trust note: a crafted image can point an entry at `ROOT` or an
-  ancestor, so a subdirectory handle may reach the root and the tree may cycle; the walk is bounded by the path
-  length, and nothing in the kernel recurses over the tree.
+  ancestor, so a subdirectory handle may reach the root and the tree may cycle; nothing in the kernel recurses over
+  the tree. File syscalls do their disk work with IRQs masked, so each is bounded: a path has at most
+  `file::MAX_DEPTH` (16) components (`ENAMETOOLONG`), a lookup or a `readdir` scan reads at most a directory's 14
+  blocks, a `readdir` call lists at most 64 entries, and file I/O moves at most `MAX_BUFFER`.
 - `Elf::parse` accepts only page-aligned, address-ordered, in-region `PT_LOAD`s, never W+X, entry in an executable one.
 - `BOOT_BUDGET`, `WAITER_BUDGET`, `PI_BUDGET` are sized to the user programs' frame needs: too small and `run`'s
   `expect("spawn")` panics. `PIPE_ROUND_TRIPS` must equal `ROUND_TRIPS` in `crates/user/src/bin/ping.rs`; a mismatch
@@ -81,7 +83,8 @@ touches memory through raw addresses: the board reads user buffers, copies pages
 ## How it's tested
 
 - Host: `cargo test --target aarch64-apple-darwin -p kernel` runs `tests/sched.rs`, `tests/handle.rs`,
-  `tests/pipe.rs`, `tests/exec.rs` (cpio and ELF). `file` is covered end to end (`test=shell`, `test=bench-fs`).
+  `tests/pipe.rs`, `tests/exec.rs` (cpio, ELF, archive listing), `tests/file.rs` (path walk limits, `readdir` at
+  tight buffer sizes, over an in-memory disk); `file` also end to end (`test=shell`, `test=bench-fs`).
 - End to end: every scenario in `crates/e2e/tests/boot.rs`; `run`'s `test=*` arms are listed in
   `docs/DEVELOPMENT.md` (inner loop). Full gate: `cargo test-host`.
 

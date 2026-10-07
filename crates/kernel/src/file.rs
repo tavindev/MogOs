@@ -7,10 +7,14 @@ use mogfs::{Disk, Error, Fs, Inode, Kind, ROOT};
 
 use crate::cpio;
 use crate::handle::Object;
-use crate::syscall::{CREATE, EEXIST, EFBIG, EINVAL, EIO, EISDIR, ENOENT, ENOSPC, ENOTDIR, TRUNC};
+use crate::syscall::{
+    CREATE, EEXIST, EFBIG, EINVAL, EIO, EISDIR, ENAMETOOLONG, ENOENT, ENOSPC, ENOTDIR, TRUNC,
+};
 
 /// Entries one `readdir` call lists at most.
 const LIST: usize = 64;
+/// Components a path has at most, which bounds a walk's lookups (each at most a directory's 14 blocks) with IRQs masked.
+pub const MAX_DEPTH: usize = 16;
 
 pub fn errno(error: Error) -> i64 {
     match error {
@@ -30,11 +34,14 @@ fn parent<'a, D: Disk>(
     fs: &mut Fs<D>,
     mut dir: Inode,
     path: &'a [u8],
-) -> Result<(Inode, &'a [u8]), Error> {
+) -> Result<(Inode, &'a [u8]), i64> {
+    if path.iter().filter(|&&b| b == b'/').count() >= MAX_DEPTH {
+        return Err(ENAMETOOLONG);
+    }
     let mut components = path.split(|&b| b == b'/');
     let mut name = components.next().unwrap_or_default();
     for next in components {
-        dir = fs.lookup(dir, name)?;
+        dir = fs.lookup(dir, name).map_err(errno)?;
         name = next;
     }
     Ok((dir, name))
@@ -42,8 +49,8 @@ fn parent<'a, D: Disk>(
 
 /// The file or directory at `path` under `dir`; with `CREATE` a missing file is made, with `TRUNC` the file is emptied.
 pub fn open<D: Disk>(fs: &mut Fs<D>, dir: Inode, path: &[u8], flags: u64) -> Result<Object, i64> {
+    let (dir, name) = parent(fs, dir, path)?;
     let mut open = || {
-        let (dir, name) = parent(fs, dir, path)?;
         let inode = match fs.lookup(dir, name) {
             Err(Error::NotFound) if flags & CREATE != 0 => fs.create(dir, name)?,
             found => found?,
@@ -60,7 +67,7 @@ pub fn open<D: Disk>(fs: &mut Fs<D>, dir: Inode, path: &[u8], flags: u64) -> Res
 }
 
 pub fn mkdir<D: Disk>(fs: &mut Fs<D>, dir: Inode, path: &[u8]) -> Result<(), i64> {
-    let (dir, name) = parent(fs, dir, path).map_err(errno)?;
+    let (dir, name) = parent(fs, dir, path)?;
     fs.mkdir(dir, name).map(|_| ()).map_err(errno)
 }
 
@@ -72,7 +79,7 @@ pub fn readdir<D: Disk>(
     start: u64,
     out: &mut [u8],
 ) -> Result<usize, i64> {
-    // `fs.kind` cannot run inside `fs.readdir`, so names go in first, each with room left for a `/`.
+    // `fs.kind` cannot run inside `fs.readdir`, so names go in first, each keeping room for a `/` (`len + count`).
     let mut found = [(ROOT, 0, false); LIST];
     let (mut index, mut count, mut len, mut more) = (0, 0, 0, false);
     fs.readdir(dir, |name, inode| {
@@ -80,7 +87,7 @@ pub fn readdir<D: Disk>(
         if index <= start || more {
             return;
         }
-        if count == LIST || len + name.len() + 2 > out.len() {
+        if count == LIST || len + count + name.len() + 2 > out.len() {
             more = true;
             return;
         }
