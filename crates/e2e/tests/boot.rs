@@ -488,7 +488,7 @@ fn a_flushed_block_survives_a_reboot() {
     let (status, lines) = boot_with_disk(&image, "test=disk");
     assert!(status.success(), "QEMU exited with {status}");
     let disk: Vec<_> = lines.iter().filter(|l| l.starts_with("disk: ")).collect();
-    assert_eq!(disk, ["disk: found", "disk: wrote"]);
+    assert_eq!(disk, ["disk: 16 blocks", "disk: wrote"]);
     // Blocks 1 and 2 are bytes 4096..12288: a driver addressing 512-byte sectors by block number would miss them.
     let bytes = std::fs::read(&image).unwrap();
     let expected: Vec<u8> = (0..8192).map(|i| (i % 251) as u8).collect();
@@ -501,7 +501,26 @@ fn a_flushed_block_survives_a_reboot() {
     std::fs::remove_file(&image).unwrap();
     assert!(status.success(), "QEMU exited with {status}");
     let disk: Vec<_> = lines.iter().filter(|l| l.starts_with("disk: ")).collect();
-    assert_eq!(disk, ["disk: found", "disk: read ok"]);
+    assert_eq!(disk, ["disk: 16 blocks", "disk: read ok"]);
+
+    // A fresh image behind blkdebug, which fails every host flush with EIO: the kernel must see it, so it flushed.
+    let image = disk_image("disk-flush", 16);
+    let blockdev = format!(
+        r#"{{"driver":"raw","node-name":"d0","file":{{"driver":"blkdebug","inject-error":[{{"event":"flush_to_disk","errno":5}}],"image":{{"driver":"file","filename":"{}"}}}}}}"#,
+        image.display()
+    );
+    let (status, lines) = boot(&[
+        "-blockdev",
+        &blockdev,
+        "-device",
+        "virtio-blk-device,drive=d0",
+        "-append",
+        "test=disk",
+    ]);
+    std::fs::remove_file(&image).unwrap();
+    assert!(status.success(), "QEMU exited with {status}");
+    let disk: Vec<_> = lines.iter().filter(|l| l.starts_with("disk: ")).collect();
+    assert_eq!(disk, ["disk: 16 blocks", "disk: flush failed"]);
 }
 
 #[test]

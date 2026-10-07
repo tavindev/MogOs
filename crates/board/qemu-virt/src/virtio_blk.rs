@@ -9,12 +9,9 @@ use mm::PhysAddr;
 
 use crate::GIB;
 
-/// "virt", little-endian.
-const MAGIC: u32 = 0x7472_6976;
 const BLOCK_DEVICE: u32 = 2;
 
 // virtio-mmio registers (virtio 1.2, 4.2.2).
-const MAGIC_VALUE: usize = 0x000;
 const VERSION: usize = 0x004;
 const DEVICE_ID: usize = 0x008;
 const DEVICE_FEATURES: usize = 0x010;
@@ -30,11 +27,14 @@ const STATUS: usize = 0x070;
 const QUEUE_DESC: usize = 0x080;
 const QUEUE_DRIVER: usize = 0x090;
 const QUEUE_DEVICE: usize = 0x0a0;
+/// Device configuration: virtio-blk's capacity in sectors, two 32-bit halves.
+const CAPACITY: usize = 0x100;
 
 const ACKNOWLEDGE: u32 = 1;
 const DRIVER: u32 = 2;
 const DRIVER_OK: u32 = 4;
 const FEATURES_OK: u32 = 8;
+const FAILED: u32 = 128;
 /// `VIRTIO_BLK_F_FLUSH`, feature word 0; QEMU keeps its write cache on only when it is negotiated.
 const F_FLUSH: u32 = 1 << 9;
 /// `VIRTIO_F_VERSION_1` (bit 32), feature word 1.
@@ -99,12 +99,14 @@ const _: () = assert!(size_of::<Queue>() <= PAGE);
 pub struct VirtioBlk {
     base: PhysAddr,
     queue: PhysAddr,
+    blocks: u64,
     /// Requests submitted so far, wrapping: the available ring's next index.
     idx: u16,
 }
 
 impl VirtioBlk {
-    /// Sets up the block device at `base`, if there is one, with its queue in a frame from `alloc`.
+    /// Sets up the block device at `base`, if there is one, with its queue in a frame from `alloc`; marks a block
+    /// device it cannot set up as failed.
     ///
     /// # Safety
     /// `base` must be a virtio-mmio transport in device memory that nothing else drives, and `alloc`'s frames
@@ -113,34 +115,43 @@ impl VirtioBlk {
         let mut disk = Self {
             base,
             queue: PhysAddr(0),
+            blocks: 0,
             idx: 0,
         };
-        if disk.reg(MAGIC_VALUE) != MAGIC
-            || disk.reg(VERSION) != 2
-            || disk.reg(DEVICE_ID) != BLOCK_DEVICE
-        {
+        // Device ID first, so an empty transport (ID 0) costs one read; the DTB vouches for the magic value.
+        if disk.reg(DEVICE_ID) != BLOCK_DEVICE || disk.reg(VERSION) != 2 {
             return None;
         }
         disk.set(STATUS, 0);
-        disk.set(STATUS, ACKNOWLEDGE);
         disk.set(STATUS, ACKNOWLEDGE | DRIVER);
-        disk.set(DEVICE_FEATURES_SEL, 0);
-        if disk.reg(DEVICE_FEATURES) & F_FLUSH == 0 {
+        if disk.setup(alloc).is_none() {
+            disk.set(STATUS, FAILED);
             return None;
         }
-        disk.set(DRIVER_FEATURES_SEL, 0);
-        disk.set(DRIVER_FEATURES, F_FLUSH);
-        disk.set(DRIVER_FEATURES_SEL, 1);
-        disk.set(DRIVER_FEATURES, F_VERSION_1);
-        disk.set(STATUS, ACKNOWLEDGE | DRIVER | FEATURES_OK);
-        disk.set(QUEUE_SEL, 0);
-        if disk.reg(STATUS) & FEATURES_OK == 0 || disk.reg(QUEUE_NUM_MAX) < QUEUE_SIZE as u32 {
+        Some(disk)
+    }
+
+    /// Negotiates features, reads the capacity and sets up the queue, up to `DRIVER_OK`.
+    fn setup(&mut self, alloc: impl FnOnce() -> Option<PhysAddr>) -> Option<()> {
+        self.set(DEVICE_FEATURES_SEL, 0);
+        if self.reg(DEVICE_FEATURES) & F_FLUSH == 0 {
             return None;
         }
-        disk.queue = alloc()?;
-        // SAFETY: the caller hands over the queue frame, which no reference aliases.
-        unsafe { ptr::write_bytes(disk.queue.0 as *mut u8, 0, PAGE) };
-        let queue = disk.queue();
+        self.set(DRIVER_FEATURES_SEL, 0);
+        self.set(DRIVER_FEATURES, F_FLUSH);
+        self.set(DRIVER_FEATURES_SEL, 1);
+        self.set(DRIVER_FEATURES, F_VERSION_1);
+        self.set(STATUS, ACKNOWLEDGE | DRIVER | FEATURES_OK);
+        self.set(QUEUE_SEL, 0);
+        if self.reg(STATUS) & FEATURES_OK == 0 || self.reg(QUEUE_NUM_MAX) < QUEUE_SIZE as u32 {
+            return None;
+        }
+        let sectors = self.reg(CAPACITY) as u64 | (self.reg(CAPACITY + 4) as u64) << 32;
+        self.blocks = sectors / (BLOCK as u64 / SECTOR);
+        self.queue = alloc()?;
+        // SAFETY: the caller of `new` hands over the queue frame, which no reference aliases.
+        unsafe { ptr::write_bytes(self.queue.0 as *mut u8, 0, PAGE) };
+        let queue = self.queue();
         queue.avail.flags = AVAIL_NO_INTERRUPT;
         // Every request is this chain at descriptor 0, which the zeroed ring already names.
         queue.desc[0] = Desc {
@@ -161,14 +172,14 @@ impl VirtioBlk {
             (QUEUE_DRIVER, &raw const queue.avail as u64),
             (QUEUE_DEVICE, &raw const queue.used as u64),
         ];
-        disk.set(QUEUE_NUM, QUEUE_SIZE as u32);
+        self.set(QUEUE_NUM, QUEUE_SIZE as u32);
         for (reg, addr) in areas {
-            disk.set(reg, addr as u32);
-            disk.set(reg + 4, (addr >> 32) as u32);
+            self.set(reg, addr as u32);
+            self.set(reg + 4, (addr >> 32) as u32);
         }
-        disk.set(QUEUE_READY, 1);
-        disk.set(STATUS, ACKNOWLEDGE | DRIVER | FEATURES_OK | DRIVER_OK);
-        Some(disk)
+        self.set(QUEUE_READY, 1);
+        self.set(STATUS, ACKNOWLEDGE | DRIVER | FEATURES_OK | DRIVER_OK);
+        Some(())
     }
 
     fn reg(&self, offset: usize) -> u32 {
@@ -189,14 +200,19 @@ impl VirtioBlk {
 
     /// Submits a `kind` request for the blocks from `block` on at the addresses `data` (empty for a flush, which has no
     /// data) and polls until the device completes it. An empty read or write does nothing (QEMU fails it); `EFAULT`
-    /// unless `data` is in the identity-mapped RAM GiB, where every kernel buffer lives at its physical address.
+    /// unless `data` is in the identity-mapped RAM GiB, where every kernel buffer lives at its physical address; `EIO`
+    /// past the last block.
     fn request(&mut self, kind: u32, block: u64, data: Range<u64>) -> Result<(), i64> {
-        let sector = block.checked_mul(BLOCK as u64 / SECTOR).ok_or(EIO)?;
         match data.is_empty() {
             true if kind != T_FLUSH => return Ok(()),
             false if !(GIB <= data.start && data.end <= 2 * GIB) => return Err(EFAULT),
             _ => {}
         }
+        let count = (data.end - data.start) / BLOCK as u64;
+        if block.checked_add(count).is_none_or(|end| end > self.blocks) {
+            return Err(EIO);
+        }
+        let sector = block * (BLOCK as u64 / SECTOR);
         let idx = self.idx.wrapping_add(1);
         let queue = self.queue();
         queue.header = Header {
@@ -234,6 +250,10 @@ impl VirtioBlk {
 }
 
 impl Disk for VirtioBlk {
+    fn blocks(&self) -> u64 {
+        self.blocks
+    }
+
     fn read(&mut self, block: u64, data: &mut [[u8; BLOCK]]) -> Result<(), i64> {
         let start = data.as_mut_ptr() as u64;
         self.request(T_IN, block, start..start + size_of_val(data) as u64)

@@ -3,7 +3,8 @@
 ## What this crate is
 
 Host-only integration tests: `tests/boot.rs` builds `qemu-virt`, boots `mog_os` in `qemu-system-aarch64`
-(`virt`, `cortex-a72`, 128 MiB; `-append test=<name>` for every scenario but plain boot), and asserts on the serial
+(`virt`, `cortex-a72`, 128 MiB, `-global virtio-mmio.force-legacy=false`, `-global virtio-mmio.ioeventfd=off`;
+`-append test=<name>` for every scenario but plain boot), and asserts on the serial
 lines and the exit status.
 `src/lib.rs` is an empty placeholder (`[lib] test = false`). It is the main test of the project, not a library.
 
@@ -19,6 +20,8 @@ lines and the exit status.
 - Assertions are on exact serial lines the kernel or user programs print; when boot output changes, extend `tests/boot.rs`
   in the same change (`docs/DEVELOPMENT.md`, rules for agents).
 - Each boot has a 30 s deadline, then QEMU is killed and the test fails.
+- Disk scenarios make a zeroed raw image in the temp dir per test (`disk_image`) and remove it; the flush check boots
+  through a `blkdebug` blockdev that fails every host flush with EIO.
 - `assert_no_leak` checks that a scenario's `<test>: free frames <n> before, <n> after` counts match; every scenario
   of `budget`, `spawn`, `pipe`, `wait` and `pi` uses it; a new scenario that frees frames should too.
 - A new kernel behavior gets its failing scenario here first (`docs/WORKFLOW.md`, step 2).

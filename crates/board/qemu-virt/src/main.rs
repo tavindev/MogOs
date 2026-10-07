@@ -14,7 +14,7 @@ use core::ops::Range;
 use core::panic::PanicInfo;
 use core::ptr::{self, NonNull};
 use core::slice;
-use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 
 use arch::{MemoryType, UserAccess, l1_block, user_page};
 use dtb::Dtb;
@@ -62,6 +62,10 @@ const TICK_US: u64 = 10_000;
 
 /// GIC CPU interface base, set before the first IRQ can be delivered.
 static GIC_CPU: AtomicU64 = AtomicU64::new(0);
+/// Set once `Board::disk` handed out the block device.
+static DISK_TAKEN: AtomicBool = AtomicBool::new(false);
+/// QEMU `virt` has 32 virtio-mmio transports.
+const MAX_VIRTIO: usize = 32;
 /// Boot context included; a task's slot is its ASID (8 bits).
 const MAX_TASKS: usize = 8;
 const _: () = assert!(MAX_TASKS <= 256);
@@ -736,9 +740,21 @@ impl kernel::Board for QemuVirt {
             arch::irq::restore(irq);
             frame
         };
-        // SAFETY: the DTB's virtio-mmio transports, in the device-mapped GiB 0, driven only here; frames from the
-        // allocator are identity-mapped RAM nobody else uses.
-        dtb.virtio_mmio(|base| unsafe { VirtioBlk::new(base, alloc) })
+        if DISK_TAKEN.swap(true, Relaxed) {
+            return None;
+        }
+        let (mut bases, mut count) = ([PhysAddr(0); MAX_VIRTIO], 0);
+        dtb.virtio_mmio(|base| {
+            *bases.get_mut(count)? = base;
+            count += 1;
+            None::<()>
+        });
+        // Last first: QEMU `virt` fills the transports from the highest address down.
+        bases[..count].iter().rev().find_map(|&base| {
+            // SAFETY: the DTB's virtio-mmio transports, in the device-mapped GiB 0, driven only here (`DISK_TAKEN`);
+            // frames from the allocator are identity-mapped RAM nobody else uses.
+            unsafe { VirtioBlk::new(base, alloc) }
+        })
     }
 }
 

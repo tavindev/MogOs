@@ -20,6 +20,7 @@ use core::ops::Range;
 
 use dtb::Dtb;
 use mm::{FrameAllocator, PhysAddr};
+use syscall::EIO;
 
 /// What the kernel needs from the hardware; each board implements it.
 pub trait Board {
@@ -69,8 +70,10 @@ pub trait Board {
 pub const BLOCK: usize = 4096;
 
 /// A block device of `BLOCK`-byte blocks; each call is one request, returning once the device completed it. A failed
-/// request is `EIO`; buffers must be kernel memory (identity-mapped RAM), else `EFAULT`.
+/// request, or one past the last block, is `EIO`; buffers must be kernel memory (identity-mapped RAM), else `EFAULT`.
 pub trait Disk {
+    /// Capacity in blocks.
+    fn blocks(&self) -> u64;
     /// Reads `data.len()` consecutive blocks from `block` on.
     fn read(&mut self, block: u64, data: &mut [[u8; BLOCK]]) -> Result<(), i64>;
     /// Writes `data.len()` consecutive blocks from `block` on.
@@ -153,12 +156,15 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
     let _ = writeln!(board.console(), "heap: ok");
     board.init_frames(frames);
 
+    let mut disk = board.disk(&dtb);
+
     let boot_us = board.uptime_us();
     let _ = writeln!(board.console(), "boot: {boot_us} us");
-
-    let mut disk = board.disk(&dtb);
-    let found = if disk.is_some() { "found" } else { "none" };
-    let _ = writeln!(board.console(), "disk: {found}");
+    match &disk {
+        Some(disk) => writeln!(board.console(), "disk: {} blocks", disk.blocks()),
+        None => writeln!(board.console(), "disk: none"),
+    }
+    .ok();
 
     for arg in bootargs.split_whitespace() {
         match arg {
@@ -315,21 +321,25 @@ fn yield_forever<B: Board>(board: &mut B, _: usize) -> ! {
 }
 
 /// Reads blocks 1 and 2 in one request and prints `disk: read ok` if they hold the test pattern (byte `i` of the two
-/// is `i % 251`); otherwise writes it in one request, flushes and prints `disk: wrote`. So the first boot on a zeroed
-/// image writes, and the next one reads it back. Empty reads and writes must succeed.
+/// is `i % 251`); otherwise writes it in one request, flushes and prints `disk: wrote` (`disk: flush failed` if the
+/// flush fails). So the first boot on a zeroed image writes, and the next one reads it back. Empty reads and writes
+/// must succeed, and a read straddling the last block must be `EIO`.
 fn disk_test<B: Board>(board: &mut B, disk: &mut B::Disk) {
     let pattern: [[u8; BLOCK]; 2] =
         core::array::from_fn(|b| core::array::from_fn(|i| ((b * BLOCK + i) % 251) as u8));
     let mut block = [[0; BLOCK]; 2];
     disk.read(0, &mut []).expect("empty read");
     disk.write(0, &[]).expect("empty write");
+    assert_eq!(disk.read(disk.blocks() - 1, &mut block), Err(EIO));
     disk.read(1, &mut block).expect("read");
     let done = if block == pattern {
         "read ok"
     } else {
         disk.write(1, &pattern).expect("write");
-        disk.flush().expect("flush");
-        "wrote"
+        match disk.flush() {
+            Ok(()) => "wrote",
+            Err(_) => "flush failed",
+        }
     };
     let _ = writeln!(board.console(), "disk: {done}");
 }
