@@ -78,13 +78,22 @@ fn serve(requests: u64) -> u64 {
     let buf = map(HEAD).unwrap_or_else(|| exit(2));
     let mut served = 0;
     while requests == 0 || served < requests {
-        let conn = match accept(listener, 0) {
+        let (conn, (ip, port)) = match accept(listener, 0) {
             0 => wait_for(0),
-            error => error,
+            error => (error, ([0; 4], 0)),
         };
         if conn < 0 {
             return 3;
         }
+        // An access log: who connected.
+        write(CONSOLE, b"httpd: ");
+        for (i, octet) in ip.into_iter().enumerate() {
+            write(CONSOLE, if i == 0 { b"" } else { b"." });
+            write_u64(CONSOLE, octet.into());
+        }
+        write(CONSOLE, b":");
+        write_u64(CONSOLE, port.into());
+        write(CONSOLE, b"\n");
         echo(conn as u64, buf);
         close(conn as u64);
         served += 1;

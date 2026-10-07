@@ -566,11 +566,13 @@ unsafe extern "C" fn board_syscall(frame: &mut arch::TrapFrame) -> usize {
             Ok(false) => 0,
             Err(error) => error as u64,
         },
-        Ok(Call::Net(call)) => match net::syscall(sched, call, &mut frame.x[1]) {
-            Some(result) => result as u64,
-            // SAFETY: the caller masked IRQs, and `frame` is the current process's.
-            None => return unsafe { block(sched, frame, Event::NetIo) },
-        },
+        Ok(Call::Net(call)) => {
+            match net::syscall(sched, call, (&mut frame.x[1..3]).try_into().unwrap()) {
+                Some(result) => result as u64,
+                // SAFETY: the caller masked IRQs, and `frame` is the current process's.
+                None => return unsafe { block(sched, frame, Event::NetIo) },
+            }
+        }
         Err(error) => error as u64,
     };
     frame as *mut arch::TrapFrame as usize

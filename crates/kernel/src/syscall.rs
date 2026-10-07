@@ -111,8 +111,8 @@ const LISTEN_CALL: u64 = 22;
 /// `MAX_BUFFER` moves at most `MAX_BUFFER`. A socket takes one op that receives (receive, accept, connect) and one send
 /// at a time (`EBUSY`). Closing the last handle drops its ops unreported.
 const IO_SUBMIT: u64 = 23;
-/// `io_wait()`: waits until an op the caller submitted finishes; returns its result, and its tag in x1. `EINVAL` if
-/// none is in flight.
+/// `io_wait()`: waits until an op the caller submitted finishes; returns its result, its tag in x1 and, for an
+/// accept, the peer's IPv4 address and port in x2 (`ip << 16 | port`, 0 otherwise). `EINVAL` if none is in flight.
 const IO_WAIT: u64 = 24;
 /// `shutdown(socket)`: ends the send side (write right): a FIN follows the queued data; returns 0. `ENOTCONN` unless
 /// connected.

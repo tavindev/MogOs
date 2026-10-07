@@ -147,9 +147,10 @@ Quit a hung QEMU with `Ctrl-A` then `X`.
 `cargo httpd` boots MogOs with a NIC on QEMU's user network and runs `httpd` (`crates/user/src/bin/httpd.rs`) on port
 80, which QEMU forwards from the host's `127.0.0.1:8080`. For each request it answers `HTTP/1.1 200 OK` with
 `Content-Type: text/plain` and the request it received (request line, headers, body) as the body, then closes the
-connection; one connection at a time, forever. A head over 8 KiB is `431`, a malformed or repeated
-`Content-Length` `400`, one over 1 GiB `413` (`body_length` in `crates/user/src/lib.rs`, host-tested and fuzzed). So `curl -v http://localhost:8080/anything -d hello` shows its own
-request back. The server holds only the console and a listen-only NetStack. Bootargs: `httpd=<n>` stops after `n`
+connection; one connection at a time, forever. So `curl -v http://localhost:8080/anything -d hello` shows its own
+request back, and the console logs `httpd: <peer ip>:<port>` for each connection (10.0.2.2 through `hostfwd`). A head
+over 8 KiB is `431`, a malformed or repeated `Content-Length` `400`, one over 1 GiB `413` (`body_length` in
+`crates/user/src/lib.rs`, host-tested and fuzzed). The server holds only the console and a listen-only NetStack. Bootargs: `httpd=<n>` stops after `n`
 requests (the power-off follows); `fetch=<ip>:<port>[/<path>][,<times>]` first runs `fetch`, which prints that page's
 body (or, with `<times>`, GETs it that many times and prints `bench http-get: <ns> ns`). Quit with `Ctrl-A` then `X`.
 

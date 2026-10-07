@@ -197,11 +197,12 @@ const FREE: Entry = Entry {
 };
 
 /// What `complete` reports: an op's tag and result, or for an accept the connection as a new socket and the rights
-/// its handle may have, which the caller makes and returns as the result (closing the socket if that fails).
+/// its handle may have, which the caller makes and returns as the result (closing the socket if that fails), and the
+/// peer's address.
 pub struct Completion {
     pub tag: u64,
     pub result: i64,
-    pub accepted: Option<(Sock, Rights)>,
+    pub accepted: Option<(Sock, Rights, SocketAddrV4)>,
 }
 
 /// Its parts live on the heap, so building it takes little stack.
@@ -547,7 +548,7 @@ impl Network {
                 let (result, accepted) = match (op.kind, op.done) {
                     (_, Some(done)) => (done, None),
                     (Kind::Accept, None) => match self.accept(index, owner, budgets) {
-                        Some(Ok(sock)) => (0, Some((sock, op.rights))),
+                        Some(Ok((sock, peer))) => (0, Some((sock, op.rights, peer))),
                         Some(Err(error)) => (error, None),
                         None => continue,
                     },
@@ -567,27 +568,33 @@ impl Network {
         None
     }
 
-    /// The listener at `index`'s oldest queued connection as a new socket of `owner`, or why none can be; `None`
+    /// The listener at `index`'s oldest queued connection as a new socket of `owner` and its peer, or why none can be;
+    /// `None`
     /// while none is queued.
     fn accept(
         &mut self,
         index: usize,
         owner: Owner,
         budgets: &mut impl Budgets,
-    ) -> Option<Result<Sock, i64>> {
+    ) -> Option<Result<(Sock, SocketAddrV4), i64>> {
         let entry = &mut self.sockets[index];
         if !matches!(entry.conn, Conn::Listening(_)) {
             return Some(Err(EINVAL));
         }
         let (s, id) = entry.backlog[0].take()?;
         entry.backlog.rotate_left(1);
+        // `PEER` is this host too, as 127.0.0.1 is to a POSIX program.
+        let peer = self.stack(s).tcp_info(id).map(|i| match s {
+            LO => SocketAddrV4::new(Ipv4Addr::LOCALHOST, i.remote.port()),
+            _ => i.remote,
+        });
         let adopted = self
             .free()
             .and_then(|index| self.adopt(index, owner.0, 0, Conn::Open(s, id), budgets));
         if adopted.is_err() {
             self.stack(s).abort(id);
         }
-        Some(adopted)
+        Some(adopted.map(|sock| (sock, peer.expect("a queued connection's slot"))))
     }
 
     /// Tries op `side` of socket `index` (not an accept) once; its result if it finished.

@@ -1395,6 +1395,13 @@ fn httpd_echoes_more_sequential_requests_than_its_tables_hold_and_fetch_gets_a_h
         lines.iter().any(|l| l == "hello from the host"),
         "fetch did not print the host's page"
     );
+    // QEMU's user network connects to the guest from the host's address, 10.0.2.2, each time from a new port.
+    let peers: Vec<_> = lines
+        .iter()
+        .filter_map(|l| l.strip_prefix("httpd: 10.0.2.2:")?.parse::<u16>().ok())
+        .collect();
+    assert_eq!(peers.len(), exchanges.len(), "accept's peer addresses");
+    assert!(peers.iter().all(|&port| port != 0));
     assert_no_leak(&lines, "httpd");
     assert!(status.success(), "QEMU exited with {status}");
 }
@@ -1410,7 +1417,7 @@ fn sockets_echo_over_loopback_wait_for_any_and_need_the_net_handle_and_budget() 
     );
     for expected in [
         // Two C processes on musl's BSD sockets.
-        "tcpecho: served 5 bytes",
+        "tcpecho: served 5 bytes to 127.0.0.1, port set",
         "tcpecho: hello",
         // A C child inherits no network from its parent.
         "tcpecho: child socket: EBADF",
