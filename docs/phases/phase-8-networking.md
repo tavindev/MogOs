@@ -59,3 +59,21 @@ Decision: write `crates/net` fresh. smoltcp is a host-only dev-dependency of `cr
   reordering, duplication and corruption; 100k seeded mutations of recorded frames; ARP spoof, flood, LRU and retry;
   named socket errors; fragments. Checksum: copy then sum in 32-bit words measured faster than a fused copy-and-sum
   loop on the host, so the copy is a plain `memcpy`. Benchmarks in `docs/BENCHMARKS.md`.
+- **49.** `crates/board/qemu-virt/src/virtio_net.rs`: modern virtio-mmio only, `VIRTIO_NET_F_MAC` and
+  `VIRTIO_F_VERSION_1` (12-byte header, no offloads), one RX and one TX queue of 64 descriptors, each owning a 2 KiB
+  buffer of a 256 KiB pool taken from the frame allocator once when the network starts, never grown. Every RX buffer
+  stays posted and is re-posted once the stack has read its frame (one notify per poll that re-posted any); a full RX
+  ring makes QEMU drop (it waits for a notify), never the driver allocate. TX descriptors are a free bitmask,
+  reclaimed from the used ring when a buffer is needed (TX raises no interrupt). Device-written used-ring ids and
+  lengths are range-checked before a buffer is touched. `src/net.rs` holds the NIC and the stack under `NET` (lock
+  order `KERNEL`, then `NET`) and runs the stack in a kernel net task (`Board::spawn`, priority 0), woken
+  (`Event::Net`) by the NIC's interrupt (SPI `16 + i` for transport `i`, routed to core 0), by the timer tick once
+  the stack's deadline passed (10 ms granularity against a 200 ms RTO floor and 1 s ARP retry) and by
+  `Board::with_net`. `kernel::network` parses `net=<ip>/<prefix>[,gw=<ip>]` and builds the stack's tables on the
+  heap (fallible); `Board::start_net` probes only when that bootarg is given, so a boot without it (NIC or not) is
+  unchanged: the block-device probe still stops at the first block device and the NIC probe looks past it (the e2e
+  attaches the disk first, so it is above the NIC). QEMU 9.2's user network answers ICMP echo to 10.0.2.2 and maps
+  UDP to 10.0.2.2 onto the host's loopback. e2e: `virtio_net_pings_the_gateway_and_echoes_udp_through_the_host`
+  (the host test runs the echo) and `a_net_bootarg_without_a_nic_boots_as_before`. Deviation: the net task runs at
+  priority 0, so a spinning top-priority process starves it until the fair class (phase 5 step 29). Benchmarks
+  (`test=bench-net`, `scripts/bench.sh` with `QEMU_ARGS`) in `docs/BENCHMARKS.md`.

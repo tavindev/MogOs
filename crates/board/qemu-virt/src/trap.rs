@@ -12,6 +12,7 @@ use kernel::syscall::{Call, EBADF, EFAULT, ENFILE, ENOENT, ENOMEM, KILLED};
 use kernel::{Event, FRAME_WORDS, Scheduler};
 use mm::{FrameAllocator, PhysAddr};
 
+use crate::net;
 use crate::process::{enter, free_stack, map, spawn};
 use crate::uart::Uart;
 use crate::usermem::{user_bytes, user_bytes_mut};
@@ -216,6 +217,9 @@ unsafe extern "C" fn board_irq(frame: usize) -> usize {
     if tick {
         arch::timer::arm(TICK_US);
         TICKED.fetch_or(1 << arch::cpu(), Relaxed);
+        net::tick(sched);
+    } else if irq == net::IRQ.load(Relaxed) {
+        net::interrupt(sched);
     } else if irq == UART_IRQ {
         let mut uart = Uart::new(UART0);
         while let Some(byte) = uart.get() {

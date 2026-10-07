@@ -25,11 +25,15 @@ touches memory through raw addresses: the board reads user buffers, copies pages
 - `syscall::dispatch` (`src/syscall.rs`): decodes `x8`/`x0`-`x5`, checks handles and rights, returns a `Call` for the
   board to execute. Syscall numbers and error constants are defined here.
 - `cpio::find`, `cpio::entries`, `elf::Elf::parse` (`src/cpio.rs`, `src/elf.rs`).
+- `network` (`src/network.rs`): the `net=<ip>/<prefix>[,gw=<ip>]` bootarg (`config`), the stack's tables on the heap
+  (`stack`, fallible), and `test=net` / `test=bench-net`. `run` calls `Board::start_net` only with that bootarg, before
+  `start_cpus`, and prints `net: no nic` if there is none; `Board::with_net` runs a closure on the stack and the NIC
+  and wakes the board's net task (`Event::Net`).
 
 ## Boundaries (hard)
 
 - `#![no_std]` with `extern crate alloc`; workspace `unsafe_code = "forbid"` applies, no opt-out ever.
-- Depends only on `mm`, `dtb` and `mogfs`. Never on `arch` or a board crate: dependencies point inward, boards depend on it.
+- Depends only on `mm`, `dtb`, `mogfs` and `net` (the stack, from phase 8 step 49, as `crates/net`'s contract planned). Never on `arch` or a board crate: dependencies point inward, boards depend on it.
 - Hardware reaches it only through `Board` (generic `B: Board`); AGENTS.md Architecture rules apply.
 - Callers: `crates/board/qemu-virt` (implements `Board`, calls `run`, `dispatch` and the table types) and its host
   tests in `tests/`. The user ABI it decodes is mirrored by hand in `crates/user/src/lib.rs`.

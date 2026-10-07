@@ -36,6 +36,8 @@ pub enum Event {
     Lock(usize),
     /// A console line being entered.
     Console,
+    /// Work for the net task: a frame, a passed deadline or a socket submit.
+    Net,
     /// Nothing: the boot context, which runs only once no other task is ready.
     Idle,
 }

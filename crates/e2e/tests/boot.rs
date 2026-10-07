@@ -1153,3 +1153,65 @@ fn fuzzer_never_crashes_the_kernel_or_leaks_frames() {
         assert!(status.success(), "QEMU exited with {status}");
     }
 }
+
+/// QEMU's user networking (guest 10.0.2.15, host 10.0.2.2) with a virtio-net device, then `extra`.
+fn boot_with_nic(extra: &[&str]) -> (ExitStatus, Vec<String>) {
+    let nic = [
+        "-netdev",
+        "user,id=n0",
+        "-device",
+        "virtio-net-device,netdev=n0",
+    ];
+    boot(&[extra, &nic[..]].concat())
+}
+
+/// A UDP echo on the host's loopback, which QEMU's user networking shows the guest as 10.0.2.2; returns its port.
+fn udp_echo() -> u16 {
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port = socket.local_addr().unwrap().port();
+    thread::spawn(move || {
+        let mut buf = [0; 2048];
+        while let Ok((n, from)) = socket.recv_from(&mut buf) {
+            let _ = socket.send_to(&buf[..n], from);
+        }
+    });
+    port
+}
+
+#[test]
+fn virtio_net_pings_the_gateway_and_echoes_udp_through_the_host() {
+    let port = udp_echo();
+    let args = format!("test=net net=10.0.2.15/24,gw=10.0.2.2 udp={port}");
+    // The disk comes first, so it takes the highest transport and the probe must look past it for the NIC.
+    let image = disk_image("net", 16);
+    let drive = format!("file={},if=none,format=raw,id=d0", image.display());
+    let disk = ["-drive", &drive, "-device", "virtio-blk-device,drive=d0"];
+    let (status, lines) = boot_with_nic(&[&disk[..], &["-append", &args]].concat());
+    std::fs::remove_file(&image).unwrap();
+    assert!(
+        !lines.iter().any(|l| l.starts_with("panic:")),
+        "kernel panicked"
+    );
+    for expected in [
+        "disk: 16 blocks".to_string(),
+        "ping: reply from 10.0.2.2".to_string(),
+        format!("udp: echo mog from 10.0.2.2:{port}"),
+    ] {
+        assert!(lines.contains(&expected), "missing line: {expected}");
+    }
+    let counters = lines
+        .iter()
+        .find_map(|l| l.strip_prefix("net: rx "))
+        .expect("missing counters line");
+    let (rx, tx) = counters.split_once(" tx ").unwrap();
+    let tx = tx.split(' ').next().unwrap();
+    assert!(rx.parse::<u64>().unwrap() >= 2 && tx.parse::<u64>().unwrap() >= 2);
+    assert!(status.success(), "QEMU exited with {status}");
+}
+
+#[test]
+fn a_net_bootarg_without_a_nic_boots_as_before() {
+    let (status, lines) = boot(&["-append", "net=10.0.2.15/24,gw=10.0.2.2"]);
+    assert!(lines.iter().any(|l| l == "net: no nic"), "missing line");
+    assert!(status.success(), "QEMU exited with {status}");
+}

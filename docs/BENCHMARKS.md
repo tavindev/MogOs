@@ -129,6 +129,8 @@ Speed is a primary goal, so performance is tested like behavior: measured, recor
 | Spawn round trip, `test=bench-spawn`: `spawn` of `nop` (one page of program) + `wait` + `close`, 1000 trips, timed in user space, without / with two arguments (ns) | QEMU hvf (`-cpu cortex-a72`), dev build, 42 boots, load about 9 | 3096 / 3254 | 3430 / 3604 | phase 4 shell review |
 | Kernel boot with a MogFS disk mounted, mount in 3 requests (us; 2-block superblock read) | QEMU hvf (`-cpu cortex-a72`), dev build, 42 interleaved boots (busy machine) | 294 | 342 | phase 4 shell commands |
 | `Board::disk` probe, timed in the kernel around the call (us; no disk: one device-ID read; disk: one read plus the setup) | QEMU hvf (`-cpu cortex-a72`), dev build, 21 boots each | 1 / 45 | 2 / 50 | phase 4 step 20 |
+| Network: `test=bench-net` with `net=10.0.2.15/24,gw=10.0.2.2 udp=<port>`, 64-byte UDP datagrams to a host echo (`python3`, on 127.0.0.1) through QEMU's user network: one round trip / one send of a 10000 burst / one datagram each way with 16 in flight (ns; QEMU's user network and the host echo dominate: each send is one queue notify, which QEMU serves in the vCPU thread with a host `sendto`) | QEMU hvf (`-cpu cortex-a72`), dev build, 21 boots, load about 39 | 42820 / 13522 / 16049 | 56683 / 16135 / 20201 | phase 8 step 49 |
+| Kernel boot with a NIC and `net=` (us; the NIC's setup and its 66 frames; without `net=` the NIC is never probed; base without a NIC 198 / 236 in the same run) | QEMU hvf (`-cpu cortex-a72`), dev build, 21 interleaved boots, load about 39 | 260 | 296 | phase 8 step 49 |
 
 ## Cross-OS comparison
 

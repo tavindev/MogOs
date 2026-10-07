@@ -31,6 +31,9 @@ lines and the exit status. `tests/user.rs` runs `crates/user`'s host tests (outs
   types one command per `msh> ` prompt and no echo interleaves with msh's output.
 - `assert_no_leak` checks that a scenario's `<test>: free frames <n> before, <n> after` counts match; every scenario
   of `budget`, `spawn`, `pipe`, `wait`, `pi`, `echo`, `shell`, `bench-fs`, `bench-spawn`, `fuzz`, `bench-syscalls` and `bench-shell` uses it; a new scenario that frees frames should too.
+- Network scenarios boot with QEMU's user network and a `virtio-net-device` (`boot_with_nic`, devices after `extra`);
+  the host side (a UDP echo, `udp_echo`) binds `127.0.0.1:0` so parallel tests never share a port, and the guest
+  reaches it as 10.0.2.2.
 - A new kernel behavior gets its failing scenario here first (`docs/WORKFLOW.md`, step 2).
 - Performance is the moat: a slowdown is never accepted because it has an explanation; it is removed, or shown to
   be unavoidable with before/after numbers (`docs/BENCHMARKS.md`).

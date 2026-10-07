@@ -4,11 +4,13 @@
 extern crate alloc;
 
 mod fs;
+mod net;
 mod process;
 mod trap;
 mod uart;
 mod usermem;
 mod virtio_blk;
+mod virtio_net;
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::fmt::{self, Write};
@@ -36,6 +38,7 @@ use mogfs::{Error, Fs};
 use process::{executable, spawn_init, user_program};
 use uart::Uart;
 use virtio_blk::VirtioBlk;
+use virtio_net::VirtioNet;
 
 /// The PL011 every console write and read uses (QEMU `virt` fixes it there).
 const UART0: PhysAddr = PhysAddr(0x0900_0000);
@@ -186,6 +189,7 @@ struct QemuVirt {
 impl kernel::Board for QemuVirt {
     type Console = Console;
     type Disk = VirtioBlk;
+    type Nic = VirtioNet;
 
     fn console(&mut self) -> &mut Console {
         &mut self.console
@@ -330,6 +334,17 @@ impl kernel::Board for QemuVirt {
         let mounted = kernel.fs.mount();
         kernel.mounted = mounted.is_ok();
         mounted
+    }
+
+    fn start_net(&mut self, stack: ::net::Stack<'static>) -> bool {
+        net::start(self, stack)
+    }
+
+    fn with_net<R>(
+        &mut self,
+        f: impl FnOnce(&mut ::net::Stack<'static>, &mut VirtioNet, u64) -> R,
+    ) -> R {
+        net::with(f)
     }
 
     fn lock_round_trips(&mut self, n: u64, ticket: bool) {

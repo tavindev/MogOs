@@ -4,7 +4,7 @@
 
 The adapter that implements `kernel::Board` for QEMU `virt` and owns everything stateful and unsafe outside
 `crates/arch`: `kmain`, the global kernel state, the `#[global_allocator]` and the `Board` impl (`src/main.rs`), the
-PL011 driver (`src/uart.rs`), the virtio-blk driver (`src/virtio_blk.rs`), the trap hooks (`src/trap.rs`), process
+PL011 driver (`src/uart.rs`), the virtio-blk driver (`src/virtio_blk.rs`), the virtio-net driver and the net task (`src/virtio_net.rs`, `src/net.rs`), the trap hooks (`src/trap.rs`), process
 construction and ELF loading (`src/process.rs`), user-pointer checks (`src/usermem.rs`), the file system's disk
 (`src/fs.rs`), the asm test programs (`src/user.s`), `linker.ld`, and `build.rs`, which builds `crates/user` and
 bundles it as the boot archive.
@@ -36,18 +36,28 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
   failure is `mogfs::Error::Io`. `Board::disk` hands it out
   once (`DISK_TAKEN`), scanning QEMU `virt`'s fixed virtio-mmio transports from the highest down and stopping at the first empty one
   (QEMU `virt` fills them from the top with no gaps; a board fact like `UART_IRQ`).
+- `VirtioNet` (`src/virtio_net.rs`) implements `net::Nic`: modern virtio-mmio only, `VIRTIO_NET_F_MAC` and
+  `VIRTIO_F_VERSION_1` (12-byte header, no offloads), RX queue 0 and TX queue 1 of `QUEUE_SIZE` (64) descriptors,
+  each owning a fixed 2 KiB buffer of one `POOL_FRAMES` (64) pool; RX buffers stay posted (re-posted after the stack
+  reads them, one notify per poll), TX descriptors are a free bitmask reclaimed from the used ring on demand, and only
+  RX interrupts. Used-ring ids and lengths are device-written and range-checked before a buffer is touched.
+- `src/net.rs`: `Board::start_net` scans the transports for the first net device (only with a `net=` bootarg, so no
+  boot without one pays for it), stores it and the stack in `NET`, unmasks its SPI (`VIRTIO_IRQ` + transport index,
+  routed to core 0), spawns the net task and starts the timer. The task polls the stack whenever `PENDING` is set, by
+  the NIC's interrupt (`board_irq`, which acks it), the tick once `DEADLINE` passed, or `Board::with_net`; otherwise it
+  blocks on `Event::Net`.
 - `build.rs`: nested `cargo build` of `crates/user` into `target/user`, `make -C c` (musl, busybox and the C
   programs into `target/c`, `c/CLAUDE.md`), newc `boot.cpio` into `OUT_DIR` (every user program, busybox as `sh`,
   `hello`, `cbench`, plus a non-ELF `bad` entry), `-T linker.ld`. Why it is built this way: `docs/DEVELOPMENT.md` settings table.
 
 ## Boundaries (hard)
 
-- `#![no_std]`, `#![no_main]`. Deps: `arch`, `dtb`, `kernel`, `mm`, `mogfs` (its `Error`), `linked_list_allocator` (no features).
+- `#![no_std]`, `#![no_main]`. Deps: `arch`, `dtb`, `kernel`, `mm`, `mogfs` (its `Error`), `net` (`Nic`, `Stack`), `linked_list_allocator` (no features).
 - Opts out of `forbid(unsafe_code)` (lints: `docs/DEVELOPMENT.md` settings table); every `unsafe` block has a one-line
   `// SAFETY:` and every `unsafe fn` a `# Safety` section.
 - Depends on `kernel`, never the reverse. GIC and RAM come from the DTB; board constants fix the rest:
   `UART0` (the PL011 at `0x0900_0000`: all console output and input, never read from the DTB), `DTB` (RAM base), `KERNEL_L1` (GiB 0 device, GiB 1 RAM),
-  `UNMAPPED`, `TIMER_IRQ` (27), `UART_IRQ` (33), `RESCHEDULE_SGI` (0), core `n`'s MPIDR (`n`), `SECONDARY_STACK` (16 KiB), `VIRTIO`, `VIRTIO_STRIDE`, `VIRTIO_COUNT` (32 virtio-mmio transports from `0x0a00_0000`, `0x200` apart), the PSCI calls (`SYSTEM_OFF`, `CPU_ON`, by HVC). QEMU runs with
+  `UNMAPPED`, `TIMER_IRQ` (27), `UART_IRQ` (33), `VIRTIO_IRQ` (48, transport `i`'s SPI is `48 + i`), `RESCHEDULE_SGI` (0), core `n`'s MPIDR (`n`), `SECONDARY_STACK` (16 KiB), `VIRTIO`, `VIRTIO_STRIDE`, `VIRTIO_COUNT` (32 virtio-mmio transports from `0x0a00_0000`, `0x200` apart), the PSCI calls (`SYSTEM_OFF`, `CPU_ON`, by HVC). QEMU runs with
   `-global virtio-mmio.force-legacy=false` (the driver rejects legacy) and `-global virtio-mmio.ioeventfd=off`
   (`docs/DEVELOPMENT.md` settings table).
 - Bare-metal only: excluded from `cargo test-host`.
@@ -61,8 +71,8 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
 
 ## Invariants & rules
 
-- Kernel state is reached only through `arch::Lock`s: `KERNEL` (the big lock), then `HEAP` or `CONSOLE` (leaves,
-  nothing taken under them); never another order. Every trap hook takes `KERNEL` with `lock_masked` and returns holding
+- Kernel state is reached only through `arch::Lock`s: `KERNEL` (the big lock), then `NET` (the NIC and stack, only
+  under `KERNEL`), then `HEAP` or `CONSOLE` (leaves, nothing taken under them); never another order. Every trap hook takes `KERNEL` with `lock_masked` and returns holding
   it (`Guard::leak`); the trap exit releases it once, after `mov sp, x0`, through `board_unlock`, so no core resumes a
   task whose kernel stack another core still runs on. `breakpoint_self_test` takes it before its `brk`. `Board`
   methods take `lock()` guards and never hold one across a switch (`run_others` drops it before `yield_now`). Panic,

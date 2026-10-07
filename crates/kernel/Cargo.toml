@@ -8,6 +8,7 @@ license.workspace = true
 dtb = { path = "../dtb" }
 mm = { path = "../mm" }
 mogfs = { path = "../mogfs" }
+net = { path = "../net" }
 
 [lints]
 workspace = true

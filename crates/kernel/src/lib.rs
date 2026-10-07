@@ -8,6 +8,7 @@ pub mod elf;
 pub mod file;
 pub mod handle;
 pub mod mutex;
+pub mod network;
 pub mod pipe;
 mod sched;
 pub mod syscall;
@@ -30,6 +31,7 @@ use mm::{FrameAllocator, PhysAddr};
 pub trait Board {
     type Console: Write;
     type Disk: Disk;
+    type Nic: net::Nic;
 
     fn console(&mut self) -> &mut Self::Console;
     fn exception_level(&self) -> u8;
@@ -76,6 +78,15 @@ pub trait Board {
     /// Mounts the MogFS on `disk` as the board's file system; once it is mounted, every process spawned from boot
     /// context also gets its root directory (read, write, duplicate, transfer) as handle 3. Never formats.
     fn mount(&mut self, disk: Self::Disk) -> Result<(), mogfs::Error>;
+    /// Runs `stack` on the NIC the probe found, in a kernel net task woken by the NIC's interrupt, by the timer tick
+    /// once the stack's next deadline passed, and by `with_net`; starts the timer. False, starting nothing, without a
+    /// NIC. Call once, after `disk`.
+    fn start_net(&mut self, stack: net::Stack<'static>) -> bool;
+    /// Runs `f` with the stack, the NIC and the time in ns, then wakes the net task. After `start_net` returned true.
+    fn with_net<R>(
+        &mut self,
+        f: impl FnOnce(&mut net::Stack<'static>, &mut Self::Nic, u64) -> R,
+    ) -> R;
     /// Makes `n` uncontended acquire + release round trips on a ticket lock like the board's kernel lock (`ticket`),
     /// or on a test-and-set lock.
     fn lock_round_trips(&mut self, n: u64, ticket: bool);
@@ -186,6 +197,12 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
         .any(|a| a == "test=disk" || a == "test=bench-disk");
     let mounted = disk.take_if(|_| !raw).map(|disk| board.mount(disk));
 
+    let config = bootargs
+        .split_whitespace()
+        .find_map(|a| network::config(a.strip_prefix("net=")?));
+    // Without a `net=` bootarg nothing is set up and nothing is printed.
+    let net = config.is_none_or(|c| board.start_net(network::stack(c).expect("net heap")));
+
     board.start_cpus(bootargs.split_whitespace().any(|a| a == "test=smp"));
     let boot_us = board.uptime_us();
     let _ = writeln!(board.console(), "boot: {boot_us} us");
@@ -196,6 +213,9 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
     .ok();
     if let Some(Err(error)) = mounted {
         let _ = writeln!(board.console(), "fs: {error:?}");
+    }
+    if !net {
+        let _ = writeln!(board.console(), "net: no nic");
     }
 
     for arg in bootargs.split_whitespace() {
@@ -244,6 +264,16 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
                     "budget: free frames {before} before, {after} after"
                 );
             }
+            "test=net" | "test=bench-net" => {
+                let gateway = config
+                    .and_then(|c| c.gateway)
+                    .expect("net=<ip>/<prefix>,gw=<ip>");
+                let port = arg_value(bootargs, "udp=").expect("udp=<port>");
+                match arg {
+                    "test=net" => network::net_test(board, gateway, port),
+                    _ => network::net_bench(board, gateway, port),
+                }
+            }
             "test=disk" => disk_test(board, disk.as_mut().expect("no disk")),
             "test=bench-disk" => disk_bench(board, disk.as_mut().expect("no disk")),
             _ => {}
@@ -251,6 +281,13 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
     }
 
     board.power_off()
+}
+
+/// The value of the bootarg `<prefix><value>`.
+fn arg_value<T: core::str::FromStr>(bootargs: &str, prefix: &str) -> Option<T> {
+    bootargs
+        .split_whitespace()
+        .find_map(|a| a.strip_prefix(prefix)?.parse().ok())
 }
 
 /// Core 0 joins the secondaries' `cpu <n>: online` lines, then waits until every core has taken a timer tick.

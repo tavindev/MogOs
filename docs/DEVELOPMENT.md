@@ -111,6 +111,8 @@ cargo run -p mogfs --example mkfs --target aarch64-apple-darwin -- disk.img 1638
 cargo run -- -drive file=disk.img,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0 -append test=bench-fs  # MogFS image; open(CREATE|TRUNC)+write+sync and open+close round trips in ns
 [ -f disk.img ] || cargo mkfs; cargo shell, then: sh -c cbench  # musl syscall round trip and busybox spawn in ns
 scripts/oscompare.sh [runs]  # same C benchmarks (c/oscb.c) on MogOs, Linux and macOS, interleaved; docs/BENCHMARKS.md "Cross-OS comparison"
+cargo run -- -netdev user,id=n0 -device virtio-net-device,netdev=n0 -append "test=net net=10.0.2.15/24,gw=10.0.2.2 udp=7777"  # needs a UDP echo on the host's 127.0.0.1:7777; pings 10.0.2.2 (ping: reply from ...), echoes mog over UDP (udp: echo ...), prints the frame counters; a net= bootarg without a NIC prints net: no nic
+QEMU_ARGS="-netdev user,id=n0 -device virtio-net-device,netdev=n0" scripts/bench.sh "bench-net net=10.0.2.15/24,gw=10.0.2.2 udp=7777" 21 <mog_os>  # UDP round trip, burst send and 16-in-flight stream to the host echo (docs/BENCHMARKS.md)
 cargo run -- -s -S     # boot halted, gdbstub on localhost:1234; attach lldb/gdb
 cargo build --release  # LTO release image
 ```
