@@ -84,10 +84,10 @@ const RENAME: u64 = 17;
 /// caller's budget until the last handle closes (`ENOBUFS`); `ENFILE` when the socket table is full.
 const SOCKET: u64 = 18;
 /// `bind(socket, port)`: sets the local port `listen` and `connect` use (0, the default, picks an ephemeral one for
-/// `connect`); returns 0. `EINVAL` once listening or connected.
+/// `connect`; write right); returns 0. `EINVAL` once listening or connected.
 const BIND: u64 = 19;
-/// `listen(socket)`: listens on the bound port (`EINVAL` without one) on every interface (`LISTEN`, else `EACCES`;
-/// `EADDRINUSE`); returns 0.
+/// `listen(socket)`: listens on the bound port (`EINVAL` without one) on every interface (write right and `LISTEN`, else
+/// `EACCES`; `EADDRINUSE`); returns 0.
 const LISTEN_CALL: u64 = 20;
 /// `io_submit(socket, op, ptr, len, tag)`: starts `op` and returns 0 at once; `io_wait` reports its result with `tag`.
 /// `OP_RECEIVE` reads at most `len` bytes into `ptr` (read right; 0 is the end of the stream), `OP_SEND` queues up to
@@ -316,9 +316,11 @@ pub enum NetCall {
     },
     Listen(Sock),
     /// Submit `op` on `sock`; for a receive or send `ptr..ptr + len` is in `USER` unless empty, but may be unmapped.
+    /// `rights` are the handle's: an accepted connection's handle gets no more.
     Submit {
         sock: Sock,
         op: u8,
+        rights: u16,
         ptr: u64,
         len: u32,
         tag: u64,
@@ -474,11 +476,11 @@ pub fn dispatch(nr: u64, args: &[u64; 7], handles: &mut Handles) -> Result<Call,
         BIND => {
             let port = u16::try_from(args[1]).map_err(|_| EINVAL)?;
             Ok(Call::Net(NetCall::Bind {
-                sock: socket(handles, args[0], 0)?,
+                sock: socket(handles, args[0], WRITE)?,
                 port,
             }))
         }
-        LISTEN_CALL => Ok(Call::Net(NetCall::Listen(socket(handles, args[0], 0)?))),
+        LISTEN_CALL => Ok(Call::Net(NetCall::Listen(socket(handles, args[0], WRITE)?))),
         IO_SUBMIT => {
             let (op, ptr, len, tag) = (args[1], args[2], args[3], args[4]);
             let need = match op {
@@ -487,6 +489,7 @@ pub fn dispatch(nr: u64, args: &[u64; 7], handles: &mut Handles) -> Result<Call,
                 _ => return Err(EINVAL),
             };
             let sock = socket(handles, args[0], need)?;
+            let (_, rights) = handles.entry(args[0])?;
             let len = match op {
                 OP_RECEIVE | OP_SEND => {
                     let len = len.min(MAX_BUFFER);
@@ -498,6 +501,7 @@ pub fn dispatch(nr: u64, args: &[u64; 7], handles: &mut Handles) -> Result<Call,
             Ok(Call::Net(NetCall::Submit {
                 sock,
                 op: op as u8,
+                rights: rights as u16,
                 ptr,
                 len: len as u32,
                 tag,

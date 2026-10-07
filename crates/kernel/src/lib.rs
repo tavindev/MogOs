@@ -268,7 +268,9 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
             "test=smp" => smp_test(board),
             "test=fuzz" => fuzz(board, bootargs),
             "test=bench-shell" => shell_bench(board),
-            "test=sockets" => run_archived(board, "sockets", "nettest", (NET_BUDGET, INIT_ARCHIVE)),
+            "test=sockets" => {
+                run_archived(board, "sockets", "nettest", (NET_BUDGET, SHELL_ARCHIVE))
+            }
             "test=bench-sockets" => run_checked(board, "bench-sockets", |board| {
                 let args = b"nettest\0bench\0";
                 board

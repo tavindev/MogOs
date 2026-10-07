@@ -45,6 +45,14 @@ fn main(args: &[&[u8]]) -> u64 {
                 connect(sock as u64, [127, 0, 0, 1], 1, 0),
             )
         }
+        b"readaccept" => {
+            // Handle 1 is a read-only listener: what it accepts must not be writable.
+            let conn = match accept(1, 0) {
+                0 => wait_for(0),
+                error => error,
+            };
+            report(b"read-only accept send", send(conn as u64, b"x"))
+        }
         b"budget" => {
             let mut n = 0;
             loop {
@@ -81,22 +89,27 @@ fn report(what: &[u8], result: i64) -> u64 {
 fn init() -> u64 {
     let c = open(DIR, b"tcpecho", 0) as u64;
     let posix = |net: u64| {
-        let console = || dup(CONSOLE, WRITE | READ | TRANSFER) as u64;
-        // Handles 3 and 4 (root, archive) are transfer-only placeholders: `tcpecho` needs neither.
-        let placeholder = || dup(CONSOLE, TRANSFER) as u64;
-        [
-            console(),
-            console(),
-            console(),
-            placeholder(),
-            placeholder(),
-            net,
-        ]
+        let console = || dup(CONSOLE, WRITE | READ | DUPLICATE | TRANSFER) as u64;
+        // Handle 3, the root, is a transfer-only placeholder; 4 is the archive, which `tcpecho p` spawns from.
+        let placeholder = dup(CONSOLE, TRANSFER) as u64;
+        let archive = dup(DIR, READ | EXEC | DUPLICATE | TRANSFER) as u64;
+        [console(), console(), console(), placeholder, archive, net]
     };
     let server = spawn_at(c, &posix(net()), C_BUDGET, u64::MAX, b"tcpecho\0s\0");
     let client = spawn_at(c, &posix(net()), C_BUDGET, u64::MAX, b"tcpecho\0c\0");
-    if server < 0 || client < 0 || wait(server as u64) != 0 || wait(client as u64) != 0 {
+    if !reaped(server) || !reaped(client) {
         return 1;
+    }
+    // A C program on musl holding a NetStack it could pass on (duplicate right) spawns a child, which must not get it.
+    let parent = spawn_at(
+        c,
+        &posix(dup(net_handle(), CONNECT | LISTEN | DUPLICATE | TRANSFER) as u64),
+        2 * C_BUDGET + 64,
+        u64::MAX,
+        b"tcpecho\0p\0",
+    );
+    if !reaped(parent) {
+        return 4;
     }
     let me = open(DIR, b"nettest", 0) as u64;
     let child = |args: &[u8], handles: &[u64], sockets: usize| {
@@ -105,21 +118,55 @@ fn init() -> u64 {
     };
     let server = child(b"nettest\0serve\0", &[console(), net()], 1 + CONNECTIONS);
     let client = child(b"nettest\0connect\0", &[console(), net()], CONNECTIONS);
-    if server < 0 || client < 0 || wait(server as u64) != 0 || wait(client as u64) != 0 {
+    if !reaped(server) || !reaped(client) {
         return 2;
     }
-    let listen_only = dup(init_net(), LISTEN | TRANSFER) as u64;
+    let listen_only = dup(net_handle(), LISTEN | TRANSFER) as u64;
     for (args, handles, sockets) in [
         (&b"nettest\0nonet\0"[..], &[console()][..], 0),
         (b"nettest\0listenonly\0", &[console(), listen_only], 1),
         (b"nettest\0budget\0", &[console(), net()], 3),
     ] {
         let process = child(args, handles, sockets);
-        if process < 0 || wait(process as u64) != 0 {
+        if !reaped(process) {
             return 3;
         }
     }
+    read_only_accept()
+}
+
+/// A child accepts through a read-only duplicate of a listener; the connection's handle must not write.
+fn read_only_accept() -> u64 {
+    let net = net_handle();
+    let listener = socket(net) as u64;
+    if bind(listener, 12) != 0 || listen(listener) != 0 {
+        return 5;
+    }
+    let read_only = dup(listener, READ | TRANSFER) as u64;
+    let child = open(DIR, b"nettest", 0) as u64;
+    let budget = OWN_BUDGET + SOCKET_FRAMES;
+    let process = spawn_at(
+        child,
+        &[console(), read_only],
+        budget,
+        u64::MAX,
+        b"nettest\0readaccept\0",
+    );
+    let client = socket(net) as u64;
+    if process < 0 || connect(client, [127, 0, 0, 1], 12, 0) != 0 || wait_for(0) != 0 {
+        return 6;
+    }
+    if !reaped(process) {
+        return 7;
+    }
+    close(client);
+    close(listener);
     0
+}
+
+/// Waits for `process` to exit 0, then closes its handle (init's table has room for few).
+fn reaped(process: i64) -> bool {
+    process >= 0 && wait(process as u64) == 0 && close(process as u64) == 0
 }
 
 fn console() -> u64 {
@@ -127,20 +174,7 @@ fn console() -> u64 {
 }
 
 fn net() -> u64 {
-    dup(init_net(), CONNECT | LISTEN | TRANSFER) as u64
-}
-
-/// init's NetStack: after the console, itself, the archive and, if a disk is mounted, the root directory, which a
-/// duplicate with `CONNECT` tells apart (it lacks the right).
-fn init_net() -> u64 {
-    let net = |h| {
-        let d = dup(h, CONNECT | TRANSFER);
-        d >= 0 && close(d as u64) == 0
-    };
-    [3, 4]
-        .into_iter()
-        .find(|&h| net(h))
-        .unwrap_or_else(|| exit(8))
+    dup(net_handle(), CONNECT | LISTEN | TRANSFER) as u64
 }
 
 /// `bench`'s rounds: 64-byte round trips, connect + close pairs, and 4 KiB sends streamed (16 MiB).
@@ -162,7 +196,7 @@ fn bench() -> u64 {
         b"nettest\0benchserve\0",
     );
     let buf = map(4096).unwrap_or_else(|| exit(7));
-    let net = init_net();
+    let net = net_handle();
     let sock = dial(net);
     let start = now_ns();
     for _ in 0..ROUND_TRIPS {

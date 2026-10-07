@@ -28,10 +28,10 @@
 
 enum { N_EXIT, N_IO, N_DUP, N_CLOSE, N_MAP, N_OPEN, N_SPAWN, N_PIPE, N_WAIT, N_KILL = 12, N_MKDIR, N_READDIR,
 	N_SYNC, N_UNLINK, N_RENAME, N_SOCKET, N_BIND, N_LISTEN, N_SUBMIT, N_IO_WAIT, N_SHUTDOWN };
-enum { R_READ = 1, R_WRITE = 2, R_DUP = 8, R_TRANSFER = 16, R_EXEC = 32, R_CONNECT = 256, R_LISTEN = 512 };
+enum { R_READ = 1, R_WRITE = 2, R_DUP = 8, R_TRANSFER = 16, R_EXEC = 32 };
 enum { N_CREATE = 1, N_TRUNC = 2 };
 enum { OP_RECEIVE, OP_SEND, OP_ACCEPT, OP_CONNECT };
-enum { H_ROOT = 3, H_ARCHIVE = 4, H_NET = 5, HANDLES = 6 };
+enum { H_ROOT = 3, H_ARCHIVE = 4, H_NET = 5 };
 /* Native limits: largest map, largest spawn argument buffer and count, a killed process's exit code. */
 enum { MAX_MAP = 16 << 12, MAX_ARGS = 32, MAX_ARG_BYTES = 4096, KILLED = 256 };
 /* Frames a spawned C program gets, halved while the parent's budget is short, down to what busybox needs to run
@@ -87,10 +87,9 @@ static long svc(long nr, long a, long b, long c, long d, long e, long f, long g)
 static long ndup(long h)
 {
 	static const long rights[] = { R_READ | R_WRITE | R_DUP | R_TRANSFER, R_READ | R_EXEC | R_DUP | R_TRANSFER,
-		R_CONNECT | R_LISTEN | R_DUP | R_TRANSFER, R_WRITE | R_DUP | R_TRANSFER, R_READ | R_DUP | R_TRANSFER,
-		R_TRANSFER };
+		R_WRITE | R_DUP | R_TRANSFER, R_READ | R_DUP | R_TRANSFER, R_TRANSFER };
 	long r = -EBADF;
-	for (int i = 0; i < 6 && r < 0; i++) r = svc(N_DUP, h, rights[i], 0, 0, 0, 0, 0);
+	for (int i = 0; i < 5 && r < 0; i++) r = svc(N_DUP, h, rights[i], 0, 0, 0, 0, 0);
 	return r;
 }
 
@@ -514,7 +513,7 @@ static long spawn(const char *path, char *const argv[], char *const envp[])
 	const char *name = strrchr(path, '/');
 	name = name ? name + 1 : path;
 	if (strcmp(name, "sh") && strcmp(name, "hello") && strcmp(name, "cbench") && strcmp(name, "oscb") &&
-	    strcmp(name, "oscnop"))
+	    strcmp(name, "oscnop") && strcmp(name, "tcpecho"))
 		return -ENOENT;
 	for (int fd = 0; fd < 3; fd++) {
 		struct file *f = fd_file(fd);
@@ -533,15 +532,13 @@ static long spawn(const char *path, char *const argv[], char *const envp[])
 	}
 	long exe = svc(N_OPEN, H_ARCHIVE, (long)name, strlen(name), 0, 0, 0, 0);
 	if (exe < 0) return exe;
-	long handles[HANDLES], p = -ENOMEM;
-	int got = 0, n = HANDLES;
+	/* Every slot but the NetStack: a child never inherits network access (least privilege). */
+	long handles[H_NET], p = -ENOMEM;
+	int got = 0, n = H_NET;
 	for (; got < n; got++) {
 		struct file *f = got < 3 && !(st.cloexec >> got & 1) ? fd_file(got) : 0;
 		long dup = got < 3 ? (f ? ndup(f->handle) : -EBADF) : ndup(got);
-		/* An absent NetStack, the last slot, is left out: one handle fewer for a parent near its table's limit. */
-		if (dup < 0 && got == H_NET) n = H_NET;
-		if (got == n) break;
-		/* Another absent slot gets a handle with no rights, so the later ones keep their values. */
+		/* An absent slot gets a handle with no rights, so the later ones keep their values. */
 		if (dup < 0) dup = svc(N_DUP, exe, R_TRANSFER, 0, 0, 0, 0, 0);
 		if (dup < 0) {
 			p = dup;

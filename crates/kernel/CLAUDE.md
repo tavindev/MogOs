@@ -32,7 +32,12 @@ touches memory through raw addresses: the board reads user buffers, copies pages
   rings, `Network::new` with the DTB's `rng_seed` as the TCP key, `Board::start_net`) with a NIC or for
   `test=sockets` / `test=bench-sockets`, before `start_cpus`. A socket is an entry reached by index and generation,
   counted by handles like a pipe, charged `SOCKET_FRAMES` (8) to its creator's budget (`Budget::charge`; the memory is
-  the fixed pool, so the charge is accounting) and refunded by the board with the last handle if the owner runs.
+  the fixed pool, so the charge is accounting) and refunded with the last handle if the owner runs (`Budgets`, which
+  `Scheduler` implements). A listener holds at most `BACKLOG` (8) connections before they are accepted, each charged
+  to the listener's owner by the net task's `poll` and moved to the accepter at accept; one past it, or past the
+  owner's budget, is reset, so a remote peer never makes the kernel hold a connection nobody pays for. Residual: a
+  closed connection keeps its TCP slot until its FIN exchange ends (FIN-WAIT-2 up to 60 s) after its charge is
+  refunded; the fixed slots bound that.
   Ops run in the submitter's context (its buffers are mapped only there): tried at submit (not an accept) and by every
   `complete` (`io_wait`); the board's net task only polls and wakes `Event::NetIo`. One receive-side op (receive,
   accept, connect) and one send per socket: the ops a process has in flight are bounded by its sockets, so by its
@@ -78,7 +83,8 @@ touches memory through raw addresses: the board reads user buffers, copies pages
 - Errors are negated musl errno values; `KILLED` (256) sits outside `exit`'s 0..=255.
 - Syscalls 18-23 (phase 8 step 50): socket, bind, listen, io_submit, io_wait (result in x0, tag in x1), shutdown. A
   `NetStack` handle (`CONNECT`, `LISTEN`) makes sockets, which remember which of the two it held; socket handles carry
-  read and write; `io_submit` checks read (receive, accept) or write (send, connect) at submit.
+  read and write; `bind` and `listen` need write, `io_submit` read (receive, accept) or write (send, connect), and an
+  accepted connection's handle gets no right the accepting handle lacks.
 - Syscalls 0-17 (`src/syscall.rs` docs): exit, io_submit_wait, dup, close, map, open, spawn, pipe, wait, mutex, lock,
   unlock, kill, mkdir, readdir, sync, unlink, rename. `io_submit_wait` takes a file offset in x4 (files need it, the console and pipes
   ignore it; offsets live in libc, not in handles, so `Object` stays `Copy`). `open` takes flags in x3; the opened
@@ -100,7 +106,7 @@ touches memory through raw addresses: the board reads user buffers, copies pages
   once), and about 7000, about 150 ms, on a crafted one (504 directories of 14 blocks each).
 - `Elf::parse` accepts only page-aligned, address-ordered, in-region `PT_LOAD`s, never W+X, entry in an executable one.
 - init's handles (`Handles::init`): 0 console (read, write, duplicate, transfer), 1 itself (kill), 2 the boot archive
-  with `INIT_ARCHIVE` (read, exec); only msh (`test=shell`, `test=bench-shell`) gets `SHELL_ARCHIVE` (also duplicate, transfer), since it
+  with `INIT_ARCHIVE` (read, exec); only msh (`test=shell`, `test=bench-shell`) and `nettest` (`test=sockets`, which hands it to a C program that spawns) get `SHELL_ARCHIVE` (also duplicate, transfer), since it
   hands the archive to `sh`, which spawns from it. Every other init can neither copy nor pass it on.
 - `BOOT_BUDGET`, `SHELL_BUDGET` (msh under `test=shell` and `test=bench-shell`: its 25 frames and the 2048 it gives `sh`), `WAITER_BUDGET`, `PI_BUDGET`, `FUZZ_BUDGET`, `SYSBENCH_BUDGET` are sized to the user programs' frame needs: too small and `run`'s
   `expect("spawn")` panics. `PIPE_ROUND_TRIPS` must equal `ROUND_TRIPS` in `crates/user/src/bin/ping.rs`; a mismatch

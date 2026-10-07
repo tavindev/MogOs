@@ -28,8 +28,9 @@ kernel's ABI is `crates/kernel/src/syscall.rs`, mirrored here by hand (numbers, 
 ## The libc ABI (invariants)
 
 - Handles at start: 0-2 stdin, stdout, stderr; 3 the root directory; 4 the boot archive; 5 the NetStack. An absent
-  one fails on use. libc spawns children with the same six (a transfer-only placeholder for an absent slot; an absent
-  NetStack, the last, is left out, so a process without one spends no handle on it).
+  one fails on use. libc spawns children with the first five (a transfer-only placeholder for an absent slot), never
+  the NetStack: a child inherits no network (least privilege); a program that needs one is spawned natively with
+  it.
 - Sockets: `AF_INET` `SOCK_STREAM` only. `socket` makes a native socket on handle 5; `bind` takes the port (the
   address is not checked: a socket listens on every interface); `connect`, `accept`, `read`/`write`,
   `send`/`recv`(`to`/`from`) submit one native op and wait for it at once (one thread, so it is the only one in

@@ -5,6 +5,8 @@ use mogfs::ROOT;
 const SYNC: u64 = 15;
 const UNLINK: u64 = 16;
 const RENAME: u64 = 17;
+const BIND: u64 = 19;
+const LISTEN: u64 = 20;
 const USER: u64 = 1 << 32;
 
 #[test]
@@ -30,6 +32,23 @@ fn unlink_and_rename_need_a_writable_mogfs_directory() {
         &mut handles,
     );
     assert!(matches!(rename, Ok(Call::Rename { .. })));
+}
+
+#[test]
+fn bind_and_listen_change_a_socket_so_they_need_its_write_right() {
+    let mut handles = Handles::new();
+    let sock = Object::Socket(kernel::network::Sock {
+        index: 0,
+        generation: 1,
+    });
+    let read_only = handles.insert(sock, READ).unwrap();
+    let writable = handles.insert(sock, WRITE).unwrap();
+    for nr in [BIND, LISTEN] {
+        let call = dispatch(nr, &[read_only, 80, 0, 0, 0, 0, 0], &mut handles);
+        assert_eq!(call.err(), Some(EACCES), "syscall {nr}");
+        let call = dispatch(nr, &[writable, 80, 0, 0, 0, 0, 0], &mut handles);
+        assert!(matches!(call, Ok(Call::Net(_))), "syscall {nr}");
+    }
 }
 
 #[test]

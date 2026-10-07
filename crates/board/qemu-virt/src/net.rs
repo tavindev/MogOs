@@ -5,7 +5,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 
 use arch::Lock;
 use kernel::handle::{DUPLICATE, Object, READ, TRANSFER, WRITE};
-use kernel::network::{Network, SOCKET_FRAMES, Sock, UserMemory};
+use kernel::network::{Network, Sock, UserMemory};
 use kernel::syscall::{EINVAL, NetCall};
 use kernel::{Board, Event, Scheduler};
 use mm::PhysAddr;
@@ -119,10 +119,16 @@ pub fn syscall(sched: &mut Scheduler<MAX_TASKS>, call: NetCall, tag: &mut u64) -
         NetCall::Submit {
             sock,
             op,
+            rights,
             ptr,
             len,
             tag,
-        } => submit(sched, sock, (op.into(), ptr, len as usize, tag)),
+        } => submit(
+            sched,
+            sock,
+            (op.into(), ptr, len as usize, tag),
+            rights.into(),
+        ),
         NetCall::IoWait => {
             let (result, done) = io_wait(sched)?;
             *tag = done;
@@ -136,17 +142,17 @@ fn socket(sched: &mut Scheduler<MAX_TASKS>, allowed: u64) -> i64 {
     let owner = (sched.current().0, sched.generation());
     let mut net = NET.lock();
     let network = &mut net.as_mut().expect("a NetStack without a network").1;
-    let made = network.socket(owner, allowed, &mut sched.memory().budget);
+    let made = network.socket(owner, allowed, sched);
     drop(net);
     match made {
-        Ok(sock) => handle(sched, sock),
+        Ok(sock) => handle(sched, sock, SOCKET_RIGHTS),
         Err(error) => error,
     }
 }
 
-/// A handle to the new `sock` in the current process's table; closes it if the table is full.
-fn handle(sched: &mut Scheduler<MAX_TASKS>, sock: Sock) -> i64 {
-    match sched.handles().insert(Object::Socket(sock), SOCKET_RIGHTS) {
+/// A handle with `rights` to the new `sock` in the current process's table; closes it if the table is full.
+fn handle(sched: &mut Scheduler<MAX_TASKS>, sock: Sock, rights: u64) -> i64 {
+    match sched.handles().insert(Object::Socket(sock), rights) {
         Ok(handle) => handle as i64,
         Err(error) => {
             close(sched, sock);
@@ -156,12 +162,16 @@ fn handle(sched: &mut Scheduler<MAX_TASKS>, sock: Sock) -> i64 {
 }
 
 /// `io_submit` of `op` on `sock` for the current process.
-fn submit(sched: &mut Scheduler<MAX_TASKS>, sock: Sock, op: (u64, u64, usize, u64)) -> i64 {
+fn submit(
+    sched: &mut Scheduler<MAX_TASKS>,
+    sock: Sock,
+    op: (u64, u64, usize, u64),
+    rights: u64,
+) -> i64 {
     let current = (sched.current().0, sched.generation());
     let mut net = NET.lock();
     let network = &mut net.as_mut().expect("a socket without a network").1;
-    let alive = |(slot, generation)| sched.budget(slot, generation).is_some();
-    let result = network.submit(sock, op, (current, now()), alive, &mut User);
+    let result = network.submit(sock, op, rights, (current, now()), sched, &mut User);
     drop(net);
     wake(sched);
     status(result)
@@ -174,7 +184,7 @@ fn io_wait(sched: &mut Scheduler<MAX_TASKS>) -> Option<(i64, u64)> {
     let Some((_, network)) = net.as_mut() else {
         return Some((EINVAL, 0));
     };
-    let Some(done) = network.complete(current, &mut sched.memory().budget, &mut User) else {
+    let Some(done) = network.complete(current, sched, &mut User) else {
         let waiting = network.in_flight(current);
         return (!waiting).then_some((EINVAL, 0));
     };
@@ -182,7 +192,7 @@ fn io_wait(sched: &mut Scheduler<MAX_TASKS>) -> Option<(i64, u64)> {
     // Receiving opened the window and sending queued data: either may owe a segment.
     wake(sched);
     let result = match done.accepted {
-        Some(sock) => handle(sched, sock),
+        Some((sock, rights)) => handle(sched, sock, rights & SOCKET_RIGHTS),
         None => done.result,
     };
     Some((result, done.tag))
@@ -197,11 +207,10 @@ pub fn open(sock: Sock) {
 
 /// Drops a handle to `sock`; the last one refunds its owner, if it still runs.
 pub fn close(sched: &mut Scheduler<MAX_TASKS>, sock: Sock) {
-    if let Some((slot, generation)) = net(sched, |n| n.close(sock))
-        && let Some(budget) = sched.budget(slot, generation)
-    {
-        budget.refund(SOCKET_FRAMES);
+    if let Some((_, network)) = NET.lock().as_mut() {
+        network.close(sock, sched);
     }
+    wake(sched);
 }
 
 fn status(result: Result<(), i64>) -> i64 {
@@ -240,7 +249,7 @@ fn task(_: &mut QemuVirt, _: usize) -> ! {
             continue;
         }
         if let Some((nic, network)) = &mut *NET.lock() {
-            let (deadline, more) = network.poll(nic.as_mut(), now());
+            let (deadline, more) = network.poll(nic.as_mut(), now(), &mut kernel.sched);
             DEADLINE.store(deadline.unwrap_or(u64::MAX), Relaxed);
             PENDING.fetch_or(more, Relaxed);
         }

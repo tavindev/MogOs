@@ -389,6 +389,19 @@ pub fn send(socket: u64, mut data: &[u8]) -> i64 {
     0
 }
 
+/// A boot-spawned process's NetStack: after the console, itself, the archive and, if a disk is mounted, the root
+/// directory, which a duplicate with `CONNECT` tells apart (it lacks the right). Exits 8 without one.
+pub fn net_handle() -> u64 {
+    let net = |h| {
+        let d = dup(h, CONNECT | TRANSFER);
+        d >= 0 && close(d as u64) == 0
+    };
+    [3, 4]
+        .into_iter()
+        .find(|&h| net(h))
+        .unwrap_or_else(|| exit(8))
+}
+
 /// Ends the send side of `socket`'s connection.
 pub fn shutdown(socket: u64) -> i64 {
     syscall(23, [socket, 0, 0, 0])

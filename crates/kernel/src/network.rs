@@ -16,18 +16,17 @@ use alloc::vec::Vec;
 use core::fmt::Write;
 use core::net::{Ipv4Addr, SocketAddrV4};
 
-use mm::Budget;
 use net::{
     Config, Error, HalfOpen, MAX_FRAME, Mac, Neighbor, Nic, Proto, Socket, SocketId, Stack, State,
     Tcp, TcpId, TcpSocket, TimeWait,
 };
 
-use crate::Board;
 use crate::handle::{CONNECT, LISTEN, Rights};
 use crate::syscall::{
     EACCES, EADDRINUSE, EAGAIN, EBADF, EBUSY, ECONNREFUSED, ECONNRESET, EFAULT, EHOSTUNREACH,
     EINVAL, EISCONN, ENETUNREACH, ENFILE, ENOBUFS, ENOTCONN, EPIPE, ETIMEDOUT,
 };
+use crate::{Board, Scheduler};
 
 const NEIGHBORS: usize = 8;
 const UDP_SOCKETS: usize = 4;
@@ -43,6 +42,9 @@ const PAGE: usize = 4096;
 /// What a socket charges its creator's budget: its two rings.
 pub const SOCKET_FRAMES: usize = 2 * RING / PAGE;
 const SOCKETS: usize = 32;
+/// Connections a listener holds before they are accepted; one past it is reset. Each is charged to the listener's
+/// owner until accepted, so a remote peer can make the kernel hold no connection nobody pays for.
+pub const BACKLOG: usize = 8;
 /// Frames each direction of the loopback wire holds: more than every slot's window in flight at once.
 const WIRE: usize = 128;
 const WIRE_FRAME: usize = 1536;
@@ -93,6 +95,32 @@ pub fn frames(eth: bool) -> usize {
     (stacks * SLOTS * 2 * RING + 2 * WIRE * WIRE_FRAME).div_ceil(PAGE)
 }
 
+/// The processes' budgets, by owner.
+pub trait Budgets {
+    /// Charges `frames` to `owner`; false, charging nothing, over its budget or once it has exited.
+    fn charge(&mut self, owner: Owner, frames: usize) -> bool;
+    /// Refunds `frames` to `owner`, if it still runs.
+    fn refund(&mut self, owner: Owner, frames: usize);
+    fn alive(&mut self, owner: Owner) -> bool;
+}
+
+impl<const N: usize> Budgets for Scheduler<N> {
+    fn charge(&mut self, (slot, generation): Owner, frames: usize) -> bool {
+        self.budget(slot, generation)
+            .is_some_and(|b| b.charge(frames))
+    }
+
+    fn refund(&mut self, (slot, generation): Owner, frames: usize) {
+        if let Some(budget) = self.budget(slot, generation) {
+            budget.refund(frames);
+        }
+    }
+
+    fn alive(&mut self, (slot, generation): Owner) -> bool {
+        self.budget(slot, generation).is_some()
+    }
+}
+
 /// Reads and writes the submitting process's memory.
 pub trait UserMemory {
     fn bytes(&self, ptr: u64, len: usize) -> Option<&[u8]>;
@@ -110,6 +138,8 @@ enum Kind {
 #[derive(Clone, Copy)]
 struct Op {
     submitter: Owner,
+    /// The rights of the handle it was submitted with: an accepted connection's handle gets no more.
+    rights: Rights,
     tag: u64,
     kind: Kind,
     /// Its result, once finished and not yet reported.
@@ -137,6 +167,8 @@ struct Entry {
     conn: Conn,
     /// The receive-side op and the send.
     ops: [Option<Op>; 2],
+    /// A listener's connections not yet accepted, each charged to `owner`.
+    backlog: [Option<(usize, TcpId)>; BACKLOG],
 }
 
 const FREE: Entry = Entry {
@@ -147,14 +179,15 @@ const FREE: Entry = Entry {
     port: 0,
     conn: Conn::Fresh,
     ops: [None; 2],
+    backlog: [None; BACKLOG],
 };
 
-/// What `complete` reports: an op's tag and result, or for an accept the connection as a new socket, whose handle the
-/// caller makes and returns as the result (closing the socket if that fails).
+/// What `complete` reports: an op's tag and result, or for an accept the connection as a new socket and the rights
+/// its handle may have, which the caller makes and returns as the result (closing the socket if that fails).
 pub struct Completion {
     pub tag: u64,
     pub result: i64,
-    pub accepted: Option<Sock>,
+    pub accepted: Option<(Sock, Rights)>,
 }
 
 /// Its parts live on the heap, so building it takes little stack.
@@ -222,9 +255,15 @@ impl Network {
         self.stacks[ETH].as_deref_mut()
     }
 
-    /// Handles every received frame and due timer on every stack; returns the next deadline and whether frames are
-    /// still on the loopback wire (poll again).
-    pub fn poll(&mut self, nic: Option<&mut impl Nic>, now: u64) -> (Option<u64>, bool) {
+    /// Handles every received frame and due timer on every stack, then moves each listener's new connections into its
+    /// backlog, charged to its owner (resetting any past `BACKLOG` or the budget); returns the next deadline and
+    /// whether frames are still on the loopback wire (poll again).
+    pub fn poll(
+        &mut self,
+        nic: Option<&mut impl Nic>,
+        now: u64,
+        budgets: &mut impl Budgets,
+    ) -> (Option<u64>, bool) {
         let mut next = None;
         if let (Some(stack), Some(nic)) = (&mut self.stacks[ETH], nic) {
             next = stack.poll(nic, now);
@@ -244,19 +283,35 @@ impl Network {
                 break;
             }
         }
+        for index in 0..SOCKETS {
+            let Conn::Listening(ids) = self.sockets[index].conn else {
+                continue;
+            };
+            for (id, s) in ids.into_iter().zip([ETH, LO]) {
+                let Some(id) = id else { continue };
+                while let Some(conn) = self.stack(s).accept(id) {
+                    let entry = &mut self.sockets[index];
+                    let free = entry.backlog.iter().position(Option::is_none);
+                    match free.filter(|_| budgets.charge(entry.owner, SOCKET_FRAMES)) {
+                        Some(i) => entry.backlog[i] = Some((s, conn)),
+                        None => self.stack(s).abort(conn),
+                    }
+                }
+            }
+        }
         (next, self.wire.count != [0; 2])
     }
 
-    /// A new socket owned by `owner`, whose budget `budget` is charged `SOCKET_FRAMES` for it; `allowed` are the
-    /// NetStack handle's rights (`CONNECT`, `LISTEN`). Its one handle is the caller's to make.
+    /// A new socket owned by `owner`, charged `SOCKET_FRAMES`; `allowed` are the NetStack handle's rights
+    /// (`CONNECT`, `LISTEN`). Its one handle is the caller's to make.
     pub fn socket(
         &mut self,
         owner: Owner,
         allowed: Rights,
-        budget: &mut Budget,
+        budgets: &mut impl Budgets,
     ) -> Result<Sock, i64> {
         let index = self.free()?;
-        self.adopt(index, owner, allowed, Conn::Fresh, budget)
+        self.adopt(index, owner, allowed, Conn::Fresh, budgets)
     }
 
     /// Counts one more handle to `sock`.
@@ -266,15 +321,19 @@ impl Network {
         }
     }
 
-    /// Drops a handle to `sock`; the last one closes its connection or listener (its ops are dropped) and returns the
-    /// owner, whose budget the caller refunds `SOCKET_FRAMES` if it still runs (one that outlives its owner is charged to
-    /// nobody; the table bounds them).
-    pub fn close(&mut self, sock: Sock) -> Option<Owner> {
-        let entry = self.entry(sock).ok()?;
+    /// Drops a handle to `sock`; the last one closes its connection, or its listener and resets its backlog (its ops
+    /// are dropped), and refunds the owner if it still runs (a socket that outlives its owner is charged to nobody;
+    /// the table bounds them).
+    pub fn close(&mut self, sock: Sock, budgets: &mut impl Budgets) {
+        let Ok(entry) = self.entry(sock) else {
+            return;
+        };
         entry.handles -= 1;
         if entry.handles > 0 {
-            return None;
+            return;
         }
+        let entry = *entry;
+        let mut frames = SOCKET_FRAMES;
         match entry.conn {
             Conn::Fresh => {}
             Conn::Listening(ids) => {
@@ -283,10 +342,14 @@ impl Network {
                         self.stack(s).tcp_close(id);
                     }
                 }
+                for (s, conn) in entry.backlog.into_iter().flatten() {
+                    self.stack(s).abort(conn);
+                    frames += SOCKET_FRAMES;
+                }
             }
             Conn::Open(s, id) => self.stack(s).tcp_close(id),
         }
-        Some(self.sockets[sock.index as usize].owner)
+        budgets.refund(entry.owner, frames);
     }
 
     /// Sets the local port `listen` and `connect` use (0: an ephemeral one for `connect`).
@@ -338,15 +401,16 @@ impl Network {
         }
     }
 
-    /// Submits `op` with `tag` on `sock` for `submitter`; `ptr` and `len` are its buffer, checked to lie in user space
-    /// (`OP_CONNECT`: the address and port). Tries it at once, except an accept. `EBUSY` while an op of the same side
-    /// is in flight for a process that still runs (`alive`).
+    /// Submits `op` with `tag` on `sock` for `submitter`, through a handle with `rights`; `ptr` and `len` are its
+    /// buffer, checked to lie in user space (`OP_CONNECT`: the address and port). Tries it at once, except an accept.
+    /// `EBUSY` while an op of the same side is in flight for a process that still runs.
     pub fn submit(
         &mut self,
         sock: Sock,
         (op, ptr, len, tag): (u64, u64, usize, u64),
+        rights: Rights,
         (submitter, now): (Owner, u64),
-        mut alive: impl FnMut(Owner) -> bool,
+        budgets: &mut impl Budgets,
         user: &mut impl UserMemory,
     ) -> Result<(), i64> {
         let kind = match op {
@@ -359,7 +423,7 @@ impl Network {
         let side = (op == OP_SEND) as usize;
         let index = sock.index as usize;
         let entry = *self.entry(sock)?;
-        if entry.ops[side].is_some_and(|o| alive(o.submitter)) {
+        if entry.ops[side].is_some_and(|o| budgets.alive(o.submitter)) {
             return Err(EBUSY);
         }
         if op == OP_CONNECT {
@@ -380,6 +444,7 @@ impl Network {
         }
         self.sockets[index].ops[side] = Some(Op {
             submitter,
+            rights,
             tag,
             kind,
             done: None,
@@ -402,11 +467,12 @@ impl Network {
     }
 
     /// The next op of `owner` that finished, or finishes when tried again now. An accepted connection becomes a
-    /// socket charged to `budget` (`ENOBUFS`, the connection reset, if it is short).
+    /// socket of `owner`: its charge moves from the listener's owner (`ENOBUFS`, the connection reset, if `owner`'s
+    /// budget is short).
     pub fn complete(
         &mut self,
         owner: Owner,
-        budget: &mut Budget,
+        budgets: &mut impl Budgets,
         user: &mut impl UserMemory,
     ) -> Option<Completion> {
         for index in 0..SOCKETS {
@@ -420,8 +486,8 @@ impl Network {
                 };
                 let (result, accepted) = match (op.kind, op.done) {
                     (_, Some(done)) => (done, None),
-                    (Kind::Accept, None) => match self.accept(index, owner, budget) {
-                        Some(Ok(sock)) => (0, Some(sock)),
+                    (Kind::Accept, None) => match self.accept(index, owner, budgets) {
+                        Some(Ok(sock)) => (0, Some((sock, op.rights))),
                         Some(Err(error)) => (error, None),
                         None => continue,
                     },
@@ -441,24 +507,24 @@ impl Network {
         None
     }
 
-    /// The listener at `index`'s next connection as a new socket of `owner`, or why none can be; `None` while no
-    /// connection is ready.
+    /// The listener at `index`'s oldest queued connection as a new socket of `owner`, or why none can be; `None`
+    /// while none is queued.
     fn accept(
         &mut self,
         index: usize,
         owner: Owner,
-        budget: &mut Budget,
+        budgets: &mut impl Budgets,
     ) -> Option<Result<Sock, i64>> {
-        let Conn::Listening(ids) = self.sockets[index].conn else {
+        let entry = &mut self.sockets[index];
+        if !matches!(entry.conn, Conn::Listening(_)) {
             return Some(Err(EINVAL));
-        };
-        let (s, id) = ids
-            .into_iter()
-            .zip([ETH, LO])
-            .find_map(|(id, s)| id.and_then(|id| Some((s, self.stack(s).accept(id)?))))?;
+        }
+        let (s, id) = entry.backlog[0].take()?;
+        entry.backlog.rotate_left(1);
+        budgets.refund(entry.owner, SOCKET_FRAMES);
         let adopted = self
             .free()
-            .and_then(|index| self.adopt(index, owner, 0, Conn::Open(s, id), budget));
+            .and_then(|index| self.adopt(index, owner, 0, Conn::Open(s, id), budgets));
         if adopted.is_err() {
             self.stack(s).abort(id);
         }
@@ -506,16 +572,16 @@ impl Network {
             .ok_or(ENFILE)
     }
 
-    /// Makes entry `index` a socket of `owner` with one handle, charging `budget` for it.
+    /// Makes entry `index` a socket of `owner` with one handle, charging it.
     fn adopt(
         &mut self,
         index: usize,
         owner: Owner,
         allowed: Rights,
         conn: Conn,
-        budget: &mut Budget,
+        budgets: &mut impl Budgets,
     ) -> Result<Sock, i64> {
-        if !budget.charge(SOCKET_FRAMES) {
+        if !budgets.charge(owner, SOCKET_FRAMES) {
             return Err(ENOBUFS);
         }
         let entry = &mut self.sockets[index];

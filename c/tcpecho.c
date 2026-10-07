@@ -1,10 +1,14 @@
 /* `test=sockets`: a TCP echo over 127.0.0.1 on musl's BSD sockets. `tcpecho s` serves one connection on port 8,
  * echoing what one read gets; `tcpecho c` connects (retrying while refused: the server may not listen yet), sends
- * "hello" and prints the echo. */
+ * "hello" and prints the echo. `tcpecho p` spawns `tcpecho n`, which prints what `socket` gets: a child inherits no
+ * network. */
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netinet/in.h>
+#include <spawn.h>
 #include <stdio.h>
+#include <string.h>
+#include <sys/wait.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -12,7 +16,17 @@ int main(int argc, char **argv)
 {
 	struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(8), .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
 	char buf[64];
+	if (argc > 1 && argv[1][0] == 'p') {
+		char *args[] = { argv[0], "n", 0 };
+		pid_t pid;
+		int status;
+		return posix_spawn(&pid, argv[0], 0, 0, args, 0) || waitpid(pid, &status, 0) != pid || status;
+	}
 	int one = 1, s = socket(AF_INET, SOCK_STREAM, 0);
+	if (argc > 1 && argv[1][0] == 'n') {
+		printf("tcpecho: child socket: %s\n", s < 0 && errno == EBADF ? "EBADF" : "not EBADF");
+		return 0;
+	}
 	if (s < 0) return 1;
 	if (argc > 1 && argv[1][0] == 's') {
 		if (setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one) || bind(s, (void *)&a, sizeof a) ||

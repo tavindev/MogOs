@@ -1229,12 +1229,16 @@ fn sockets_echo_over_loopback_wait_for_any_and_need_the_net_handle_and_budget() 
         // Two C processes on musl's BSD sockets.
         "tcpecho: served 5 bytes",
         "tcpecho: hello",
+        // A C child inherits no network from its parent.
+        "tcpecho: child socket: EBADF",
         // One process serves 8 connections at once through `io_wait`; another drives 8 clients the same way.
         "nettest: served 8",
         "nettest: 8 echoes",
         // A child spawned without the NetStack handle, then one with a listen-only duplicate.
         "nettest: no handle: EBADF",
         "nettest: listen-only connect: EACCES",
+        // A connection accepted through a read-only listener handle cannot be written.
+        "nettest: read-only accept send: EACCES",
         // Socket buffers are charged to the budget.
         "nettest: ENOBUFS after 3 sockets",
     ] {

@@ -122,4 +122,8 @@ Decision: write `crates/net` fresh. smoltcp is a host-only dev-dependency of `cr
   handled out of line (`net::syscall`), which kept `board_syscall` unchanged for other calls: with them inline, an
   A/B showed `wait` +4% and `kill` +33% (the latter from `free_table`'s loop moving across a cache line; it moved
   back). Deviations: `bind` takes only a port (a socket listens on every interface), `accept` reports no peer
-  address, and the fuzzer reaches the socket calls only without a NetStack.
+  address, and the fuzzer reaches the socket calls only without a NetStack. Security review fixes (each with a test
+  that failed first): `bind` and `listen` need the socket's write right (`tests/dispatch.rs`); an accepted handle has
+  only the accepting handle's rights (`tests/network.rs`, and `nettest: read-only accept send: EACCES` e2e); musl never
+  passes the NetStack to a spawned child (`tcpecho: child socket: EBADF` e2e); a listener's connections waiting for
+  accept are at most `BACKLOG` (8), each charged to its owner until accepted, the rest reset (`tests/network.rs`).
