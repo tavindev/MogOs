@@ -79,8 +79,11 @@ fn next(state: &mut u64, below: u64) -> u64 {
 /// A random entry of `dir`.
 fn pick(fs: &mut Fs<Guarded>, dir: Inode, rng: &mut u64) -> Option<(Vec<u8>, Inode)> {
     let mut entries = vec![];
-    fs.readdir(dir, |n, i| entries.push((n.to_vec(), i)))
-        .unwrap();
+    fs.readdir(dir, 0, |n, i, _| {
+        entries.push((n.to_vec(), i));
+        false
+    })
+    .unwrap();
     (!entries.is_empty()).then(|| entries.swap_remove(next(rng, entries.len() as u64) as usize))
 }
 
@@ -168,6 +171,8 @@ fn incremental_free_space_matches_mount_and_never_writes_reachable() {
             let used: u32 = fs.used.iter().map(|w| w.count_ones()).sum();
             assert_eq!(fs.free, fs.blocks - used, "{ctx}: free count");
             assert!(fs.used[..fs.hint].iter().all(|&w| w == !0), "{ctx}: hint");
+            let inodes = &fs.records[..fs.inode_hint];
+            assert!(inodes.iter().all(|r| r.kind != FREE), "{ctx}: inode hint");
         }
     }
 }

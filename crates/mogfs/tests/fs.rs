@@ -103,12 +103,13 @@ type Tree = Vec<(String, Vec<u8>)>;
 /// Every path under `dir` with its contents; directories end in `/`.
 fn walk<D: Disk>(fs: &mut Fs<D>, dir: Inode, path: &str, out: &mut Tree) -> Result<(), Error> {
     let mut entries = Vec::new();
-    fs.readdir(dir, |name, inode| {
-        entries.push((String::from_utf8(name.to_vec()).unwrap(), inode))
+    fs.readdir(dir, 0, |name, inode, kind| {
+        entries.push((String::from_utf8(name.to_vec()).unwrap(), inode, kind));
+        false
     })?;
-    for (name, inode) in entries {
+    for (name, inode, kind) in entries {
         let path = format!("{path}/{name}");
-        if fs.kind(inode)? == Kind::Dir {
+        if kind == Kind::Dir {
             out.push((format!("{path}/"), Vec::new()));
             walk(fs, inode, &path, out)?;
         } else {
@@ -200,6 +201,15 @@ fn round_trip_survives_remount_and_drops_uncommitted_changes() {
 }
 
 #[test]
+fn the_disk_can_be_replaced_before_mount() {
+    let (mut a, mut b) = (hello(), MemDisk::new(64));
+    let mut fs = Fs::new(&mut b);
+    *fs.disk() = &mut a;
+    fs.mount().unwrap();
+    assert!(fs.lookup(ROOT, b"docs").is_ok());
+}
+
+#[test]
 fn truncate_empties_a_file_and_frees_its_blocks() {
     let mut disk = MemDisk::new(16);
     let mut fs = format(&mut disk);
@@ -221,8 +231,11 @@ fn truncate_empties_a_file_and_frees_its_blocks() {
 
 fn names<D: Disk>(fs: &mut Fs<D>, dir: Inode) -> Vec<String> {
     let mut out = Vec::new();
-    fs.readdir(dir, |n, _| out.push(String::from_utf8(n.to_vec()).unwrap()))
-        .unwrap();
+    fs.readdir(dir, 0, |n, _, _| {
+        out.push(String::from_utf8(n.to_vec()).unwrap());
+        false
+    })
+    .unwrap();
     out
 }
 
@@ -459,7 +472,9 @@ fn crafted_records_fall_back_and_crafted_entries_are_corrupt() {
     // A directory with no block for its entries, an entry naming an inode past the table, too long a name, a bad name.
     let mut bad = crafted(disk.clone(), &[table], 64 + 8, &0u32.to_le_bytes());
     assert_eq!(snapshot(&mut bad), Err(Error::Corrupt));
-    let entries: [(usize, &[u8]); 4] = [
+    // An entry naming a free inode.
+    let entries: [(usize, &[u8]); 5] = [
+        (0, &3u32.to_le_bytes()),
         (0, &MAX_INODES.to_le_bytes()),
         (4, &[NAME_MAX as u8 + 1]),
         (4, &[0]),
@@ -723,6 +738,8 @@ fn limits_and_misuse_return_errors() {
     }
     let f = fs.create(ROOT, &long[..NAME_MAX]).unwrap();
     assert_eq!(fs.mkdir(ROOT, &long[..NAME_MAX]), Err(Error::Exists));
+    // `create` opens what is already there.
+    assert_eq!(fs.create(ROOT, &long[..NAME_MAX]), Ok(f));
     assert_eq!(fs.lookup(ROOT, b"missing"), Err(Error::NotFound));
     assert_eq!(fs.lookup(ROOT, b".."), Err(Error::InvalidName));
     assert_eq!(fs.lookup(f, b"x"), Err(Error::NotDir));
@@ -769,7 +786,7 @@ fn no_space_changes_nothing() {
     assert_eq!(snapshot(&mut disk), Ok(vec![entry("/f", &[7; 4088])]));
 }
 
-/// Counts the reads, writes and flushes that reach `disk`.
+/// Counts the read, write and flush requests that reach `disk`.
 struct Counted<'a>(&'a mut MemDisk, &'a Cell<[usize; 3]>);
 
 impl Counted<'_> {
@@ -782,12 +799,12 @@ impl Counted<'_> {
 
 impl Disk for Counted<'_> {
     fn read(&mut self, block: u64, bufs: &mut [Block]) -> Result<(), Error> {
-        self.bump(0, bufs.len());
+        self.bump(0, 1);
         (&mut *self.0).read(block, bufs)
     }
 
     fn write(&mut self, block: u64, bufs: &[Block]) -> Result<(), Error> {
-        self.bump(1, bufs.len());
+        self.bump(1, 1);
         (&mut *self.0).write(block, bufs)
     }
 
@@ -807,8 +824,8 @@ fn block_io_per_operation() {
     let io = Cell::new([0; 3]);
     let mut fs = Fs::new(Counted(&mut disk, &io));
     fs.mount().unwrap();
-    // [reads, writes, flushes]: both superblocks, then each slot's inode table.
-    assert_eq!(io.take(), [4, 0, 0]);
+    // [reads, writes, flushes]: both superblocks in one request, then each slot's inode table.
+    assert_eq!(io.take(), [3, 0, 0]);
     let docs = fs.lookup(ROOT, b"docs").unwrap();
     assert_eq!(io.take(), [1, 0, 0]);
     // Reads the directory block it scans and appends to, then writes it; the inode table waits for the commit.
@@ -846,6 +863,31 @@ fn block_io_per_operation() {
 
     fs.commit().unwrap();
     io.take();
+    // Returning true stops before the next block; `start` begins at its entry's block.
+    let mut seen = vec![];
+    fs.readdir(dir, 0, |n, _, _| {
+        seen.push(n.to_vec());
+        true
+    })
+    .unwrap();
+    assert_eq!(io.take(), [1, 0, 0]);
+    fs.readdir(dir, 73, |n, _, kind| {
+        seen.push(n.to_vec());
+        assert_eq!(kind, Kind::File);
+        false
+    })
+    .unwrap();
+    assert_eq!(io.take(), [1, 0, 0]);
+    assert_eq!(seen, [&b"0"[..], b"73", b"74"]);
+    fs.readdir(dir, 75, |_, _, _| true).unwrap();
+    assert_eq!(io.take(), [0, 0, 0]);
+    // Creating an existing name scans once; truncating an empty file changes nothing.
+    let zero = fs.create(dir, b"0").unwrap();
+    assert_eq!(io.take(), [1, 0, 0]);
+    fs.truncate(zero).unwrap();
+    fs.commit().unwrap();
+    assert_eq!(io.take(), [0, 0, 0]);
+
     // Within a directory: one scan, then the entry's block rewritten with the new name.
     fs.rename(docs, b"b.txt", docs, b"c.txt").unwrap();
     assert_eq!(io.take(), [1, 1, 0]);
@@ -855,8 +897,8 @@ fn block_io_per_operation() {
     // Across directories: scans both, appends to the target; removing the last entry only shrinks the source.
     fs.rename(docs, b"c.txt", ROOT, b"c.txt").unwrap();
     assert_eq!(io.take(), [1, 1, 0]);
-    // A directory move also reads every directory below it (both blocks of `many`), then the root block again for
-    // its last entry; it writes the root's block and a first block for the emptied `docs`.
+    // A directory move also reads every directory below it (both blocks of `many`), then the root block for its
+    // last entry; it writes the root's block and a first block for the emptied `docs`.
     fs.rename(ROOT, b"many", docs, b"many").unwrap();
     assert_eq!(io.take(), [3, 2, 0]);
     // Unlinking the last entry only scans.
