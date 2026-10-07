@@ -707,6 +707,8 @@ extern "C" fn kmain_secondary() -> ! {
     records()[cpu].store(arch::record_speculation(conduit()), Release);
     arch::timer::allow_user_counter();
     enable_gic_cpu();
+    // Its first reschedule: tasks made ready before its GIC was up signalled no one.
+    send_sgi(cpu);
     ONLINE.fetch_add(1, Release);
     if SMP_TEST.load(Relaxed) {
         arch::timer::arm(TICK_US);

@@ -35,7 +35,7 @@ pub fn percpu_size() -> usize {
 /// # Safety
 ///
 /// `area` must be 16-byte aligned, below 256 TiB, `percpu_size()` bytes of mapped memory only this core uses from now
-/// on; call it once per core, before any `PerCpu` use, with IRQs masked.
+/// on, and `index` below 65536; call it once per core, before any `PerCpu` use, with IRQs masked.
 pub unsafe fn enter_percpu(index: usize, area: usize) {
     let template = &raw const __percpu_start;
     // SAFETY: the caller guarantees `area` is this core's own, and the template is the linker's `.percpu`.
@@ -185,7 +185,13 @@ impl<T> PerCpu<T> {
         };
         // SAFETY: `new`'s contract puts `self` in the template, and `enter_percpu` made this core's copy at `offset` from
         // it, which only this core reaches, with IRQs masked.
-        let copy = unsafe { &*(self as *const Self).wrapping_byte_offset(offset) };
+        let copy = unsafe {
+            &*core::ptr::with_exposed_provenance::<Self>(
+                (self as *const Self)
+                    .expose_provenance()
+                    .wrapping_add_signed(offset),
+            )
+        };
         let mut slot = copy.0.borrow_mut();
         let result = f(&mut slot);
         drop(slot);

@@ -234,18 +234,20 @@ impl<const N: usize, const P: usize> Scheduler<N, P> {
     }
 
     /// Gives the scheduler `cpus` cores: core 0 runs the boot context, its idle context's first frame at `idle_frame`;
-    /// the others start idle, their idle frame saved by their first switch.
+    /// the others start idle and counted as signalled (an SGI before a core's interrupt controller is up is lost), so
+    /// each must reschedule once it is up; their idle frame is saved by that first switch.
     pub fn start_cores(&mut self, cpus: usize, idle_frame: usize) {
         let idle = Core {
             current: IDLE,
             process: 0,
             idle: 0,
-            kicked: false,
+            kicked: true,
         };
         self.cores = alloc::vec![idle; cpus].leak();
         self.cores[0] = Core {
             current: 0,
             idle: idle_frame,
+            kicked: false,
             ..idle
         };
     }

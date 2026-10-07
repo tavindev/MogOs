@@ -45,8 +45,8 @@ pub trait Board {
     fn init_heap(&mut self, region: Range<PhysAddr>);
     /// Microseconds since the board entered the kernel.
     fn uptime_us(&self) -> u64;
-    /// Starts the periodic timer interrupt on every core that runs a task; each tick switches to the next task. An
-    /// idle core takes no tick. IRQs are unmasked only in tasks and `idle`.
+    /// Starts the periodic timer interrupt on this core, and on each other core once it next leaves its idle context; each
+    /// tick switches to the next task. An idle core takes no tick. IRQs are unmasked only in tasks and `idle`.
     fn start_timer(&mut self);
     /// Sleeps until an interrupt arrives and handles it. Boot context only: returns with IRQs masked.
     fn idle(&mut self);

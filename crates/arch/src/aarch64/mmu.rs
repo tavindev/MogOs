@@ -298,7 +298,7 @@ unsafe fn free_table<F: FnMut(PhysAddr)>(table: PhysAddr, level: u32, free: &mut
         if desc & VALID_TABLE_OR_PAGE != VALID_TABLE_OR_PAGE {
             continue;
         }
-        // SAFETY: the boot table is only written by `enable_mmu`, before any address space exists.
+        // SAFETY: the boot table is written only by `enable_mmu` and `map_device_gib`, before any address space exists.
         if level == 1 && unsafe { (*boot).0[i] } != 0 {
             continue;
         }

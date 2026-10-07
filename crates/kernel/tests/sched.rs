@@ -367,6 +367,11 @@ fn a_zombie_thread_stays_until_its_last_handle_closes_and_a_stale_close_counts_f
 fn a_woken_task_signals_an_idle_core_only_while_it_still_waits_for_one() {
     let mut sched = Scheduler::<4, 4>::new();
     sched.start_cores(2, 0xd0);
+    assert_eq!(
+        sched.switch(1, 0xd1),
+        0xd1,
+        "core 1 comes up: nothing to run"
+    );
     spawn(&mut sched, 0x100);
     let ((b, _), _) = spawn(&mut sched, 0x200);
     sched.take_woken();
@@ -399,6 +404,17 @@ fn a_core_runs_only_tasks_no_other_core_runs_and_core_0_resumes_boot_once_every_
     let mut sched = Scheduler::<4, 4>::new();
     sched.start_cores(2, 0xd0);
     assert!(sched.idle(1));
+    spawn(&mut sched, 0x50);
+    assert_eq!(sched.claim_idle(0), None, "core 1 is not up yet");
+    sched.take_woken();
+    assert_eq!(
+        sched.switch(1, 0xd1),
+        0x50,
+        "up, it reschedules and finds the task"
+    );
+    let (x, _) = sched.current(1);
+    assert_eq!(sched.end(x, 0), (STACK, None));
+    assert_eq!(sched.switch(1, 0xdead), 0xd1);
     let ((a, _), process) = spawn(&mut sched, 0x100);
     let b = thread(&mut sched, process.0, 0x200, 0);
     assert_eq!(sched.claim_idle(0), Some(1));

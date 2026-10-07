@@ -19,7 +19,7 @@ pub fn arm(us: u64) {
 
 /// Turns the EL1 virtual timer off, so its interrupt stops asserting.
 pub fn stop() {
-    // SAFETY: disabling the virtual timer only affects its own interrupt; `isb` completes it before a following EOI.
+    // SAFETY: disabling the virtual timer only affects its own interrupt; `isb` completes it before IRQs unmask.
     unsafe {
         asm!(
             "msr cntv_ctl_el0, xzr",
