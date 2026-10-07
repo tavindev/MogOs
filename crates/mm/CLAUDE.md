@@ -11,6 +11,10 @@ or the policy of who gets how many frames (`crates/kernel`, board `spawn`).
 ## Responsibilities
 
 - `FrameAllocator`: `new` over a RAM range, `reserve`, `alloc`, `alloc_contiguous`, `free`, `free_count`.
+  `alloc` and `alloc_contiguous` start their first-fit scan at `hint`, below which every word is full: `free` lowers
+  it, `alloc` moves it to the word it took from (`WORDS` when none is free), `alloc_contiguous` past the full words
+  at it. Results are first fit's for every `count >= 1` (`matches_a_bit_by_bit_model`); only the scan over the full
+  prefix (the reserved image, then the frames in use) is skipped.
 - `Budget`: `alloc` / `alloc_contiguous` / `free` against a `FrameAllocator`; `shrink` / `grow` when frames move
   between parent and child.
 

@@ -300,3 +300,14 @@ Filled in as each step lands.
     `__stacks` that the frame allocator may have handed out; still only on a path that powers off.
   - Against main overall (hvf min at `-smp 1`): syscall 30 -> 55 ns (BHB 13-15, one `csdb` 9), `enosys` 32.5 ->
     46.8 (BHB only), pipe round trip 352 -> 519, yield and median boot hold.
+- `spawn`'s first-fit scan past the reserved image: the frame allocator keeps a hint, the lowest word that may have a
+  free bit (`crates/mm`; same results as first fit, the randomized model test now reserves long prefixes and frees
+  low runs, and dropping or misplacing the hint fails it). TCG instructions against `e997c36`: `spawn` 26424 ->
+  23786 (main `78add1d`: 25078), with arguments 28518 -> 25672, `map` 2148 -> 1975, `pipe` 1353 -> 1158, `kill`
+  +27 (the hint check in each `free`). hvf (63 boots, min): `spawn` 1674 -> 1596 ns at `-smp 1`, 1758 -> 1555 at
+  `-smp 4`; host `alloc+free` -18.8%, the contiguous rows -1.2 to -0.1% (11 rounds). Boot's remaining table-fill cost:
+  timed in `enable_mmu`, writing only the blocks and pages needed before the MMU is on (0.15 us) and the rest with
+  caches on (0.5 us) leaves `aarch64_mmu_on` at about 2 us (its system-register writes trap under hvf; main pays it
+  too). That two-phase fill measured no boot change under hvf (222 against 227 us median, 199 against 197 min, 63
+  boots) and added 4000 TCG instructions, so it was not kept: of the 4-5 us, about 2.5 are the uncached fill and
+  2 the MMU switch every kernel pays.

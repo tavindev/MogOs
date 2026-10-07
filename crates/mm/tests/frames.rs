@@ -115,10 +115,11 @@ fn contiguous_alloc_skips_fragmented_runs() {
     assert_eq!(frames.alloc_contiguous(4), Some(frame(197)..frame(201)));
 }
 
-/// Drives the allocator and a bit-per-frame model with the same random operations and compares every result.
+/// Drives the allocator and a bit-per-frame model with the same random operations and compares every result. Long
+/// reservations from frame 0 (the boot image) and frees of whole low runs move the first-fit hint both ways.
 #[test]
 fn matches_a_bit_by_bit_model() {
-    for seed in 1..=500u64 {
+    for seed in 1..=2000u64 {
         let mut rng = seed;
         let mut next = move |n: u64| {
             rng ^= rng << 13;
@@ -151,14 +152,19 @@ fn matches_a_bit_by_bit_model() {
                     assert_eq!(frames.alloc(), expect, "seed {seed}");
                 }
                 2 => {
-                    let start = next(total);
-                    let end = start + next(8);
+                    let start = if next(4) == 0 { 0 } else { next(total) };
+                    let end = start + if next(4) == 0 { next(total) } else { next(8) };
                     used[start as usize..(end.min(total)) as usize].fill(true);
                     frames.reserve(frame(start)..frame(end));
                 }
                 _ => {
+                    let low = next(4) == 0;
                     for _ in 0..next(16) {
-                        let i = next(total) as usize;
+                        let i = if low {
+                            next(total.min(70))
+                        } else {
+                            next(total)
+                        } as usize;
                         if used[i] {
                             used[i] = false;
                             frames.free(frame(i as u64));

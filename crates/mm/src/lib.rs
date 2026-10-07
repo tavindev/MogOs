@@ -19,6 +19,8 @@ pub struct FrameAllocator<const WORDS: usize> {
     base: u64,
     frames: usize,
     used: [u64; WORDS],
+    /// Every word below it is full, so first fit starts its scan here.
+    hint: usize,
 }
 
 impl<const WORDS: usize> FrameAllocator<WORDS> {
@@ -28,6 +30,7 @@ impl<const WORDS: usize> FrameAllocator<WORDS> {
             base: 0,
             frames: 0,
             used: [u64::MAX; WORDS],
+            hint: 0,
         }
     }
 
@@ -40,7 +43,12 @@ impl<const WORDS: usize> FrameAllocator<WORDS> {
         if !frames.is_multiple_of(64) {
             used[frames / 64] = u64::MAX << (frames % 64);
         }
-        Self { base, frames, used }
+        Self {
+            base,
+            frames,
+            used,
+            hint: 0,
+        }
     }
 
     /// Marks every frame overlapping `range` as in use.
@@ -59,8 +67,15 @@ impl<const WORDS: usize> FrameAllocator<WORDS> {
 
     /// Allocates the first run of `count` free frames.
     pub fn alloc_contiguous(&mut self, count: usize) -> Option<Range<PhysAddr>> {
-        let mut run = 0; // free frames ending at the previous word's top
-        for (w, &word) in self.used.iter().enumerate() {
+        let mut from = self.hint;
+        while self.used.get(from) == Some(&u64::MAX) {
+            from += 1;
+        }
+        self.hint = from;
+        // Free frames ending at the previous word's top: none at the hint, as every word below it is full.
+        let mut run = 0;
+        for (i, &word) in self.used[from..].iter().enumerate() {
+            let w = from + i;
             let free = !word;
             let start = if run + free.trailing_ones() as usize >= count {
                 Some(w * 64 - run)
@@ -92,7 +107,12 @@ impl<const WORDS: usize> FrameAllocator<WORDS> {
     }
 
     pub fn alloc(&mut self) -> Option<PhysAddr> {
-        let word = self.used.iter().position(|&w| w != u64::MAX)?;
+        let found = self.used[self.hint..].iter().position(|&w| w != u64::MAX);
+        let Some(word) = found.map(|w| self.hint + w) else {
+            self.hint = WORDS;
+            return None;
+        };
+        self.hint = word;
         let bit = self.used[word].trailing_ones() as usize;
         self.used[word] |= 1 << bit;
         Some(PhysAddr(self.base + (word * 64 + bit) as u64 * FRAME_SIZE))
@@ -111,6 +131,9 @@ impl<const WORDS: usize> FrameAllocator<WORDS> {
             "double free {frame:#x}"
         );
         self.used[i / 64] &= !(1 << (i % 64));
+        if i / 64 < self.hint {
+            self.hint = i / 64;
+        }
     }
 
     pub fn free_count(&self) -> usize {
