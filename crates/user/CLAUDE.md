@@ -14,6 +14,9 @@ board crate).
   `docs/DEVELOPMENT.md`. `cargo test-host` does not build it.
 - `#![no_std]`, `#![no_main]`, no dependencies. `unsafe` blocks only in `src/lib.rs` for `svc` and `map`'s slice
   (bins only use `#[unsafe(no_mangle)]`), each with a `// SAFETY:`.
+- A program that takes arguments defines `_start(argc, _, len)` and calls `start(argc, len, main)`, which hands `main`
+  the arguments as `&[&[u8]]` (the kernel puts them at the end of the top stack page, `STACK_TOP`) and exits with its
+  result; boot-spawned programs get none.
 - Talks to the kernel only through `svc #0`; handles arrive at values 0, 1, ... as the spawner passed them
   (init: 0 console, 1 itself, 2 boot archive, 3 the MogFS root directory when a disk is mounted).
 - `read`/`write` are `read_at`/`write_at` at offset 0: `io_submit_wait` takes the file offset in x4, which the console
@@ -25,7 +28,7 @@ board crate).
 - The ABI is mirrored by hand from `crates/kernel/src/syscall.rs` (numbers, rights bits, error values, `KILLED`);
   change both together.
 - `link.ld` and `build.rs`: static ELFs at 4 GiB, one RX and one RW `PT_LOAD`, `-zmax-page-size=4096`. Everything
-  must fit in the board's `IMAGE` (below the stack page at 4 GiB + 2 MiB) or `spawn` returns `ENOEXEC`.
+  must fit in the board's `IMAGE` (below the top two stack pages, which end at 4 GiB + 2 MiB) or `spawn` returns `ENOEXEC`.
 - Child budgets (`CHILD_BUDGET`, `A_BUDGET`, `PONG_BUDGET`, ...) are sized deliberately, some exact, some with slack,
   as their comments say; they must fit in the kernel's `BOOT_BUDGET`, `WAITER_BUDGET`, `PI_BUDGET`. `ROUND_TRIPS` in
   `ping.rs` must equal the kernel's `PIPE_ROUND_TRIPS`.
@@ -40,7 +43,7 @@ board crate).
   (`parent_blocks_on_an_empty_pipe_until_the_child_writes`), `waiter` (`an_exited_child_keeps_its_slot_until_waited_for`),
   `pi` / `low` / `mid` / `high` (`priority_inheritance_lets_the_mutex_owner_outrun_a_middle_priority_spinner`),
   `ping` / `pong` (`pipe_bench_reports_round_trip`), `msh` (`shell_files_survive_a_reboot_only_once_synced`),
-  `fsbench` (`fs_bench_reports_round_trips`), all in `crates/e2e/tests/boot.rs`.
+  `fsbench` (`fs_bench_reports_round_trips`), `spawnbench` / `nop` (`spawn_bench_reports_round_trip`), all in `crates/e2e/tests/boot.rs`.
 - Clippy and fmt via the `crates/user` commands in `docs/DEVELOPMENT.md` must be clean.
 
 ---

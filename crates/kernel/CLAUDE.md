@@ -67,7 +67,9 @@ touches memory through raw addresses: the board reads user buffers, copies pages
 - Syscalls 0-17 (`src/syscall.rs` docs): exit, io_submit_wait, dup, close, map, open, spawn, pipe, wait, mutex, lock,
   unlock, kill, mkdir, readdir, sync, unlink, rename. `io_submit_wait` takes a file offset in x4 (files need it, the console and pipes
   ignore it; offsets live in libc, not in handles, so `Object` stays `Copy`). `open` takes flags in x3; the opened
-  object gets the directory handle's rights, so a child never has more. Changing the archive is `EROFS`.
+  object gets the directory handle's rights, so a child never has more. `spawn` takes arguments in x5/x6 (NUL-ended
+  strings, at most `MAX_ARGS` (32) and `MAX_BUFFER` bytes, `E2BIG`; checked by `syscall::argc`); `dispatch` reads
+  x0-x6. `Call` stays 56 bytes (const-asserted), so `Spawn`'s small fields are `u8`/`u16`. Changing the archive is `EROFS`.
 - An inode a handle reaches is never freed: `unlink` is `EBUSY` while any table holds a `Dir` or `Node` handle to it
   (`Scheduler::holds`, at most `MAX_TASKS * MAX_HANDLES` entries), since `create` reuses freed inodes. The scan sees
   every handle: `spawn` moves handles within one syscall, and an exiting process's table is emptied as it releases.
@@ -90,7 +92,7 @@ touches memory through raw addresses: the board reads user buffers, copies pages
 ## How it's tested
 
 - Host: `cargo test --target aarch64-apple-darwin -p kernel` runs `tests/sched.rs`, `tests/handle.rs`,
-  `tests/pipe.rs`, `tests/exec.rs` (cpio, ELF, archive listing), `tests/file.rs` (path walk limits, `readdir` at
+  `tests/pipe.rs`, `tests/exec.rs` (cpio, ELF, archive listing), `tests/args.rs` (`spawn`'s argument checks), `tests/file.rs` (path walk limits, `readdir` at
   tight buffer sizes, over an in-memory disk); `file` also end to end (`test=shell`, `test=bench-fs`).
 - End to end: every scenario in `crates/e2e/tests/boot.rs`; `run`'s `test=*` arms are listed in
   `docs/DEVELOPMENT.md` (inner loop). Full gate: `cargo test-host`.

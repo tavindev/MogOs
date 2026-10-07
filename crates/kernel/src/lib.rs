@@ -177,6 +177,7 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
             "test=echo" => run_archived(board, "echo", "echo", BOOT_BUDGET),
             "test=shell" => run_archived(board, "shell", "msh", BOOT_BUDGET),
             "test=bench-fs" => run_archived(board, "bench-fs", "fsbench", BOOT_BUDGET),
+            "test=bench-spawn" => run_archived(board, "bench-spawn", "spawnbench", BOOT_BUDGET),
             "test=pi" => {
                 board.start_timer();
                 run_archived(board, "pi", "pi", PI_BUDGET);

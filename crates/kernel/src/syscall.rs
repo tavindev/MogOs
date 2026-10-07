@@ -1,4 +1,4 @@
-//! Native syscalls: `x8` = number, `x0`-`x5` = arguments, `x0` = result (negative = error), `svc #0`.
+//! Native syscalls: `x8` = number, `x0`-`x6` = arguments, `x0` = result (negative = error), `svc #0`.
 
 use core::ops::Range;
 
@@ -30,10 +30,13 @@ const MAP: u64 = 4;
 /// `/`-separated component must be a name, so `..`, `.`, an empty component (`/x`, `a//b`) is `EINVAL`; more than
 /// `file::MAX_DEPTH` (16) components is `ENAMETOOLONG`.
 const OPEN: u64 = 5;
-/// `spawn(exe, handles_ptr, handles_len, budget, priority)`: starts the executable `exe` (exec right) as a new process
-/// at `priority`, capped at the caller's own (so no process escalates), moving it the `handles_len` handles at
-/// `handles_ptr` (transfer right; values 0, 1, ... in the child) and `budget` frames of the caller's budget; returns a
-/// handle to the process (wait, kill). On failure nothing moves.
+/// `spawn(exe, handles_ptr, handles_len, budget, priority, args_ptr, args_len)`: starts the executable `exe` (exec
+/// right) as a new process at `priority`, capped at the caller's own (so no process escalates), moving it the
+/// `handles_len` handles at `handles_ptr` (transfer right; values 0, 1, ... in the child) and `budget` frames of the
+/// caller's budget; returns a handle to the process (wait, kill). On failure nothing moves. `args` holds the child's
+/// arguments, each ending in a NUL (`EINVAL` otherwise), at most `MAX_ARGS` and `MAX_BUFFER` bytes (`E2BIG`); the
+/// kernel copies them to the top of the child's stack, on a page charged to the child's budget below which the stack
+/// gets its usual page, and the child starts with x0 = their count, x1 = their address, x2 = their length.
 const SPAWN: u64 = 6;
 /// `pipe()`: returns a handle to a new pipe's read end (read, duplicate, transfer), and in `x1` one to its write end
 /// (write, duplicate, transfer). Its one-page buffer is charged to the caller's budget until the last handle to it
@@ -74,6 +77,9 @@ const UNLINK: u64 = 16;
 /// `EINVAL` if a directory would move below itself, `EROFS` on the boot archive.
 const RENAME: u64 = 17;
 
+/// Most arguments a `spawn` passes.
+pub const MAX_ARGS: usize = 32;
+
 /// The exit code `wait` reports for a process a fault killed: outside `exit`'s 0..=255.
 pub const KILLED: u64 = 256;
 
@@ -92,6 +98,8 @@ pub const EPERM: i64 = -1;
 pub const ENOENT: i64 = -2;
 /// The disk failed a request, or the file system is corrupt.
 pub const EIO: i64 = -5;
+/// Over `spawn`'s argument limits.
+pub const E2BIG: i64 = -7;
 /// Not a valid executable.
 pub const ENOEXEC: i64 = -8;
 
@@ -229,13 +237,16 @@ pub enum Call {
         from: (Inode, u64, usize),
         to: (Inode, u64, usize),
     },
-    /// Spawn the boot archive's file `file`, moving the `len` handles at `ptr` (in `USER` unless empty, maybe unmapped) and `budget`.
+    /// Spawn the boot archive's file `file`, moving the `len` handles at `ptr` (in `USER` unless empty, maybe unmapped)
+    /// and `budget`, with the arguments at `args..args + args_len` (as for `ptr`). The small fields keep `Call` at 56 bytes.
     Spawn {
         file: Range<usize>,
         ptr: u64,
-        len: usize,
+        len: u8,
         budget: usize,
-        priority: u64,
+        priority: u8,
+        args: u64,
+        args_len: u16,
     },
     /// Create a mutex.
     NewMutex,
@@ -248,9 +259,11 @@ pub enum Call {
     },
 }
 
-/// Runs syscall `nr` with arguments `args` (`x0`-`x5`) against the caller's `handles`, leaving the board the parts
+const _: () = assert!(size_of::<Call>() == 56, "every syscall returns a Call");
+
+/// Runs syscall `nr` with arguments `args` (`x0`-`x6`) against the caller's `handles`, leaving the board the parts
 /// that touch hardware or tasks; `Err` holds the result to return.
-pub fn dispatch(nr: u64, args: &[u64; 6], handles: &mut Handles) -> Result<Call, i64> {
+pub fn dispatch(nr: u64, args: &[u64; 7], handles: &mut Handles) -> Result<Call, i64> {
     match nr {
         EXIT => Ok(Call::Exit(args[0] & 0xff)),
         IO => {
@@ -325,12 +338,19 @@ pub fn dispatch(nr: u64, args: &[u64; 6], handles: &mut Handles) -> Result<Call,
                 return Err(EINVAL);
             }
             user_buffer(ptr, len * 8)?;
+            let (argv, argv_len) = (args[5], args[6]);
+            if argv_len > MAX_BUFFER {
+                return Err(E2BIG);
+            }
+            user_buffer(argv, argv_len)?;
             Ok(Call::Spawn {
                 file: start..end,
                 ptr,
-                len: len as usize,
+                len: len as u8,
                 budget: budget as usize,
-                priority: args[4],
+                priority: args[4].min(u8::MAX.into()) as u8,
+                args: argv,
+                args_len: argv_len as u16,
             })
         }
         PIPE => Ok(Call::NewPipe),
@@ -391,6 +411,17 @@ fn path(handles: &Handles, handle: u64, ptr: u64, len: u64) -> Result<(Inode, u6
     };
     user_buffer(ptr, len)?;
     Ok((dir, ptr, len as usize))
+}
+
+/// The number of arguments in `args`, each ending in a NUL; `E2BIG` over `MAX_ARGS`, `EINVAL` if the last one has
+/// no NUL.
+pub fn argc(args: &[u8]) -> Result<usize, i64> {
+    let count = args.iter().filter(|&&b| b == 0).count();
+    match args.last() {
+        _ if count > MAX_ARGS => Err(E2BIG),
+        Some(&last) if last != 0 => Err(EINVAL),
+        _ => Ok(count),
+    }
 }
 
 /// `EFAULT` unless `len` is 0 (any `ptr`, as Rust passes empty slices) or `ptr..ptr + len` lies in `USER` and `len`

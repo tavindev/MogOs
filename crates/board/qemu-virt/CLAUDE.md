@@ -59,7 +59,9 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
 - A blocking call rewinds its `svc` (`block` calls `TrapFrame::restart`) and reruns when woken.
 - User memory is read only through `user_bytes` / `user_bytes_mut`, which probe every page with
   `arch::user_readable` / `user_writable`; slices live only until the trap returns.
-- User layout: code at `USER_BASE` (4 GiB), ELF segments within `IMAGE`, one stack page below `USER_STACK_TOP`,
+- User layout: code at `USER_BASE` (4 GiB), ELF segments within `IMAGE` (below the top two pages), one stack page
+  below `USER_STACK_TOP`; a `spawn` with arguments copies them to the end of that page and adds a stack page below it
+  (both charged to the child), and the child starts with x0-x2 = count, address, length,
   `map` from `MAP_BASE` upward. Kernel blocks (`KERNEL_L1`) are EL1-only in every address space.
 - `MAX_MUTEXES = MAX_TASKS * MAX_HANDLES`: every live mutex holds a handle, so the handle tables are the quota.
 - `linker.ld` provides `__stack_top`, `__bss_start`, `__bss_end`, `__kernel_start`, `__kernel_end`; its load address

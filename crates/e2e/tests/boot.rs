@@ -301,12 +301,16 @@ fn spawn_moves_handles_and_budget_to_the_child() {
             "S: spawn over budget: ENOMEM",
             "S: spawn without handles over budget: ENOMEM",
             "S: spawn one frame short: ENOMEM",
+            "S: spawn 4097 bytes of args: E2BIG",
+            "S: spawn 33 args: E2BIG",
+            "S: spawn args without a NUL: EINVAL",
             "S: console not moved",
             "S: spawned child with the console",
             "S: moved console: EBADF",
             "C: hello through handle 0",
             "C: statics work",
             "C: handle 1 not given: EBADF",
+            "C: 32 args of 4096 bytes: child, a b",
         ]
     );
     // The one-frame-short spawn fails after mapping everything but the kernel stack, so this checks its rollback.
@@ -756,5 +760,22 @@ fn fs_bench_reports_round_trips() {
             .unwrap();
     }
     assert_no_leak(&lines, "bench-fs");
+    assert!(status.success(), "QEMU exited with {status}");
+}
+
+#[test]
+fn spawn_bench_reports_round_trip() {
+    let (status, lines) = boot(&["-append", "test=bench-spawn"]);
+    assert!(
+        !lines.iter().any(|l| l.starts_with("panic:")),
+        "kernel panicked"
+    );
+    lines
+        .iter()
+        .find_map(|l| l.strip_prefix("spawn: ")?.strip_suffix(" ns/round-trip"))
+        .expect("missing spawn line")
+        .parse::<u64>()
+        .unwrap();
+    assert_no_leak(&lines, "bench-spawn");
     assert!(status.success(), "QEMU exited with {status}");
 }

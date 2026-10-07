@@ -176,17 +176,19 @@ pub unsafe fn new_task(stack_top: usize, entry: extern "C" fn(usize) -> !, arg: 
 }
 
 /// Writes a frame just below `stack_top` (the process's kernel stack) that starts at user address `entry`
-/// at EL0 with IRQs unmasked and SP_EL0 = `sp`; returns its address for the scheduler.
+/// at EL0 with IRQs unmasked, SP_EL0 = `sp` and x0-x2 = `args`; returns its address for the scheduler.
 ///
 /// # Safety
 ///
 /// `stack_top` must be 16-byte aligned, with the memory below it a fresh stack owned by the new task.
-pub unsafe fn new_user_task(stack_top: usize, entry: u64, sp: u64) -> usize {
+pub unsafe fn new_user_task(stack_top: usize, entry: u64, sp: u64, args: [u64; 3]) -> usize {
     let frame = (stack_top - size_of::<TrapFrame>()) as *mut TrapFrame;
+    let mut x = [0; 31];
+    x[..3].copy_from_slice(&args);
     // SAFETY: the caller guarantees the bytes below `stack_top` are ours to write.
     unsafe {
         frame.write(TrapFrame {
-            x: [0; 31],
+            x,
             elr: entry,
             spsr: SPSR_EL0T_IRQ_ON,
             sp_el0: sp,

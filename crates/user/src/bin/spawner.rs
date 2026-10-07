@@ -1,4 +1,5 @@
-//! `test=spawn`'s init: spawns `child` with only the console, after failing spawns that must move nothing.
+//! `test=spawn`'s init: spawns `child` with only the console and the most arguments `spawn` takes, after failing
+//! spawns that must move nothing.
 #![no_std]
 #![no_main]
 
@@ -47,8 +48,29 @@ extern "C" fn _start() -> ! {
         spawned == ENOMEM,
         b"S: spawn one frame short: ENOMEM\n",
     );
+    // The most `spawn` takes: 32 arguments in 4096 bytes, the last one long.
+    let args = map(2 * 4096).unwrap_or_else(|| exit(1));
+    args[..10].copy_from_slice(b"child\0a b\0");
+    args[10..68].chunks_mut(2).for_each(|arg| arg[0] = b'x');
+    args[68..4095].fill(b'y');
+    let spawned = spawn_at(child, &[CONSOLE], CHILD_BUDGET, u64::MAX, &args[..4097]);
+    check(
+        console,
+        spawned == E2BIG,
+        b"S: spawn 4097 bytes of args: E2BIG\n",
+    );
+    let mut many = [0; 66];
+    many.chunks_mut(2).for_each(|arg| arg[0] = b'x');
+    let spawned = spawn_at(child, &[CONSOLE], CHILD_BUDGET, u64::MAX, &many);
+    check(console, spawned == E2BIG, b"S: spawn 33 args: E2BIG\n");
+    let spawned = spawn_at(child, &[CONSOLE], CHILD_BUDGET, u64::MAX, b"child");
+    check(
+        console,
+        spawned == EINVAL,
+        b"S: spawn args without a NUL: EINVAL\n",
+    );
     write(CONSOLE, b"S: console not moved\n");
-    let spawned = spawn(child, &[CONSOLE], CHILD_BUDGET);
+    let spawned = spawn_at(child, &[CONSOLE], CHILD_BUDGET, u64::MAX, &args[..4096]);
     check(
         console,
         spawned >= 0,

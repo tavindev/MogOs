@@ -14,13 +14,20 @@ pub const TRANSFER: u64 = 1 << 4;
 pub const CREATE: u64 = 1 << 0;
 pub const TRUNC: u64 = 1 << 1;
 
+/// Where the stack ends: the board's `USER_STACK_TOP`.
+const STACK_TOP: usize = (1 << 32) + (2 << 20);
+/// Most arguments `spawn` passes.
+pub const MAX_ARGS: usize = 32;
+
 pub const EPERM: i64 = -1;
 pub const ENOENT: i64 = -2;
 pub const EIO: i64 = -5;
+pub const E2BIG: i64 = -7;
 pub const ENOEXEC: i64 = -8;
 pub const EBADF: i64 = -9;
 pub const ENOMEM: i64 = -12;
 pub const EACCES: i64 = -13;
+pub const EFAULT: i64 = -14;
 pub const EBUSY: i64 = -16;
 pub const EEXIST: i64 = -17;
 pub const ENOTDIR: i64 = -20;
@@ -121,21 +128,36 @@ pub fn open(dir: u64, path: &[u8], flags: u64) -> i64 {
     syscall(5, [dir, path.as_ptr() as u64, path.len() as u64, flags])
 }
 
-/// `spawn_at` this process's own priority.
+/// `spawn_at` this process's own priority, with no arguments.
 pub fn spawn(exe: u64, handles: &[u64], budget: usize) -> i64 {
-    spawn_at(exe, handles, budget, u64::MAX)
+    spawn_at(exe, handles, budget, u64::MAX, &[])
 }
 
 /// Moves `handles` to the child (at values 0, 1, ...) and `budget` frames of this process's budget; the child runs at
-/// `priority` (0 lowest), capped at this process's own.
-pub fn spawn_at(exe: u64, handles: &[u64], budget: usize, priority: u64) -> i64 {
+/// `priority` (0 lowest), capped at this process's own, with `args`: strings each ending in a NUL, at most `MAX_ARGS`
+/// and 4096 bytes (`E2BIG`).
+pub fn spawn_at(exe: u64, handles: &[u64], budget: usize, priority: u64, args: &[u8]) -> i64 {
     let result;
-    // SAFETY: as in `syscall`; `spawn` reads only the handle list.
+    // SAFETY: as in `syscall`; `spawn` reads only the handle list and the arguments.
     unsafe {
         asm!("svc #0", inlateout("x0") exe => result, in("x1") handles.as_ptr(),
-            in("x2") handles.len(), in("x3") budget, in("x4") priority, in("x8") 6, options(nostack))
+            in("x2") handles.len(), in("x3") budget, in("x4") priority, in("x5") args.as_ptr(),
+            in("x6") args.len(), in("x8") 6, options(nostack))
     };
     result
+}
+
+/// Runs `main` with the arguments `spawn` passed and exits with its result: `_start` receives x0 = their count, x1 =
+/// their address, x2 = their length (0, none, for a process spawned at boot), and passes the count and length here.
+pub fn start(argc: usize, len: usize, main: fn(&[&[u8]]) -> u64) -> ! {
+    let len = len.min(4096);
+    // SAFETY: the kernel copies the arguments to the end of the top stack page, which stays mapped; `len` fits in it.
+    let bytes = unsafe { core::slice::from_raw_parts((STACK_TOP - len) as *const u8, len) };
+    let mut args: [&[u8]; MAX_ARGS] = [&[]; MAX_ARGS];
+    for (arg, bytes) in args.iter_mut().zip(bytes.split(|&b| b == 0)) {
+        *arg = bytes;
+    }
+    exit(main(&args[..argc.min(MAX_ARGS)]))
 }
 
 /// Returns the read end (or an error) and the write end.
