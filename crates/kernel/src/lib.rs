@@ -19,8 +19,11 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::Write;
 use core::ops::Range;
+use core::sync::atomic::AtomicUsize;
+use core::sync::atomic::Ordering::Relaxed;
 
 use dtb::Dtb;
+use handle::{INIT_ARCHIVE, Rights, SHELL_ARCHIVE};
 use mm::{FrameAllocator, PhysAddr};
 
 /// What the kernel needs from the hardware; each board implements it.
@@ -58,10 +61,16 @@ pub trait Board {
     /// its tables, pages and kernel stack, and init's handles (`Handles::init`), at priority 0 like the boot context;
     /// `ENOMEM` or `EAGAIN` (no free slot).
     fn spawn_user(&mut self, program: Program, budget: usize) -> Result<(), i64>;
-    /// As `spawn_user`, for the boot archive's executable `name`, at the top priority (`PRIORITIES - 1`), with `args`
-    /// as `spawn` passes them (each ending in a NUL); `ENOENT` or `ENOEXEC` if it is missing or invalid, `E2BIG` or
-    /// `EINVAL` for bad `args`.
-    fn spawn_archived(&mut self, name: &str, budget: usize, args: &[u8]) -> Result<(), i64>;
+    /// As `spawn_user`, for the boot archive's executable `name`, at the top priority (`PRIORITIES - 1`), its archive
+    /// handle with `archive`, with `args` as `spawn` passes them (each ending in a NUL); `ENOENT` or `ENOEXEC` if it is
+    /// missing or invalid, `E2BIG` or `EINVAL` for bad `args`.
+    fn spawn_archived(
+        &mut self,
+        name: &str,
+        budget: usize,
+        archive: Rights,
+        args: &[u8],
+    ) -> Result<(), i64>;
     /// Tasks in the run queue, the boot context included.
     fn tasks(&self) -> usize;
     /// The board's block device, set up with memory from the frame allocator; call once, after `init_frames`.
@@ -69,6 +78,11 @@ pub trait Board {
     /// Mounts the MogFS on `disk` as the board's file system; once it is mounted, every process spawned from boot
     /// context also gets its root directory (read, write, duplicate, transfer) as handle 3. Never formats.
     fn mount(&mut self, disk: Self::Disk) -> Result<(), mogfs::Error>;
+    /// Makes `n` uncontended acquire + release round trips on a ticket lock like the board's kernel lock (`ticket`),
+    /// or on a test-and-set lock.
+    fn lock_round_trips(&mut self, n: u64, ticket: bool);
+    /// Adds 1 to a counter `n` times, taking a board `Lock` (the kind `KERNEL` is) for each; returns the counter.
+    fn add_locked(&mut self, n: u64) -> u64;
 }
 
 /// Hand-written asm user programs the board provides; newer ones are ELF files in the boot archive.
@@ -92,6 +106,10 @@ pub enum Program {
 
 /// Round trips timed by `test=bench`.
 const BENCH_YIELDS: u64 = 100_000;
+/// Round trips per lock timed by `test=bench-lock`, and the additions each of its two adders makes.
+const BENCH_LOCKS: u64 = 10_000_000;
+/// `test=bench-lock`'s adders that are done.
+static ADDERS_DONE: AtomicUsize = AtomicUsize::new(0);
 /// Round trips the boot archive's `ping` makes with `pong` under `test=bench-pipe`; must equal its `ROUND_TRIPS`.
 const PIPE_ROUND_TRIPS: u64 = 100_000;
 /// Blocks `test=bench-disk` writes and reads (8 MiB); the disk must hold at least this many.
@@ -105,6 +123,8 @@ pub const FRAME_WORDS: usize = 512;
 const HEAP_FRAMES: usize = 256;
 /// Each boot-spawned process's budget in frames; a process moves part of its own to each child it spawns.
 const BOOT_BUDGET: usize = 25;
+/// msh's 25 and the 2048 it gives `sh` (busybox) and the C programs `sh` spawns.
+const SHELL_BUDGET: usize = BOOT_BUDGET + 2048;
 /// `waiter`'s 9 frames and its two children's 9 and 10 at once.
 const WAITER_BUDGET: usize = 28;
 /// `pi`'s 9 frames, its two pipes' pages and its three children's 9 each.
@@ -114,8 +134,6 @@ const PI_BUDGET: usize = 38;
 const FUZZ_BUDGET: usize = 8192;
 /// `sysbench`'s own frames, its 11 batches of 64 `map`ped pages that it never returns, its pipes and 4 `nop` children.
 const SYSBENCH_BUDGET: usize = 1024;
-/// msh's budget with its argument page.
-const SHELL_BENCH_BUDGET: usize = BOOT_BUDGET + 1;
 /// Times msh runs `SHELL_BENCH` under `test=bench-shell`.
 const SHELL_ROUNDS: usize = 5;
 /// msh's arguments under `test=bench-shell`: the command lines it times, on the fixtures `shellsetup` makes.
@@ -123,13 +141,14 @@ const SHELL_BENCH: &[u8] = b"msh\0ls d1\0ls d100\0ls d390\0cat small\0cat big\0w
 
 /// `reserved` lists physical ranges in use (kernel image, DTB).
 pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> ! {
+    // First: console writes and traps take locks, whose atomics need the MMU on.
+    board.enable_mmu();
     let el = board.exception_level();
     let _ = writeln!(board.console(), "MogOs: hello from EL{el}");
 
     board.breakpoint_self_test();
     let _ = writeln!(board.console(), "exceptions: ok");
 
-    board.enable_mmu();
     let _ = writeln!(board.console(), "mmu: on");
     let bootargs = dtb.bootargs().unwrap_or_default();
     if bootargs.split_whitespace().any(|a| a == "test=mmu-fault") {
@@ -183,23 +202,34 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
             "test=user" => user_demo(board),
             "test=bench-syscall" => run_alone(board, Program::SyscallBench),
             "test=handles" => run_alone(board, Program::Handles),
-            "test=spawn" => run_archived(board, "spawn", "spawner", BOOT_BUDGET),
-            "test=pipe" => run_archived(board, "pipe", "reader", BOOT_BUDGET),
-            "test=wait" => run_archived(board, "wait", "waiter", WAITER_BUDGET),
-            "test=echo" => run_archived(board, "echo", "readlines", BOOT_BUDGET),
-            "test=shell" => run_archived(board, "shell", "msh", BOOT_BUDGET),
-            "test=bench-fs" => run_archived(board, "bench-fs", "fsbench", BOOT_BUDGET),
-            "test=bench-spawn" => run_archived(board, "bench-spawn", "spawnbench", BOOT_BUDGET),
+            "test=spawn" => run_archived(board, "spawn", "spawner", (BOOT_BUDGET, INIT_ARCHIVE)),
+            "test=pipe" => run_archived(board, "pipe", "reader", (BOOT_BUDGET, INIT_ARCHIVE)),
+            "test=wait" => run_archived(board, "wait", "waiter", (WAITER_BUDGET, INIT_ARCHIVE)),
+            "test=echo" => run_archived(board, "echo", "readlines", (BOOT_BUDGET, INIT_ARCHIVE)),
+            "test=shell" => run_archived(board, "shell", "msh", (SHELL_BUDGET, SHELL_ARCHIVE)),
+            "test=bench-fs" => {
+                run_archived(board, "bench-fs", "fsbench", (BOOT_BUDGET, INIT_ARCHIVE))
+            }
+            "test=bench-spawn" => run_archived(
+                board,
+                "bench-spawn",
+                "spawnbench",
+                (BOOT_BUDGET, INIT_ARCHIVE),
+            ),
             "test=pi" => {
                 board.start_timer();
-                run_archived(board, "pi", "pi", PI_BUDGET);
+                run_archived(board, "pi", "pi", (PI_BUDGET, INIT_ARCHIVE));
             }
             "test=bench-pipe" => pipe_bench(board),
+            "test=bench-lock" => lock_bench(board),
             "test=fuzz" => fuzz(board, bootargs),
             "test=bench-shell" => shell_bench(board),
-            "test=bench-syscalls" => {
-                run_archived(board, "bench-syscalls", "sysbench", SYSBENCH_BUDGET)
-            }
+            "test=bench-syscalls" => run_archived(
+                board,
+                "bench-syscalls",
+                "sysbench",
+                (SYSBENCH_BUDGET, INIT_ARCHIVE),
+            ),
             "test=budget" => {
                 let before = board.free_frames();
                 run_alone(board, Program::Budget);
@@ -284,9 +314,16 @@ fn user_demo<B: Board>(board: &mut B) {
 
 /// Runs the boot archive's `program` with `budget` frames until every task has exited; prints the free frames before
 /// and after as `<test>: free frames <n> before, <n> after`.
-fn run_archived<B: Board>(board: &mut B, test: &str, program: &str, budget: usize) {
+fn run_archived<B: Board>(
+    board: &mut B,
+    test: &str,
+    program: &str,
+    (budget, archive): (usize, Rights),
+) {
     let before = board.free_frames();
-    board.spawn_archived(program, budget, &[]).expect("spawn");
+    board
+        .spawn_archived(program, budget, archive, &[])
+        .expect("spawn");
     wait(board);
     let after = board.free_frames();
     let _ = writeln!(
@@ -320,7 +357,7 @@ fn fuzz<B: Board>(board: &mut B, bootargs: &str) {
     }
     run_checked(board, "fuzz", |board| {
         board
-            .spawn_archived("fuzz", FUZZ_BUDGET, &args)
+            .spawn_archived("fuzz", FUZZ_BUDGET, INIT_ARCHIVE, &args)
             .expect("spawn")
     });
 }
@@ -329,12 +366,12 @@ fn fuzz<B: Board>(board: &mut B, bootargs: &str) {
 fn shell_bench<B: Board>(board: &mut B) {
     run_checked(board, "bench-shell", |board| {
         board
-            .spawn_archived("shellsetup", BOOT_BUDGET, &[])
+            .spawn_archived("shellsetup", BOOT_BUDGET, INIT_ARCHIVE, &[])
             .expect("spawn");
         wait(board);
         for _ in 0..SHELL_ROUNDS {
             board
-                .spawn_archived("msh", SHELL_BENCH_BUDGET, SHELL_BENCH)
+                .spawn_archived("msh", SHELL_BUDGET, SHELL_ARCHIVE, SHELL_BENCH)
                 .expect("spawn");
             wait(board);
         }
@@ -372,11 +409,40 @@ fn yield_bench<B: Board>(board: &mut B) {
 fn pipe_bench<B: Board>(board: &mut B) {
     let start = board.uptime_us();
     board
-        .spawn_archived("ping", BOOT_BUDGET, &[])
+        .spawn_archived("ping", BOOT_BUDGET, INIT_ARCHIVE, &[])
         .expect("spawn");
     wait(board);
     let ns = (board.uptime_us() - start) * 1000 / PIPE_ROUND_TRIPS;
     let _ = writeln!(board.console(), "pipe: {ns} ns/round-trip");
+}
+
+/// Times uncontended acquire + release of the ticket and the test-and-set lock; then two tasks, preempted by the timer,
+/// each add `BENCH_LOCKS` to a counter under the board's lock, and the total must be exact.
+fn lock_bench<B: Board>(board: &mut B) {
+    for (name, ticket) in [("ticket", true), ("test-and-set", false)] {
+        let start = board.uptime_us();
+        board.lock_round_trips(BENCH_LOCKS, ticket);
+        let tenths = (board.uptime_us() - start) * 10_000 / BENCH_LOCKS;
+        let (ns, tenth) = (tenths / 10, tenths % 10);
+        let _ = writeln!(board.console(), "lock: {name} {ns}.{tenth} ns/round-trip");
+    }
+    board.spawn(add_and_yield, 0).expect("spawn");
+    board.spawn(add_and_yield, 0).expect("spawn");
+    board.start_timer();
+    while ADDERS_DONE.load(Relaxed) < 2 {
+        board.idle();
+    }
+    let count = board.add_locked(0);
+    let _ = writeln!(board.console(), "lock: count {count}");
+}
+
+fn add_and_yield<B: Board>(board: &mut B, _: usize) -> ! {
+    let count = board.add_locked(BENCH_LOCKS);
+    let _ = writeln!(board.console(), "lock: adder done at {count}");
+    ADDERS_DONE.fetch_add(1, Relaxed);
+    loop {
+        board.yield_now();
+    }
 }
 
 fn yield_forever<B: Board>(board: &mut B, _: usize) -> ! {

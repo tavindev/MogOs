@@ -46,11 +46,6 @@ impl<'a> Dtb<'a> {
         })
     }
 
-    /// Base address of the first top-level node compatible with `arm,pl011`.
-    pub fn uart(&self) -> Option<PhysAddr> {
-        Some(PhysAddr(self.reg_of(b"arm,pl011")?.reg(0)?.0))
-    }
-
     /// Distributor and CPU interface bases of the first top-level GICv2 (`arm,cortex-a15-gic`).
     pub fn gic(&self) -> Option<(PhysAddr, PhysAddr)> {
         let reg = self.reg_of(b"arm,cortex-a15-gic")?;

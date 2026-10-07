@@ -39,7 +39,7 @@ Every new `.md` file must be linked from its parent so it stays reachable from t
 
 - Build: `cargo build`
 - Run in QEMU: `cargo run` (prints to the terminal via PL011 UART, exits via PSCI `SYSTEM_OFF`)
-- Shell on a persistent disk: `[ -f disk.img ] || cargo mkfs; cargo shell` (msh builtins `cd`, `pwd`, `exit`, `help`; programs `ls`, `mkdir`, `touch`, `write`, `cat`, `rm`, `mv`, `echo`, `sync`)
+- Shell on a persistent disk: `[ -f disk.img ] || cargo mkfs; cargo shell` (msh builtins `cd`, `pwd`, `exit`, `help`; programs `ls`, `mkdir`, `touch`, `write`, `cat`, `rm`, `mv`, `echo`, `sync`, and `sh`: busybox on musl)
 - Run in a QEMU window: `cargo window` (mouse stays free; Ctrl+Option+G releases a grab)
 - Quit a hung QEMU: `Ctrl-A` then `X`
 - Test: `cargo test-host` (host tests, `crates/user`'s included, plus the QEMU boot tests in `crates/e2e`; must pass)
@@ -54,10 +54,12 @@ Every new `.md` file must be linked from its parent so it stays reachable from t
 - `crates/mm` ([CLAUDE.md](crates/mm/CLAUDE.md)) — arch-independent memory management (`PhysAddr`, frame allocator). Safe, host-tested.
 - `crates/dtb` ([CLAUDE.md](crates/dtb/CLAUDE.md)) — minimal FDT parser. Safe, host-tested.
 - `crates/mogfs` ([CLAUDE.md](crates/mogfs/CLAUDE.md)) — MogFS: checksummed copy-on-write file system over a `Disk` trait (format at the top of `src/lib.rs`). Safe, `no_std`, host-tested; `examples/mkfs.rs` writes an empty image.
-- `crates/arch` ([CLAUDE.md](crates/arch/CLAUDE.md)) — the only arch-specific crate, `unsafe` allowed; AArch64 code in `src/aarch64/` (boot, traps, MMU and page tables, GICv2, timer).
+- `crates/net` ([CLAUDE.md](crates/net/CLAUDE.md)) — network stack over a `Nic` trait: Ethernet, ARP, IPv4, ICMP echo, UDP, in caller-supplied memory with time as an input. Safe, `no_std`, host-tested over a seeded simulated link (`tests/sim/mod.rs`).
+- `crates/arch` ([CLAUDE.md](crates/arch/CLAUDE.md)) — the only arch-specific crate, `unsafe` allowed; AArch64 code in `src/aarch64/` (boot, traps, MMU and page tables, GICv2, timer, the lock and per-CPU primitives).
 - `crates/board/qemu-virt` ([CLAUDE.md](crates/board/qemu-virt/CLAUDE.md)) — board crate, `unsafe` allowed: drivers, memory map, `linker.ld`, `#[global_allocator]`, trap hooks (switch, syscall, fault), process setup and ELF loading, asm user programs (`user.s`); builds the `mog_os` binary. Its `build.rs` builds `crates/user` and bundles the programs as the boot archive (cpio).
 - `crates/user` ([CLAUDE.md](crates/user/CLAUDE.md)) — user programs (`src/bin/*.rs`, static ELFs at 4 GiB via `link.ld`) and their syscall stubs (`src/lib.rs`); user space, outside the workspace, `unsafe` only for `svc`.
 - `crates/e2e` ([CLAUDE.md](crates/e2e/CLAUDE.md)) — host-only QEMU boot tests (`tests/boot.rs`).
+- `c` ([CLAUDE.md](c/CLAUDE.md)) — the C userland: musl with the MogOs syscall layer (`c/musl`), busybox, C test programs; `c/Makefile`, run by the board's `build.rs`, fetches the pinned sources and builds into one cache shared by every worktree (the main checkout's `target/c-cache`, keyed by a hash of the inputs); `target/c` links to it.
 - `.cargo/config.toml` — default target, build/link thread caps, QEMU runners.
 - `scripts/bench.sh` — boots kernels under hvf and prints each `bench` line's median and min, base vs new interleaved.
 

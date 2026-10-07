@@ -3,9 +3,11 @@
 ## What this crate is
 
 The adapter that implements `kernel::Board` for QEMU `virt` and owns everything stateful and unsafe outside
-`crates/arch`: `kmain`, the PL011 driver (`src/uart.rs`), the virtio-blk driver (`src/virtio_blk.rs`), the global kernel state, the `#[global_allocator]`, the
-trap hooks, process construction and ELF loading, the asm test programs (`src/user.s`), `linker.ld`, and `build.rs`,
-which builds `crates/user` and bundles it as the boot archive.
+`crates/arch`: `kmain`, the global kernel state, the `#[global_allocator]` and the `Board` impl (`src/main.rs`), the
+PL011 driver (`src/uart.rs`), the virtio-blk driver (`src/virtio_blk.rs`), the trap hooks (`src/trap.rs`), process
+construction and ELF loading (`src/process.rs`), user-pointer checks (`src/usermem.rs`), the file system's disk
+(`src/fs.rs`), the asm test programs (`src/user.s`), `linker.ld`, and `build.rs`, which builds `crates/user` and
+bundles it as the boot archive.
 
 It is **NOT** where scheduling, handle, pipe, mutex or syscall-decoding logic lives (`crates/kernel`), nor raw
 AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe, host-testable code.
@@ -13,12 +15,14 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
 ## Responsibilities
 
 - `kmain`: reads the DTB at RAM base, builds `QemuVirt`, calls `kernel::run` with the image and DTB reserved.
-- `KERNEL` (`Scheduler`, `FrameAllocator`, `Pipes`, `Mutexes`, console `Line`, the MogFS `Fs<FsDisk>` and whether it
-  is mounted) and `HEAP` statics. `Fs::new` is const, so the 48 KiB file system is built in the static with an empty
-  `FsDisk(None)` (`Io` until `Board::mount` puts the `VirtioBlk` in through `Fs::disk`). File syscalls run their disk I/O inside the trap with IRQs masked: a `sync` holds the core
+- `KERNEL: Lock<Kernel>` (`Scheduler`, `FrameAllocator`, `Pipes`, `Mutexes`, console `Line`, the MogFS `Fs<FsDisk>`
+  and whether it is mounted), `HEAP` and `CONSOLE: Lock<Uart>` statics. `Fs::new` is const, so the 48 KiB file system is built in the static with an empty
+  `FsDisk(None)` (`Io` until `Board::mount` puts the `VirtioBlk` in through `Fs::disk`). File syscalls run their disk I/O inside the trap under `KERNEL`: a `sync` holds it
   for its writes and two flushes. Boot-spawned processes get the root directory as handle 3 once mounted (`spawn_init`).
 - Trap hooks `task_switch`, `board_irq`, `board_syscall`, `board_user_fault`: execute the `kernel::syscall::Call`
-  that `dispatch` returns (user buffers, pages, frames, wake/block).
+  that `dispatch` returns (user buffers, pages, frames, wake/block). `board_unlock`, called by the trap exit, releases `KERNEL`.
+- `Board::console` writes (`Console`) hold `CONSOLE` for a whole `write_fmt`, so a line is never split; it is the PL011
+  at `UART0`, like every other UART access. `test=bench-lock`'s `lock_round_trips` (ticket vs test-and-set) and `add_locked`.
 - Processes: `spawn_process`, `spawn`, `task_exit`, `kill`, `map`, `release`, `enter` (TTBR0/ASID switch).
 - `VirtioBlk` (`src/virtio_blk.rs`) implements `kernel::Disk` (`mogfs::Disk`): modern (version 2) virtio-mmio only,
   one 4-entry queue in one frame, one request in flight, completion polled (no IRQ), DMA straight to the caller's
@@ -26,16 +30,17 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
   failure is `mogfs::Error::Io`. `Board::disk` hands it out
   once (`DISK_TAKEN`), scanning QEMU `virt`'s fixed virtio-mmio transports from the highest down and stopping at the first empty one
   (QEMU `virt` fills them from the top with no gaps; a board fact like `UART_IRQ`).
-- `build.rs`: nested `cargo build` of `crates/user` into `target/user`, newc `boot.cpio` into `OUT_DIR` (plus a
-  non-ELF `bad` entry), `-T linker.ld`. Why it is built this way: `docs/DEVELOPMENT.md` settings table.
+- `build.rs`: nested `cargo build` of `crates/user` into `target/user`, `make -C c` (musl, busybox and the C
+  programs into `target/c`, `c/CLAUDE.md`), newc `boot.cpio` into `OUT_DIR` (every user program, busybox as `sh`,
+  `hello`, `cbench`, plus a non-ELF `bad` entry), `-T linker.ld`. Why it is built this way: `docs/DEVELOPMENT.md` settings table.
 
 ## Boundaries (hard)
 
 - `#![no_std]`, `#![no_main]`. Deps: `arch`, `dtb`, `kernel`, `mm`, `mogfs` (its `Error`), `linked_list_allocator` (no features).
 - Opts out of `forbid(unsafe_code)` (lints: `docs/DEVELOPMENT.md` settings table); every `unsafe` block has a one-line
   `// SAFETY:` and every `unsafe fn` a `# Safety` section.
-- Depends on `kernel`, never the reverse. UART, GIC and RAM come from the DTB; board constants fix the rest:
-  `UART0` (user `write`, panic and fault output), `DTB` (RAM base), `KERNEL_L1` (GiB 0 device, GiB 1 RAM),
+- Depends on `kernel`, never the reverse. GIC and RAM come from the DTB; board constants fix the rest:
+  `UART0` (the PL011 at `0x0900_0000`: all console output and input, never read from the DTB), `DTB` (RAM base), `KERNEL_L1` (GiB 0 device, GiB 1 RAM),
   `UNMAPPED`, `TIMER_IRQ` (27), `VIRTIO`, `VIRTIO_STRIDE`, `VIRTIO_COUNT` (32 virtio-mmio transports from `0x0a00_0000`, `0x200` apart), the PSCI call. QEMU runs with
   `-global virtio-mmio.force-legacy=false` (the driver rejects legacy) and `-global virtio-mmio.ioeventfd=off`
   (`docs/DEVELOPMENT.md` settings table).
@@ -50,12 +55,18 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
 
 ## Invariants & rules
 
-- `KERNEL` and `HEAP` are `UnsafeCell` globals touched only with IRQs masked on the one core; trap hooks are entered
-  masked, `Board` methods wrap access in `arch::irq::disable` / `restore`. Every `// SAFETY` that touches them rests on this.
+- Kernel state is reached only through `arch::Lock`s: `KERNEL` (the big lock), then `HEAP` or `CONSOLE` (leaves,
+  nothing taken under them); never another order. Every trap hook takes `KERNEL` with `lock_masked` and returns holding
+  it (`Guard::leak`); the trap exit releases it once, after `mov sp, x0`, through `board_unlock`, so no core resumes a
+  task whose kernel stack another core still runs on. `breakpoint_self_test` takes it before its `brk`. `Board`
+  methods take `lock()` guards and never hold one across a switch (`run_others` drops it before `yield_now`). Panic,
+  fault, echo and user `write` output use `UART0` directly, never `CONSOLE`.
+- Locks need the MMU on (exclusives), so `kernel::run` calls `enable_mmu` first, before any output or trap.
 - A process's slot is its ASID (`MAX_TASKS <= 256`, const-asserted); the boot table keeps ASID 0 (`enter`).
 - Every frame a process uses (tables, pages, kernel stack, pipe pages it creates) is charged to its `Budget`;
   `spawn_process` returns every frame on failure, `spawn` moves nothing on failure.
-- `task_exit` frees the kernel stack it runs on: sound only while nothing allocates before the trap returns.
+- `task_exit` frees the kernel stack it runs on: sound because the frames are back in `KERNEL`'s allocator, which no
+  core can reach until the trap exit has left that stack and released `KERNEL`.
 - A blocking call rewinds its `svc` (`block` calls `TrapFrame::restart`) and reruns when woken.
 - User memory is read only through `user_bytes` / `user_bytes_mut`, which probe every page with
   `arch::user_readable` / `user_writable`; slices live only until the trap returns.
@@ -74,8 +85,8 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
 - Every scenario in `crates/e2e/tests/boot.rs` boots this binary; run one with
   `cargo test --target aarch64-apple-darwin -p e2e -- <test name>`. Manual: `cargo run -- -append test=<name>`
   (list in `docs/DEVELOPMENT.md`).
-- `cargo build`, `cargo clippy` clean. Hot paths (`switch`, `board_syscall`, pipes) report `test=bench`,
-  `test=bench-syscall`, `test=bench-pipe` numbers (`docs/BENCHMARKS.md`).
+- `cargo build`, `cargo clippy` clean. Hot paths (`switch`, `board_syscall`, pipes, the lock) report `test=bench`,
+  `test=bench-syscall`, `test=bench-pipe`, `test=bench-lock` numbers (`docs/BENCHMARKS.md`).
 
 ---
 

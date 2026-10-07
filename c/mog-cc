@@ -1,0 +1,21 @@
+#!/bin/sh
+# clang for MogOs programs: our musl's headers, soft-float, and (unless only compiling) a static link at 4 GiB with
+# rust-lld. The Makefile exports the MOG_* variables.
+mode=link
+for arg; do
+	case $arg in
+	-c|-S|-E|-M|-MM) mode=compile ;;
+	-r) mode=partial ;;
+	esac
+done
+cc="$MOG_CLANG $MOG_CFLAGS -nostdinc -isystem $MOG_SYSROOT/include"
+# rust-lld loads the toolchain's libLLVM.dylib, as rustc arranges when it links; set here since SIP drops DYLD_*
+# variables passed through /bin/sh.
+export DYLD_FALLBACK_LIBRARY_PATH="$MOG_DYLIBS"
+ld="-nostdlib -fuse-ld=lld --ld-path=$MOG_LD"
+case $mode in
+compile) exec $cc "$@" ;;
+partial) exec $cc $ld "$@" ;;
+esac
+exec $cc $ld -static -L"$MOG_SYSROOT/lib" -Wl,-T,"$MOG_LINK" -Wl,-zmax-page-size=4096 -Wl,-znorelro \
+	"$MOG_SYSROOT/lib/crt1.o" "$@" "$MOG_SYSROOT/lib/libc.a" "$MOG_BUILTINS"

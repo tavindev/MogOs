@@ -30,6 +30,16 @@ fn main() {
         .unwrap();
     assert!(status.success(), "user programs failed to build");
 
+    // musl, busybox and the C programs (`c/Makefile`, a cache shared by every worktree); `target/c` links to them.
+    println!("cargo:rerun-if-changed={}", root.join("c").display());
+    let c_out = root.join("target/c");
+    let status = Command::new("make")
+        .args(["-j3", "-C"])
+        .arg(root.join("c"))
+        .status()
+        .unwrap();
+    assert!(status.success(), "C programs failed to build");
+
     let bin = target_dir.join("aarch64-unknown-none-softfloat/release");
     // The boot archive's files: every `crates/user` program, sorted so the archive is reproducible, plus a non-ELF.
     let mut files: Vec<_> = fs::read_dir(user.join("src/bin"))
@@ -41,6 +51,10 @@ fn main() {
             (name, data)
         })
         .collect();
+    // busybox goes in as `sh`, the path its applets re-exec (`CONFIG_BUSYBOX_EXEC_PATH`).
+    for (name, file) in [("sh", "busybox"), ("hello", "hello"), ("cbench", "cbench")] {
+        files.push((name.into(), fs::read(c_out.join("bin").join(file)).unwrap()));
+    }
     files.sort();
     files.push(("bad".into(), b"not an ELF".to_vec()));
     let out = Path::new(&env::var("OUT_DIR").unwrap()).join("boot.cpio");

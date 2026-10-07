@@ -10,7 +10,7 @@ touches memory through raw addresses: the board reads user buffers, copies pages
 
 ## Responsibilities
 
-- `Board` trait and `Program` enum (`src/lib.rs`); `run` drives boot and the `test=*` bootargs scenarios.
+- `Board` trait and `Program` enum (`src/lib.rs`); `run` drives boot and the `test=*` bootargs scenarios, enabling the MMU first (the board's locks need it). The crate has no lock: its tables are plain data the board keeps under its big lock.
 - `Disk` and `BLOCK_SIZE` (4096) are `mogfs`'s, re-exported (`src/lib.rs`): synchronous `read`/`write` of
   consecutive blocks, `flush`, `blocks`; every failure is `mogfs::Error::Io`. `Board::disk` is called once in `run`,
   then `Board::mount` (except under `test=disk` and `test=bench-disk`, which keep the raw device), both before the
@@ -61,7 +61,7 @@ touches memory through raw addresses: the board reads user buffers, copies pages
 - Pipes and mutexes: entry reached by `index` + `generation`, counted handles, freed when the count hits zero.
   `End::index` and `Mutex::index` are `u32` so copying an `Object` stays a plain move on the syscall path.
 - Pipe writes are all-or-nothing (`Pipe::write`); `MAX_BUFFER <= pipe::SIZE` is const-asserted in `src/syscall.rs`.
-- `MAX_BUFFER` (4 KiB) and `MAX_MAP` (16 pages) bound the work a syscall does with IRQs masked; `user_buffer` checks
+- `MAX_BUFFER` (4 KiB) and `MAX_MAP` (16 pages) bound the work a syscall does under the board's big lock (IRQs masked); `user_buffer` checks
   every user range lies in `USER` (4 GiB..512 GiB).
 - Errors are negated musl errno values; `KILLED` (256) sits outside `exit`'s 0..=255.
 - Syscalls 0-17 (`src/syscall.rs` docs): exit, io_submit_wait, dup, close, map, open, spawn, pipe, wait, mutex, lock,
@@ -76,7 +76,7 @@ touches memory through raw addresses: the board reads user buffers, copies pages
 - Paths resolve only below a directory handle: each component goes through `mogfs::lookup`, which rejects `.`, `..`
   and empty names, so `../x` and `/x` are `EINVAL`. Trust note: a crafted image can point an entry at `ROOT` or an
   ancestor, so a subdirectory handle may reach the root and the tree may cycle; nothing in the kernel recurses over
-  the tree. File syscalls do their disk work with IRQs masked, so each is bounded: a path has at most
+  the tree. File syscalls do their disk work under the big lock with IRQs masked, so each is bounded: a path has at most
   `file::MAX_DEPTH` (16) components (`ENAMETOOLONG`), a lookup or a `readdir` scan reads at most a directory's 14
   blocks, a `readdir` call lists at most 64 entries, and file I/O moves at most `MAX_BUFFER`. Worst case: `open(CREATE)`
   on a 16-component path of full directories is about 240 block requests, about 5 ms with IRQs masked. A
@@ -84,7 +84,10 @@ touches memory through raw addresses: the board reads user buffers, copies pages
   the whole tree: about 500 requests, about 10.5 ms with IRQs masked, on a well-formed image (each directory read
   once), and about 7000, about 150 ms, on a crafted one (504 directories of 14 blocks each).
 - `Elf::parse` accepts only page-aligned, address-ordered, in-region `PT_LOAD`s, never W+X, entry in an executable one.
-- `BOOT_BUDGET`, `WAITER_BUDGET`, `PI_BUDGET`, `FUZZ_BUDGET`, `SYSBENCH_BUDGET`, `SHELL_BENCH_BUDGET` are sized to the user programs' frame needs: too small and `run`'s
+- init's handles (`Handles::init`): 0 console (read, write, duplicate, transfer), 1 itself (kill), 2 the boot archive
+  with `INIT_ARCHIVE` (read, exec); only msh (`test=shell`, `test=bench-shell`) gets `SHELL_ARCHIVE` (also duplicate, transfer), since it
+  hands the archive to `sh`, which spawns from it. Every other init can neither copy nor pass it on.
+- `BOOT_BUDGET`, `SHELL_BUDGET` (`test=shell`: msh's 25 frames and the 2048 it gives `sh`), `WAITER_BUDGET`, `PI_BUDGET`, `FUZZ_BUDGET`, `SYSBENCH_BUDGET` are sized to the user programs' frame needs: too small and `run`'s
   `expect("spawn")` panics. `PIPE_ROUND_TRIPS` must equal `ROUND_TRIPS` in `crates/user/src/bin/ping.rs`; a mismatch
   only prints a wrong `pipe:` number, nothing fails.
 - Performance is the moat: a slowdown is never accepted because it has an explanation; it is removed, or shown to

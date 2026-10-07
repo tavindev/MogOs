@@ -11,6 +11,7 @@ pub const READ: u64 = 1 << 0;
 pub const WRITE: u64 = 1 << 1;
 pub const DUPLICATE: u64 = 1 << 3;
 pub const TRANSFER: u64 = 1 << 4;
+pub const EXEC: u64 = 1 << 5;
 
 /// `open` flags: create a missing file; empty the file.
 pub const CREATE: u64 = 1 << 0;
@@ -322,10 +323,13 @@ pub enum Grant {
     Target(u64),
     /// The parent directory of each of the first `n` arguments, which go to the program as their last components.
     Parents(u64, usize),
+    /// A C program on musl: the console (read and write) as stdin, stdout and stderr, the root and the boot archive
+    /// (handles 0-4, each also duplicate), and `<argc> /<cwd>` before the arguments.
+    Posix,
 }
 
 /// The programs msh runs, each with only what its job needs (least privilege, `crates/user/CLAUDE.md`).
-pub const COMMANDS: [(&[u8], Grant); 9] = [
+pub const COMMANDS: [(&[u8], Grant); 10] = [
     (b"cat", Grant::Target(READ)),
     (b"ls", Grant::Target(READ)),
     (b"echo", Grant::Console),
@@ -335,6 +339,7 @@ pub const COMMANDS: [(&[u8], Grant); 9] = [
     (b"touch", Grant::Parents(READ | WRITE, 1)),
     (b"write", Grant::Parents(READ | WRITE, 1)),
     (b"mv", Grant::Parents(WRITE, 2)),
+    (b"sh", Grant::Posix),
 ];
 
 /// What msh grants the command `name`; `None` if msh does not run it.
@@ -359,6 +364,7 @@ mod tests {
             ("touch", Some(Grant::Parents(READ | WRITE, 1))),
             ("write", Some(Grant::Parents(READ | WRITE, 1))),
             ("mv", Some(Grant::Parents(WRITE, 2))),
+            ("sh", Some(Grant::Posix)),
             ("msh", None),
             ("mid", None),
             ("child", None),
@@ -366,6 +372,6 @@ mod tests {
         for (name, grant_) in expected {
             assert_eq!(grant(name.as_bytes()), grant_, "{name}");
         }
-        assert_eq!(COMMANDS.len(), 9);
+        assert_eq!(COMMANDS.len(), 10);
     }
 }

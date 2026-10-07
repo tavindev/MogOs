@@ -1,9 +1,9 @@
-use kernel::handle::{DUPLICATE, Handles, KILL, MAP, MAX_HANDLES, Object, WRITE};
+use kernel::handle::{DUPLICATE, Handles, INIT_ARCHIVE, KILL, MAP, MAX_HANDLES, Object, WRITE};
 use kernel::syscall::{EACCES, EBADF, EMFILE};
 
 #[test]
 fn closed_handle_and_its_reused_entry_reject_the_old_value() {
-    let mut handles = Handles::init(1, 1);
+    let mut handles = Handles::init(1, 1, INIT_ARCHIVE);
     let old = handles.dup(0, WRITE).unwrap().0;
     handles.close(old).unwrap();
     assert_eq!(handles.get(old, WRITE), Err(EBADF));
@@ -21,7 +21,7 @@ fn closed_handle_and_its_reused_entry_reject_the_old_value() {
 
 #[test]
 fn dup_fails_when_the_table_is_full() {
-    let mut handles = Handles::init(1, 1);
+    let mut handles = Handles::init(1, 1, INIT_ARCHIVE);
     for _ in 3..MAX_HANDLES {
         handles.dup(0, WRITE).unwrap();
     }
@@ -37,7 +37,7 @@ fn dup_fails_when_the_table_is_full() {
 
 #[test]
 fn dup_rights_must_be_a_subset_and_need_duplicate() {
-    let mut handles = Handles::init(1, 1);
+    let mut handles = Handles::init(1, 1, INIT_ARCHIVE);
     assert_eq!(handles.dup(0, WRITE | MAP), Err(EACCES));
     assert_eq!(handles.dup(0, 1 << 40), Err(EACCES));
     let no_write = handles.dup(0, DUPLICATE).unwrap().0;
@@ -49,7 +49,7 @@ fn dup_rights_must_be_a_subset_and_need_duplicate() {
 
 #[test]
 fn split_moves_transferable_handles_or_nothing() {
-    let handles = Handles::init(1, 1);
+    let handles = Handles::init(1, 1, INIT_ARCHIVE);
     let (rest, moved) = handles.split(&[0]).unwrap();
     assert_eq!(rest.get(0, WRITE), Err(EBADF), "moved out");
     assert_eq!(moved.get(0, WRITE), Ok(Object::Console));
