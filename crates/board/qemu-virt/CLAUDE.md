@@ -17,9 +17,10 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
 - Trap hooks `task_switch`, `board_irq`, `board_syscall`, `board_user_fault`: execute the `kernel::syscall::Call`
   that `dispatch` returns (user buffers, pages, frames, wake/block).
 - Processes: `spawn_process`, `spawn`, `task_exit`, `kill`, `map`, `release`, `enter` (TTBR0/ASID switch).
-- `VirtioBlk` (`src/virtio_blk.rs`) implements `kernel::Disk`: modern (version 2) virtio-mmio only, one 4-entry
-  queue in one frame, one request in flight, completion polled (no IRQ), DMA straight to the caller's blocks (only
-  inside the identity-mapped RAM GiB, else `EFAULT`), requests past the capacity `EIO`. `Board::disk` hands it out
+- `VirtioBlk` (`src/virtio_blk.rs`) implements `kernel::Disk` (`mogfs::Disk`): modern (version 2) virtio-mmio only,
+  one 4-entry queue in one frame, one request in flight, completion polled (no IRQ), DMA straight to the caller's
+  blocks (only inside the identity-mapped RAM GiB); a buffer outside it, a request past the capacity or a device
+  failure is `mogfs::Error::Io`. `Board::disk` hands it out
   once (`DISK_TAKEN`), scanning QEMU `virt`'s fixed virtio-mmio transports from the highest down and stopping at the first empty one
   (QEMU `virt` fills them from the top with no gaps; a board fact like `UART_IRQ`).
 - `build.rs`: nested `cargo build` of `crates/user` into `target/user`, newc `boot.cpio` into `OUT_DIR` (plus a
@@ -27,7 +28,7 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
 
 ## Boundaries (hard)
 
-- `#![no_std]`, `#![no_main]`. Deps: `arch`, `dtb`, `kernel`, `mm`, `linked_list_allocator` (no features).
+- `#![no_std]`, `#![no_main]`. Deps: `arch`, `dtb`, `kernel`, `mm`, `mogfs` (its `Error`), `linked_list_allocator` (no features).
 - Opts out of `forbid(unsafe_code)` (lints: `docs/DEVELOPMENT.md` settings table); every `unsafe` block has a one-line
   `// SAFETY:` and every `unsafe fn` a `# Safety` section.
 - Depends on `kernel`, never the reverse. UART, GIC and RAM come from the DTB; board constants fix the rest:

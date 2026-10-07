@@ -11,9 +11,9 @@ touches memory through raw addresses: the board reads user buffers, copies pages
 ## Responsibilities
 
 - `Board` trait and `Program` enum (`src/lib.rs`); `run` drives boot and the `test=*` bootargs scenarios.
-- `Disk` trait and `BLOCK` (4096) (`src/lib.rs`): synchronous `read`/`write` of consecutive blocks, `flush`,
-  `blocks`; errors `EIO` (device failure or past the end) and `EFAULT` (buffer not kernel memory). `Board::disk` is
-  called once in `run`, before the `boot:` line, so the probe counts toward boot time.
+- `Disk` and `BLOCK_SIZE` (4096) are `mogfs`'s, re-exported (`src/lib.rs`): synchronous `read`/`write` of
+  consecutive blocks, `flush`, `blocks`; every failure is `mogfs::Error::Io`. `Board::disk` is called once in `run`,
+  before the `boot:` line, so the probe counts toward boot time.
 - `Scheduler<N>` (`src/sched.rs`): slots, states (`Ready`, `Blocked`, `Exited`, `Zombie`), priorities, `reap`, `kill`.
 - `Handles` (`src/handle.rs`): per-process handle tables, rights, `dup`, `split` for `spawn`.
 - `Pipes<N>` (`src/pipe.rs`), `Mutexes<N>` (`src/mutex.rs`): fixed tables of kernel objects.
@@ -24,7 +24,7 @@ touches memory through raw addresses: the board reads user buffers, copies pages
 ## Boundaries (hard)
 
 - `#![no_std]` with `extern crate alloc`; workspace `unsafe_code = "forbid"` applies, no opt-out ever.
-- Depends only on `mm` and `dtb`. Never on `arch` or a board crate: dependencies point inward, boards depend on it.
+- Depends only on `mm`, `dtb` and `mogfs`. Never on `arch` or a board crate: dependencies point inward, boards depend on it.
 - Hardware reaches it only through `Board` (generic `B: Board`); AGENTS.md Architecture rules apply.
 - Callers: `crates/board/qemu-virt` (implements `Board`, calls `run`, `dispatch` and the table types) and its host
   tests in `tests/`. The user ABI it decodes is mirrored by hand in `crates/user/src/lib.rs`.
