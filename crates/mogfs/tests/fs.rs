@@ -306,9 +306,6 @@ fn le32(b: &[u8], at: usize) -> usize {
 
 #[test]
 fn crafted_superblocks_are_rejected() {
-    // The next commit's generation would overflow.
-    let mut disk = crafted(hello(), &[0, 1], 8, &u64::MAX.to_le_bytes());
-    assert_eq!(snapshot(&mut disk), Err(Error::Corrupt));
     // Block counts too small to hold the slots and a table, or past the disk.
     for blocks in [0u32, 1, 2, 65] {
         let mut disk = crafted(hello(), &[0, 1], 16, &blocks.to_le_bytes());
@@ -323,6 +320,19 @@ fn crafted_superblocks_are_rejected() {
     let mut disk = crafted(hello(), &[0], 8, &3u64.to_le_bytes());
     assert_eq!(snapshot(&mut disk), Ok(vec![]));
     assert_eq!(Fs::new(&mut MemDisk::new(2)).format(), Err(Error::NoSpace));
+}
+
+#[test]
+fn the_last_generation_commits_and_then_commits_fail() {
+    let mut disk = crafted(hello(), &[0], 8, &(u64::MAX - 1).to_le_bytes());
+    let mut fs = mount(&mut disk).unwrap();
+    fs.create(ROOT, b"new").unwrap();
+    fs.commit().unwrap();
+    fs.create(ROOT, b"lost").unwrap();
+    assert_eq!(fs.commit(), Err(Error::Corrupt));
+    let mut tree = hello_tree();
+    tree.push(entry("/new", b""));
+    assert_eq!(snapshot(&mut disk.crash(|_, _| true)), Ok(tree));
 }
 
 #[test]
@@ -346,6 +356,9 @@ fn crafted_records_fall_back_and_crafted_entries_are_corrupt() {
         (128 + 8, 1),
         (128 + 8, 64),
         (128 + 8, docs as u32),
+        // A data block past the file's size, or a free inode with a size.
+        (128 + 12, 40),
+        (192 + 4, 5),
     ];
     for (at, value) in records {
         let mut bad = crafted(disk.clone(), &[table], at, &value.to_le_bytes());
@@ -364,6 +377,57 @@ fn crafted_records_fall_back_and_crafted_entries_are_corrupt() {
         let mut bad = crafted(disk.clone(), &[docs], at, value);
         assert_eq!(snapshot(&mut bad), Err(Error::Corrupt), "{at}");
     }
+}
+
+/// A free record pointing at a live block would release it when its inode is reused, and a later file would
+/// overwrite `/docs/a.txt`'s data.
+#[test]
+fn crafted_free_record_cannot_alias_a_live_block() {
+    let disk = hello();
+    let table = le32(&disk.durable[0], 20);
+    let a_data = le32(&disk.durable[table], 128 + 8) as u32;
+    let mut disk = crafted(disk, &[table], 192 + 8, &a_data.to_le_bytes());
+    // Rejected: mount falls back to the empty older slot.
+    assert_eq!(snapshot(&mut disk.clone()), Ok(vec![]));
+    let mut fs = mount(&mut disk).unwrap();
+    fs.create(ROOT, b"x").unwrap();
+    fs.commit().unwrap();
+    fs.create(ROOT, b"y").unwrap();
+    fs.commit().unwrap();
+    for i in 0..10 {
+        let f = fs.create(ROOT, format!("z{i}").as_bytes()).unwrap();
+        fs.write(f, 0, b"EVIL!").unwrap();
+    }
+    fs.commit().unwrap();
+    let mut fs = mount(&mut disk).unwrap();
+    let a = fs
+        .lookup(ROOT, b"docs")
+        .and_then(|d| fs.lookup(d, b"a.txt"));
+    let mut buf = [0; 5];
+    let r = a.and_then(|a| fs.read(a, 0, &mut buf));
+    assert!(r != Ok(5) || &buf == b"hello", "a.txt reads {buf:?}");
+}
+
+/// Mount falls back past a damaged newest table; its blocks stay reserved, so no write can reseal it as valid.
+#[test]
+fn fallback_keeps_the_damaged_newest_slot_reserved() {
+    let mut disk = hello();
+    let mut fs = mount(&mut disk).unwrap();
+    for i in 0..8 {
+        let f = fs.create(ROOT, format!("p{i}").as_bytes()).unwrap();
+        fs.write(f, 0, &[1; 100]).unwrap();
+    }
+    fs.commit().unwrap();
+    fs.create(ROOT, b"q").unwrap();
+    fs.commit().unwrap();
+    // Generation 4 is in slot 0.
+    let t = le32(&disk.durable[0], 20);
+    disk.durable[t][100] ^= 1;
+    let old = snapshot(&mut disk.clone()).unwrap();
+    let mut fs = mount(&mut disk).unwrap();
+    let f = fs.create(ROOT, b"zeros").unwrap();
+    fs.write(f, 0, &[0; MAX_FILE_SIZE as usize]).unwrap();
+    assert_eq!(snapshot(&mut disk.crash(|_, _| true)), Ok(old));
 }
 
 #[test]
@@ -385,13 +449,13 @@ fn older_slot_past_the_newest_block_count_is_ignored() {
     assert_eq!(snapshot(&mut disk), Ok(tree));
 }
 
-/// Fails the first read of block 0.
-struct FailOnce<'a>(&'a mut MemDisk, bool);
+/// Fails the next `.2` reads of block `.1`.
+struct FailReads<'a>(&'a mut MemDisk, u64, usize);
 
-impl Disk for FailOnce<'_> {
+impl Disk for FailReads<'_> {
     fn read(&mut self, block: u64, bufs: &mut [Block]) -> Result<(), Error> {
-        if block == 0 && !self.1 {
-            self.1 = true;
+        if block == self.1 && self.2 > 0 {
+            self.2 -= 1;
             return Err(Error::Io);
         }
         (&mut *self.0).read(block, bufs)
@@ -413,7 +477,7 @@ impl Disk for FailOnce<'_> {
 #[test]
 fn io_error_at_mount_is_not_a_fallback() {
     let mut disk = hello();
-    let mut fs = Fs::new(FailOnce(&mut disk, false));
+    let mut fs = Fs::new(FailReads(&mut disk, 0, 1));
     assert_eq!(fs.mount(), Err(Error::Io));
     fs.mount().unwrap();
     fs.create(ROOT, b"new").unwrap();
@@ -421,6 +485,20 @@ fn io_error_at_mount_is_not_a_fallback() {
     let mut tree = hello_tree();
     tree.push(entry("/new", b""));
     assert_eq!(snapshot(&mut disk), Ok(tree));
+}
+
+#[test]
+fn failed_mount_leaves_the_fs_read_only() {
+    let mut disk = hello();
+    // The newest slot's records load, then reading the older slot's table fails.
+    let older_table = le32(&disk.durable[1], 20) as u64;
+    let mut fs = Fs::new(FailReads(&mut disk, older_table, usize::MAX));
+    assert_eq!(fs.mount(), Err(Error::Io));
+    let docs = fs.lookup(ROOT, b"docs").unwrap();
+    let a = fs.lookup(docs, b"a.txt").unwrap();
+    assert_eq!(fs.write(a, 0, b"HE"), Err(Error::Io));
+    assert_eq!(fs.commit(), Err(Error::Io));
+    assert_eq!(snapshot(&mut disk.crash(|_, _| true)), Ok(hello_tree()));
 }
 
 /// Mounts `disk`, overwrites `/docs/a.txt`, adds `/src` and `/docs/b.txt`, and commits.

@@ -29,8 +29,8 @@ a device driver.
 - Every on-disk value is range-checked once when decoded (superblock, records, directory entries); a crafted image
   gives `Corrupt` (or a fallback mount), never a panic, overflow or out-of-range index. A block reached twice within
   one slot is corrupt.
-- `NoSpace` is decided before anything changes (`reserve`). After `Io` from a change, writes and commits fail until
-  the next `mount`; `Io` from `commit` means the commit may or may not be durable.
+- `NoSpace` is decided before anything changes (`reserve`). After `Io` from a change, or a failed `mount`, writes and
+  commits fail until a `mount` succeeds; `Io` from `commit` means the commit may or may not be durable.
 - `mount` returns `Io` on any read error; only `Corrupt` falls back to the older slot.
 - Performance is the moat: a slowdown is never accepted because it has an explanation; it is removed, or shown to
   be unavoidable with before/after numbers (`docs/BENCHMARKS.md`). The block I/O per operation is asserted exactly
@@ -40,7 +40,8 @@ a device driver.
 
 - Host: `cargo test --target aarch64-apple-darwin -p mogfs` (`tests/fs.rs`: round trip, corruption and fallback,
   crafted images, power cut through a write-back-cache disk at every write and flush with subsets of the pending
-  writes landing, `Io` handling, limits, block I/O counts).
+  writes landing, `Io` handling, limits, block I/O counts). `src/tests.rs` runs random changes and commits on a disk
+  that panics on a write to a block either slot reaches, and checks the in-memory free space against a fresh mount's.
 - Benchmark: `cargo bench-host` runs `benches/fs.rs`; baseline rows in `docs/BENCHMARKS.md`.
 - `examples/mkfs.rs` writes an empty image through a file-backed `Disk`.
 
