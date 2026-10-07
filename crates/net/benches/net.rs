@@ -368,6 +368,23 @@ fn syn_answer(syns: &[Vec<u8>], table: usize) -> (f64, f64) {
     )
 }
 
+/// One `poll` with nothing to do on a listener with a `half_open`-entry table and 2 slots; ns per poll.
+fn idle_poll(half_open: usize) -> f64 {
+    host!(b, IP_B, [1, 2], 2, 4096, half_open);
+    b.listen(80).unwrap();
+    let mut nic = Replay {
+        frames: &[],
+        next: 0,
+        scratch: vec![0; 2048],
+    };
+    let n = 100_000;
+    let start = Instant::now();
+    for i in 0..n {
+        black_box(b.poll(&mut nic, i));
+    }
+    start.elapsed().as_nanos() as f64 / n as f64
+}
+
 /// Connect, accept, a close from each side and the TIME_WAIT entry, over the loss-free link; ns per connection.
 fn handshake_and_close(half_open: usize) -> f64 {
     let mut link = sim::Link::new(1, sim::Faults::default(), [MAC_A, MAC_B]);
@@ -430,6 +447,12 @@ fn main() {
         "tcp connect + accept + close both ways through a SYN cookie",
         (0..RUNS).map(|_| handshake_and_close(0)).collect(),
     );
+    for h in [4, 64, 4096] {
+        report(
+            &format!("tcp idle poll, {h}-entry half-open table"),
+            (0..RUNS).map(|_| idle_poll(h)).collect(),
+        );
+    }
     let syns = record_syns(4096);
     for table in [64, 4096, 0] {
         let runs: Vec<_> = (0..RUNS).map(|_| syn_answer(&syns, table)).collect();

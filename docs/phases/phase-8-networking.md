@@ -106,3 +106,14 @@ Decision: write `crates/net` fresh. smoltcp is a host-only dev-dependency of `cr
   A security scan flagged key reuse (one key for ISNs, ports, cookies, TIME_WAIT and the weak half-open mix, and the
   cookie clock XORed into the key): each use now has a key derived from the seed, and the cookie's clock and index
   are hashed as message words. Cost: 1.5 ns per cookie SYN (a third message word); connect + close unchanged.
+- **47 (second review).** An owed FIN or SYN that never left (next hop unresolved) now runs the retransmission timer,
+  and `poll` reports the ARP retry of a request TCP just started; the link tests lose ARP frames so the liveness rule
+  covers it. Released connections are bounded like Linux's orphans (FIN-WAIT-2 60 s from our FIN's ACK whatever the
+  peer sends, at most 8 zero-window probes); `tcp_info` reports `released`. `poll` walks the half-open table only when
+  a SYN-ACK retransmission is due (idle poll 7 ns at any size, from 1.2 us at 4096). A SYN takes TIME_WAIT over only
+  with a listener and room for the gap ISS, never via a cookie. A cookie ACK that misses a half-open entry for the
+  same connection is still checked as a cookie. The cookie gate is per listener. Interleaved against 9c4ca51: TCP
+  rows within noise, connect + close 398-407 against 427-430 ns; UDP 1472-byte receive reads 2 ns slower
+  (66.3-67.8 against 64.3-65.2) with no change on its path, and both builds match with loops aligned to 64 bytes
+  (65.5-67.7 against 65.2-66.1), so it is code placement; `-C llvm-args=-align-loops=64` in the build config is the
+  fix outside this crate.

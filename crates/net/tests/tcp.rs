@@ -184,15 +184,13 @@ fn wrap_start(key: [u64; 2], before: u32) -> u64 {
     0u32.wrapping_sub(before).wrapping_sub(isn) as u64 * 4000
 }
 
-/// Liveness, after a poll: a connection with work outstanding (anything but idle in ESTABLISHED, CLOSE-WAIT or an
-/// open FIN-WAIT-2; the released FIN-WAIT-2 timeout has its own tests) has a deadline.
+/// Liveness, after a poll: a connection with work outstanding (anything but idle in ESTABLISHED or CLOSE-WAIT, or
+/// an open FIN-WAIT-2) has a deadline.
 fn live(s: &Stack, id: TcpId) {
     let i = s.tcp_info(id).unwrap();
     let idle = matches!(i.state, State::Closed | State::Listen)
-        || (matches!(
-            i.state,
-            State::Established | State::CloseWait | State::FinWait2
-        ) && i.queued == 0);
+        || (matches!(i.state, State::Established | State::CloseWait) && i.queued == 0)
+        || (i.state == State::FinWait2 && !i.released);
     assert!(
         idle || i.deadline.is_some(),
         "work outstanding and no deadline: {i:?}"
@@ -239,6 +237,7 @@ fn faults(loss: u64) -> Faults {
         reorder: 20,
         corrupt: 5,
         delay: MS,
+        arp_loss: 300,
     }
 }
 
@@ -1338,7 +1337,14 @@ fn out_of_window_segments_get_at_most_one_ack_per_half_second() {
 #[test]
 fn a_silent_peer_always_ends_in_closed() {
     for seed in 0..40 {
-        let mut link = Link::new(seed, faults(10), [MAC_A, MAC_B]);
+        let mut link = Link::new(
+            seed,
+            Faults {
+                arp_loss: if seed % 4 == 0 { 1000 } else { 300 },
+                ..faults(10)
+            },
+            [MAC_A, MAC_B],
+        );
         let (mut ma, mut mb) = (
             Mem::new(1, 16 << 10, 16 << 10, 4, 4),
             Mem::new(2, 16 << 10, 16 << 10, 4, 4),
@@ -1703,4 +1709,312 @@ fn closing_a_connection_already_in_fin_wait_2_starts_its_timeout() {
             .is_ok(),
         "released and freed"
     );
+}
+
+/// Polls `stack` with nobody answering ARP, following its deadlines up to `to`; returns when it stopped.
+fn polls_no_arp(stack: &mut Stack, tap: &mut Tap, from: u64, to: u64) -> u64 {
+    let mut now = from;
+    loop {
+        tap.tx.clear();
+        match stack.poll(tap, now) {
+            Some(t) if t <= to => now = t.max(now + 1),
+            _ => return now,
+        }
+    }
+}
+
+#[test]
+fn a_fin_that_never_leaves_still_has_a_deadline() {
+    for close_wait in [false, true] {
+        let mut m = Mem::new(2, 4096, 4096, 4, 4);
+        host!(a, m, IP_A, [1, 1]);
+        let mut tap = Tap::new(MAC_A);
+        let (c, p) = accepted(&mut a, &mut tap);
+        if close_wait {
+            tap.rx.push_back(p.now(ACK | FIN, &[]));
+            a.poll(&mut tap, 0);
+        }
+        a.tcp_close(c);
+        a.poll(&mut tap, 0);
+        live(&a, c);
+        let end = polls_no_arp(&mut a, &mut tap, 0, 24 * 3600 * SEC);
+        assert_eq!(
+            state(&a, c),
+            State::Closed,
+            "next hop never resolved: the owed FIN times out"
+        );
+        assert!(
+            a.connect(end, 0, SocketAddrV4::new(IP_B, 1)).is_ok(),
+            "the slot is freed"
+        );
+    }
+}
+
+#[test]
+fn a_released_connection_gives_up_on_a_peer_that_keeps_its_window_shut() {
+    let mut m = Mem::new(2, 4096, 4096, 4, 4);
+    host!(a, m, IP_A, [1, 1]);
+    let mut tap = Tap::new(MAC_A);
+    let (c, p) = accepted(&mut a, &mut tap);
+    feed(&mut a, &mut tap, 0, [p.seg(p.seq, p.ack, ACK, 0, &[], &[])]);
+    a.send(c, &[1; 1000]).unwrap();
+    a.tcp_close(c);
+    let mut now = 0;
+    while let Some(t) = a.poll(&mut tap, now) {
+        now = t.max(now + 1);
+        if !feed(&mut a, &mut tap, now, []).is_empty() {
+            feed(
+                &mut a,
+                &mut tap,
+                now,
+                [p.seg(p.seq, p.ack, ACK, 0, &[], &[])],
+            );
+        }
+        assert!(now < 3600 * SEC, "still probing after an hour");
+    }
+    assert_eq!(state(&a, c), State::Closed);
+}
+
+#[test]
+fn a_released_fin_wait_2_is_not_kept_alive_by_the_peers_acks() {
+    let mut m = Mem::new(2, 4096, 4096, 4, 4);
+    host!(a, m, IP_A, [1, 1]);
+    let mut tap = Tap::new(MAC_A);
+    let (c, mut p) = accepted(&mut a, &mut tap);
+    a.tcp_close(c);
+    feed(&mut a, &mut tap, 0, []);
+    p.ack += 1;
+    feed(&mut a, &mut tap, 0, [p.now(ACK, &[])]);
+    assert!(a.tcp_info(c).unwrap().released);
+    for i in 1..=3 {
+        feed(&mut a, &mut tap, i * 30 * SEC, [p.now(ACK, &[])]);
+    }
+    assert_eq!(
+        state(&a, c),
+        State::Closed,
+        "60 s after the FIN was acknowledged, whatever the peer sends"
+    );
+}
+
+/// A connection from port 5555 to the peer's PORT, closed by us first so it sits in TIME_WAIT; returns the peer.
+fn in_time_wait(a: &mut Stack, tap: &mut Tap) -> Peer {
+    let c = a.connect(0, 5555, SocketAddrV4::new(IP_B, PORT)).unwrap();
+    let syn = feed(a, tap, 0, [])
+        .into_iter()
+        .find(|s| s.flags == SYN)
+        .unwrap();
+    let mut p = Peer {
+        port: PORT,
+        to: 5555,
+        seq: 7000,
+        ack: syn.seq.wrapping_add(1),
+    };
+    feed(
+        a,
+        tap,
+        MS,
+        [p.seg(7000, p.ack, SYN | ACK, 65535, &[2, 4, 5, 0xb4], &[])],
+    );
+    p.seq = 7001;
+    a.tcp_close(c);
+    feed(a, tap, 2 * MS, []);
+    p.ack = p.ack.wrapping_add(1);
+    feed(a, tap, 3 * MS, [p.now(ACK | FIN, &[])]);
+    p.seq += 1;
+    assert_eq!(state(a, c), State::Closed);
+    p
+}
+
+#[test]
+fn a_syn_on_time_wait_without_a_listener_keeps_the_entry() {
+    let mut m = Mem::new(2, 4096, 4096, 4, 4);
+    host!(a, m, IP_A, [1, 1]);
+    let mut tap = Tap::new(MAC_A);
+    let p = in_time_wait(&mut a, &mut tap);
+    let syn = feed(
+        &mut a,
+        &mut tap,
+        5 * MS,
+        [p.seg(p.seq + 100, 0, SYN, 65535, &[], &[])],
+    );
+    assert_eq!(syn[0].flags, ACK, "TIME_WAIT answers the SYN");
+    let fin = feed(
+        &mut a,
+        &mut tap,
+        6 * MS,
+        [p.seg(p.seq - 1, p.ack, ACK | FIN, 65535, &[], &[])],
+    );
+    assert_eq!(
+        fin[0].flags, ACK,
+        "and is still there for the retransmitted FIN"
+    );
+}
+
+#[test]
+fn a_time_wait_takeover_never_falls_back_to_a_cookie() {
+    let mut m = Mem::new(3, 4096, 4096, 1, 4);
+    host!(a, m, IP_A, [1, 1]);
+    let mut tap = Tap::new(MAC_A);
+    let p = in_time_wait(&mut a, &mut tap);
+    let l = a.listen(5555).unwrap();
+    let spoof = Peer { port: 2000, ..p };
+    feed(
+        &mut a,
+        &mut tap,
+        4 * MS,
+        [spoof.seg(77, 0, SYN, 65535, &[], &[])],
+    );
+    let out = feed(
+        &mut a,
+        &mut tap,
+        5 * MS,
+        [p.seg(p.seq + 100, 0, SYN, 65535, &[], &[])],
+    );
+    assert_eq!(
+        (out[0].flags, a.counters.syn_cookies),
+        (ACK, 0),
+        "no room for the gap ISS: TIME_WAIT answers"
+    );
+    feed(
+        &mut a,
+        &mut tap,
+        6 * MS,
+        [spoof.seg(78, 0, RST, 0, &[], &[])],
+    );
+    let out = feed(
+        &mut a,
+        &mut tap,
+        7 * MS,
+        [p.seg(p.seq + 100, 0, SYN, 65535, &[], &[])],
+    );
+    assert_eq!(
+        out[0].flags,
+        SYN | ACK,
+        "with room, the SYN takes TIME_WAIT over"
+    );
+    let _ = l;
+}
+
+#[test]
+fn a_cookie_ack_is_accepted_even_after_the_syn_got_a_table_entry() {
+    let mut m = Mem::new(3, 4096, 4096, 1, 4);
+    host!(a, m, IP_A, [1, 1]);
+    let mut tap = Tap::new(MAC_A);
+    let l = a.listen(PORT).unwrap();
+    let y = Peer {
+        port: 2000,
+        to: PORT,
+        seq: 77,
+        ack: 0,
+    };
+    feed(&mut a, &mut tap, 0, [y.seg(77, 0, SYN, 65535, &[], &[])]);
+    let x = Peer {
+        port: 3000,
+        to: PORT,
+        seq: 7000,
+        ack: 0,
+    };
+    let cookie = feed(&mut a, &mut tap, MS, [x.seg(7000, 0, SYN, 65535, &[], &[])])[0].seq;
+    assert_eq!(a.counters.syn_cookies, 1);
+    feed(&mut a, &mut tap, 2 * MS, [y.seg(78, 0, RST, 0, &[], &[])]);
+    let entry = feed(
+        &mut a,
+        &mut tap,
+        3 * MS,
+        [x.seg(7000, 0, SYN, 65535, &[], &[])],
+    )[0]
+    .seq;
+    assert_ne!(entry, cookie);
+    let out = feed(
+        &mut a,
+        &mut tap,
+        4 * MS,
+        [x.seg(7001, cookie + 1, ACK, 65535, &[], &[])],
+    );
+    assert!(out.iter().all(|s| s.flags & RST == 0));
+    assert!(
+        a.accept(l).is_some(),
+        "the client answered the cookie SYN-ACK"
+    );
+}
+
+#[test]
+fn a_cookie_is_accepted_only_by_a_listener_that_sent_cookies() {
+    let (mut mf, mut mq) = (Mem::new(4, 4096, 4096, 0, 4), Mem::new(4, 4096, 4096, 0, 4));
+    host!(flooded, mf, IP_A, [9, 9]);
+    host!(twin, mq, IP_A, [9, 9]);
+    let other = flooded.listen(PORT + 1).unwrap();
+    flooded.listen(PORT).unwrap();
+    twin.listen(PORT + 1).unwrap();
+    let mut tap = Tap::new(MAC_A);
+    cookie_syn(&mut flooded, &mut tap, 0, 4000);
+    let syn = Peer {
+        port: 3000,
+        to: PORT + 1,
+        seq: 7000,
+        ack: 0,
+    };
+    let cookie = feed(&mut twin, &mut tap, 0, [syn.now(SYN, &[])]).remove(0);
+    assert_eq!((cookie.flags, twin.counters.syn_cookies), (SYN | ACK, 1));
+    let q = Peer {
+        port: 3000,
+        to: PORT + 1,
+        seq: 7001,
+        ack: cookie.seq + 1,
+    };
+    let out = feed(&mut flooded, &mut tap, MS, [q.now(ACK, &[])]);
+    assert_eq!(
+        out[0].flags, RST,
+        "a flood on port 80 does not open guessing on port 81"
+    );
+    assert_eq!(flooded.accept(other), None);
+}
+
+#[test]
+fn a_cookie_is_accepted_in_its_period_and_the_next_only() {
+    let p16 = 16 * SEC;
+    for (issued, checked, want) in [
+        (0, p16 - 1, true),
+        (p16 - 1, p16, true),
+        (p16 - 1, 2 * p16 - 1, true),
+        (p16 - 1, 2 * p16, false),
+        (p16, 3 * p16 - 1, true),
+        (p16, 3 * p16, false),
+        (5 * p16 + 3, 7 * p16 + 3, false),
+    ] {
+        let mut m = Mem::new(3, 4096, 4096, 0, 4);
+        host!(a, m, IP_A, [7, 7]);
+        let l = a.listen(PORT).unwrap();
+        let mut tap = Tap::new(MAC_A);
+        let p = Peer {
+            port: 3000,
+            to: PORT,
+            seq: 7000,
+            ack: 0,
+        };
+        let sa = feed(
+            &mut a,
+            &mut tap,
+            issued,
+            [p.seg(7000, 0, SYN, 65535, &[2, 4, 5, 0xb4], &[])],
+        );
+        // Keep the gate open so only the cookie's own clock decides.
+        feed(
+            &mut a,
+            &mut tap,
+            checked,
+            [Peer { port: 9, ..p }.seg(1, 0, SYN, 65535, &[], &[])],
+        );
+        feed(
+            &mut a,
+            &mut tap,
+            checked,
+            [p.seg(7001, sa[0].seq.wrapping_add(1), ACK, 65535, &[], &[])],
+        );
+        assert_eq!(
+            a.accept(l).is_some(),
+            want,
+            "issued {issued} checked {checked}"
+        );
+    }
 }

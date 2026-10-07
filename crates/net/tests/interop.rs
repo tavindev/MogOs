@@ -106,6 +106,7 @@ fn interop(seed: u64, loss: u64, bytes: usize, we_connect: bool) {
         reorder: 20,
         corrupt: 5,
         delay: MS,
+        arp_loss: 300,
     };
     let mut link = Link::new(seed, faults, [MAC_A, MAC_B]);
     let mut neighbors = [Neighbor::EMPTY; 4];

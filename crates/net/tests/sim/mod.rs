@@ -14,6 +14,8 @@ pub struct Faults {
     pub reorder: u64,
     pub corrupt: u64,
     pub delay: u64,
+    /// Extra loss for ARP frames, so neighbours fail to resolve.
+    pub arp_loss: u64,
 }
 
 pub struct Rng(u64);
@@ -146,7 +148,8 @@ impl Nic for End<'_> {
             record.push(frame.clone());
         }
         let f = link.faults;
-        if link.rng.chance(f.loss) {
+        let arp = frame.get(12..14) == Some(&[8, 6]);
+        if link.rng.chance(f.loss) || (arp && link.rng.chance(f.arp_loss)) {
             link.spare.push(frame);
             return true;
         }

@@ -140,6 +140,7 @@ fn ping_and_udp_echo_under_loss_reordering_duplication_and_corruption() {
             reorder: 100,
             corrupt: 50,
             delay: MS,
+            arp_loss: 300,
         };
         let mut link = Link::new(seed, faults, [MAC_A, MAC_B]);
         exchange(&mut link, 30 * SEC);

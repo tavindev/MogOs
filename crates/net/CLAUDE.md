@@ -35,10 +35,11 @@ kernel, step 50), DHCP, DNS or IPv6 (phase 9), or IPv4 fragment reassembly.
 - TCP: RFC 9293 with MSS and window scaling, RFC 6298 RTO (initial 1 s, floor 200 ms, max 60 s; SYN given up
   after 6 retransmissions, data after 10, a SYN-ACK after 5), NewReno (RFC 5681, RFC 6582) with byte counting
   (RFC 3465) and go-back-N after a timeout, a persist timer that probes a zero window as long as the peer answers
-  and gives up (`TimedOut`) after 10 unanswered probes, FIN-WAIT-2 ended 60 s after the peer's last segment once
-  the caller has released the connection (Linux's rule; an open half-closed connection waits as long as it
-  likes), and a 60 s TIME_WAIT restarted only by the retransmitted FIN. Sender silly-window avoidance applies
-  to new data only, receiver avoidance (RFC 9293 3.8.6.2.2) moves the window's edge by min(MSS, ring / 2) or not at
+  and gives up (`TimedOut`) after 10 unanswered probes. Released (orphan) connections are bounded like Linux's:
+  FIN-WAIT-2 ends 60 s after our FIN was acknowledged whatever the peer sends (an open half-closed connection
+  waits as long as it likes), and a zero window gets at most 8 probes even if answered. A FIN (or SYN) owed but not
+  yet sent, say while the next hop does not resolve, runs the retransmission timer like one in flight. TIME_WAIT
+  lasts 60 s, restarted only by the retransmitted FIN. Sender silly-window avoidance applies to new data only, receiver avoidance (RFC 9293 3.8.6.2.2) moves the window's edge by min(MSS, ring / 2) or not at
   all, and out-of-window segments get at most one ACK per 500 ms per connection. Out-of-order data is kept in the
   receive ring (4 ranges). No timestamps: RFC 7323 timestamps with PAWS were built and measured, and cost 3-5% of
   loss-free goodput and 7% of connect + close beyond noise, so the ISS rule below is the only wrapped-sequence
@@ -65,27 +66,35 @@ kernel, step 50), DHCP, DNS or IPv6 (phase 9), or IPv4 fragment reassembly.
 - Timers: one deadline per connection, derived from its state by `deadline()` from a single start time and cached at
   the end of every event that can move it (a segment in, a timer firing, an output attempt, which every caller
   action leads to). No purpose arms or cancels another's. The tests check after every poll that a connection with
-  work outstanding (anything but idle in ESTABLISHED, CLOSE-WAIT or FIN-WAIT-2) has a deadline, and that a silent
-  peer always ends in CLOSED or idle; released FIN-WAIT-2 timing out has its own tests.
+  work outstanding (anything but idle in ESTABLISHED or CLOSE-WAIT, or an open FIN-WAIT-2; `tcp_info().released`
+  tells them apart) has a deadline, and that a silent peer always ends in CLOSED or idle. The link tests also lose
+  30% of ARP frames (all of them for a quarter of the silent-peer seeds), so the rule covers neighbours that never
+  resolve. `Stack::poll` runs TCP before the ARP walk, so a request TCP just started reports its retry deadline.
 - The half-open table is found in O(1) at any size: a keyed multiply-xorshift mix of the connection picks a run of 8
   slots, every lookup checks the whole run (so freeing is just clearing), and a SYN whose run is full gets a cookie.
   The mix is not SipHash on purpose: SipHash cost 20 ns per handshake, and steering SYNs into one run only sends them
   to cookies. Filling a table to the last slot sends about 3% (random connections: up to about 11%) to cookies.
-  Still linear per `poll`: the SYN-ACK retransmission walk over the half-open table, the connection slots, and the
-  TIME_WAIT lookup.
+  `poll` walks the half-open table only when its earliest SYN-ACK retransmission is due (idle poll 7 ns at any
+  size, 1.2 us at 4096 entries before). Still linear: the connection slots per `poll`, and the TIME_WAIT lookup.
 - TCP's attack surface, each with a test: a SYN flood fills only the half-open table and answers to the frame's
   source, so it never touches the ARP cache or a slot; a full table answers with SYN cookies (user-approved,
   replacing oldest-first eviction; `syn_cookies`): the ISS holds one clock bit (16 s periods, this one or the last),
   a 2-bit MSS index and 29 bits of SipHash over the connection and the peer's ISN, and a cookie ACK is accepted only
-  while the stack (any listener) has sent cookies in the last two periods, never with SYN set, and failures are counted
-  (`bad_cookies`) and reset; a cookie connection runs without window scaling; RFC 5961 challenge
+  while that listener has sent cookies in the last two periods (Linux's per-listener overflow time), never with SYN
+  set, also when it does not match a half-open entry for the same connection; failures are counted (`bad_cookies`)
+  and reset; a cookie connection runs without window scaling. Odds: a blind guess succeeds with probability 2^-29,
+  about 36 s of guessing at 10 GbE line rate (14.9 M minimum frames per second) once the attacker floods that same
+  listener to open its gate; a flood on one listener no longer opens guessing on another. Residual: a cookie ACK
+  replayed after its connection closed without TIME_WAIT (an `abort`), within two periods, opens a connection
+  again; it needs the original ACK, so the attacker is on-path, as with Linux's cookies. RFC 5961 challenge
   ACKs (inexact in-window RST, any SYN, an ACK outside `snd_una - max window ..= snd_max`) at most 10 per second per
   connection (`challenge_acks`), never one global limit (CVE-2016-5696); an ACK above `snd_max` drops the whole
   segment; cwnd grows by bytes acknowledged, so ACK division gains nothing; an ICMP error must quote a sequence
   number in `snd_una..snd_max`, and a hard error aborts only a SYN-SENT connection (RFC 5927); a RST never ends
   TIME_WAIT (RFC 1337); a full TIME_WAIT table reuses its oldest entry (`time_wait_reused`), and a SYN above an
   entry's sequence starts a new connection whose ISS is the old `snd_nxt` plus 65537 plus 24 keyed bits, above
-  anything the old connection sent and unpredictable; a window update needs `snd_una <= ack`.
+  anything the old connection sent and unpredictable, but only with a listener and room in the half-open table for
+  that ISS (never a cookie); otherwise TIME_WAIT stays and answers the SYN with an ACK; a window update needs `snd_una <= ack`.
 - ISNs are SipHash-2-4 of the connection plus a 4 us clock (RFC 6528); ephemeral ports are RFC 6056 algorithm 3.
   No key is used twice: `Tcp::new` derives one per use from the caller's seed (SipHash of the seed and a label):
   ISNs, ports, cookies, the TIME_WAIT takeover bits and the half-open mix, so the weak mix's observable collisions
