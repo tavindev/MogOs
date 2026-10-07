@@ -51,3 +51,141 @@ Speed is a primary goal, so performance is tested like behavior: measured, recor
 | Spawn round trip, `test=bench-spawn`: `spawn` of `nop` (one page of program) + `wait` + `close`, 1000 trips, timed in user space, without / with two arguments (ns) | QEMU hvf (`-cpu cortex-a72`), dev build, 42 boots, load about 9 | 3096 / 3254 | 3430 / 3604 | phase 4 shell review |
 | Kernel boot with a MogFS disk mounted, mount in 3 requests (us; 2-block superblock read) | QEMU hvf (`-cpu cortex-a72`), dev build, 42 interleaved boots (busy machine) | 294 | 342 | phase 4 shell commands |
 | `Board::disk` probe, timed in the kernel around the call (us; no disk: one device-ID read; disk: one read plus the setup) | QEMU hvf (`-cpu cortex-a72`), dev build, 21 boots each | 1 / 45 | 2 / 50 | phase 4 step 20 |
+
+## Cross-OS comparison
+
+`scripts/oscompare.sh [runs]` (default 21) runs the same C benchmarks, `c/oscb.c`, on MogOs, Linux in the same QEMU
+setup, and the macOS host as a bare-metal reference, plus MogOs's own Rust benchmarks. It fetches and builds
+everything into the gitignored `third_party/oscompare/`, boots each OS once per run, interleaved (each run: MogOs
+`oscb` from msh, each native MogOs test, Linux, Linux with `mitigations=off`, macOS), and prints the table below with
+the configuration and versions. A 21-run pass takes about 20 minutes on a busy machine.
+
+### Fairness rules
+
+- Same host, same QEMU binary (9.2.1), `-M virt -cpu cortex-a72 -accel hvf -m 128M -smp 1` for every guest. TCG
+  numbers are informational only and not part of this table. `-smp 1` changes when MogOs gets SMP (phase 5); then both
+  sides move to the same core count.
+- Same disk: a fully allocated 64 MiB raw image, fresh for every boot, one `virtio-blk-device` with
+  `virtio-mmio.force-legacy=false` and `virtio-mmio.ioeventfd=off`, QEMU's default cache mode.
+- Same source and libc: `oscb.c` (and its spawn target `oscnop.c`) is built against musl 1.2.5 on both guests, with the
+  release and SHA-256 pinned in `c/Makefile`: MogOs's build through `c/mog-cc` (its syscall layer, soft-float, `-Os`),
+  Linux's from the unpatched release with the same clang (`/opt/homebrew/opt/llvm/bin/clang`), `-Os` and the
+  toolchain's `rust-lld`, static. macOS builds it with `xcrun clang -Os` against its own libc.
+- Same timer: `CNTVCT_EL0`/`CNTFRQ_EL0` read from user space on MogOs and Linux. macOS returns garbage for an EL0
+  `mrs cntvct_el0`, so there `mach_absolute_time` reads the same 24 MHz counter.
+- Each benchmark is its own process (`oscb <bench> <dir> <nop>`), one batch per boot; the table gives the median of
+  the runs and the best run (min for ns, max for MiB/s). A benchmark that fails prints `oscb: error <name>` and the
+  rest still run.
+- Nothing is tuned on either side: Alpine's stock `virt` kernel and default ext4 options, MogOs's release build.
+  Linux runs twice, mitigations default and `mitigations=off`; the guest prints `/sys/devices/system/cpu/vulnerabilities`
+  so the mode is recorded. On `cortex-a72` under hvf Meltdown is "Not affected" (no KPTI); the only switch is
+  Spectre v2's BHB mitigation.
+
+### What each row measures
+
+| Row | `oscb` (every OS) | MogOs native column (Rust, for reference) |
+| --- | --- | --- |
+| `getppid` | `getppid()`, 100000 times: Linux's null syscall. MogOs's libc answers it without trapping, so it has no ratio | n/a |
+| `write0` | `write(1, p, 0)` to the console, 100000 (Linux: through the tty layer) | `test=bench-syscall`, the same call without libc |
+| `yield` | `sched_yield` between two processes, 100000 round trips | n/a: MogOs has no user-space yield call (`test=bench` times kernel tasks) |
+| `pipe` | 1 byte to a `posix_spawn`ed partner and back over two pipes, 100000 | `test=bench-pipe`, timed by the kernel from spawn to exit |
+| `spawn` | `posix_spawn` of `oscnop` by path + `waitpid`, 1000 | `test=bench-spawn`: native `spawn` of the one-page `nop` from a held handle |
+| `open+close` | `open(O_RDONLY)` + `close` of a file, 100000 | `test=bench-fs` |
+| `create+write+fsync` | `open(O_CREAT \| O_TRUNC)` + 100 bytes + `fsync` + `close`, 1000 | `test=bench-fs` (`sync` instead of `fsync`) |
+| `readdir1000` | `opendir` + `readdir` of 1000 entries + `closedir`, 100 times | n/a |
+| `file-*-256k` | 8 MiB in 256 KiB writes + `fsync`, then read back warm (whatever the OS caches) | n/a |
+| `raw-*` | Linux: `O_DIRECT` on the whole disk, 8 MiB written + `fsync`, then read, 4 KiB then 256 KiB per call; not run on macOS | `test=bench-disk`: the same in the kernel, polled (MogOs has no raw-device path from C, so these ratios are native) |
+
+Linux setup: the kernel, initramfs and modloop of `alpine-virt-3.24.2-aarch64.iso` (Linux 6.18.52, pinned by
+SHA-256), plus a small overlay initramfs with `oscb`, `scripts/oscompare-init.sh` as `rdinit`, and `mke2fs` from the
+ISO's packages. The modloop (ext4's module) is a second, read-only virtio disk, so it never sits in the guest's RAM;
+the init loads the modules, deletes the initramfs's module tree, runs the raw test, then `mke2fs -t ext4 -b 4096
+-E lazy_itable_init=0,lazy_journal_init=0` (no background init thread) and mounts it with defaults (`rw,relatime`,
+`data=ordered`). MogOs runs `sh -c 'oscb syscalls / oscnop; ...'` from msh on a fresh MogFS image.
+
+Known differences, not corrected for:
+
+- Memory: Linux reports `MemTotal` 91 MiB and `MemAvailable` 53 MiB at benchmark time; MogOs has about 126 MiB of
+  free frames. No benchmark here comes close to either.
+- `write0` on Linux crosses the tty layer, which MogOs's console write does not have; `getppid` is Linux's
+  null-syscall floor (105 ns).
+- `fsync`: ext4 commits the journal for one file; MogOs's libc maps `fsync` to `sync`, a whole-tree MogFS commit (the
+  dirty inode-table block and the superblock, two flushes). Both end in QEMU flushing the image file on the host,
+  which dominates and is noisy (see the min/median spread).
+- macOS runs on all 12 cores, another kernel and CPU mode (bare metal, no hypervisor): `yield` and `pipe` cross cores
+  there, `fsync` does not flush the drive (`F_FULLFSYNC` would), `oscnop` is dynamic. A reference, not a rival.
+
+### Skipped
+
+- FreeBSD: an official arm64 VM image is about 594 MiB compressed, plus 156 MiB of `base.txz` for a sysroot to build
+  `oscb`; it boots through UEFI, macOS cannot write files into its UFS image (so running the benchmarks needs
+  cloud-init or serial-console automation), and 128 MiB is below its supported minimum. Past a reasonable download and
+  setup for one more column; revisit if a third data point is needed.
+- TCG: informational only by the rules above.
+
+### Results
+
+2026-10-07, Apple M4 Pro (12 cores), macOS 26.6.2, QEMU 9.2.1 hvf, MogOs `09053b6` plus `oscb` in the boot archive,
+release build, Alpine 3.24.2 (Linux 6.18.52-0-virt), musl 1.2.5 on both guests, 21 interleaved runs. Busy machine:
+load average 15 before, 11 after (other agents building), so the disk and `fsync` rows are noisy. Cells: median
+(best). Ratio: Linux (mitigations default) median over MogOs `oscb` median for ns, the inverse for MiB/s, so above 1
+means MogOs is faster; "native" marks a row only MogOs's Rust benchmark covers. Every MogOs `yield`, `readdir1000`
+and `file-*` run failed (`oscb: error`, reasons below).
+
+| Benchmark | Unit | MogOs `oscb` | MogOs native | Linux | Linux `mitigations=off` | macOS host (reference) | MogOs vs Linux |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `getppid` | ns | 2.0 (1.9), no trap | n/a | 105.3 (100.7) | 82.9 (80.5) | 74.7 (71.8) | n/a |
+| `write0` | ns | 39.8 (34.9) | 30.0 (28.0) | 1245.4 (1219.1) | 1216.0 (1196.2) | 450.6 (394.8) | 31.29x (2.65x vs `getppid`) |
+| `yield` | ns | n/a | n/a | 554.9 (537.5) | 501.4 (496.8) | 155.8 (94.4) | n/a |
+| `pipe` | ns | 441.7 (409.0) | 367.0 (355.0) | 1055.9 (1036.4) | 963.0 (947.1) | 5091.4 (4635.7) | 2.39x |
+| `spawn` | ns | 18027.1 (16495.0) | 3289.0 (3034.0) | 18456.9 (16628.8) | 18139.4 (16946.8) | 1354800.4 (1222897.6) | 1.02x |
+| `open+close` | ns | 156.0 (152.5) | 93.0 (89.0) | 453.9 (445.7) | 404.3 (399.1) | 7562.7 (7356.1) | 2.91x |
+| `create+write+fsync` | ns | 163829.0 (119608.4) | 146639.0 (119856.0) | 227311.2 (198542.0) | 231912.0 (201045.7) | 52674.0 (45583.5) | 1.39x |
+| `readdir1000` | ns | n/a | n/a | 79399.2 (75798.3) | 79562.1 (72553.8) | 291324.6 (262707.9) | n/a |
+| `file-write+fsync-256k` | MiB/s | n/a | n/a | 2632.5 (2867.4) | 2632.4 (3097.9) | 3765.9 (4451.5) | n/a |
+| `file-read-256k` | MiB/s | n/a | n/a | 35430.9 (36781.6) | 34169.8 (36831.0) | 18790.4 (22349.0) | n/a |
+| `raw-write+flush-4k` | MiB/s | n/a | 176.0 (198.0) | 97.7 (114.4) | 106.6 (129.2) | n/a | 1.80x (native) |
+| `raw-read-4k` | MiB/s | n/a | 226.0 (254.0) | 122.4 (146.7) | 127.3 (137.7) | n/a | 1.85x (native) |
+| `raw-write+flush-256k` | MiB/s | n/a | 3449.0 (4134.0) | 2394.3 (2749.2) | 2579.7 (3164.2) | n/a | 1.44x (native) |
+| `raw-read-256k` | MiB/s | n/a | 8032.0 (11347.0) | 4686.4 (6660.9) | 5241.3 (6570.4) | n/a | 1.71x (native) |
+
+### Analysis
+
+Where MogOs wins (mechanisms to keep, not margins to bank on):
+
+- Syscall entry: 40 ns through musl (30 ns native) against Linux's 105 ns `getppid` (83 ns with `mitigations=off`, so
+  about 22 ns of Linux's is the Spectre-v2 BHB mitigation, which MogOs does not have yet). Linux's `write0` adds the
+  tty layer's locks (1245 ns).
+- Pipe round trip, 2.4x: a direct switch on one core without wait queues, fd-table locking or RCU.
+- `open+close`, 2.9x: a lookup in a one-block directory whose inode table is in memory, against a path walk with
+  permission checks, a `struct file` and fd-table updates.
+- `create+write+fsync`, 1.4x, but inside host-flush noise (best runs: 120 µs vs 199 µs): MogFS commits with two
+  flushes and no journal.
+- Raw disk, 1.4-1.9x (native): one polled request and no block layer, against `O_DIRECT` through blk-mq with an
+  interrupt per completion. Not yet reachable from C.
+
+Where MogOs loses or cannot run yet (work items, most likely cause first):
+
+1. `spawn` through musl is a tie with Linux (18.0 vs 18.5 µs) although native `spawn` is 5.5x faster (3.3 µs): the
+   libc path costs about 15 µs. Likely causes, unmeasured: `__mog_start` maps and zeroes a 128 KiB stack (32 frames)
+   at every start, `oscnop` is 41 KiB (eleven pages copied and the BSS zeroed eagerly) against `nop`'s one page, and
+   `vfork` + `execve` + `wait4` add the fd-table save, argument-string building and a pid-table lookup. Fixes: profile
+   it first; then a lazily grown or smaller initial stack, demand paging (phase 6) so untouched pages cost nothing,
+   and a smaller C runtime image.
+2. libc overhead on the fast paths: `open+close` 156 ns via musl vs 93 native, `write0` 40 vs 30, `pipe` 442 vs 367.
+   The lexical path resolution and fd-table indirection in `c/musl/src/mogos/mogos.c` sit on every call. Fix: a
+   per-call profile, then trim the dispatcher (for example resolve relative paths against a cached directory handle
+   instead of rebuilding from the root).
+3. `readdir1000` and `file-*`: fail. MogFS v1 holds 504 inodes and files up to 57232 bytes (14 direct pointers), and
+   there is no page cache, so warm reads would hit the disk. Fix: MogFS v2 with extents and larger directories
+   (phase 7) and the kernel page cache (phase 6, D2 in `docs/research/linux-survey.md`). Expect `file-read` to lose
+   until the page cache lands (Linux reads at 35 GiB/s from memory).
+4. `yield`: fails (`sched_yield` is `ENOSYS` in the libc, no native call). Fix: a yield syscall, so the scheduler's
+   switch cost is measured against Linux's 555 ns.
+5. `fsync` is a whole-tree commit without group commit: one writer ties or wins, many concurrent writers will lose to
+   ext4's journal batching. Fix: per-file `fsync` and group commit (survey M8, phase 7); measure with several writers
+   once SMP exists.
+6. Missing Spectre-class hardening makes part of the syscall margin unpaid (Linux pays about 22 ns for BHB here). Fix:
+   the SMCCC workarounds the survey lists (phase 10); then compare MogOs-with-mitigations against the `Linux` column.
+7. Single core only: Linux's numbers include SMP-safe locking MogOs does not need yet. Rerun at the same core count
+   when phase 5 lands; the locks added then must not eat these margins.
