@@ -3,7 +3,7 @@
 ## What this crate is
 
 Host-only integration tests: `tests/boot.rs` builds `qemu-virt`, boots `mog_os` in `qemu-system-aarch64`
-(`virt`, `cortex-a72`, 128 MiB, `-global virtio-mmio.force-legacy=false`, `-global virtio-mmio.ioeventfd=off`;
+(`virt,gic-version=3`, `cortex-a72`, 128 MiB, `-global virtio-mmio.force-legacy=false`, `-global virtio-mmio.ioeventfd=off`;
 `-append test=<name>` for every scenario but plain boot; `-smp 4` unless a scenario passes `-smp`: the ordering and
 benchmark scenarios `yield`, `preempt`, `pi` (also run at `-smp 4` with only per-process order asserted), `pipe`,
 `bench-syscall`, `bench-pipe`, `bench-disk` and `bench-fs` boot `-smp 1`), and asserts on the serial

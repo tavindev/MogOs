@@ -29,7 +29,7 @@ fn boot_with_input(extra: &[&str], input: Option<(&str, &[&[u8]])>) -> (ExitStat
     let mut qemu = Command::new("qemu-system-aarch64")
         .args([
             "-M",
-            "virt",
+            "virt,gic-version=3",
             "-cpu",
             "cortex-a72",
             "-m",
@@ -1359,7 +1359,15 @@ fn host_page(body: &'static str) -> u16 {
     let port = listener.local_addr().unwrap().port();
     thread::spawn(move || {
         for mut stream in listener.incoming().flatten() {
-            let _ = stream.read(&mut [0; 1024]);
+            // The whole head: replying and closing with request bytes unread would reset the connection, and on
+            // several cores the guest's request may arrive in more than one segment.
+            let (mut head, mut buf) = (Vec::new(), [0; 1024]);
+            while !head.ends_with(b"\r\n\r\n") {
+                match stream.read(&mut buf) {
+                    Ok(n) if n > 0 => head.extend_from_slice(&buf[..n]),
+                    _ => break,
+                }
+            }
             let head = format!("HTTP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
             let _ = stream.write_all((head + body).as_bytes());
         }

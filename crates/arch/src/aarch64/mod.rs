@@ -23,6 +23,15 @@ pub fn secondary_entry() -> u64 {
     aarch64_secondary as *const () as u64
 }
 
+/// This core's affinity from MPIDR_EL1: Aff0, Aff1 and Aff2 in bits 0-23, Aff3 in bits 32-39 (the layout `GICD_IROUTER`
+/// and `ICC_SGI1R_EL1` take).
+pub fn mpidr() -> u64 {
+    let mpidr: u64;
+    // SAFETY: reading MPIDR_EL1 has no side effects.
+    unsafe { asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nomem, nostack, preserves_flags)) };
+    mpidr & 0xff_00ff_ffff
+}
+
 /// Microseconds since the virtual counter started.
 pub fn uptime_us() -> u64 {
     let (ticks, freq): (u64, u64);

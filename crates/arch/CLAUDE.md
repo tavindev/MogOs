@@ -3,7 +3,7 @@
 ## What this crate is
 
 The only architecture-specific crate: boot and secondary-core entry (`src/aarch64/boot.s`), exception vectors and `TrapFrame`
-(`trap.rs`), MMU and page tables (`mmu.rs`), GICv2 (`gic.rs`), the virtual timer (`timer.rs`), IRQ masking
+(`trap.rs`), MMU and page tables (`mmu.rs`), GICv3 (`gic.rs`: distributor and redistributor MMIO, CPU interface by system registers), the virtual timer (`timer.rs`), IRQ masking
 (`irq.rs`), the only lock and per-CPU primitives (`lock.rs`), `uptime_us` (`mod.rs`).
 
 It is **NOT** board-specific: no MMIO addresses, no memory map, no drivers, no scheduling policy (those are
@@ -18,7 +18,7 @@ It is **NOT** board-specific: no MMIO addresses, no memory map, no drivers, no s
   `secondary_entry` (PSCI `CPU_ON`'s entry: `aarch64_mmu_on` on the same table, the stack top from the context id),
   `map_page` (`None` on a level-1 or level-2 block on the way, never writing a table into kernel memory), `unmap_page`, `free_space`, `set_ttbr0`, `flush_asid` (`tlbi aside1is`), `user_readable` /
   `user_writable` (`at` probes), `clean_dcache` / `invalidate_icache` (`ic ialluis`; clean each code page, invalidate once).
-- `irq::disable` / `restore` / `wait` / `window`, `gic::enable` / `enable_cpu` / `route` / `unmask` / `send_sgi` / `ack` / `eoi`,
+- `irq::disable` / `restore` / `wait` / `window`, `gic::enable` / `affinity` / `enable_cpu` / `route` / `unmask` / `unmask_local` / `send_sgi` / `ack` / `eoi`, `mpidr`,
   `timer::arm` / `stop`, `timer::allow_user_counter`.
 - `Lock<T>`, a ticket spinlock: `lock()` masks IRQs, then acquires, and its `Guard` releases, then restores DAIF;
   `lock_masked()` skips DAIF, for code entered masked; `Guard::leak` keeps it held until the `unsafe` `Lock::unlock`

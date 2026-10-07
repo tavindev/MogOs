@@ -15,10 +15,11 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
 ## Responsibilities
 
 - `kmain`: turns on the MMU (`arch::enable_mmu`, first), reads the DTB at RAM base and its core count (at most
-  `MAX_CPUS`), routes `UART_IRQ` to core 0 (`GICD_ITARGETSR`, else a GIC with several cores delivers it nowhere), builds
+  `MAX_CPUS`), enables the GICv3 distributor (affinity routing, Group 1; it panics without an `arm,gic-v3`), routes `UART_IRQ` to core 0 (Group 1, `GICD_IROUTER`), builds
   `QemuVirt`, calls `kernel::run` with the image and DTB reserved. `Board::start_cpus`, the last step of boot, starts core 1
   with PSCI `CPU_ON` without waiting, and core 1 starts the rest (a refused `CPU_ON` panics). `kmain_secondary`: a started core enables its GIC CPU
-  interface, timer PPI and `RESCHEDULE_SGI` (its banked `ISENABLER0`), lets EL0 read the counter, and becomes its idle
+  interface (`enable_gic_cpu`: its redistributor, checked against its MPIDR, woken, SGIs and PPIs in Group 1, then the
+  ICC system registers), timer PPI, `RESCHEDULE_SGI` and `PING_SGI` (`GICR_ISENABLER0`), lets EL0 read the counter, and becomes its idle
   context (`idle`, `wfi` in a loop); only under `test=smp` (`SMP_TEST`) does it print `cpu <n>: online` and arm its
   timer once. Core 0's idle context runs on its own 16 KiB stack above the secondaries' (`linker.ld`), its first frame
   built by `init_frames`, which also gives the scheduler its cores (`Scheduler::start_cores`).
@@ -69,8 +70,8 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
   `// SAFETY:` and every `unsafe fn` a `# Safety` section.
 - Depends on `kernel`, never the reverse. GIC and RAM come from the DTB; board constants fix the rest:
   `UART0` (the PL011 at `0x0900_0000`: all console output and input, never read from the DTB), `DTB` (RAM base), `KERNEL_L1` (GiB 0 device, GiB 1 RAM),
-  `UNMAPPED`, `TIMER_IRQ` (27), `UART_IRQ` (33), `VIRTIO_IRQ` (48, transport `i`'s SPI is `48 + i`), `RESCHEDULE_SGI` (0), core `n`'s MPIDR (`n`), `SECONDARY_STACK` (16 KiB), `VIRTIO`, `VIRTIO_STRIDE`, `VIRTIO_COUNT` (32 virtio-mmio transports from `0x0a00_0000`, `0x200` apart), the PSCI calls (`SYSTEM_OFF`, `CPU_ON`, by HVC). QEMU runs with
-  `-global virtio-mmio.force-legacy=false` (the driver rejects legacy) and `-global virtio-mmio.ioeventfd=off`
+  `UNMAPPED`, `TIMER_IRQ` (27), `UART_IRQ` (33), `VIRTIO_IRQ` (48, transport `i`'s SPI is `48 + i`), `RESCHEDULE_SGI` (0), `PING_SGI` (1), core `n`'s MPIDR (`n`, below 16 cores), `REDIST_STRIDE` (128 KiB), `SECONDARY_STACK` (16 KiB), `VIRTIO`, `VIRTIO_STRIDE`, `VIRTIO_COUNT` (32 virtio-mmio transports from `0x0a00_0000`, `0x200` apart), the PSCI calls (`SYSTEM_OFF`, `CPU_ON`, by HVC). QEMU runs with
+  `-M virt,gic-version=3`, `-global virtio-mmio.force-legacy=false` (the driver rejects legacy) and `-global virtio-mmio.ioeventfd=off`
   (`docs/DEVELOPMENT.md` settings table).
 - Bare-metal only: excluded from `cargo test-host`.
 
@@ -100,9 +101,9 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
   (`TICKS`), and stopped otherwise; an idle core starts it again when it picks a task. A thread another core runs is
   never ended in place: `end_process` and `kill` mark it (`Scheduler::mark`) and signal its core, which ends it in
   `board_irq`, or in `block` if it blocks first; a marked caller gets `EAGAIN` from `thread`, so its process gains
-  none. The last thread to end frees the address space (`exit_process`). IRQs dispatch on `iar & 0x3ff` and EOI the
-  full IAR.
-- Everything a secondary reads (`GIC_DIST`, `GIC_CPU`, `CPUS`, `SMP_TEST`) is stored before its `CPU_ON`, which `dsb ish` precedes.
+  none. The last thread to end frees the address space (`exit_process`). IRQs dispatch on the INTID `ICC_IAR1_EL1` returns and EOI it
+  (`ICC_EOIR1_EL1`), except the special IDs from 1020.
+- Everything a secondary reads (`GIC_DIST`, `GIC_REDIST`, `CPUS`, `SMP_TEST`) is stored before its `CPU_ON`, which `dsb ish` precedes.
 - Secondaries must set every per-core register core 0 sets (vectors, `CNTKCTL_EL1`): EL0 on a core without
   `allow_user_counter` traps its counter reads.
 - A process's index is its ASID (`MAX_PROCESSES <= 256`, const-asserted); index 0 is the kernel, whose boot table

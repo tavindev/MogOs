@@ -2,7 +2,7 @@
 
 ## What this crate is
 
-Reads the flattened device tree QEMU passes: `total_size`, then `Dtb::memory`, `gic` (GICv2), `cpus` (the count of second-level nodes, the `/cpus` children, with `device_type = "cpu"`) and
+Reads the flattened device tree QEMU passes: `total_size`, then `Dtb::memory`, `gic` (the first `arm,gic-v3`: its distributor and `#redistributor-regions` regions), `cpus` (the count of second-level nodes, the `/cpus` children, with `device_type = "cpu"`) and
 `chosen` (`/chosen`'s `bootargs` and the first 16 bytes of `rng-seed`, the TCP key, in one walk). All in `src/lib.rs`. It is **NOT** a general device-tree library: no writing, no phandles, no
 nested-bus address translation.
 

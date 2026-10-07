@@ -17,8 +17,8 @@ use crate::net;
 use crate::process::{free_stack, map, spawn, thread};
 use crate::usermem::{UserIn, UserOut, copy_in};
 use crate::{
-    ARCHIVE, CONSOLE, GIC_CPU, KERNEL, Kernel, MAX_MUTEXES, MAX_PIPES, PING_SGI, PONGS, Sched,
-    TICK_US, TICKED, TICKS, TIMER_IRQ, UART_IRQ, kick, send, send_sgi,
+    ARCHIVE, CONSOLE, KERNEL, Kernel, MAX_MUTEXES, MAX_PIPES, PING_SGI, PONGS, Sched, TICK_US,
+    TICKED, TICKS, TIMER_IRQ, UART_IRQ, kick, send, send_sgi,
 };
 
 /// # Safety
@@ -282,6 +282,9 @@ fn pipe_io(pipes: &mut Pipes<MAX_PIPES>, end: End, ptr: u64, len: usize) -> Opti
     }
 }
 
+/// The first of the special interrupt IDs `ack` may return (1023: none pending), which take no EOI.
+const SPURIOUS: u32 = 1020;
+
 /// # Safety
 /// IRQs must be masked (trap context), as `task_switch` requires; returns holding `KERNEL`.
 #[unsafe(no_mangle)]
@@ -289,10 +292,7 @@ unsafe extern "C" fn board_irq(frame: usize) -> usize {
     let kernel = Guard::leak(KERNEL.lock_masked());
     let cpu = arch::cpu();
     let idle = kernel.sched.idle(cpu);
-    let gic = PhysAddr(GIC_CPU.load(Relaxed));
-    // SAFETY: IRQs are delivered only after `kmain` stored the DTB's GIC CPU interface.
-    let iar = unsafe { arch::gic::ack(gic) };
-    let irq = iar & 0x3ff;
+    let irq = arch::gic::ack();
     let tick = irq == TIMER_IRQ;
     if tick {
         TICKED.fetch_or(1 << cpu, Relaxed);
@@ -312,8 +312,9 @@ unsafe extern "C" fn board_irq(frame: usize) -> usize {
             }
         }
     }
-    // SAFETY: as above.
-    unsafe { arch::gic::eoi(gic, iar) };
+    if irq < SPURIOUS {
+        arch::gic::eoi(irq);
+    }
     let next = match kernel.sched.marked(cpu) {
         // SAFETY: the caller masked IRQs, and `frame` is `cpu`'s current thread's, which is marked.
         Some(code) => unsafe { exit_thread(kernel, cpu, frame, code) },

@@ -83,13 +83,18 @@ const PSCI_CPU_ON: u64 = 0xc400_0003;
 /// Each secondary core's stack, and core 0's idle context's, reserved in `linker.ld` above `__stack_top`.
 const SECONDARY_STACK: u64 = 0x4000;
 
-/// GIC distributor and CPU interface bases, set before the first IRQ can be delivered and before any secondary starts.
+/// The GICv3 distributor and the DTB's first redistributor region, set before the first IRQ can be delivered and before
+/// any secondary starts. Core `n`'s redistributor is the region's `n`th frame (at most `MAX_CPUS` start).
 static GIC_DIST: AtomicU64 = AtomicU64::new(0);
-static GIC_CPU: AtomicU64 = AtomicU64::new(0);
+static GIC_REDIST: AtomicU64 = AtomicU64::new(0);
+/// A GICv3 redistributor's two 64 KiB frames (control, then SGIs and PPIs).
+const REDIST_STRIDE: u64 = 0x2_0000;
 /// Bit `n` is set once core `n` has taken a timer tick.
 static TICKED: AtomicUsize = AtomicUsize::new(0);
 /// `Board::start_timer` was called: a core that runs a task ticks.
 static TICKS: AtomicBool = AtomicBool::new(false);
+/// Cores whose GIC is set up, counted once each (core 0 at `start_cpus`).
+static ONLINE: AtomicUsize = AtomicUsize::new(0);
 /// `test=smp`: secondaries announce themselves and run their timer; otherwise they sleep until 25b gives them work.
 static SMP_TEST: AtomicBool = AtomicBool::new(false);
 /// The DTB's cores, at most `MAX_CPUS`; `start_cpus` starts them all or panics.
@@ -393,6 +398,10 @@ impl kernel::Board for QemuVirt {
     }
 
     fn ipi_round_trips(&mut self, n: u64) {
+        // An SGI to a core that has not set up its GIC yet could be lost.
+        while ONLINE.load(Acquire) < CPUS.load(Relaxed) {
+            spin_loop();
+        }
         for i in 1..=n {
             send(1, PING_SGI);
             while PONGS.load(Acquire) < i {
@@ -411,6 +420,7 @@ impl kernel::Board for QemuVirt {
 
     fn start_cpus(&mut self, smp_test: bool) {
         SMP_TEST.store(smp_test, Relaxed);
+        ONLINE.store(1, Relaxed);
         // Core 1 starts the rest, so boot pays one call.
         if CPUS.load(Relaxed) > 1 {
             start_cpu(1);
@@ -455,33 +465,27 @@ extern "C" fn kmain() -> ! {
     let dtb_range = DTB..PhysAddr(DTB.0 + size as u64);
 
     let dtb = Dtb::new(blob).expect("bad DTB");
-    let gic = dtb.gic().expect("no GICv2 in DTB");
-    GIC_DIST.store(gic.0.0, Relaxed);
-    GIC_CPU.store(gic.1.0, Relaxed);
-    let gic_gib = [gic.0, gic.1].map(|r| r.0 / GIB).into_iter();
+    let gic = dtb.gic().expect("no GICv3 in DTB");
+    let dist = gic.distributor().expect("no GICv3 distributor");
+    let (redist, _) = gic.redistributors().next().expect("no GICv3 redistributor");
+    GIC_DIST.store(dist.0, Relaxed);
+    GIC_REDIST.store(redist.0, Relaxed);
+    let gic_gib = gic.redistributors().map(|r| r.0.0 / GIB);
     let user_end = gic_gib
+        .chain([dist.0 / GIB])
         .filter(|&g| g >= USER_BASE / GIB)
         .fold(511, u64::min);
     USER_END.store(user_end * GIB, Relaxed);
-    // SAFETY: the DTB's GICv2 registers, in the device-mapped GiB 0.
-    unsafe { arch::gic::enable(gic.0, gic.1) };
-    for irq in [UART_IRQ, TIMER_IRQ] {
-        // SAFETY: as above.
-        unsafe { arch::gic::unmask(gic.0, irq) };
-    }
+    // SAFETY: the DTB's GICv3 distributor, in the device-mapped GiB 0, enabled once, before any CPU interface.
+    unsafe { arch::gic::enable(dist) };
+    enable_gic_cpu();
+    // SAFETY: as above; UART_IRQ is an SPI, routed to this core.
+    unsafe { arch::gic::route(dist, UART_IRQ, arch::mpidr()) };
+    // SAFETY: as above.
+    unsafe { arch::gic::unmask(dist, UART_IRQ) };
     Uart::new(UART0).enable_rx_irq();
     let cpus = dtb.cpus().min(arch::MAX_CPUS);
     CPUS.store(cpus, Relaxed);
-    // A one-core GIC delivers every interrupt to that core (ITARGETSR is RAZ/WI), and no other core sends it an SGI.
-    if cpus > 1 {
-        // SAFETY: as above; UART_IRQ is an SPI and core 0's CPU interface is 0.
-        unsafe { arch::gic::route(gic.0, UART_IRQ, 0) };
-        // SAFETY: as above.
-        for irq in [RESCHEDULE_SGI, PING_SGI] {
-            // SAFETY: as above.
-            unsafe { arch::gic::unmask(gic.0, irq) };
-        }
-    }
 
     kernel::run(
         &mut QemuVirt {
@@ -521,18 +525,35 @@ extern "C" fn kmain_secondary() -> ! {
     if arch::cpu() == 1 {
         (2..CPUS.load(Relaxed)).for_each(start_cpu);
     }
-    let dist = PhysAddr(GIC_DIST.load(Relaxed));
-    // SAFETY: the DTB's GICv2 CPU interface, stored by `kmain` before it started this core, in device-mapped GiB 0.
-    unsafe { arch::gic::enable_cpu(PhysAddr(GIC_CPU.load(Relaxed))) };
-    for irq in [TIMER_IRQ, RESCHEDULE_SGI, PING_SGI] {
-        // SAFETY: as above, the distributor; below 32, so this core's banked ISENABLER0.
-        unsafe { arch::gic::unmask(dist, irq) };
-    }
+    enable_gic_cpu();
+    ONLINE.fetch_add(1, Release);
     if SMP_TEST.load(Relaxed) {
         let _ = writeln!(Console, "cpu {}: online", arch::cpu());
         arch::timer::arm(TICK_US);
     }
     idle(0)
+}
+
+/// Turns on this core's redistributor and GIC CPU interface and unmasks its timer PPI and SGIs; panics if the
+/// redistributor's affinity is not this core's MPIDR.
+fn enable_gic_cpu() {
+    let cpu = arch::cpu();
+    let redist = PhysAddr(GIC_REDIST.load(Relaxed) + cpu as u64 * REDIST_STRIDE);
+    // SAFETY: core `cpu`'s frame of the DTB's first redistributor region (stored by `kmain` before any secondary starts),
+    // in the device-mapped GiB 0.
+    let affinity = unsafe { arch::gic::affinity(redist) } as u64;
+    let mpidr = arch::mpidr();
+    assert_eq!(
+        affinity,
+        mpidr & 0xff_ffff | (mpidr >> 32) << 24,
+        "core {cpu}'s redistributor"
+    );
+    // SAFETY: as above, and `affinity` showed it is this core's; `kmain` enabled the distributor first.
+    unsafe { arch::gic::enable_cpu(redist) };
+    for irq in [TIMER_IRQ, RESCHEDULE_SGI, PING_SGI] {
+        // SAFETY: as above.
+        unsafe { arch::gic::unmask_local(redist, irq) };
+    }
 }
 
 /// A core's idle context: sleeps until an IRQ, whose handler switches to a ready task, if any.
@@ -547,11 +568,9 @@ fn send_sgi(cpu: usize) {
     send(cpu, RESCHEDULE_SGI);
 }
 
-/// Sends `cpu` SGI `sgi`.
+/// Sends `cpu` (MPIDR `cpu` on QEMU `virt` below 16 cores) SGI `sgi`.
 fn send(cpu: usize, sgi: u32) {
-    // SAFETY: the DTB's GICv2 distributor, stored before any IRQ or secondary core, in device-mapped GiB 0; `cpu` is
-    // below `MAX_CPUS`.
-    unsafe { arch::gic::send_sgi(PhysAddr(GIC_DIST.load(Relaxed)), cpu, sgi) };
+    arch::gic::send_sgi(cpu as u64, sgi);
 }
 
 /// Signals an idle core for each task made ready since the last call, while one is left to signal.

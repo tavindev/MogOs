@@ -14,7 +14,7 @@ use net::Config;
 use crate::usermem::{UserIn, UserOut};
 use crate::virtio_net::{NET_DEVICE, POOL_FRAMES, VirtioNet};
 use crate::{
-    CPUS, GIC_DIST, KERNEL, MAX_PROCESSES, QemuVirt, Sched, VIRTIO, VIRTIO_COUNT, VIRTIO_STRIDE,
+    GIC_DIST, KERNEL, MAX_PROCESSES, QemuVirt, Sched, VIRTIO, VIRTIO_COUNT, VIRTIO_STRIDE,
 };
 
 const _: () = assert!(MAX_PROCESSES <= network::MAX_HOLDERS);
@@ -99,10 +99,8 @@ fn setup(board: &mut QemuVirt) {
     if nic.is_some() {
         let irq = IRQ.load(Relaxed);
         let dist = PhysAddr(GIC_DIST.load(Relaxed));
-        if CPUS.load(Relaxed) > 1 {
-            // SAFETY: the DTB's GICv2 distributor, in the device-mapped GiB 0; `irq` is an SPI, core 0's interface is 0.
-            unsafe { arch::gic::route(dist, irq, 0) };
-        }
+        // SAFETY: the DTB's GICv3 distributor, in the device-mapped GiB 0; `irq` is an SPI, core 0's MPIDR is 0.
+        unsafe { arch::gic::route(dist, irq, 0) };
         // SAFETY: as above.
         unsafe { arch::gic::unmask(dist, irq) };
     }

@@ -16,7 +16,7 @@ cargo run -q --manifest-path "$root/Cargo.toml" -p mogfs --example mkfs --target
 # boot <label> <kernel>: appends `<label> <tab> <name> <tab> <ns>` per bench line to $tmp/results.
 boot() {
     cp "$tmp/clean.img" "$tmp/disk.img"
-    qemu-system-aarch64 -M virt -accel hvf -cpu cortex-a72 -m 128M -global virtio-mmio.force-legacy=false \
+    qemu-system-aarch64 -M virt,gic-version=3 -accel hvf -cpu cortex-a72 -m 128M -global virtio-mmio.force-legacy=false \
         -global virtio-mmio.ioeventfd=off -nographic -kernel "$2" \
         -drive file="$tmp/disk.img",if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0 ${QEMU_ARGS:-} \
         -append "test=$test" </dev/null | tr -d '\r' >"$tmp/out"
