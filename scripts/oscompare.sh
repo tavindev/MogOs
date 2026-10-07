@@ -51,12 +51,15 @@ fetch() { # url sha256 file
 
 build_linux_guest() {
     local g=$TP/linux
-    [ -f "$g/initrd" ] && [ "$g/initrd" -nt "$ROOT/c/oscb.c" ] && [ "$g/initrd" -nt "$ROOT/scripts/oscompare-init.sh" ] && return
+    local f fresh=1
+    for f in c/oscb.c c/oscnop.c scripts/oscompare-init.sh scripts/oscompare.sh; do [ "$g/initrd" -nt "$ROOT/$f" ] || fresh=; done
+    [ -n "$fresh" ] && return
     fetch "$ALPINE_URL" "$ALPINE_SHA" "$TP/$ALPINE_ISO"
     fetch "$MUSL_URL" "$MUSL_SHA" "$TP/$MUSL.tar.gz"
-    if [ ! -f "$TP/musl/lib/libc.a" ]; then
+    local musl=$TP/sysroot-$MUSL$OPT
+    if [ ! -f "$musl/lib/libc.a" ]; then
         rm -rf "$TP/$MUSL" && tar xzf "$TP/$MUSL.tar.gz" -C "$TP"
-        (cd "$TP/$MUSL" && ./configure --target=aarch64-linux-musl --prefix="$TP/musl" --disable-shared \
+        (cd "$TP/$MUSL" && ./configure --target=aarch64-linux-musl --prefix="$musl" --disable-shared \
             CC="$LLVM/clang" CFLAGS="--target=aarch64-linux-musl $OPT" AR="$LLVM/llvm-ar" RANLIB="$LLVM/llvm-ranlib" \
             >/dev/null && make -j3 install >/dev/null)
     fi
@@ -69,9 +72,9 @@ build_linux_guest() {
     cp "$g/pkg/etc/mke2fs.conf" "$g/root/etc/"
     cp -P "$g"/pkg/usr/lib/*.so* "$g/root/usr/lib/"
     for name in oscb oscnop; do
-        "$LLVM/clang" --target=aarch64-linux-musl --sysroot="$TP/musl" $OPT -Wall -c "$ROOT/c/$name.c" -o "$g/$name.o"
+        "$LLVM/clang" --target=aarch64-linux-musl --sysroot="$musl" $OPT -Wall -c "$ROOT/c/$name.c" -o "$g/$name.o"
         DYLD_LIBRARY_PATH=$SYSROOT/lib "$LLD" -static -s -o "$g/root/bench/$name" \
-            "$TP/musl/lib/crt1.o" "$TP/musl/lib/crti.o" "$g/$name.o" "$TP/musl/lib/libc.a" "$TP/musl/lib/crtn.o"
+            "$musl/lib/crt1.o" "$musl/lib/crti.o" "$g/$name.o" "$musl/lib/libc.a" "$musl/lib/crtn.o"
     done
     cp "$ROOT/scripts/oscompare-init.sh" "$g/root/bench/init"
     chmod 755 "$g/root/bench/init"
@@ -106,16 +109,20 @@ boot() { perl -e 'alarm 300; exec @ARGV' "${QEMU[@]}" "$@" </dev/null; }
 # Boots MogOs into msh, types `command` at the prompt, then `exit`; prints the console output.
 boot_msh() { # command
     python3 - "$1" "${QEMU[@]}" "${MOGOS[@]}" -append test=shell <<'EOF'
-import subprocess, sys, time
+import signal, subprocess, sys
 command, argv = sys.argv[1], sys.argv[2:]
 qemu = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
-out, deadline = b"", time.monotonic() + 300
+out = b""
+def timeout(*_):
+    qemu.kill()
+    sys.exit(f"msh: timed out\n{out.decode(errors='replace')}")
+signal.signal(signal.SIGALRM, timeout)
+signal.alarm(300)
 for line in (command, "exit"):
     while out.count(b"msh> ") < (1 if line == command else 2):
         chunk = qemu.stdout.read1(4096)
-        if not chunk or time.monotonic() > deadline:
-            qemu.kill()
-            sys.exit(f"msh: no prompt\n{out.decode(errors='replace')}")
+        if not chunk:
+            timeout()
         out += chunk
     qemu.stdin.write(line.encode() + b"\r")
     qemu.stdin.flush()
@@ -143,24 +150,25 @@ build_mogos
 for run in $(seq "$RUNS"); do
     echo "run $run/$RUNS" >&2
     fresh_disk "$TP/mogfs.img"
-    boot_msh "$MOGOS_SCRIPT" >"$OUT/mogos-$run.log"
+    # A failed boot only loses its samples: the table shows each row's count when it is short.
+    boot_msh "$MOGOS_SCRIPT" >"$OUT/mogos-$run.log" || true
     for test in $MOGOS_NATIVE; do
         fresh_disk "$TP/mogfs.img"
-        boot "${MOGOS[@]}" -append "$test" >"$OUT/native-$run-$test.log"
+        boot "${MOGOS[@]}" -append "$test" >"$OUT/native-$run-$test.log" || true
     done
     fresh_disk
-    boot "${LINUX[@]}" -append "$LINUX_APPEND" >"$OUT/linux-$run.log"
+    boot "${LINUX[@]}" -append "$LINUX_APPEND" >"$OUT/linux-$run.log" || true
     fresh_disk
-    boot "${LINUX[@]}" -append "$LINUX_APPEND mitigations=off" >"$OUT/linux-nomit-$run.log"
+    boot "${LINUX[@]}" -append "$LINUX_APPEND mitigations=off" >"$OUT/linux-nomit-$run.log" || true
     rm -rf "$OUT/macos-dir" && mkdir "$OUT/macos-dir"
     for b in $BENCHES; do "$TP/macos/oscb" "$b" "$OUT/macos-dir" "$TP/macos/oscnop" || true; done >"$OUT/macos-$run.log"
 done
 echo "load after: $(sysctl -n vm.loadavg)" >>"$OUT/meta.txt"
 
-python3 - "$OUT" <<'EOF'
+python3 - "$OUT" "$RUNS" <<'EOF'
 import glob, os, re, statistics, sys
 
-out = sys.argv[1]
+out, runs = sys.argv[1], int(sys.argv[2])
 # MogOs's native benchmark lines, mapped to the oscb rows that measure the same thing.
 native = [
     (r"^syscall: (\d+) ns", "write0"),
@@ -211,17 +219,19 @@ def cell(values, unit):
     if not values:
         return "n/a"
     best = min(values) if unit == "ns" else max(values)
-    return f"{statistics.median(values):.1f} ({best:.1f})"
+    short = "" if len(values) == runs else f" n={len(values)}"
+    return f"{statistics.median(values):.1f} ({best:.1f}){short}"
 print("| Benchmark | Unit | " + " | ".join(oses) + " | MogOs vs Linux |")
 print("| --- | --- |" + " --- |" * (len(oses) + 1))
 for key, unit in rows:
     cells = [cell(data[o].get(key), unit) for o in oses]
-    # MogOs's getppid never traps (libc answers it), so it has no ratio; the raw disk has only the native path.
+    # MogOs's getppid never traps (libc answers it), so it has no ratio; Linux's write0 crosses its tty layer, so
+    # MogOs's write0 is compared with Linux's null syscall; the raw disk has only the native path.
     m = None if key == "getppid" else data["mogos"].get(key) or data["native"].get(key)
-    l = data["linux"].get(key)
+    l = data["linux"].get("getppid" if key == "write0" else key)
     ratio = "n/a"
     if m and l:
         r = statistics.median(l) / statistics.median(m) if unit == "ns" else statistics.median(m) / statistics.median(l)
-        ratio = f"{r:.2f}x" + ("" if data["mogos"].get(key) else " (native)")
+        ratio = f"{r:.2f}x" + ("" if data["mogos"].get(key) else " (native)") + (" vs getppid" if key == "write0" else "")
     print(f"| {key} | {unit} | " + " | ".join(cells) + f" | {ratio} |")
 EOF

@@ -21,8 +21,9 @@ echo "oscb-meta: cmdline $(cat /proc/cmdline)"
 for f in /sys/devices/system/cpu/vulnerabilities/*; do echo "oscb-meta: vuln ${f##*/}: $(cat "$f")"; done
 grep -E '^(MemTotal|MemAvailable):' /proc/meminfo | sed 's/^/oscb-meta: /'
 /bench/oscb raw /dev/$disk
-mke2fs -q -F -t ext4 -b 4096 -E lazy_itable_init=0,lazy_journal_init=0 /dev/$disk
-mount -t ext4 /dev/$disk /mnt
+# Without ext4 every later benchmark would run on the initramfs, so a failure here ends the boot.
+mke2fs -q -F -t ext4 -b 4096 -E lazy_itable_init=0,lazy_journal_init=0 /dev/$disk || poweroff -f
+mount -t ext4 /dev/$disk /mnt || poweroff -f
 echo "oscb-meta: mount $(grep ' /mnt ' /proc/mounts)"
 for b in syscalls yield pipe spawn files readdir fileio; do /bench/oscb $b /mnt /bench/oscnop; done
 umount /mnt
