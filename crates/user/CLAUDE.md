@@ -12,7 +12,7 @@ board crate).
 
 - Outside the workspace (own `Cargo.lock`): lint and format with the `--manifest-path` commands in
   `docs/DEVELOPMENT.md`. `cargo test-host` does not build it.
-- `#![no_std]`, `#![no_main]`, no dependencies. `unsafe` blocks only in `src/lib.rs` for `svc` and `map`'s slice
+- `#![no_std]`, `#![no_main]`, no dependencies. `unsafe` blocks only in `src/lib.rs` for `svc`, `map`'s slice and `start`'s argument slice
   (bins only use `#[unsafe(no_mangle)]`), each with a `// SAFETY:`.
 - A program that takes arguments defines `_start(argc, _, len)` and calls `start(argc, len, main)`, which hands `main`
   the arguments as `&[&[u8]]` (the kernel puts them at the end of the top stack page, `STACK_TOP`) and exits with its

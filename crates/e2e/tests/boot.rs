@@ -730,7 +730,9 @@ fn shell_files_survive_a_reboot_only_once_synced() {
 
     let (status, boot3) = shell(
         &image,
-        &["cd docs", "ls", "cd nope", "pwd", "cd", "pwd", "ls", "exit"],
+        &[
+            "cd docs", "ls", "cd nope", "touch f", "cd f", "pwd", "cd", "pwd", "ls", "exit",
+        ],
     );
     std::fs::remove_file(&image).unwrap();
     assert!(status.success(), "QEMU exited with {status}");
@@ -740,6 +742,8 @@ fn shell_files_survive_a_reboot_only_once_synced() {
             ("cd docs", &[]),
             ("ls", &[]),
             ("cd nope", &["msh: cd: ENOENT"]),
+            ("touch f", &[]),
+            ("cd f", &["msh: cd: ENOTDIR"]),
             ("pwd", &["/docs"]),
             ("cd", &[]),
             ("pwd", &["/"]),
