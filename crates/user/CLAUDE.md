@@ -2,7 +2,7 @@
 
 ## What this crate is
 
-EL0 programs (`src/bin/*.rs`), each the init or a child of one `test=*` scenario, and the native syscall stubs they
+EL0 programs (`src/bin/*.rs`), each the init or a child of one `test=*` scenario (msh's commands are its children), and the native syscall stubs they
 share (`src/lib.rs`). `crates/board/qemu-virt/build.rs` builds them and bundles every bin into the boot archive.
 
 It is **NOT** libc or a Rust `std` target, and **NOT** where the hand-written asm programs live (`src/user.s` in the
@@ -32,6 +32,13 @@ board crate).
 - Child budgets (`CHILD_BUDGET`, `A_BUDGET`, `PONG_BUDGET`, ...) are sized deliberately, some exact, some with slack,
   as their comments say; they must fit in the kernel's `BOOT_BUDGET`, `WAITER_BUDGET`, `PI_BUDGET`. `ROUND_TRIPS` in
   `ping.rs` must equal the kernel's `PIPE_ROUND_TRIPS`.
+- Least privilege (security rule): msh resolves every path argument itself, against its root handle and current
+  directory, and passes a program only the console (write) and a handle to what its job needs, narrowed by `dup` to
+  the rights it uses plus transfer: `cat` a read-only file, `ls` a read-only directory, `mkdir` and `rm` the parent
+  directory with write, `touch` and `write` the parent with read and write, `mv` both parents with write, `sync` the
+  root with write, `echo` and any other program nothing. The leaf name goes as an argument. A program never gets the
+  root unless its job needs it (`sync`), nor a right it does not use. A shell program exits with the errno of its
+  failure (`status`), which msh prints by name.
 - A failed check exits instead of printing, so a wrong result shows as a missing line in the e2e test; panic is
   `exit(1)`.
 - Performance is the moat: a slowdown is never accepted because it has an explanation; it is removed, or shown to
@@ -42,7 +49,9 @@ board crate).
 - Only end to end: `spawner` / `child` (`spawn_moves_handles_and_budget_to_the_child`), `reader` / `writer`
   (`parent_blocks_on_an_empty_pipe_until_the_child_writes`), `waiter` (`an_exited_child_keeps_its_slot_until_waited_for`),
   `pi` / `low` / `mid` / `high` (`priority_inheritance_lets_the_mutex_owner_outrun_a_middle_priority_spinner`),
-  `ping` / `pong` (`pipe_bench_reports_round_trip`), `msh` (`shell_files_survive_a_reboot_only_once_synced`),
+  `ping` / `pong` (`pipe_bench_reports_round_trip`), `readlines` (`console_reads_edited_lines_typed_ahead`), `msh`
+  and its programs `ls`, `mkdir`, `touch`, `write`, `cat`, `rm`, `mv`, `echo`, `sync`
+  (`shell_files_survive_a_reboot_only_once_synced`, `sync_reports_a_failed_flush`),
   `fsbench` (`fs_bench_reports_round_trips`), `spawnbench` / `nop` (`spawn_bench_reports_round_trip`), all in `crates/e2e/tests/boot.rs`.
 - Clippy and fmt via the `crates/user` commands in `docs/DEVELOPMENT.md` must be clean.
 

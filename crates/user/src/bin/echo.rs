@@ -1,19 +1,13 @@
-//! Reads two lines from the console, then prints them back.
+//! msh's `echo`: prints its arguments, separated by spaces.
 #![no_std]
 #![no_main]
 
 use user::*;
 
 #[unsafe(no_mangle)]
-extern "C" fn _start() -> ! {
-    write(CONSOLE, b"E: ready\n");
-    let mut lines = [[0; 64]; 2];
-    let lens = lines
-        .each_mut()
-        .map(|line| read(CONSOLE, line).max(0) as usize);
-    for (line, len) in lines.iter().zip(lens) {
-        write(CONSOLE, b"got: ");
-        write(CONSOLE, &line[..len]);
-    }
-    exit(0)
+extern "C" fn _start(argc: usize, _: usize, len: usize) -> ! {
+    start(argc, len, |args| {
+        write_words(CONSOLE, &args[1.min(args.len())..], 0);
+        0
+    })
 }

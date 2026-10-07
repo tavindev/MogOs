@@ -7,6 +7,7 @@ use core::panic::PanicInfo;
 /// Handle 0: the console, for every program spawned with it first.
 pub const CONSOLE: u64 = 0;
 
+pub const READ: u64 = 1 << 0;
 pub const WRITE: u64 = 1 << 1;
 pub const TRANSFER: u64 = 1 << 4;
 
@@ -33,6 +34,7 @@ pub const EEXIST: i64 = -17;
 pub const ENOTDIR: i64 = -20;
 pub const EISDIR: i64 = -21;
 pub const EINVAL: i64 = -22;
+pub const EMFILE: i64 = -24;
 pub const EFBIG: i64 = -27;
 pub const ENOSPC: i64 = -28;
 pub const EROFS: i64 = -30;
@@ -158,6 +160,32 @@ pub fn start(argc: usize, len: usize, main: fn(&[&[u8]]) -> u64) -> ! {
         *arg = bytes;
     }
     exit(main(&args[..argc.min(MAX_ARGS)]))
+}
+
+/// The exit code for a syscall result: its errno (`-result`) if it failed, else 0; msh prints it by name.
+pub fn status(result: i64) -> u64 {
+    result.min(0).unsigned_abs()
+}
+
+/// Argument `i`, empty if missing (a name the kernel then rejects).
+pub fn arg<'a>(args: &[&'a [u8]], i: usize) -> &'a [u8] {
+    args.get(i).copied().unwrap_or_default()
+}
+
+/// Writes `words` separated by spaces, then a newline, at `offset`; returns the first error or the bytes written.
+pub fn write_words(handle: u64, words: &[&[u8]], mut offset: u64) -> i64 {
+    for (i, &word) in words.iter().enumerate() {
+        let sep: &[u8] = if i == 0 { b"" } else { b" " };
+        for part in [sep, word] {
+            let n = write_at(handle, part, offset);
+            if n < 0 {
+                return n;
+            }
+            offset += n as u64;
+        }
+    }
+    let n = write_at(handle, b"\n", offset);
+    if n < 0 { n } else { offset as i64 + n }
 }
 
 /// Returns the read end (or an error) and the write end.

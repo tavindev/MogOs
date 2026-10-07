@@ -659,10 +659,18 @@ fn shell_files_survive_a_reboot_only_once_synced() {
         &image,
         &[
             "mkdir docs",
-            "write docs/a.txt hello",
+            "cd docs",
+            "pwd",
+            "write a.txt hello",
+            "cd ..",
+            "mv docs/a.txt docs/b.txt",
+            "mkdir tmp",
+            "rm tmp",
+            "echo hi  there",
             "sync",
-            "write docs/b.txt late",
+            "write docs/late.txt x",
             "ls docs",
+            "frob",
             "exit",
         ],
     );
@@ -671,25 +679,35 @@ fn shell_files_survive_a_reboot_only_once_synced() {
         boot1,
         session(&[
             ("mkdir docs", &[]),
-            ("write docs/a.txt hello", &[]),
+            ("cd docs", &[]),
+            ("pwd", &["/docs"]),
+            ("write a.txt hello", &[]),
+            ("cd ..", &[]),
+            ("mv docs/a.txt docs/b.txt", &[]),
+            ("mkdir tmp", &[]),
+            ("rm tmp", &[]),
+            ("echo hi  there", &["hi there"]),
             ("sync", &[]),
-            ("write docs/b.txt late", &[]),
-            ("ls docs", &["a.txt", "b.txt"]),
+            ("write docs/late.txt x", &[]),
+            ("ls docs", &["b.txt", "late.txt"]),
+            ("frob", &["msh: frob: command not found"]),
             ("exit", &[]),
         ])
     );
 
-    // b.txt was written but never synced, so the reboot drops it.
+    // late.txt was written but never synced, so the reboot drops it; this boot commits after mounting.
     let (status, boot2) = shell(
         &image,
         &[
             "ls",
             "ls docs",
-            "cat docs/a.txt",
+            "cat docs/b.txt",
             "cat ../x",
             "cat /x",
-            "write docs/c.txt again",
+            "rm docs",
+            "rm docs/b.txt",
             "sync",
+            "ls docs",
             "exit",
         ],
     );
@@ -698,25 +716,34 @@ fn shell_files_survive_a_reboot_only_once_synced() {
         boot2,
         session(&[
             ("ls", &["docs/"]),
-            ("ls docs", &["a.txt"]),
-            ("cat docs/a.txt", &["hello"]),
+            ("ls docs", &["b.txt"]),
+            ("cat docs/b.txt", &["hello"]),
             ("cat ../x", &["msh: cat: EINVAL"]),
             ("cat /x", &["msh: cat: EINVAL"]),
-            ("write docs/c.txt again", &[]),
+            ("rm docs", &["msh: rm: ENOTEMPTY"]),
+            ("rm docs/b.txt", &[]),
             ("sync", &[]),
+            ("ls docs", &[]),
             ("exit", &[]),
         ])
     );
 
-    // A commit right after mounting an existing image lands.
-    let (status, boot3) = shell(&image, &["ls docs", "cat docs/c.txt", "exit"]);
+    let (status, boot3) = shell(
+        &image,
+        &["cd docs", "ls", "cd nope", "pwd", "cd", "pwd", "ls", "exit"],
+    );
     std::fs::remove_file(&image).unwrap();
     assert!(status.success(), "QEMU exited with {status}");
     assert_eq!(
         boot3,
         session(&[
-            ("ls docs", &["a.txt", "c.txt"]),
-            ("cat docs/c.txt", &["again"]),
+            ("cd docs", &[]),
+            ("ls", &[]),
+            ("cd nope", &["msh: cd: ENOENT"]),
+            ("pwd", &["/docs"]),
+            ("cd", &[]),
+            ("pwd", &["/"]),
+            ("ls", &["docs/"]),
             ("exit", &[]),
         ])
     );

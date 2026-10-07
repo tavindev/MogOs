@@ -61,19 +61,40 @@ cargo run -- -append test=spawn      # spawner (from the boot archive) checks fa
 cargo run -- -append test=pipe       # reader blocks on an empty pipe until its child writer writes, reads EOF, waits for exit code 7, respawns into the reused slot; a stale process handle is EBADF; 8 KiB I/O moves 4 KiB (R: and W: lines); free frames before/after match
 cargo run -- -append test=wait       # waiter's child A exits before child B is spawned; wait still returns both codes and budgets; closing a third, exited child's handle returns its budget too (P: and C: lines); free frames before/after match
 cargo run -- -append test=pi         # timer on: L (priority 1) holds a mutex H (3) blocks on while Mid (2) is ready to spin forever; H acquires only through priority inheritance, then init kills Mid (L:, H:, P: lines; no M: line); free frames before/after match
-cargo run -- -append test=echo       # echo prints E: ready, reads two lines typed on the console (echoed, backspace erases), prints got: <line> for each
+cargo run -- -append test=echo       # readlines prints E: ready, reads two lines typed on the console (echoed, backspace erases), prints got: <line> for each
 cargo run -- -append test=bench-spawn # spawnbench spawns nop with two arguments, waits and closes it 1000 times; prints the round trip in ns
 cargo run -- -append test=bench-pipe # ping and pong echo one byte over two pipes 100000 times; prints the round trip in ns
 cargo run -- -drive file=disk.img,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0 -append test=disk  # attach a raw image (`truncate -s 1M disk.img`); every boot prints `disk: <n> blocks` (`disk: none` without a disk); the first writes blocks 1-2 and flushes (disk: wrote), the next reads them back (disk: read ok); a failed flush prints disk: flush failed
 cargo run -- -drive file=disk.img,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0 -append test=bench-disk  # image of at least 8 MiB; sequential write+flush and read throughput in MiB/s, 4 KiB and 256 KiB per request
 cargo run -p mogfs --example mkfs --target aarch64-apple-darwin -- disk.img 16384  # empty 64 MiB MogFS image
-[ -f disk.img ] || cargo mkfs; cargo shell  # formats disk.img if missing, boots into msh with it: ls [dir], mkdir, touch, write <file> <text>, cat, sync, exit; files survive a reboot once synced
+[ -f disk.img ] || cargo mkfs; cargo shell  # formats disk.img if missing, boots into msh with it; files survive a reboot once synced (see "Using the shell")
 cargo run -- -drive file=disk.img,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0 -append test=bench-fs  # MogFS image; open(CREATE|TRUNC)+write+sync and open+close round trips in ns
 cargo run -- -s -S     # boot halted, gdbstub on localhost:1234; attach lldb/gdb
 cargo build --release  # LTO release image
 ```
 
 Quit a hung QEMU with `Ctrl-A` then `X`.
+
+## Using the shell
+
+`[ -f disk.img ] || cargo mkfs; cargo shell` boots into `msh> ` on a persistent `disk.img`. Paths are relative to the
+current directory and stay below the root: `..` (except `cd ..`), `.` and a leading `/` are `EINVAL`.
+
+| Command | Does |
+| --- | --- |
+| `cd [dir]`, `pwd` | builtins: change the current directory (`cd ..` up one, `cd` alone to the root), print it |
+| `help`, `exit` | builtins: list the builtins and the boot archive's programs; leave (the boot powers off) |
+| `ls [dir]` | list a directory (`name/` for a directory) |
+| `mkdir <dir>`, `touch <file>` | make a directory; make an empty file if missing |
+| `write <file> <text>` | replace a file with `text` and a newline |
+| `cat <file>` | print a file |
+| `rm <path>`, `mv <from> <to>` | remove a file or empty directory; move or rename (never over an existing name) |
+| `echo <text>` | print `text` |
+| `sync` | make every change durable; nothing written since the last `sync` survives a reboot |
+
+Every command but the builtins is a program from the boot archive (`crates/user/src/bin`), never from disk; msh
+passes it only the handles its job needs. A failure prints `msh: <command>: <errno>`, an unknown command
+`msh: <name>: command not found`.
 
 ## Rules for agents
 
