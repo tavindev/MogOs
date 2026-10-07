@@ -50,7 +50,7 @@ fn main(args: &[&[u8]]) -> u64 {
         b"readaccept" => {
             // Handle 1 is a read-only listener: what it accepts must not be writable.
             let conn = match accept(1, 0) {
-                0 => wait_for(0),
+                0 => wait_for(0).0,
                 error => error,
             };
             report(b"read-only accept send", send(conn as u64, b"x"))
@@ -227,7 +227,7 @@ fn read_only_accept() -> u64 {
         b"nettest\0readaccept\0",
     );
     let client = socket(net) as u64;
-    if process < 0 || connect(client, [127, 0, 0, 1], 12, 0) != 0 || wait_for(0) != 0 {
+    if process < 0 || connect(client, [127, 0, 0, 1], 12, 0) != 0 || wait_for(0).0 != 0 {
         return 6;
     }
     if !reaped(process) {
@@ -310,7 +310,7 @@ fn dial(net: u64) -> u64 {
     loop {
         let sock = socket(net) as u64;
         match connect(sock, [127, 0, 0, 1], BENCH_PORT, 0) {
-            0 => match wait_for(0) {
+            0 => match wait_for(0).0 {
                 0 => return sock,
                 ECONNREFUSED => close(sock),
                 _ => exit(5),
@@ -348,7 +348,7 @@ fn bench_serve() -> u64 {
         return 1;
     }
     let next = || match accept(listener, 0) {
-        0 => wait_for(0),
+        0 => wait_for(0).0,
         error => error,
     };
     let buf = map(4096).unwrap_or_else(|| exit(4));
@@ -391,7 +391,7 @@ fn serve() -> u64 {
     let buf = buffers().as_mut_ptr() as u64;
     let (mut conns, mut accepted, mut closed) = ([0; CONNECTIONS], 0, 0);
     while closed < CONNECTIONS {
-        let (result, tag) = io_wait();
+        let (result, tag, _) = io_wait();
         if result < 0 {
             return 2;
         }
@@ -441,7 +441,7 @@ fn connect_all() -> u64 {
     let message = |i: usize| [b'e', b'c', b'h', b'o', b' ', b'0' + i as u8];
     let mut echoes = 0;
     while echoes < CONNECTIONS {
-        let (result, tag) = io_wait();
+        let (result, tag, _) = io_wait();
         let i = (tag % SEND) as usize;
         let at = buf.as_mut_ptr() as u64 + 64 * i as u64;
         let submitted = match tag {

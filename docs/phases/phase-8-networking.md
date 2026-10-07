@@ -211,3 +211,8 @@ Decision: write `crates/net` fresh. smoltcp is a host-only dev-dependency of `cr
   every test green. `net: ready <N> us` reports boot to network ready (TCG
   `-icount`: 226000 instructions, against main's 264000 with the setup inside `boot:`). e2e: a socket moved to a
   child refunds its old holder (`nettest: moving a socket refunds its old holder`; it fails without the refund).
+- **Accept reports the peer.** With `TcpInfo::remote` from `crates/net`, `io_wait` returns an accept's peer in x2
+  (`ip << 16 | port`); a loopback peer (`PEER`'s 127.0.0.2) reads as 127.0.0.1. musl's `accept` fills `sockaddr_in`
+  and `*addrlen`; the user stub returns the peer from `io_wait` and `wait_for`. `httpd` logs `httpd: <ip>:<port>` per
+  connection. e2e: `tcpecho: served 5 bytes to 127.0.0.1, port set`, and every hostfwd request's `httpd: 10.0.2.2:`
+  line with a nonzero port; host: `an_accepted_handle_gets_no_more_rights_than_the_accepting_one` checks the peer.

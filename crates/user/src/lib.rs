@@ -368,22 +368,29 @@ pub fn accept(socket: u64, tag: u64) -> i64 {
     unsafe { io_submit(socket, OP_ACCEPT, 0, 0, tag) }
 }
 
-/// Waits for the next op this process submitted to finish; returns its result and tag.
-pub fn io_wait() -> (i64, u64) {
-    let (result, tag);
-    // SAFETY: as in `syscall`; `io_wait` writes only x0 and x1.
+/// Waits for the next op this process submitted to finish; returns its result, tag and, for an accept, the peer's
+/// IPv4 address and port.
+pub fn io_wait() -> (i64, u64, ([u8; 4], u16)) {
+    let (result, tag, peer): (i64, u64, u64);
+    // SAFETY: as in `syscall`; `io_wait` writes only x0, x1 and x2.
     unsafe {
-        asm!("svc #0", lateout("x0") result, lateout("x1") tag, in("x8") 24, options(nostack))
+        asm!("svc #0", lateout("x0") result, lateout("x1") tag, lateout("x2") peer, in("x8") 24,
+            options(nostack))
     };
-    (result, tag)
+    (
+        result,
+        tag,
+        (((peer >> 16) as u32).to_be_bytes(), peer as u16),
+    )
 }
 
-/// Waits for the op with `tag`, dropping any other completion: for a process with nothing else in flight.
-pub fn wait_for(tag: u64) -> i64 {
+/// Waits for the op with `tag`, dropping any other completion: for a process with nothing else in flight. Returns
+/// its result and, for an accept, the peer.
+pub fn wait_for(tag: u64) -> (i64, ([u8; 4], u16)) {
     loop {
         match io_wait() {
-            (result, t) if t == tag => return result,
-            (result, _) if result == EINVAL => return result,
+            (result, t, peer) if t == tag => return (result, peer),
+            (result, _, peer) if result == EINVAL => return (result, peer),
             _ => {}
         }
     }
@@ -393,7 +400,7 @@ pub fn wait_for(tag: u64) -> i64 {
 pub fn receive(socket: u64, buf: &mut [u8]) -> i64 {
     // SAFETY: `buf` stays borrowed until `wait_for` reports the op.
     match unsafe { io_submit(socket, OP_RECEIVE, buf.as_mut_ptr() as u64, buf.len(), 0) } {
-        0 => wait_for(0),
+        0 => wait_for(0).0,
         error => error,
     }
 }
@@ -404,7 +411,7 @@ pub fn send(socket: u64, mut data: &[u8]) -> i64 {
         // SAFETY: `data` stays borrowed until `wait_for` reports the op.
         let sent = match unsafe { io_submit(socket, OP_SEND, data.as_ptr() as u64, data.len(), 0) }
         {
-            0 => wait_for(0),
+            0 => wait_for(0).0,
             error => error,
         };
         if sent < 0 {

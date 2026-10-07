@@ -35,7 +35,7 @@ kernel's ABI is `crates/kernel/src/syscall.rs`, mirrored here by hand (numbers, 
   `INADDR_ANY` (every interface) or 127.0.0.1 (loopback only; any other address is `EADDRNOTAVAIL`); `connect`, `accept`, `read`/`write`,
   `send`/`recv`(`to`/`from`) submit one native op and wait for it at once (one thread, so it is the only one in
   flight); `listen` passes its backlog (the kernel clamps it to 1..=8 and charges it at once); `shutdown` ends the send side (`SHUT_RD` alone does nothing); `setsockopt(SO_REUSEADDR)` succeeds (ports
-  rebind once closed), other options are `ENOPROTOOPT`; `accept` does not report the peer's address.
+  rebind once closed), other options are `ENOPROTOOPT`; `accept` fills `sockaddr_in` with the peer's address and sets `*addrlen` (a loopback peer is 127.0.0.1).
 - Arguments: when the first string is `<argc> <stdin> <stdout> <stderr> /<cwd>` (each stdio fd `t` console, `p`
   pipe, `d` directory, `f<offset>` a file, `a<offset>` a file opened to append; msh's `Grant::Posix` writes
   `<argc> /<cwd>`, stdio on the console), the next `argc` are argv and the rest envp, and the process starts in

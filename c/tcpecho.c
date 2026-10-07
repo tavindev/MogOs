@@ -32,12 +32,15 @@ int main(int argc, char **argv)
 		if (setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one) || bind(s, (void *)&a, sizeof a) ||
 		    listen(s, 1))
 			return 2;
-		int c = accept(s, 0, 0);
+		struct sockaddr_in peer;
+		socklen_t len = sizeof peer;
+		int c = accept(s, (void *)&peer, &len);
 		ssize_t n = c < 0 ? -1 : read(c, buf, sizeof buf);
 		if (n <= 0 || write(c, buf, n) != n) return 3;
 		close(c);
 		close(s);
-		printf("tcpecho: served %zd bytes\n", n);
+		printf("tcpecho: served %zd bytes to %s, port %s\n", n, inet_ntoa(peer.sin_addr),
+		       len == sizeof peer && peer.sin_port ? "set" : "missing");
 		return 0;
 	}
 	for (int tries = 0; connect(s, (void *)&a, sizeof a); tries++) {
