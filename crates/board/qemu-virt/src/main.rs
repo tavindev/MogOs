@@ -180,8 +180,9 @@ unsafe fn block(
     unsafe { switch(sched, frame as *mut arch::TrapFrame as usize) }
 }
 
-/// Drops one handle to `object`: an exited process frees its slot; a pipe wakes its waiters and, once no handle reaches
-/// it, frees its page, refunding its creator if that still runs.
+/// Drops one handle to `object`: an exited process frees its slot and, as `wait` does, moves its budget to the
+/// current task; a pipe wakes its waiters and, once no handle reaches it, frees its page, refunding its creator if that
+/// still runs.
 fn release(
     sched: &mut Scheduler<MAX_TASKS>,
     frames: &mut FrameAllocator<FRAME_WORDS>,
@@ -190,7 +191,11 @@ fn release(
 ) {
     let end = match object {
         Object::Pipe(end) => end,
-        Object::Process { slot, generation } => return sched.close(slot, generation),
+        Object::Process { slot, generation } => {
+            let limit = sched.close(slot, generation);
+            let held = pipes.charged_to((slot, generation));
+            return sched.memory().budget.grow(limit.saturating_sub(held));
+        }
         _ => return,
     };
     if let Some((page, (slot, generation))) = pipes.close(end) {

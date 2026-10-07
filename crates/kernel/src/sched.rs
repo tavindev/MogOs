@@ -157,12 +157,15 @@ impl<const N: usize> Scheduler<N> {
         Ok(Some((code, budget.limit())))
     }
 
-    /// A handle to the process in `slot` with `generation` was closed: frees its slot if it exited.
-    pub fn close(&mut self, slot: usize, generation: u64) {
-        if let State::Zombie(code) = self.state[slot]
-            && self.generation[slot] == generation
-        {
-            self.state[slot] = State::Exited(code);
+    /// A handle to the process in `slot` with `generation` was closed: if it exited, frees its slot and returns its
+    /// budget's limit, as `reap` would; otherwise 0.
+    pub fn close(&mut self, slot: usize, generation: u64) -> usize {
+        if !matches!(self.state[slot], State::Zombie(_)) {
+            return 0;
+        }
+        match self.reap(slot, generation) {
+            Ok(Some((_, limit))) => limit,
+            _ => 0,
         }
     }
 

@@ -118,7 +118,12 @@ fn an_exited_child_keeps_its_slot_until_reaped_and_one_without_a_handle_frees_at
 fn closing_the_handle_frees_an_exited_child_and_lets_a_running_one_free_at_exit() {
     let mut sched = Scheduler::<3>::new();
     add(&mut sched, 0x100, 0x1000);
-    let child = add(&mut sched, 0x200, 0x2000);
+    let child = sched.free_slot().unwrap();
+    let memory = Memory {
+        budget: Budget::new(12),
+        ..MEMORY
+    };
+    sched.add(child, 0x200, PhysAddr(0x2000), memory, Handles::new());
     assert_eq!(sched.switch(0x10), 0x100);
     let process = Object::Process {
         slot: child.0,
@@ -130,10 +135,10 @@ fn closing_the_handle_frees_an_exited_child_and_lets_a_running_one_free_at_exit(
     assert_eq!(sched.free_slot(), None);
     assert_eq!(sched.switch(0x11), 0x110);
 
-    sched.close(child.0, child.1 + 1);
+    assert_eq!(sched.close(child.0, child.1 + 1), 0);
     assert_eq!(sched.free_slot(), None, "another generation's close");
     sched.handles().close(handle).unwrap();
-    sched.close(child.0, child.1);
+    assert_eq!(sched.close(child.0, child.1), 12, "the budget, as reap");
     assert_eq!(sched.free_slot().unwrap().0, child.0, "closed: freed");
 
     let child = add(&mut sched, 0x300, 0x3000);
@@ -143,7 +148,7 @@ fn closing_the_handle_frees_an_exited_child_and_lets_a_running_one_free_at_exit(
     };
     let handle = sched.handles().insert(process, WAIT).unwrap();
     sched.handles().close(handle).unwrap();
-    sched.close(child.0, child.1);
+    assert_eq!(sched.close(child.0, child.1), 0, "still running");
     assert_eq!(sched.switch(0x111), 0x300);
     sched.exit(2);
     assert_eq!(

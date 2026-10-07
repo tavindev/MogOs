@@ -1,5 +1,5 @@
 //! `test=wait`'s init: child A exits before child B is spawned, and `wait` still reports both exit codes and both
-//! budgets, so A's slot stayed reserved.
+//! budgets, so A's slot stayed reserved; closing a third, exited child's handle also returns its budget.
 #![no_std]
 #![no_main]
 
@@ -45,6 +45,22 @@ extern "C" fn _start() -> ! {
     check(
         both >= 0 && wait(both as u64) == 0,
         b"P: both budgets returned\n",
+    );
+    // A third child exits unwaited for: closing its handle returns its budget too.
+    let (read_end, write_end) = pipe();
+    let silent = dup(write_end, TRANSFER) as u64;
+    close(write_end);
+    let third = spawn(writer, &[silent], A_BUDGET);
+    check(
+        third >= 0 && read(read_end as u64, &mut buf) == 0,
+        b"P: third child exited\n",
+    );
+    close(read_end as u64);
+    close(third as u64);
+    let both = spawn(child, &[], A_BUDGET + B_BUDGET);
+    check(
+        both >= 0 && wait(both as u64) == 0,
+        b"P: close returned its budget\n",
     );
     exit(0)
 }

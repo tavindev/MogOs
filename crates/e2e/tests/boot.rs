@@ -340,6 +340,8 @@ fn an_exited_child_keeps_its_slot_until_waited_for() {
             "C: handle 1 not given: EBADF",
             "P: B exited with 0",
             "P: both budgets returned",
+            "P: third child exited",
+            "P: close returned its budget",
         ]
     );
     assert_no_leak(&lines, "wait");
