@@ -302,7 +302,12 @@ fn rename_moves_entries_within_and_across_directories() {
     fs.create(ROOT, b"g").unwrap();
     fs.commit().unwrap();
     assert_eq!(fs.rename(ROOT, b"f", ROOT, b"g"), Err(Error::Exists));
+    assert_eq!(fs.rename(ROOT, b"g", ROOT, b"f"), Err(Error::Exists));
     assert_eq!(fs.rename(ROOT, b"no", ROOT, b"h"), Err(Error::NotFound));
+    assert_eq!(fs.rename(ROOT, b"no", ROOT, b"f"), Err(Error::NotFound));
+    // Renaming an entry to itself does nothing.
+    fs.rename(ROOT, b"f", ROOT, b"f").unwrap();
+    assert_eq!(fs.rename(ROOT, b"no", ROOT, b"no"), Err(Error::NotFound));
     assert_eq!(fs.rename(ROOT, b"f", f, b"h"), Err(Error::NotDir));
     assert_eq!(fs.rename(ROOT, b"f", ROOT, b"/"), Err(Error::InvalidName));
     // A directory cannot move into itself or below itself.
@@ -612,6 +617,57 @@ impl Disk for FailReads<'_> {
     }
 }
 
+/// Flips a byte in read `.2` (from 0) of block `.1`.
+struct FlipRead<'a>(&'a mut MemDisk, u64, usize);
+
+impl Disk for FlipRead<'_> {
+    fn read(&mut self, block: u64, bufs: &mut [Block]) -> Result<(), Error> {
+        (&mut *self.0).read(block, bufs)?;
+        if block == self.1 {
+            if self.2 == 0 {
+                bufs[0][7] ^= 1;
+            }
+            self.2 = self.2.wrapping_sub(1);
+        }
+        Ok(())
+    }
+
+    fn write(&mut self, block: u64, bufs: &[Block]) -> Result<(), Error> {
+        (&mut *self.0).write(block, bufs)
+    }
+
+    fn flush(&mut self) -> Result<(), Error> {
+        (&mut *self.0).flush()
+    }
+
+    fn blocks(&self) -> u64 {
+        self.0.durable.len() as u64
+    }
+}
+
+#[test]
+fn corrupt_append_in_a_rename_across_directories_is_not_committed() {
+    let mut disk = MemDisk::new(64);
+    let mut fs = format(&mut disk);
+    let dir = fs.mkdir(ROOT, b"many").unwrap();
+    for i in 0..74 {
+        fs.create(dir, format!("{i}").as_bytes()).unwrap();
+    }
+    fs.commit().unwrap();
+    let old = snapshot(&mut disk).unwrap();
+    let root = le32(&disk.durable[0], 20);
+    let root = le32(&disk.durable[root], 8) as u64;
+    // The root's block is read by `lookup`, by the check for `x`, and by the append after `0` left `many`.
+    let mut fs = Fs::new(FlipRead(&mut disk, root, 2));
+    fs.mount().unwrap();
+    let dir = fs.lookup(ROOT, b"many").unwrap();
+    assert_eq!(fs.rename(dir, b"0", ROOT, b"x"), Err(Error::Corrupt));
+    assert_eq!(fs.commit(), Err(Error::Io));
+    assert_eq!(fs.create(ROOT, b"y"), Err(Error::Io));
+    fs.mount().unwrap();
+    assert_eq!(snapshot(&mut disk), Ok(old));
+}
+
 #[test]
 fn io_error_at_mount_is_not_a_fallback() {
     let mut disk = hello();
@@ -635,12 +691,17 @@ fn failed_mount_leaves_the_fs_read_only() {
     let docs = fs.lookup(ROOT, b"docs").unwrap();
     let a = fs.lookup(docs, b"a.txt").unwrap();
     assert_eq!(fs.write(a, 0, b"HE"), Err(Error::Io));
+    assert_eq!(fs.truncate(a), Err(Error::Io));
+    assert_eq!(fs.unlink(docs, b"a.txt"), Err(Error::Io));
+    assert_eq!(fs.rename(docs, b"a.txt", ROOT, b"a.txt"), Err(Error::Io));
+    assert_eq!(fs.rename(docs, b"a.txt", docs, b"a.txt"), Err(Error::Io));
+    assert_eq!(fs.create(docs, b"new"), Err(Error::Io));
     assert_eq!(fs.commit(), Err(Error::Io));
     assert_eq!(snapshot(&mut disk.crash(|_, _| true)), Ok(hello_tree()));
 }
 
-/// Mounts `disk`, overwrites `/docs/a.txt`, adds `/src` and `/docs/b.txt`, moves `a.txt` and then `docs` into `/src`,
-/// and commits.
+/// Mounts `disk`, overwrites `/docs/a.txt`, adds `/src` and `/docs/b.txt`, renames `b.txt` to `c.txt`, moves `a.txt`
+/// and then `docs` into `/src`, and commits.
 fn change(disk: &mut MemDisk) -> Result<(), Error> {
     let mut fs = mount(disk)?;
     let docs = fs.lookup(ROOT, b"docs")?;
@@ -649,6 +710,7 @@ fn change(disk: &mut MemDisk) -> Result<(), Error> {
     let src = fs.mkdir(ROOT, b"src")?;
     let b = fs.create(docs, b"b.txt")?;
     fs.write(b, 0, &[7; 5000])?;
+    fs.rename(docs, b"b.txt", docs, b"c.txt")?;
     fs.rename(docs, b"a.txt", src, b"a.txt")?;
     fs.rename(ROOT, b"docs", src, b"docs")?;
     fs.commit()
@@ -660,7 +722,7 @@ fn remove(disk: &mut MemDisk) -> Result<(), Error> {
     let src = fs.lookup(ROOT, b"src")?;
     let docs = fs.lookup(src, b"docs")?;
     fs.unlink(src, b"a.txt")?;
-    fs.unlink(docs, b"b.txt")?;
+    fs.unlink(docs, b"c.txt")?;
     fs.unlink(src, b"docs")?;
     fs.commit()
 }
@@ -738,8 +800,11 @@ fn limits_and_misuse_return_errors() {
     }
     let f = fs.create(ROOT, &long[..NAME_MAX]).unwrap();
     assert_eq!(fs.mkdir(ROOT, &long[..NAME_MAX]), Err(Error::Exists));
-    // `create` opens what is already there.
+    // `create` opens what is already there, a directory too.
     assert_eq!(fs.create(ROOT, &long[..NAME_MAX]), Ok(f));
+    let d = fs.mkdir(ROOT, b"d").unwrap();
+    assert_eq!(fs.create(ROOT, b"d"), Ok(d));
+    assert_eq!(fs.kind(d), Ok(Kind::Dir));
     assert_eq!(fs.lookup(ROOT, b"missing"), Err(Error::NotFound));
     assert_eq!(fs.lookup(ROOT, b".."), Err(Error::InvalidName));
     assert_eq!(fs.lookup(f, b"x"), Err(Error::NotDir));
@@ -904,4 +969,27 @@ fn block_io_per_operation() {
     // Unlinking the last entry only scans.
     fs.unlink(ROOT, b"c.txt").unwrap();
     assert_eq!(io.take(), [1, 0, 0]);
+
+    // Within a directory, one scan finds the entry (here in the second block) and checks the new name.
+    fs.commit().unwrap();
+    io.take();
+    fs.rename(dir, b"74", dir, b"x").unwrap();
+    assert_eq!(io.take(), [2, 1, 0]);
+    // The last entry is read beside the entry's buffered block, which is not read again.
+    fs.commit().unwrap();
+    io.take();
+    fs.unlink(dir, b"1").unwrap();
+    assert_eq!(io.take(), [2, 1, 0]);
+    // The search below `p` stops at `t`, before scanning `q`.
+    let p = fs.mkdir(ROOT, b"p").unwrap();
+    let q = fs.mkdir(p, b"q").unwrap();
+    fs.create(q, b"f").unwrap();
+    let t = fs.mkdir(p, b"t").unwrap();
+    fs.commit().unwrap();
+    io.take();
+    assert_eq!(fs.rename(ROOT, b"p", t, b"p"), Err(Error::InvalidName));
+    assert_eq!(io.take(), [2, 0, 0]);
+    // Nothing is below a directory moving into the root.
+    fs.rename(docs, b"many", ROOT, b"many").unwrap();
+    assert_eq!(io.take(), [2, 1, 0]);
 }
