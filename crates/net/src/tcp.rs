@@ -436,8 +436,9 @@ impl<'a> TcpSocket<'a> {
 
     fn ack_in(&mut self, s: &Seg, now: u64) {
         let win = (s.win as u32) << self.snd_shift;
+        let changed = win != self.snd_wnd;
         if lt(self.wl1, s.seq) || (self.wl1 == s.seq && le(self.wl2, s.ack)) {
-            if win != self.snd_wnd {
+            if changed {
                 self.probes = 0;
                 if self.snd_una == self.snd_max {
                     self.timer = None;
@@ -476,7 +477,7 @@ impl<'a> TcpSocket<'a> {
         } else if acked == 0
             && s.data.is_empty()
             && s.flags & FIN == 0
-            && win == self.snd_wnd
+            && !changed
             && self.snd_una != self.snd_max
         {
             self.dupacks = self.dupacks.saturating_add(1);
@@ -886,7 +887,7 @@ impl<'a> Stack<'a> {
         }
         self.next_hop(*to.ip())?;
         let local = match local {
-            0 => self.ephemeral(to)?,
+            0 => self.ephemeral(to, now)?,
             port if self.in_use(port, to, now) => return Err(Error::InUse),
             port => port,
         };
@@ -1380,14 +1381,14 @@ impl<'a> Stack<'a> {
     }
 
     /// RFC 6056 algorithm 3: a keyed offset per destination plus a counter.
-    fn ephemeral(&mut self, to: SocketAddrV4) -> Result<u16, Error> {
+    fn ephemeral(&mut self, to: SocketAddrV4, now: u64) -> Result<u16, Error> {
         let range = 65536 - EPHEMERAL;
         let ips = (u32::from(self.config.ip) as u64) << 32 | u32::from(*to.ip()) as u64;
         let offset = siphash(self.tcp.key, [ips, 1 << 32 | to.port() as u64]) as u32;
         for n in 0..range {
             let port = (EPHEMERAL + offset.wrapping_add(self.tcp.next_port.wrapping_add(n)) % range)
                 as u16;
-            if !self.in_use(port, to, 0) && self.listener(port).is_none() {
+            if !self.in_use(port, to, now) && self.listener(port).is_none() {
                 self.tcp.next_port = self.tcp.next_port.wrapping_add(n + 1);
                 return Ok(port);
             }

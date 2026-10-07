@@ -508,6 +508,13 @@ fn acks_above_snd_nxt_are_ignored_and_ack_division_does_not_grow_cwnd() {
     );
     let snd_max = p.ack + cwnd;
 
+    let updates = [40000, 40001, 40002].map(|w| p.seg(p.seq, p.ack, ACK, w, &[], &[]));
+    assert!(
+        feed(&mut a, &mut tap, 0, updates).is_empty(),
+        "window updates are not duplicate ACKs (RFC 5681)"
+    );
+    assert_eq!(a.tcp_info(c).unwrap().cwnd, cwnd);
+
     let before = a.counters;
     let out = feed(
         &mut a,

@@ -71,7 +71,8 @@ Decision: write `crates/net` fresh. smoltcp is a host-only dev-dependency of `cr
   with `snd_nxt` both ends of a go-back-N recovery rejected each other's ACKs forever, which the 64 MiB runs found.
   Segments about a connection go to the MAC it resolved, so a challenge ACK never answers a spoofed frame's source.
   Tests (`tests/tcp.rs`): 1 MiB each way for 200 seeds and 64 MiB for 3 at 0%, 1% and 5% loss with reordering,
-  duplication and corruption, ISNs half a transfer below 2^32; the attack list on a scripted peer; every timeout;
+  duplication and corruption, the client's ISN half a transfer below 2^32 (so its send and the server's receive
+  sequence spaces wrap); the attack list on a scripted peer; every timeout;
   half-close, abort, refusal, simultaneous open; a reader stalled for 10 RTOs; 21 sequential connections through one
   slot; the mutation test over TCP segments. The 64 MiB soak over 200 seeds is `--ignored` (about two minutes). The
   gate's TCP tests take under a second. Interop (`tests/interop.rs`): our TCP and smoltcp 0.12's, each side opening,
