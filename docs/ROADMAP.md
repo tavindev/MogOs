@@ -31,7 +31,7 @@ Phases 5-12 come from [research/linux-survey.md](research/linux-survey.md): what
 - Completion I/O avoids io_uring's traps: a small fixed op set checked against handle rights at submit, no kernel worker with the caller's authority, ring memory charged to the budget.
 - All drivers stay in the kernel (monolithic); Rust safety with `unsafe` confined to arch/board/driver code is the isolation.
 - The native ABI is frozen after Linux compatibility (phase 9) has exercised it, not before.
-- No practical core cap and no fixed object limits (user, 2026-10-07): GICv3, per-CPU areas sized at boot, tree bring-up and a queued lock; every object bounded by its owner's budget (phase 5 steps 25c, 31, 32).
+- No practical core cap and no fixed object limits (user, 2026-10-07): GICv3, per-CPU areas sized at boot, tree bring-up and a queued lock; every object bounded by its owner's budget, and a child spawned without an explicit budget charges its parent's resource group, like a cgroup (phase 5 steps 25c, 30-32).
 
 ## Ongoing in every phase
 
