@@ -1,6 +1,7 @@
 //! Checked access to the current process's memory from a trap. A sibling thread may write that memory at any time,
 //! so the kernel never holds a reference into it: bytes move by raw copy, and inputs the kernel parses are copied in
-//! once and then validated.
+//! once and then validated. Pointers come from `dispatch`, which clamps them into user space
+//! behind its barrier.
 
 use core::ptr;
 

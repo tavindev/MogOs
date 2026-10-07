@@ -14,12 +14,14 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
 
 ## Responsibilities
 
-- `kmain`: turns on the MMU (`arch::enable_mmu`, first), reads the DTB at RAM base and its core count (at most
+- `kmain`: turns on the MMU (`arch::enable_mmu`, first), reads the DTB at RAM base, stores its PSCI `method` (`CONDUIT`)
+  and installs core 0's vectors with it (`arch::install_vectors`), reads its core count (at most
   `MAX_CPUS`), routes `UART_IRQ` to core 0 (`GICD_ITARGETSR`, else a GIC with several cores delivers it nowhere), builds
   `QemuVirt`, calls `kernel::run` with the image and DTB reserved. `Board::start_cpus`, the last step of boot, starts core 1
-  with PSCI `CPU_ON` without waiting, and core 1 starts the rest (a refused `CPU_ON` panics). `kmain_secondary`: a started core enables its GIC CPU
+  with PSCI `CPU_ON` without waiting, and core 1 starts the rest (a refused `CPU_ON` panics). `kmain_secondary`: a started core installs its own vectors and records them, enables its GIC CPU
   interface, timer PPI and `RESCHEDULE_SGI` (its banked `ISENABLER0`) and idles in `wfi`; only under `test=smp`
   (`SMP_TEST`) does it print `cpu <n>: online` and arm its timer. It runs no task yet (step 25b).
+- `Nospec`, the `kernel::Clamp` `dispatch` and `split` use (`arch::clamp`).
 - `KERNEL: Lock<Kernel>` (`Scheduler` with its process table, `FrameAllocator`, `Pipes`, `Mutexes`, console `Line`,
   the MogFS `Fs<FsDisk>` and whether it is mounted, and `buf`, the 8 KiB a syscall copies user inputs into), `HEAP` and
   `CONSOLE: Lock<Uart>` statics. `Fs::new` is const, so the 48 KiB file system is built in the static with an empty
@@ -29,7 +31,8 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
   that `dispatch` returns (user buffers, pages, frames, wake/block). `board_unlock`, called by the trap exit, releases `KERNEL`.
 - `Board::console` writes (`Console`) hold `CONSOLE` for a whole `write_fmt`, so no other `Console` line splits it (the unlocked writers below can); it is the PL011
   at `UART0`, like every other UART access. `test=bench-lock`'s `lock_round_trips` (ticket vs test-and-set) and `add_locked`;
-  `test=smp`'s `cpus` and `ticked_cpus` (`TICKED`, a bit per core set on each tick).
+  `test=smp`'s `cpus` and `ticked_cpus` (`TICKED`, a bit per core set on each tick). `report_speculation` records core 0's
+  vectors, waits until every started core has recorded its own (`arch::speculation`), then prints `spec: ...`.
 - Processes and threads: `spawn_process`, `spawn`, `thread`, `map` (`src/process.rs`); `end_thread`, `end_process`,
   `exit_thread`, `exit_process`, `kill`, `release`, and `switch`, which moves SP_EL0 and TPIDR_EL0 on every switch with
   a user thread on either side and writes TTBR0 only when the process changes (`src/trap.rs`).
@@ -66,8 +69,8 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
 - Opts out of `forbid(unsafe_code)` (lints: `docs/DEVELOPMENT.md` settings table); every `unsafe` block has a one-line
   `// SAFETY:` and every `unsafe fn` a `# Safety` section.
 - Depends on `kernel`, never the reverse. GIC and RAM come from the DTB; board constants fix the rest:
-  `UART0` (the PL011 at `0x0900_0000`: all console output and input, never read from the DTB), `DTB` (RAM base), `KERNEL_L1` (GiB 0 device, GiB 1 RAM),
-  `UNMAPPED`, `TIMER_IRQ` (27), `UART_IRQ` (33), `VIRTIO_IRQ` (48, transport `i`'s SPI is `48 + i`), `RESCHEDULE_SGI` (0), core `n`'s MPIDR (`n`), `SECONDARY_STACK` (16 KiB), `VIRTIO`, `VIRTIO_STRIDE`, `VIRTIO_COUNT` (32 virtio-mmio transports from `0x0a00_0000`, `0x200` apart), the PSCI calls (`SYSTEM_OFF`, `CPU_ON`, by HVC). QEMU runs with
+  `UART0` (the PL011 at `0x0900_0000`: all console output and input, never read from the DTB), `DTB` (RAM base; its whole 2 MiB block is reserved and read-only), `KERNEL_ENTRIES` (2: the boot table's GiB 0 device and GiB 1 RAM entries every address space copies),
+  `UNMAPPED`, `TIMER_IRQ` (27), `UART_IRQ` (33), `VIRTIO_IRQ` (48, transport `i`'s SPI is `48 + i`), `RESCHEDULE_SGI` (0), core `n`'s MPIDR (`n`), `SECONDARY_STACK` (`0x5000`: a 4 KiB guard page and a 16 KiB stack), `VIRTIO`, `VIRTIO_STRIDE`, `VIRTIO_COUNT` (32 virtio-mmio transports from `0x0a00_0000`, `0x200` apart), the PSCI calls (`SYSTEM_OFF`, `CPU_ON`, by HVC). QEMU runs with
   `-global virtio-mmio.force-legacy=false` (the driver rejects legacy) and `-global virtio-mmio.ioeventfd=off`
   (`docs/DEVELOPMENT.md` settings table).
 - Bare-metal only: excluded from `cargo test-host`.
@@ -90,7 +93,7 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
 - Locks need the MMU on (exclusives), so `kmain` calls `enable_mmu` first, before any output, trap or secondary core.
 - Only core 0 runs tasks: `board_irq` switches only there, since the scheduler has one `current`. Every core still
   takes `KERNEL` in its trap hooks. IRQs dispatch on `iar & 0x3ff` and EOI the full IAR.
-- Everything a secondary reads (`GIC_DIST`, `GIC_CPU`, `CPUS`, `SMP_TEST`) is stored before its `CPU_ON`, which `dsb ish` precedes.
+- Everything a secondary reads (`GIC_DIST`, `GIC_CPU`, `CPUS`, `SMP_TEST`, `CONDUIT`) is stored before its `CPU_ON`, which `dsb ish` precedes.
 - A process's index is its ASID (`MAX_PROCESSES <= 256`, const-asserted); index 0 is the kernel, whose boot table
   keeps ASID 0 (`switch`). Tables: `MAX_TASKS` (8) threads, the boot context included, and `MAX_PROCESSES` (8)
   processes, the kernel included.
@@ -107,7 +110,8 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
 - Every new `Process` or `Thread` handle is counted (`Scheduler::held`): the one `spawn_process` hands out (the
   spawner's, or init's own), `thread`'s, and each `dup`; `release` uncounts each closed one.
 - A blocking call rewinds its `svc` (`block` calls `TrapFrame::restart`) and reruns when woken.
-- User memory is reached only through `UserIn` / `UserOut` (`src/usermem.rs`), which probe every page with
+- User memory is reached only through `UserIn` / `UserOut` (`src/usermem.rs`), which take pointers `dispatch`
+  clamped into user space, then probe every page with
   `arch::user_readable` / `user_writable` once and then move bytes by raw copy, in the same trap, before any switch;
   never through a reference, since a sibling thread may write the memory meanwhile. Inputs the kernel parses (paths,
   spawn arguments and handle lists) are copied into `buf` (`copy_in`) once and validated there; bulk data goes straight
@@ -116,10 +120,13 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
 - User layout: code at `USER_BASE` (4 GiB), ELF segments within `IMAGE` (below the top two pages and an unmapped guard page, so a stack overflow faults), one stack page
   below `USER_STACK_TOP`; a `spawn` with arguments copies them to the end of that page and adds a stack page below it
   (both charged to the child), and the child starts with x0-x2 = count, address, length,
-  `map` from `MAP_BASE` upward. Kernel blocks (`KERNEL_L1`) are EL1-only in every address space.
+  `map` from `MAP_BASE` upward. Kernel entries (`KERNEL_ENTRIES`, copied from `arch::boot_table()`) are EL1-only in every address space.
 - `MAX_MUTEXES = MAX_PROCESSES * MAX_HANDLES`: every live mutex holds a handle, so the handle tables are the quota.
-- `linker.ld` provides `__stack_top`, `__bss_start`, `__bss_end`, `__kernel_start`, `__kernel_end`, and above
-  `__stack_top` the secondaries' stacks (core `n`'s ends at `__stack_top + n * 0x4000`), inside the reserved image; its load address
+- `linker.ld` provides `__kernel_start` (2 MiB aligned), `__text_end`, `__rodata_end` (both page aligned: `kmain`'s
+  `KernelMap` maps text RX, rodata RO, the rest RW), `__bss_start`, `__bss_end`, `__boot_guard` (core 0's guard page
+  below its 64 KiB stack), `__stack_top`, `__kernel_end`, and above `__stack_top` each secondary's guard page and
+  stack (core `n`'s ends at `__stack_top + n * 0x5000`), inside the reserved image; it `ASSERT`s the image fits its
+  2 MiB block, the one mapped by pages; its load address
   is explained in `docs/DEVELOPMENT.md`.
 - Performance is the moat: a slowdown is never accepted because it has an explanation; it is removed, or shown to
   be unavoidable with before/after numbers (`docs/BENCHMARKS.md`).

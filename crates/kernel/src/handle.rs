@@ -4,6 +4,7 @@
 
 use mogfs::Inode;
 
+use crate::Clamp;
 use crate::mutex::Mutex;
 use crate::network::Sock;
 use crate::pipe::End;
@@ -65,6 +66,37 @@ pub enum Object {
     Socket(Sock),
 }
 
+/// A handle value from user space and its index, bounded under speculation by a `Clamp`.
+#[derive(Clone, Copy)]
+pub struct Handle {
+    value: u64,
+    index: usize,
+}
+
+impl Handle {
+    /// The handle `value`, its index clamped by `C` behind its own barrier.
+    pub fn new<C: Clamp>(value: u64) -> Self {
+        let [index] = C::clamp([value as u32 as u64], [MAX_HANDLES as u64]);
+        Self::clamped(value, index)
+    }
+
+    /// Whether the value names the entry at its index with `generation`. Checked after the load through the clamped
+    /// index, so no branch picks between the clamped index and another.
+    #[inline(always)]
+    fn valid(self, generation: u32) -> bool {
+        (self.value as u32 as usize) < MAX_HANDLES && (self.value >> 32) as u32 == generation
+    }
+
+    /// The handle `value` with `index`, its index as `dispatch` clamped it with the call's other values.
+    #[inline]
+    pub(crate) fn clamped(value: u64, index: u64) -> Self {
+        Self {
+            value,
+            index: index as usize,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct Handles([(u32, Option<(Object, Rights)>); MAX_HANDLES]);
 
@@ -84,7 +116,8 @@ impl Handles {
     }
 
     /// The object `handle` reaches, if it holds every right in `need`.
-    pub fn get(&self, handle: u64, need: Rights) -> Result<Object, i64> {
+    #[inline(always)]
+    pub fn get(&self, handle: Handle, need: Rights) -> Result<Object, i64> {
         let (object, rights) = self.entry(handle)?;
         if rights & need != need {
             return Err(EACCES);
@@ -93,7 +126,8 @@ impl Handles {
     }
 
     /// A new handle to `handle`'s object with `rights`, a subset of its own, and the object; needs the duplicate right.
-    pub fn dup(&mut self, handle: u64, rights: Rights) -> Result<(u64, Object), i64> {
+    #[inline(always)]
+    pub fn dup(&mut self, handle: Handle, rights: Rights) -> Result<(u64, Object), i64> {
         let (object, held) = self.entry(handle)?;
         if held & DUPLICATE == 0 || rights & !held != 0 {
             return Err(EACCES);
@@ -113,10 +147,12 @@ impl Handles {
     }
 
     /// Moves the handles in `list` (each needs the transfer right) out of a copy of this table into a new table, at
-    /// values 0, 1, ... in order; returns both, so a caller that fails later keeps this table unchanged.
-    pub fn split(&self, list: &[u64]) -> Result<(Self, Self), i64> {
+    /// values 0, 1, ... in order; returns both, so a caller that fails later keeps this table unchanged. `C` clamps
+    /// each index, read from user memory after `dispatch`.
+    pub fn split<C: Clamp>(&self, list: &[u64]) -> Result<(Self, Self), i64> {
         let (mut rest, mut moved) = (*self, Self::new());
-        for &handle in list {
+        for &value in list {
+            let handle = Handle::new::<C>(value);
             let (object, rights) = rest.entry(handle)?;
             if rights & TRANSFER == 0 {
                 return Err(EACCES);
@@ -128,11 +164,16 @@ impl Handles {
     }
 
     /// Closes `handle`; returns the object it reached.
-    pub fn close(&mut self, handle: u64) -> Result<Object, i64> {
-        let (object, _) = self.entry(handle)?;
-        let entry = &mut self.0[handle as u32 as usize];
-        *entry = (entry.0 + 1, None);
-        Ok(object)
+    #[inline(always)]
+    pub fn close(&mut self, handle: Handle) -> Result<Object, i64> {
+        let entry = &mut self.0[handle.index];
+        match entry.1 {
+            Some((object, _)) if handle.valid(entry.0) => {
+                *entry = (entry.0 + 1, None);
+                Ok(object)
+            }
+            _ => Err(EBADF),
+        }
     }
 
     /// The objects the open handles reach.
@@ -141,9 +182,10 @@ impl Handles {
     }
 
     /// The object `handle` reaches and its rights.
-    pub fn entry(&self, handle: u64) -> Result<(Object, Rights), i64> {
-        match self.0.get(handle as u32 as usize) {
-            Some(&(generation, Some(entry))) if generation == (handle >> 32) as u32 => Ok(entry),
+    #[inline(always)]
+    pub fn entry(&self, handle: Handle) -> Result<(Object, Rights), i64> {
+        match self.0[handle.index] {
+            (generation, Some(entry)) if handle.valid(generation) => Ok(entry),
             _ => Err(EBADF),
         }
     }

@@ -30,6 +30,10 @@ a device driver.
 
 ## Invariants & rules
 
+- Spectre v1: `read`, `write` (through `write_data`) and `scan` index a record's block pointers `% PTRS`, in bounds
+  by construction, since a position from a user's offset or `readdir` start, on a mispredicted loop bound, runs one
+  block past the end; the kernel clamps the offset and start themselves at `dispatch`.
+
 - No block reachable from either superblock slot is written; blocks allocated since the last commit are rewritten in
   place. `commit` writes the dirty table blocks, flushes, writes the other slot, flushes; nothing changed, no I/O.
 - Every on-disk value is range-checked once when decoded (superblock, records, directory entries); a crafted image

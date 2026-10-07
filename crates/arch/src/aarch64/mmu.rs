@@ -2,18 +2,13 @@ use core::arch::{asm, global_asm};
 
 use mm::PhysAddr;
 
-/// Memory type of a mapping; the value is its `MAIR_EL1` attribute index.
-pub enum MemoryType {
-    Device = 0,
-    Normal = 1,
-}
-
-/// `MAIR_EL1` matching `MemoryType`: Device-nGnRE, Normal write-back cacheable.
+/// `MAIR_EL1`: attribute 0 Device-nGnRE, 1 Normal write-back cacheable.
 const MAIR: u64 = 0x04 | 0xff << 8;
 
 const VALID_BLOCK: u64 = 0b01;
 const VALID_TABLE_OR_PAGE: u64 = 0b11;
-const INNER_SHAREABLE: u64 = 0b11 << 8;
+/// Attribute index 1, inner shareable.
+const NORMAL: u64 = 1 << 2 | 0b11 << 8;
 const ACCESS_FLAG: u64 = 1 << 10;
 const NOT_GLOBAL: u64 = 1 << 11;
 const PXN: u64 = 1 << 53;
@@ -22,14 +17,28 @@ const AP_EL0: u64 = 1 << 6;
 const AP_READ_ONLY: u64 = 1 << 7;
 /// Output address bits of a 4 KiB page or table descriptor.
 const ADDR: u64 = 0x0000_ffff_ffff_f000;
+const GIB: u64 = 1 << 30;
+const BLOCK_2M: u64 = 1 << 21;
+const PAGE: u64 = 1 << 12;
 
-/// Level-1 block descriptor (4 KiB granule) mapping the 1 GiB at `addr` for EL1 read/write only, global.
-pub const fn l1_block(addr: PhysAddr, ty: MemoryType) -> u64 {
-    let attrs = match ty {
-        MemoryType::Device => PXN | UXN,
-        MemoryType::Normal => INNER_SHAREABLE | UXN,
+/// How EL1 may use a kernel mapping; EL0 never reaches one, and none is both writable and executable.
+#[derive(Clone, Copy)]
+enum Kernel {
+    Device,
+    ReadWrite,
+    ReadOnly,
+    Text,
+}
+
+/// A global, EL1-only block (`VALID_BLOCK`) or page (`VALID_TABLE_OR_PAGE`) descriptor for the aligned `addr`.
+const fn kernel(addr: u64, access: Kernel, valid: u64) -> u64 {
+    let attrs = match access {
+        Kernel::Device => PXN,
+        Kernel::ReadWrite => NORMAL | PXN,
+        Kernel::ReadOnly => NORMAL | PXN | AP_READ_ONLY,
+        Kernel::Text => NORMAL | AP_READ_ONLY,
     };
-    addr.0 & 0x0000_ffff_c000_0000 | attrs | ACCESS_FLAG | (ty as u64) << 2 | VALID_BLOCK
+    addr | attrs | UXN | ACCESS_FLAG | valid
 }
 
 /// Level-1 or level-2 descriptor pointing at the next-level table in the frame at `addr`.
@@ -50,19 +59,15 @@ pub const fn user_page(addr: PhysAddr, access: UserAccess) -> u64 {
         UserAccess::ReadExecute => AP_EL0 | AP_READ_ONLY,
         UserAccess::ReadWrite => AP_EL0 | UXN,
     };
-    addr.0 & ADDR
-        | PXN
-        | access
-        | NOT_GLOBAL
-        | ACCESS_FLAG
-        | INNER_SHAREABLE
-        | (MemoryType::Normal as u64) << 2
-        | VALID_TABLE_OR_PAGE
+    addr.0 & ADDR | PXN | access | NOT_GLOBAL | ACCESS_FLAG | NORMAL | VALID_TABLE_OR_PAGE
 }
 
 // Checked at build time: TCG enforces AP/XN but ignores cacheability attributes, so a wrong bit there would still boot.
-const _: () = assert!(l1_block(PhysAddr(0), MemoryType::Device) == 0x0060_0000_0000_0401);
-const _: () = assert!(l1_block(PhysAddr(0x4000_0000), MemoryType::Normal) == 0x0040_0000_4000_0705);
+const _: () = assert!(kernel(0, Kernel::Device, VALID_BLOCK) == 0x0060_0000_0000_0401);
+const _: () = assert!(kernel(0x4000_0000, Kernel::ReadOnly, VALID_BLOCK) == 0x0060_0000_4000_0785);
+const _: () = assert!(kernel(0x4040_0000, Kernel::ReadWrite, VALID_BLOCK) == 0x0060_0000_4040_0705);
+const _: () =
+    assert!(kernel(0x4020_0000, Kernel::Text, VALID_TABLE_OR_PAGE) == 0x0040_0000_4020_0787);
 const _: () = assert!(table_entry(PhysAddr(0x4000_3000)) == 0x0000_0000_4000_3003);
 const _: () =
     assert!(user_page(PhysAddr(0x4000_1000), UserAccess::ReadExecute) == 0x0020_0000_4000_1fc7);
@@ -73,6 +78,9 @@ const _: () =
 struct Table([u64; 512]);
 
 static mut L1: Table = Table([0; 512]);
+/// The RAM GiB's 2 MiB blocks, and the image's 4 KiB pages.
+static mut L2: Table = Table([0; 512]);
+static mut L3: Table = Table([0; 512]);
 
 /// TCR_EL1 but for the PA size, which `aarch64_mmu_on` reads from ID_AA64MMFR0_EL1.
 const TCR: u64 = 25 // T0SZ: 39-bit VA
@@ -82,6 +90,7 @@ const TCR: u64 = 25 // T0SZ: 39-bit VA
 const SCTLR: u64 = 1 << 0 | 1 << 2 | 1 << 12 // M, C, I: MMU, data and instruction caches on
     | 1 << 3 | 1 << 4 // SA, SA0: SP alignment checks at EL1 and EL0
     | 1 << 16 | 1 << 18 // nTWI, nTWE: EL0 wfi/wfe not trapped; EL0 cannot mask IRQs (UMA = 0), so a tick ends them
+    | 1 << 19 // WXN: a writable mapping never executes
     | 1 << 23 // SPAN: PAN untouched on exception entry (the kernel reads checked user pages directly)
     | 1 << 11 | 1 << 20 | 1 << 22 | 1 << 28 | 1 << 29; // RES1 on ARMv8.0
 // UMA, DZE, UCT, UCI = 0: EL0 cannot mask interrupts, zero or query caches, or maintain them; E0E, EE = 0: little endian.
@@ -120,19 +129,64 @@ aarch64_mmu_on:
     l1 = sym L1,
 );
 
-/// Fills the boot table from `l1` (4 KiB granule, 39-bit VA, attributes per `MAIR`) and turns on the MMU and caches
-/// with it; other cores turn theirs on with the same table from `aarch64_secondary`.
+/// The kernel's identity map, which `enable_mmu` builds: every entry EL1-only and global.
+pub struct KernelMap {
+    /// The GiB of device memory: PXN.
+    pub device: PhysAddr,
+    /// The GiB of RAM: 2 MiB blocks, read-write and PXN, but for `dtb` and `image`.
+    pub ram: PhysAddr,
+    /// A 2 MiB block mapped read-only and PXN.
+    pub dtb: PhysAddr,
+    /// The image's 2 MiB block, by 4 KiB pages: read-only and executable below `text_end`, read-only and PXN below
+    /// `rodata_end`, read-write and PXN above, but for the unmapped `guards`.
+    pub image: PhysAddr,
+    pub text_end: PhysAddr,
+    pub rodata_end: PhysAddr,
+    pub guards: [PhysAddr; super::MAX_CPUS],
+}
+
+/// Builds the boot tables for `map` (4 KiB granule, 39-bit VA, attributes per `MAIR`) and turns on the MMU, caches
+/// and WXN with them; other cores turn theirs on with the same tables from `aarch64_secondary`.
 ///
 /// # Safety
 ///
-/// Call once, on core 0, with the MMU off (the table is overwritten in place, no break-before-make) and before any
-/// atomic read-modify-write (exclusives need Normal memory). The entries must map, at their current physical addresses,
-/// all code, data, stack and MMIO the program uses.
-pub unsafe fn enable_mmu(l1: &[u64]) {
-    let table = &raw mut L1;
-    // SAFETY: core 0 alone with the MMU off; nothing else references L1.
-    unsafe { (&mut (*table).0)[..l1.len()].copy_from_slice(l1) };
-    // SAFETY: the table is written and the caller guarantees it maps everything in use.
+/// Call once, on core 0, with the MMU off (the tables are written in place, no break-before-make) and before any
+/// atomic read-modify-write (exclusives need Normal memory). `map` must map, at their current physical addresses,
+/// all code, data, stack and MMIO the program uses, with its text below `text_end`; the GiBs, `dtb` and `image` aligned.
+pub unsafe fn enable_mmu(map: &KernelMap) {
+    let (l1, l2, l3) = (&raw mut L1, &raw mut L2, &raw mut L3);
+    // SAFETY: core 0 alone with the MMU off; nothing else references the tables.
+    let l1 = unsafe { &mut (*l1).0 };
+    // SAFETY: as above.
+    let l2 = unsafe { &mut (*l2).0 };
+    // SAFETY: as above.
+    let l3 = unsafe { &mut (*l3).0 };
+    l1[(map.device.0 / GIB) as usize] = kernel(map.device.0, Kernel::Device, VALID_BLOCK);
+    l1[(map.ram.0 / GIB) as usize] = table_entry(PhysAddr(l2.as_ptr() as u64));
+    let block = |addr: PhysAddr| ((addr.0 - map.ram.0) / BLOCK_2M) as usize;
+    for (i, entry) in l2.iter_mut().enumerate() {
+        *entry = kernel(
+            map.ram.0 + i as u64 * BLOCK_2M,
+            Kernel::ReadWrite,
+            VALID_BLOCK,
+        );
+    }
+    l2[block(map.dtb)] = kernel(map.dtb.0, Kernel::ReadOnly, VALID_BLOCK);
+    l2[block(map.image)] = table_entry(PhysAddr(l3.as_ptr() as u64));
+    let page = |addr: PhysAddr| ((addr.0 - map.image.0) / PAGE) as usize;
+    let (text, rodata) = (page(map.text_end), page(map.rodata_end));
+    for (i, entry) in l3.iter_mut().enumerate() {
+        let access = match i {
+            _ if i < text => Kernel::Text,
+            _ if i < rodata => Kernel::ReadOnly,
+            _ => Kernel::ReadWrite,
+        };
+        *entry = kernel(map.image.0 + i as u64 * PAGE, access, VALID_TABLE_OR_PAGE);
+    }
+    for guard in map.guards {
+        l3[page(guard)] = 0;
+    }
+    // SAFETY: the tables are written and the caller guarantees they map everything in use.
     unsafe { asm!("bl aarch64_mmu_on", out("x9") _, out("x10") _, out("x30") _) }
 }
 
@@ -204,11 +258,12 @@ pub unsafe fn unmap_page(l1: PhysAddr, va: u64) -> PhysAddr {
 }
 
 /// Calls `free` on every frame of the address space under `l1`: its user pages, its level-3 and level-2 tables, then
-/// `l1` itself.
+/// `l1` itself; the kernel's entries, those the boot table holds, are shared and skipped.
 ///
 /// # Safety
 ///
-/// `l1` must be a level-1 table built by `map_page` (the kernel blocks aside) that no TTBR0 uses any more.
+/// `l1` must be a level-1 table built by `map_page` over a copy of the boot table's entries that no TTBR0 uses any
+/// more.
 pub unsafe fn free_space(l1: PhysAddr, mut free: impl FnMut(PhysAddr)) {
     // SAFETY: the caller's guarantee.
     unsafe { free_table(l1, 1, &mut free) }
@@ -218,11 +273,15 @@ pub unsafe fn free_space(l1: PhysAddr, mut free: impl FnMut(PhysAddr)) {
 ///
 /// `table` must be a level-`level` table of an address space built by `map_page`.
 unsafe fn free_table<F: FnMut(PhysAddr)>(table: PhysAddr, level: u32, free: &mut F) {
+    let boot = &raw const L1;
     for i in 0..512 {
         // SAFETY: the caller guarantees `table` is an identity-mapped table frame.
         let desc = unsafe { (table.0 as *const u64).wrapping_add(i).read() };
-        // Kernel blocks (`0b01`) are skipped; table and page descriptors are `0b11`.
         if desc & VALID_TABLE_OR_PAGE != VALID_TABLE_OR_PAGE {
+            continue;
+        }
+        // SAFETY: the boot table is only written by `enable_mmu`, before any address space exists.
+        if level == 1 && unsafe { (*boot).0[i] } != 0 {
             continue;
         }
         let next = PhysAddr(desc & ADDR);

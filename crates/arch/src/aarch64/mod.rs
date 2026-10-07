@@ -4,11 +4,13 @@ pub mod gic;
 pub mod irq;
 mod lock;
 mod mmu;
+mod spec;
 pub mod timer;
 mod trap;
 
 pub use lock::*;
 pub use mmu::*;
+pub use spec::*;
 pub use trap::*;
 
 global_asm!(include_str!("boot.s"));

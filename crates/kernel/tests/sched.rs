@@ -1,7 +1,16 @@
-use kernel::handle::{Handles, Object, WAIT};
+use kernel::handle::{Handle, Handles, Object, WAIT};
 use kernel::syscall::{EBADF, KILLED};
 use kernel::{Event, Memory, Scheduler};
 use mm::{Budget, PhysAddr};
+
+/// The host's clamp: no speculation to bound.
+struct Min;
+
+impl kernel::Clamp for Min {
+    fn clamp<const N: usize>(values: [u64; N], limits: [u64; N]) -> [u64; N] {
+        core::array::from_fn(|i| values[i].min(limits[i] - 1))
+    }
+}
 
 const STACK: PhysAddr = PhysAddr(0x9000);
 
@@ -174,7 +183,7 @@ fn closing_the_handle_frees_an_exited_child_and_lets_a_running_one_free_at_exit(
 
     assert_eq!(sched.close(child.0, child.1 + 1), 0);
     assert_eq!(sched.free_process(), None, "another generation's close");
-    sched.handles().close(handle).unwrap();
+    sched.handles().close(Handle::new::<Min>(handle)).unwrap();
     assert_eq!(sched.close(child.0, child.1), 12, "the budget, as reap");
     assert_eq!(sched.free_process().unwrap().0, child.0, "closed: freed");
 
@@ -184,7 +193,7 @@ fn closing_the_handle_frees_an_exited_child_and_lets_a_running_one_free_at_exit(
         generation: child.1,
     };
     let handle = give(&mut sched, process);
-    sched.handles().close(handle).unwrap();
+    sched.handles().close(Handle::new::<Min>(handle)).unwrap();
     assert_eq!(sched.close(child.0, child.1), 0, "still running");
     assert_eq!(sched.switch(0x111), 0x300);
     exit(&mut sched, 2);
@@ -248,7 +257,7 @@ fn a_join_reports_the_code_once_and_a_held_thread_stays_a_zombie() {
     assert_eq!(sched.join(free.0, free.1), Err(EBADF), "a reused slot");
     assert_eq!(sched.join(reused.0, reused.1), Ok(None));
 
-    sched.handles().close(handle).unwrap();
+    sched.handles().close(Handle::new::<Min>(handle)).unwrap();
     let held = thread(&mut sched, process.0, 0x500, 0);
     let object = Object::Thread {
         slot: held.0,

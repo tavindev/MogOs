@@ -18,8 +18,8 @@ use mogfs::ROOT;
 
 use crate::usermem::copy_in;
 use crate::{
-    ARCHIVE, IMAGE, KERNEL, KERNEL_L1, Kernel, MAP_BASE, PAGE, Sched, TASK_STACK_FRAMES, USER_BASE,
-    USER_STACK_TOP,
+    ARCHIVE, IMAGE, KERNEL, KERNEL_ENTRIES, Kernel, MAP_BASE, Nospec, PAGE, Sched,
+    TASK_STACK_FRAMES, USER_BASE, USER_STACK_TOP,
 };
 
 /// Returns a thread's kernel stack at `stack` to `frames`, refunding `budget`.
@@ -123,8 +123,14 @@ fn spawn_process(
     (args, argc): (&[u8], usize),
 ) -> Result<(), i64> {
     let l1 = zeroed(frames, &mut budget).ok_or(ENOMEM)?;
-    // SAFETY: `l1` is a fresh, zeroed frame.
-    unsafe { (l1.0 as *mut [u64; 2]).write(KERNEL_L1) };
+    // SAFETY: `l1` is a fresh frame; the boot table's kernel entries stay fixed after `kmain`.
+    unsafe {
+        ptr::copy_nonoverlapping(
+            arch::boot_table().0 as *const u64,
+            l1.0 as *mut u64,
+            KERNEL_ENTRIES,
+        )
+    };
     let stack = (|| {
         for segment in segments {
             let data = &file[segment.data];
@@ -249,7 +255,10 @@ pub(crate) fn spawn(
     for (handle, bytes) in list.iter_mut().zip(bytes.as_chunks::<8>().0) {
         *handle = u64::from_le_bytes(*bytes);
     }
-    let (mut parent, child) = sched.handles().split(&list[..len])?;
+    // `len` is at most `MAX_HANDLES` (`dispatch`); the modulo keeps the slice in bounds on a mispredicted path too.
+    let (mut parent, child) = sched
+        .handles()
+        .split::<Nospec>(&list[..len % (MAX_HANDLES + 1)])?;
     let current = sched.process();
     if budget > sched.memory(current).budget.remaining() {
         return Err(ENOMEM);

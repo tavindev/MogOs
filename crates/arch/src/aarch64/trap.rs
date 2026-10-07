@@ -21,37 +21,71 @@ impl TrapFrame {
     }
 }
 
-// Each of the 16 entries saves x0/x1, puts its index in x1, and joins the common path.
+// The vector tables, 2 KiB apart in `spec::TABLES` order. Each entry saves x0/x1, puts its index in x1, and joins the
+// common path; a lower-EL entry (8-15) first runs its table's Spectre-BHB mitigation, before any branch.
 global_asm!(
     r#"
-.macro VECTOR index
+// kind: 0 plain, 1 clearbhb, 2 and 3 firmware workaround 3 by hvc and smc, 4 and 5 a loop of k with `dsb nsh; isb`
+// and with `sb`.
+.macro MITIGATE kind, k
+    .if \kind == 1
+    hint #22 // clrbhb
+    isb
+    .elseif \kind == 2 || \kind == 3
+    // SMCCC 1.1 clobbers x0-x3 only; x2 and x3 go back from their frame slots.
+    stp x2, x3, [sp, #16]
+    movz w0, #0x3fff
+    movk w0, #0x8000, lsl #16
+    .if \kind == 2
+    hvc #0
+    .else
+    smc #0
+    .endif
+    ldp x2, x3, [sp, #16]
+    .elseif \kind >= 4
+    mov x0, #\k
+1:  b . + 4
+    subs x0, x0, #1
+    b.ne 1b
+    .if \kind == 4
+    dsb nsh
+    isb
+    .else
+    .inst 0xd50330ff // sb
+    .endif
+    .endif
+.endm
+
+.macro VECTOR index, kind, k
     .balign 0x80
     sub sp, sp, #288
     stp x0, x1, [sp]
+    .if \index >= 8
+    MITIGATE \kind, \k
+    .endif
     mov x1, #\index
     b .Ltrap
+.endm
+
+.macro TABLE kind, k=0
+    .balign 2048
+    .irp index, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
+    VECTOR \index, \kind, \k
+    .endr
 .endm
 
 .section .text.vectors, "ax"
 .balign 2048
 .global aarch64_vectors
 aarch64_vectors:
-    VECTOR 0
-    VECTOR 1
-    VECTOR 2
-    VECTOR 3
-    VECTOR 4
-    VECTOR 5
-    VECTOR 6
-    VECTOR 7
-    VECTOR 8
-    VECTOR 9
-    VECTOR 10
-    VECTOR 11
-    VECTOR 12
-    VECTOR 13
-    VECTOR 14
-    VECTOR 15
+    TABLE 0
+    TABLE 1
+    TABLE 2
+    TABLE 3
+    .irp k, 8, 11, 24, 32, 38, 132
+    TABLE 4, \k
+    TABLE 5, \k
+    .endr
 
 .Ltrap:
     stp x2, x3, [sp, #16]
@@ -123,20 +157,6 @@ unsafe extern "C" {
     /// The board's scheduler: saves the yielding task's frame address and returns the next task's; entered and left like
     /// the hooks below.
     fn task_switch(frame: usize) -> usize;
-}
-
-/// Points `VBAR_EL1` at this crate's vector table.
-pub fn install_vectors() {
-    // SAFETY: `aarch64_vectors` is a complete, 2 KiB aligned EL1 vector table.
-    unsafe {
-        asm!(
-            "adrp {t}, aarch64_vectors",
-            "add {t}, {t}, :lo12:aarch64_vectors",
-            "msr vbar_el1, {t}",
-            "isb",
-            t = out(reg) _,
-        )
-    }
 }
 
 /// Executes `brk #0`, which the handler skips; returning proves it was caught. Call after `install_vectors`.

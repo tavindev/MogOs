@@ -10,7 +10,7 @@ touches memory through raw addresses: the board reads user buffers, copies pages
 
 ## Responsibilities
 
-- `Board` trait and `Program` enum (`src/lib.rs`); `run` drives boot and the `test=*` bootargs scenarios; the board turns on the MMU before calling it (its locks need the MMU), and `run` starts the other cores (`Board::start_cpus`) as the last step of boot, inside the `boot:` time. The crate has no lock: its tables are plain data the board keeps under its big lock.
+- `Board` trait, `Clamp` port, `Violation` (`Board::violate`, `test=wx-*`) and `Program` enum (`src/lib.rs`); `run` drives boot and the `test=*` bootargs scenarios; the board turns on the MMU before calling it (its locks need the MMU), and `run` starts the other cores (`Board::start_cpus`) as the last step of boot, inside the `boot:` time; right after the `boot:` line it calls `Board::report_speculation` (the `spec:` line), which waits for every core, outside the boot time. The crate has no lock: its tables are plain data the board keeps under its big lock.
 - `Disk` and `BLOCK_SIZE` (4096) are `mogfs`'s, re-exported (`src/lib.rs`): synchronous `read`/`write` of
   consecutive blocks, `flush`, `blocks`; every failure is `mogfs::Error::Io`. `Board::disk` is called once in `run`,
   then `Board::mount` (except under `test=disk` and `test=bench-disk`, which keep the raw device), both before the
@@ -23,11 +23,12 @@ touches memory through raw addresses: the board reads user buffers, copies pages
   table `Processes<P>` (address space, `Handles`, `Memory` with the budget and map cursor, live threads (a slot bitmask),
   generation); states (`Ready`, `Blocked`, `Exited`, `Zombie`) for both; `end` (a thread, and its process with its last
   thread), `reap` (a process), `join` (a thread).
-- `Handles` (`src/handle.rs`): per-process handle tables, rights, `dup`, `split` for `spawn`.
+- `Handles` (`src/handle.rs`): per-process handle tables, rights, `dup`, `split` for `spawn`; lookups take a `Handle`, a
+  user value with its index clamped (by `dispatch`, or `Handle::new` / `split` with their own barrier).
 - `Pipes<N>` (`src/pipe.rs`), `Mutexes<N>` (`src/mutex.rs`): fixed tables of kernel objects. `Pipe::read` and
   `Pipe::write` hand the caller each chunk of the ring through a closure, so the board copies straight between user
   memory and the pipe page; `read_waits` lets it skip probing the user buffer when the read would wait.
-- `syscall::dispatch` (`src/syscall.rs`): decodes `x8`/`x0`-`x5`, checks handles and rights, returns a `Call` for the
+- `syscall::dispatch` (`src/syscall.rs`): returns `ENOSYS` above the last syscall, then clamps every user value that indexes kernel memory behind one `Clamp` barrier, decodes `x8`/`x0`-`x5`, checks handles and rights, returns a `Call` for the
   board to execute. Syscall numbers and error constants are defined here.
 - `cpio::find`, `cpio::entries`, `elf::Elf::parse` (`src/cpio.rs`, `src/elf.rs`).
 - `network` (`src/network.rs`, design notes at its top): `Network`, up to three `net::Stack`s (`ETH` on the NIC,
@@ -76,6 +77,14 @@ touches memory through raw addresses: the board reads user buffers, copies pages
   stay fixed while a file lives.
 
 ## Invariants & rules
+
+- Spectre v1: `dispatch` clamps, before any use and behind one barrier (`Clamp::clamp`, `csel`s then one `csdb` on the
+  board, `min` on the host), every argument that may index kernel memory, each to the capacity of what it indexes:
+  the number, the handles in x0 and x3, each user buffer (pointer and length), the file offset and the `readdir`
+  start; only the clamped values go on. An index derived from them is bounded by construction (MogFS's `% PTRS`). A
+  value that only appears later keeps its own clamp: `spawn`'s handle list (`split`), `Handle::new`. Objects a handle
+  reaches are kernel-written. A new syscall's indexing arguments join the batch (`docs/phases/phase-10-hardening.md`,
+  60b).
 
 - Handle value is `generation << 32 | index`; `close` bumps the entry's generation; an entry retires at `1 << 31`, so
   values stay positive and never wrap (`src/handle.rs` header, `RETIRED`).

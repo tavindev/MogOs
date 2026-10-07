@@ -20,9 +20,9 @@ use core::panic::PanicInfo;
 use core::ptr::{self, NonNull};
 use core::slice;
 use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize};
 
-use arch::{Guard, Lock, MemoryType, l1_block};
+use arch::{Conduit, Guard, KernelMap, Lock};
 use dtb::Dtb;
 use fs::FsDisk;
 use kernel::console::Line;
@@ -32,7 +32,7 @@ use kernel::mutex::Mutexes;
 use kernel::network::Network;
 use kernel::pipe::Pipes;
 use kernel::syscall::{ENOENT, MAX_BUFFER};
-use kernel::{Event, FRAME_WORDS, Full, PRIORITIES, Program, Scheduler};
+use kernel::{Event, FRAME_WORDS, Full, PRIORITIES, Program, Scheduler, Violation};
 use linked_list_allocator::Heap;
 use mm::{FrameAllocator, PhysAddr};
 use mogfs::{Error, Fs};
@@ -49,11 +49,8 @@ const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
 const GIB: u64 = 1 << 30;
 /// Outside both mapped GiBs.
 const UNMAPPED: PhysAddr = PhysAddr(0x8000_0000);
-/// Device memory in GiB 0 (MMIO), the kernel image, stack, heap and DTB in RAM in GiB 1; EL1-only, global.
-const KERNEL_L1: [u64; 2] = [
-    l1_block(PhysAddr(0), MemoryType::Device),
-    l1_block(PhysAddr(GIB), MemoryType::Normal),
-];
+/// The boot table's entries every address space copies: device memory (GiB 0) and RAM (GiB 1), EL1-only, global.
+const KERNEL_ENTRIES: usize = 2;
 const PAGE: usize = 4096;
 /// Where user programs' code is mapped; one 2 MiB region, so a process needs a single level-3 table.
 const USER_BASE: u64 = 1 << 32;
@@ -74,8 +71,12 @@ const TICK_US: u64 = 10_000;
 /// The SGI that will wake a core to reschedule (step 25b); enabled on every core.
 const RESCHEDULE_SGI: u32 = 0;
 const PSCI_CPU_ON: u64 = 0xc400_0003;
-/// Each secondary core's stack, reserved in `linker.ld` above `__stack_top`.
-const SECONDARY_STACK: u64 = 0x4000;
+/// Each secondary core's 4 KiB guard page and 16 KiB stack, reserved in `linker.ld` above `__stack_top`.
+const SECONDARY_STACK: u64 = 0x5000;
+const _: () = assert!(
+    arch::MAX_CPUS == 4,
+    "linker.ld reserves 3 secondary stacks and guards"
+);
 
 /// GIC distributor and CPU interface bases, set before the first IRQ can be delivered and before any secondary starts.
 static GIC_DIST: AtomicU64 = AtomicU64::new(0);
@@ -86,6 +87,8 @@ static TICKED: AtomicUsize = AtomicUsize::new(0);
 static SMP_TEST: AtomicBool = AtomicBool::new(false);
 /// The DTB's cores, at most `MAX_CPUS`; `start_cpus` starts them all or panics.
 static CPUS: AtomicUsize = AtomicUsize::new(1);
+/// The DT's PSCI conduit for SMCCC calls: 0 none, 1 `hvc`, 2 `smc`; stored before any secondary starts.
+static CONDUIT: AtomicU8 = AtomicU8::new(0);
 /// Set once `Board::disk` handed out the block device.
 static DISK_TAKEN: AtomicBool = AtomicBool::new(false);
 /// QEMU `virt`'s 32 virtio-mmio transports: the first one's base, and the stride between them.
@@ -98,6 +101,16 @@ const MAX_TASKS: usize = 8;
 const MAX_PROCESSES: usize = 8;
 const _: () = assert!(MAX_PROCESSES <= 256);
 type Sched = Scheduler<MAX_TASKS, MAX_PROCESSES>;
+
+/// `kernel::Clamp` over `arch::clamp`: user values that index kernel memory, bounded behind one `csdb`.
+struct Nospec;
+
+impl kernel::Clamp for Nospec {
+    #[inline(always)]
+    fn clamp<const N: usize>(values: [u64; N], limits: [u64; N]) -> [u64; N] {
+        arch::clamp(values, limits)
+    }
+}
 /// Kernel stack per task: 16 KiB.
 const TASK_STACK_FRAMES: usize = 4;
 const MAX_PIPES: usize = 16;
@@ -219,6 +232,27 @@ impl kernel::Board for QemuVirt {
     fn read_unmapped(&mut self) {
         // SAFETY: the address is unmapped, so the read takes a data abort, which panics instead of returning.
         unsafe { (UNMAPPED.0 as *const u64).read_volatile() };
+    }
+
+    fn violate(&mut self, violation: Violation) {
+        /// `ret`, in `.data`.
+        static mut DATA_WORD: u32 = 0xd65f_03c0;
+        let address = match violation {
+            Violation::WriteText => kmain as *const () as usize,
+            Violation::ExecuteData => &raw mut DATA_WORD as usize,
+            Violation::OverflowStack => &raw const __boot_guard as usize,
+        };
+        let _ = writeln!(Uart::new(UART0), "wx: {address:#x}");
+        match violation {
+            // SAFETY: the text is mapped read-only, so the store takes a permission fault, which panics.
+            Violation::WriteText => unsafe { (address as *mut u32).write_volatile(0) },
+            Violation::ExecuteData => {
+                // SAFETY: `.data` is mapped PXN, so the branch takes a permission fault, which panics.
+                let data: extern "C" fn() = unsafe { core::mem::transmute(address) };
+                data()
+            }
+            Violation::OverflowStack => _ = recurse(0),
+        }
     }
 
     fn init_heap(&mut self, region: Range<PhysAddr>) {
@@ -391,10 +425,33 @@ impl kernel::Board for QemuVirt {
     fn ticked_cpus(&self) -> usize {
         TICKED.load(Relaxed).count_ones() as usize
     }
+
+    fn report_speculation(&mut self) {
+        arch::record_speculation(conduit());
+        let spec = loop {
+            if let Some(spec) = arch::speculation(CPUS.load(Relaxed)) {
+                break spec;
+            }
+            spin_loop();
+        };
+        let _ = writeln!(self.console, "spec: {spec}");
+    }
+}
+
+/// The conduit `kmain` stored in `CONDUIT`.
+fn conduit() -> Option<Conduit> {
+    match CONDUIT.load(Relaxed) {
+        1 => Some(Conduit::Hvc),
+        2 => Some(Conduit::Smc),
+        _ => None,
+    }
 }
 
 unsafe extern "C" {
     static __kernel_start: u8;
+    static __text_end: u8;
+    static __rodata_end: u8;
+    static __boot_guard: u8;
     static __kernel_end: u8;
     static __stack_top: u8;
 }
@@ -402,10 +459,22 @@ unsafe extern "C" {
 #[unsafe(no_mangle)]
 extern "C" fn kmain() -> ! {
     let entry_us = arch::uptime_us();
-    // SAFETY: core 0, MMU off, before any atomic RMW; MMIO is in GiB 0, the image, stacks and DTB in RAM in GiB 1.
-    unsafe { arch::enable_mmu(&KERNEL_L1) };
-    arch::install_vectors();
-    arch::timer::allow_user_counter();
+    let stack_top = &raw const __stack_top as u64;
+    let map = KernelMap {
+        device: PhysAddr(0),
+        ram: PhysAddr(GIB),
+        dtb: DTB,
+        image: PhysAddr(&raw const __kernel_start as u64),
+        text_end: PhysAddr(&raw const __text_end as u64),
+        rodata_end: PhysAddr(&raw const __rodata_end as u64),
+        guards: core::array::from_fn(|cpu| match cpu {
+            0 => PhysAddr(&raw const __boot_guard as u64),
+            cpu => PhysAddr(stack_top + (cpu as u64 - 1) * SECONDARY_STACK),
+        }),
+    };
+    // SAFETY: core 0, MMU off, before any atomic RMW; MMIO is in GiB 0, the image (`linker.ld` keeps it in its 2 MiB),
+    // stacks and DTB in RAM in GiB 1.
+    unsafe { arch::enable_mmu(&map) };
 
     // SAFETY: RAM base is mapped RAM; we only read the 8-byte FDT header there.
     let header = unsafe { slice::from_raw_parts(DTB.0 as *const u8, 8) };
@@ -413,11 +482,18 @@ extern "C" fn kmain() -> ! {
     // SAFETY: the magic matched, so QEMU loaded `size` bytes of DTB here and nothing writes them.
     let blob = unsafe { slice::from_raw_parts(DTB.0 as *const u8, size) };
 
-    let image =
-        PhysAddr(&raw const __kernel_start as u64)..PhysAddr(&raw const __kernel_end as u64);
-    let dtb_range = DTB..PhysAddr(DTB.0 + size as u64);
+    // The DTB's whole 2 MiB block is read-only, so no frame comes from it.
+    let reserved = DTB..PhysAddr(&raw const __kernel_end as u64);
 
     let dtb = Dtb::new(blob).expect("bad DTB");
+    let method = match dtb.psci_method() {
+        Some("hvc") => 1,
+        Some("smc") => 2,
+        _ => 0,
+    };
+    CONDUIT.store(method, Relaxed);
+    arch::install_vectors(conduit());
+    arch::timer::allow_user_counter();
     let gic = dtb.gic().expect("no GICv2 in DTB");
     GIC_DIST.store(gic.0.0, Relaxed);
     GIC_CPU.store(gic.1.0, Relaxed);
@@ -443,7 +519,7 @@ extern "C" fn kmain() -> ! {
             entry_us,
         },
         dtb,
-        &[image, dtb_range],
+        &[reserved],
     )
 }
 
@@ -470,7 +546,8 @@ fn start_cpu(cpu: usize) {
 /// its GIC CPU interface, timer PPI and reschedule SGI, and sleeps; it runs no task yet.
 #[unsafe(no_mangle)]
 extern "C" fn kmain_secondary() -> ! {
-    arch::install_vectors();
+    arch::install_vectors(conduit());
+    arch::record_speculation(conduit());
     if arch::cpu() == 1 {
         (2..CPUS.load(Relaxed)).for_each(start_cpu);
     }
@@ -488,6 +565,15 @@ extern "C" fn kmain_secondary() -> ! {
     loop {
         arch::irq::wait();
     }
+}
+
+/// Recurses without end, 512 bytes of stack a call.
+fn recurse(depth: u64) -> u64 {
+    let frame = core::hint::black_box([depth; 64]);
+    if frame[0] == u64::MAX {
+        return 0;
+    }
+    recurse(depth + 1) + frame[63]
 }
 
 fn shutdown() -> ! {
