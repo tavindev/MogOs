@@ -215,6 +215,36 @@ fn an_accepted_handle_gets_no_more_rights_than_the_accepting_one() {
 }
 
 #[test]
+fn a_closed_listener_leaves_nothing_behind() {
+    let mut w = World::new(1024);
+    let (listener, clients) = w.listen_and_connect(13, 2);
+    // Sockets made before the close, so the old listener's entry is not reused.
+    let next = w.socket(OTHER, LISTEN).unwrap();
+    let client = w.socket(OTHER, CONNECT).unwrap();
+    w.network.close(listener, &mut w.processes);
+    assert_eq!(w.used(ME), 0, "the listener and its backlog are refunded");
+    for (i, &client) in clients.iter().enumerate() {
+        w.submit(OTHER, client, (OP_RECEIVE, 0, 64, i as u64))
+            .unwrap();
+        assert!(w.complete(OTHER).result < 0, "a queued connection is reset");
+    }
+    // The port is free, and connections to a new listener (likely on the old one's TCP slot) are its owner's alone.
+    w.network.bind(next, 13).unwrap();
+    w.network.listen(next).unwrap();
+    w.submit(OTHER, client, (OP_CONNECT, LOCALHOST, 13, 7))
+        .unwrap();
+    assert_eq!(w.complete(OTHER).result, 0);
+    w.submit(OTHER, next, (OP_ACCEPT, 0, 0, 8)).unwrap();
+    assert!(w.complete(OTHER).accepted.is_some());
+    assert_eq!(w.used(ME), 0, "nothing is charged to the old owner");
+    assert!(
+        w.network
+            .complete(ME, &mut w.processes, &mut w.user)
+            .is_none()
+    );
+}
+
+#[test]
 fn queued_connections_are_bounded_and_charged_to_the_listener_until_accepted() {
     let mut w = World::new(1024);
     let (listener, clients) = w.listen_and_connect(11, BACKLOG + 2);

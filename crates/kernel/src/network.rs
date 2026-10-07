@@ -332,7 +332,14 @@ impl Network {
         if entry.handles > 0 {
             return;
         }
-        let entry = *entry;
+        // The whole entry goes, so nothing (a listener's slots, its backlog, ops) outlives the socket.
+        let entry = core::mem::replace(
+            entry,
+            Entry {
+                generation: entry.generation,
+                ..FREE
+            },
+        );
         let mut frames = SOCKET_FRAMES;
         match entry.conn {
             Conn::Fresh => {}
