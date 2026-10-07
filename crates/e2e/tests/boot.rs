@@ -1,5 +1,5 @@
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, sleep};
@@ -28,6 +28,10 @@ fn boot_with_input(extra: &[&str], mut input: Option<(&str, &[u8])>) -> (ExitSta
             "cortex-a72",
             "-m",
             "128M",
+            "-global",
+            "virtio-mmio.force-legacy=false",
+            "-global",
+            "virtio-mmio.ioeventfd=off",
             "-nographic",
             "-kernel",
         ])
@@ -94,6 +98,7 @@ fn boots_and_powers_off() {
         "ram: 0x40000000..0x48000000",
         "mmu: on",
         "heap: ok",
+        "disk: none",
     ] {
         assert!(
             lines.iter().any(|l| l == expected),
@@ -453,5 +458,95 @@ fn console_reads_edited_lines_typed_ahead() {
         ]
     );
     assert_no_leak(&lines, "echo");
+    assert!(status.success(), "QEMU exited with {status}");
+}
+
+/// A zeroed raw disk image of `blocks` 4 KiB blocks in the temp dir, unique to `test`.
+fn disk_image(test: &str, blocks: u64) -> PathBuf {
+    let path = std::env::temp_dir().join(format!("mogos-{test}-{}.img", std::process::id()));
+    let file = std::fs::File::create(&path).unwrap();
+    file.set_len(blocks * 4096).unwrap();
+    path
+}
+
+/// Boots with `image` attached as a virtio-blk device and `test` as the boot argument.
+fn boot_with_disk(image: &Path, test: &str) -> (ExitStatus, Vec<String>) {
+    let drive = format!("file={},if=none,format=raw,id=d0", image.display());
+    boot(&[
+        "-drive",
+        &drive,
+        "-device",
+        "virtio-blk-device,drive=d0",
+        "-append",
+        test,
+    ])
+}
+
+#[test]
+fn a_flushed_block_survives_a_reboot() {
+    let image = disk_image("disk", 16);
+    let (status, lines) = boot_with_disk(&image, "test=disk");
+    assert!(status.success(), "QEMU exited with {status}");
+    let disk: Vec<_> = lines.iter().filter(|l| l.starts_with("disk: ")).collect();
+    assert_eq!(disk, ["disk: 16 blocks", "disk: wrote"]);
+    // Blocks 1 and 2 are bytes 4096..12288: a driver addressing 512-byte sectors by block number would miss them.
+    let bytes = std::fs::read(&image).unwrap();
+    let expected: Vec<u8> = (0..8192).map(|i| (i % 251) as u8).collect();
+    assert!(
+        bytes[4096..12288] == expected[..],
+        "blocks 1 and 2 not on the image"
+    );
+
+    let (status, lines) = boot_with_disk(&image, "test=disk");
+    std::fs::remove_file(&image).unwrap();
+    assert!(status.success(), "QEMU exited with {status}");
+    let disk: Vec<_> = lines.iter().filter(|l| l.starts_with("disk: ")).collect();
+    assert_eq!(disk, ["disk: 16 blocks", "disk: read ok"]);
+
+    // A fresh image behind blkdebug, which fails every host flush with EIO: the kernel must see it, so it flushed.
+    let image = disk_image("disk-flush", 16);
+    let blockdev = format!(
+        r#"{{"driver":"raw","node-name":"d0","file":{{"driver":"blkdebug","inject-error":[{{"event":"flush_to_disk","errno":5}}],"image":{{"driver":"file","filename":"{}"}}}}}}"#,
+        image.display()
+    );
+    let (status, lines) = boot(&[
+        "-blockdev",
+        &blockdev,
+        "-device",
+        "virtio-blk-device,drive=d0",
+        "-append",
+        "test=disk",
+    ]);
+    std::fs::remove_file(&image).unwrap();
+    assert!(status.success(), "QEMU exited with {status}");
+    let disk: Vec<_> = lines.iter().filter(|l| l.starts_with("disk: ")).collect();
+    assert_eq!(disk, ["disk: 16 blocks", "disk: flush failed"]);
+}
+
+#[test]
+fn disk_bench_reports_throughput() {
+    let image = disk_image("bench-disk", 2048);
+    let (status, lines) = boot_with_disk(&image, "test=bench-disk");
+    std::fs::remove_file(&image).unwrap();
+    assert!(
+        !lines.iter().any(|l| l.starts_with("panic:")),
+        "kernel panicked"
+    );
+    for op in [
+        "4 KiB write+flush",
+        "4 KiB read",
+        "256 KiB write+flush",
+        "256 KiB read",
+    ] {
+        lines
+            .iter()
+            .find_map(|l| {
+                l.strip_prefix(&format!("disk: {op} "))?
+                    .strip_suffix(" MiB/s")
+            })
+            .unwrap_or_else(|| panic!("missing disk {op} line"))
+            .parse::<u64>()
+            .unwrap();
+    }
     assert!(status.success(), "QEMU exited with {status}");
 }

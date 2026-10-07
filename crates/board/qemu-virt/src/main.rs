@@ -4,6 +4,7 @@
 extern crate alloc;
 
 mod uart;
+mod virtio_blk;
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::arch::global_asm;
@@ -13,7 +14,7 @@ use core::ops::Range;
 use core::panic::PanicInfo;
 use core::ptr::{self, NonNull};
 use core::slice;
-use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 
 use arch::{MemoryType, UserAccess, l1_block, user_page};
 use dtb::Dtb;
@@ -27,6 +28,7 @@ use kernel::{Event, FRAME_WORDS, Full, Memory, PRIORITIES, Program, Scheduler};
 use linked_list_allocator::Heap;
 use mm::{Budget, FrameAllocator, PhysAddr};
 use uart::Uart;
+use virtio_blk::VirtioBlk;
 
 /// Panic- and trap-path console; normal output uses the PL011 from the DTB.
 const UART0: PhysAddr = PhysAddr(0x0900_0000);
@@ -60,6 +62,12 @@ const TICK_US: u64 = 10_000;
 
 /// GIC CPU interface base, set before the first IRQ can be delivered.
 static GIC_CPU: AtomicU64 = AtomicU64::new(0);
+/// Set once `Board::disk` handed out the block device.
+static DISK_TAKEN: AtomicBool = AtomicBool::new(false);
+/// QEMU `virt`'s 32 virtio-mmio transports: the first one's base, and the stride between them.
+const VIRTIO: PhysAddr = PhysAddr(0x0a00_0000);
+const VIRTIO_STRIDE: u64 = 0x200;
+const VIRTIO_COUNT: u64 = 32;
 /// Boot context included; a task's slot is its ASID (8 bits).
 const MAX_TASKS: usize = 8;
 const _: () = assert!(MAX_TASKS <= 256);
@@ -595,6 +603,7 @@ struct QemuVirt {
 
 impl kernel::Board for QemuVirt {
     type Console = Uart;
+    type Disk = VirtioBlk;
 
     fn console(&mut self) -> &mut Uart {
         &mut self.uart
@@ -723,6 +732,31 @@ impl kernel::Board for QemuVirt {
         let count = unsafe { &(*KERNEL.0.get()).sched }.count();
         arch::irq::restore(irq);
         count
+    }
+
+    fn disk(&mut self) -> Option<VirtioBlk> {
+        let alloc = || {
+            let irq = arch::irq::disable();
+            // SAFETY: IRQs are masked on the only core, so this is the sole reference.
+            let frame = unsafe { &mut (*KERNEL.0.get()).frames }.alloc();
+            arch::irq::restore(irq);
+            frame
+        };
+        if DISK_TAKEN.swap(true, Relaxed) {
+            return None;
+        }
+        // QEMU `virt` fills the transports from the highest address down with no gaps, so the first empty one ends them.
+        for i in (0..VIRTIO_COUNT).rev() {
+            let base = PhysAddr(VIRTIO.0 + i * VIRTIO_STRIDE);
+            // SAFETY: QEMU `virt`'s virtio-mmio transports, in the device-mapped GiB 0, driven only here (`DISK_TAKEN`);
+            // frames from the allocator are identity-mapped RAM nobody else uses.
+            match unsafe { VirtioBlk::new(base, alloc) } {
+                Ok(disk) => return Some(disk),
+                Err(0) => break,
+                Err(_) => {}
+            }
+        }
+        None
     }
 }
 
