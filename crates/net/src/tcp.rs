@@ -154,6 +154,8 @@ pub struct TcpSocket<'a> {
     /// When the running timer started: the last ACK of new data, a send with nothing outstanding, the last
     /// expiry, or (in FIN-WAIT-2) the peer's last segment. `deadline` derives the rest from the state.
     since: u64,
+    /// `deadline()` as of the end of the last event that could change it.
+    due: Option<u64>,
     retries: u8,
     probes: u8,
     /// Persist probes the peer has not answered.
@@ -214,6 +216,7 @@ impl<'a> TcpSocket<'a> {
             rttvar: 0,
             rto: INITIAL_RTO,
             since: 0,
+            due: None,
             retries: 0,
             probes: 0,
             unanswered: 0,
@@ -628,9 +631,13 @@ impl<'a> TcpSocket<'a> {
         Some(self.since + wait)
     }
 
-    fn on_timer(&mut self, now: u64) {
+    /// Fires the deadline if it has come; true if it had, so the caller recomputes it.
+    fn on_timer(&mut self, now: u64) -> bool {
+        if self.due.is_none_or(|d| now < d) {
+            return false;
+        }
         if self.deadline().is_none_or(|d| now < d) {
-            return;
+            return true;
         }
         self.since = now;
         if self.state == State::FinWait2 {
@@ -638,7 +645,8 @@ impl<'a> TcpSocket<'a> {
         } else if self.persisting() {
             self.unanswered += 1;
             if self.unanswered > DATA_TRIES {
-                return self.fail(Error::TimedOut);
+                self.fail(Error::TimedOut);
+                return true;
             }
             self.probes = self.probes.saturating_add(1);
             self.force = true;
@@ -650,7 +658,8 @@ impl<'a> TcpSocket<'a> {
                 SYN_TRIES
             };
             if self.retries > tries {
-                return self.fail(Error::TimedOut);
+                self.fail(Error::TimedOut);
+                return true;
             }
             if self.synchronized() {
                 let flight = self.snd_max.wrapping_sub(self.snd_una);
@@ -661,6 +670,7 @@ impl<'a> TcpSocket<'a> {
             (self.snd_nxt, self.timed, self.rexmit) = (self.snd_una, None, false);
             self.rto = (self.rto * 2).min(MAX_RTO);
         }
+        true
     }
 
     /// Whether the next `poll` has something to send, so the next hop is worth resolving.
@@ -1064,7 +1074,7 @@ impl<'a> Stack<'a> {
             ssthresh: s.ssthresh,
             snd_wnd: s.snd_wnd,
             rto: s.rto,
-            deadline: s.deadline(),
+            deadline: s.due,
             queued: s.tx_len,
         })
     }
@@ -1166,6 +1176,8 @@ impl<'a> Stack<'a> {
             self.reply_tcp((mac, ours), to, local, &o);
         }
         self.settle(i, now);
+        let c = &mut self.tcp.sockets[i];
+        c.due = c.deadline();
         r
     }
 
@@ -1383,15 +1395,18 @@ impl<'a> Stack<'a> {
             next = crate::earliest(next, Some(self.tcp.half_open[h].due()));
         }
         for i in 0..self.tcp.sockets.len() {
-            self.tcp.sockets[i].on_timer(now);
-            self.tcp_output(nic, now, i, mss);
-            self.settle(i, now);
-            next = crate::earliest(next, self.tcp.sockets[i].deadline());
+            let fired = self.tcp.sockets[i].on_timer(now);
+            if self.tcp_output(nic, now, i, mss) || fired {
+                let s = &mut self.tcp.sockets[i];
+                s.due = s.deadline();
+            }
+            next = crate::earliest(next, self.tcp.sockets[i].due);
         }
         next
     }
 
-    fn tcp_output(&mut self, nic: &mut impl Nic, now: u64, i: usize, mss: u16) {
+    /// Sends what the connection owes; true if it had anything to send, which may move its deadline.
+    fn tcp_output(&mut self, nic: &mut impl Nic, now: u64, i: usize, mss: u16) -> bool {
         let s = &mut self.tcp.sockets[i];
         if matches!(
             s.state,
@@ -1417,16 +1432,17 @@ impl<'a> Stack<'a> {
             let sent = nic.transmit(ETH + IP + TCP, |f| {
                 frame(f, (mac, ours), (src, remote), local, id, &o, |_| {})
             });
-            return self.count_tx(sent);
+            self.count_tx(sent);
+            return true;
         }
         if !s.wants_output() {
-            return;
+            return false;
         }
         let Ok(mac) = self
             .next_hop(*remote.ip())
             .and_then(|ip| self.resolve(nic, ip, now))
         else {
-            return;
+            return true;
         };
         self.tcp.sockets[i].mac = mac;
         loop {
@@ -1453,6 +1469,7 @@ impl<'a> Stack<'a> {
                 break;
             }
         }
+        true
     }
 
     /// Moves a connection that reached TIME_WAIT into the TIME_WAIT table.

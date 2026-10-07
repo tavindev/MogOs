@@ -184,7 +184,8 @@ fn wrap_start(key: [u64; 2], before: u32) -> u64 {
     0u32.wrapping_sub(before).wrapping_sub(isn) as u64 * 4000
 }
 
-/// Liveness: a connection with work outstanding (anything but idle in ESTABLISHED or CLOSE-WAIT) has a deadline.
+/// Liveness, after a poll: a connection with work outstanding (anything but idle in ESTABLISHED or CLOSE-WAIT)
+/// has a deadline.
 fn live(s: &Stack, id: TcpId) {
     let i = s.tcp_info(id).unwrap();
     let idle = matches!(i.state, State::Closed | State::Listen)
@@ -211,13 +212,14 @@ fn transfer(seed: u64, faults: Faults, bytes: usize, ring: usize) -> u64 {
     let (mut fa, mut fb) = (Flow::default(), Flow::default());
     let (pat, mut buf) = (pattern(), vec![0u8; 8192]);
     run(&mut link, &mut a, &mut b, start + 3600 * SEC, |a, b, _| {
+        // Checked right after the polls: a deadline moves when the next poll acts on the step's calls.
+        live(a, ca);
         cb = cb.or_else(|| b.accept(listener));
         let mut progress = pump(a, ca, &mut fa, bytes, &pat, &mut buf);
         if let Some(cb) = cb {
-            progress |= pump(b, cb, &mut fb, bytes, &pat, &mut buf);
             live(b, cb);
+            progress |= pump(b, cb, &mut fb, bytes, &pat, &mut buf);
         }
-        live(a, ca);
         let closed = |s: &Stack, id| s.tcp_info(id).unwrap().state == State::Closed;
         let done = fa.eof && fb.eof && closed(a, ca) && cb.is_some_and(|cb| closed(b, cb));
         (progress, done)
