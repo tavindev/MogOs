@@ -3,9 +3,11 @@
 ## What this crate is
 
 The adapter that implements `kernel::Board` for QEMU `virt` and owns everything stateful and unsafe outside
-`crates/arch`: `kmain`, the PL011 driver (`src/uart.rs`), the virtio-blk driver (`src/virtio_blk.rs`), the global kernel state, the `#[global_allocator]`, the
-trap hooks, process construction and ELF loading, the asm test programs (`src/user.s`), `linker.ld`, and `build.rs`,
-which builds `crates/user` and bundles it as the boot archive.
+`crates/arch`: `kmain`, the global kernel state, the `#[global_allocator]` and the `Board` impl (`src/main.rs`), the
+PL011 driver (`src/uart.rs`), the virtio-blk driver (`src/virtio_blk.rs`), the trap hooks (`src/trap.rs`), process
+construction and ELF loading (`src/process.rs`), user-pointer checks (`src/usermem.rs`), the file system's disk
+(`src/fs.rs`), the asm test programs (`src/user.s`), `linker.ld`, and `build.rs`, which builds `crates/user` and
+bundles it as the boot archive.
 
 It is **NOT** where scheduling, handle, pipe, mutex or syscall-decoding logic lives (`crates/kernel`), nor raw
 AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe, host-testable code.
