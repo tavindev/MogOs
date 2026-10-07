@@ -42,18 +42,20 @@ kernel, step 50), DHCP, DNS or IPv6 (phase 9), or IPv4 fragment reassembly.
 - ARP learns only from a reply to an entry we asked about (first reply wins) and from a request aimed at our IP;
   the ARP sender MAC must equal the Ethernet source and the sender IP must be an on-link unicast address other than
   ours. Everything else is `ignored`, so ARP traffic not aimed at us never evicts a neighbour. A full cache evicts
-  its least recently used entry. ARP has no checksum; these checks are what keep a flipped bit from poisoning the
-  cache. Pending requests live in the same bounded table and are freed after 3 unanswered tries.
-- An echo reply goes to the request's Ethernet source; IP traffic never reads or writes the ARP cache.
+  its least recently used entry. ARP has no checksum: the MAC check rejects a flipped bit in either MAC, but a flip
+  in the sender IP of a request aimed at us is learned (the NIC's FCS catches it on a real link). Pending requests
+  live in the same bounded table and are freed after 3 unanswered tries.
+- An echo reply goes to the request's Ethernet source; received IP traffic never writes the ARP cache.
 - Residual risk: plain ARP cannot stop an on-path attacker who answers our request first, or who sends a request
   aimed at us claiming a neighbour's IP.
 - A full socket table is `TableFull`, a bound port `InUse`; nothing is evicted silently. A full socket buffer drops
   the datagram (`socket_full`).
 - Replies built while the received frame is borrowed (ARP reply, echo reply) go through one buffer, sent after the
   NIC releases the frame.
-- Checksums: one pass over the payload, summed as big-endian 32-bit words. A received datagram is copied into the
-  socket buffer, then committed only if its checksum holds. Copy then sum measured faster on the host than a fused
-  copy-and-sum loop (64-byte receive path 31 against 35 ns), so `copy_sum` is a `memcpy` and a sum.
+- Checksums: summed once over the payload as big-endian 32-bit words, right after it is copied (`copy_sum`: a
+  `memcpy`, then the sum over the copied bytes, which are hot in L1). A fused copy-and-sum loop measured slower on the
+  host (64-byte receive path 35 against 31 ns, equal at 1472 bytes). A received datagram is copied into the socket
+  buffer, then committed only if its checksum holds.
 - Performance is the moat: a slowdown is never accepted because it has an explanation; it is removed, or shown to
   be unavoidable with before/after numbers (`docs/BENCHMARKS.md`).
 
@@ -66,7 +68,7 @@ kernel, step 50), DHCP, DNS or IPv6 (phase 9), or IPv4 fragment reassembly.
   the frames recorded from a clean run (bit flips, byte and 16-bit field overwrites, truncation, extension) and checks
   each is counted exactly once, and that a single checksum-detectable mutation never delivers changed data. ARP:
   spoofed and unsolicited traffic, unasked and invalid senders (broadcast, zero, multicast MAC; our IP; off-link),
-  a 10k-frame flood not aimed at us, LRU eviction, retries and the `poll` deadline.
+  a 10k-frame flood not aimed at us, LRU eviction, retries, stale refresh and the `poll` deadline.
   Also routing, named socket errors, a full socket buffer, fragments. `src/lib.rs` unit-tests the socket ring's
   wrap-around checksum.
 - Benchmark: `cargo bench-host` runs `benches/net.rs` (includes `tests/sim/mod.rs`); baseline rows in

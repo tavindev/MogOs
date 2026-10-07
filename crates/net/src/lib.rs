@@ -8,8 +8,8 @@
 //! - Sockets are UDP ports and ICMP echo identifiers (a Linux ping socket: the caller sends and receives whole echo
 //!   messages, the stack sets the identifier and checksum). Each socket queues received datagrams in its own buffer
 //!   as records: length u16, source address u32, source port u16 (0 for ICMP), data.
-//! - Checksums are summed while copying the payload: into the NIC's buffer on send, into the socket buffer on
-//!   receive (a datagram counts only once its checksum is good).
+//! - Checksums are summed over the payload as it is copied: into the NIC's buffer on send, into the socket buffer
+//!   on receive (a datagram counts only once its checksum is good).
 #![cfg_attr(not(test), no_std)]
 
 use core::net::{Ipv4Addr, SocketAddrV4};
@@ -100,7 +100,7 @@ pub struct Counters {
 }
 
 #[derive(Clone, Copy)]
-enum Drop {
+enum Reason {
     Malformed,
     Checksum,
     Fragment,
@@ -115,9 +115,8 @@ pub struct Neighbor {
     /// Unspecified when the entry is free.
     ip: Ipv4Addr,
     mac: Option<Mac>,
-    learned: u64,
-    /// When the last request went out, and how many have, while waiting for a reply.
-    asked: u64,
+    /// When the MAC was learned, or while `tries > 0`, when the last of `tries` requests went out.
+    at: u64,
     tries: u8,
     used: u64,
 }
@@ -126,8 +125,7 @@ impl Neighbor {
     pub const EMPTY: Self = Neighbor {
         ip: Ipv4Addr::UNSPECIFIED,
         mac: None,
-        learned: 0,
-        asked: 0,
+        at: 0,
         tries: 0,
         used: 0,
     };
@@ -154,10 +152,10 @@ impl<'a> Socket<'a> {
     }
 
     /// Queues a datagram; with `base` (the checksum's sum over the headers), only if the checksum holds.
-    fn push(&mut self, from: SocketAddrV4, data: &[u8], base: Option<u64>) -> Result<(), Drop> {
+    fn push(&mut self, from: SocketAddrV4, data: &[u8], base: Option<u64>) -> Result<(), Reason> {
         let need = RECORD + data.len();
         if need > self.buf.len() - self.len {
-            return Err(Drop::SocketFull);
+            return Err(Reason::SocketFull);
         }
         let mut record = [0; RECORD];
         record[..2].copy_from_slice(&(data.len() as u16).to_be_bytes());
@@ -167,7 +165,7 @@ impl<'a> Socket<'a> {
         ring_write(self.buf, tail, &record);
         let sum = ring_write(self.buf, (tail + RECORD) % self.buf.len(), data);
         if base.is_some_and(|base| fold(base + sum) != 0xffff) {
-            return Err(Drop::Checksum);
+            return Err(Reason::Checksum);
         }
         self.len += need;
         Ok(())
@@ -328,12 +326,12 @@ impl<'a> Stack<'a> {
             if let Err(d) = self.handle(frame, ours, now) {
                 let c = &mut self.counters;
                 *match d {
-                    Drop::Malformed => &mut c.malformed,
-                    Drop::Checksum => &mut c.checksum,
-                    Drop::Fragment => &mut c.fragments,
-                    Drop::Ignored => &mut c.ignored,
-                    Drop::NoSocket => &mut c.no_socket,
-                    Drop::SocketFull => &mut c.socket_full,
+                    Reason::Malformed => &mut c.malformed,
+                    Reason::Checksum => &mut c.checksum,
+                    Reason::Fragment => &mut c.fragments,
+                    Reason::Ignored => &mut c.ignored,
+                    Reason::NoSocket => &mut c.no_socket,
+                    Reason::SocketFull => &mut c.socket_full,
                 } += 1;
             }
         }) {
@@ -350,7 +348,7 @@ impl<'a> Stack<'a> {
             if n.ip.is_unspecified() || n.tries == 0 {
                 continue;
             }
-            let mut due = n.asked + ARP_RETRY;
+            let mut due = n.at + ARP_RETRY;
             if now >= due {
                 if n.tries >= ARP_TRIES {
                     self.neighbors[i] = Neighbor::EMPTY;
@@ -358,7 +356,7 @@ impl<'a> Stack<'a> {
                 }
                 self.request(nic, n.ip);
                 let n = &mut self.neighbors[i];
-                (n.asked, n.tries) = (now, n.tries + 1);
+                (n.at, n.tries) = (now, n.tries + 1);
                 due = now + ARP_RETRY;
             }
             next = Some(next.map_or(due, |t| t.min(due)));
@@ -366,37 +364,37 @@ impl<'a> Stack<'a> {
         next
     }
 
-    fn handle(&mut self, frame: &[u8], ours: Mac, now: u64) -> Result<(), Drop> {
-        let (eth, body) = frame.split_at_checked(ETH).ok_or(Drop::Malformed)?;
+    fn handle(&mut self, frame: &[u8], ours: Mac, now: u64) -> Result<(), Reason> {
+        let (eth, body) = frame.split_at_checked(ETH).ok_or(Reason::Malformed)?;
         if eth[..6] != ours && eth[..6] != BROADCAST {
-            return Err(Drop::Ignored);
+            return Err(Reason::Ignored);
         }
         match [eth[12], eth[13]] {
             TYPE_ARP => self.arp_in(eth, body, ours, now),
             TYPE_IPV4 => self.ipv4_in(eth, body, ours),
-            _ => Err(Drop::Ignored),
+            _ => Err(Reason::Ignored),
         }
     }
 
-    fn arp_in(&mut self, eth: &[u8], body: &[u8], ours: Mac, now: u64) -> Result<(), Drop> {
-        let a = body.get(..ARP).ok_or(Drop::Malformed)?;
+    fn arp_in(&mut self, eth: &[u8], body: &[u8], ours: Mac, now: u64) -> Result<(), Reason> {
+        let a = body.get(..ARP).ok_or(Reason::Malformed)?;
         if a[..7] != [0, 1, 8, 0, 6, 4, 0] || a[8..14] != eth[6..12] {
-            return Err(Drop::Malformed);
+            return Err(Reason::Malformed);
         }
         let sha: Mac = a[8..14].try_into().unwrap();
         let spa = ip_at(&a[14..18]);
         if ip_at(&a[24..28]) != self.config.ip {
-            return Err(Drop::Ignored);
+            return Err(Reason::Ignored);
         }
         if !self.on_link(spa) || !unicast_mac(sha) {
-            return Err(Drop::Malformed);
+            return Err(Reason::Malformed);
         }
         match a[7] {
             1 => {
                 let i = self
                     .find(spa)
                     .or_else(|| self.slot())
-                    .ok_or(Drop::Ignored)?;
+                    .ok_or(Reason::Ignored)?;
                 self.learn(i, spa, sha, now);
                 write_arp(&mut self.reply, 2, ours, self.config.ip, sha, spa);
                 self.reply_len = ETH + ARP;
@@ -406,57 +404,57 @@ impl<'a> Stack<'a> {
                 let i = self
                     .find(spa)
                     .filter(|&i| self.neighbors[i].tries > 0)
-                    .ok_or(Drop::Ignored)?;
+                    .ok_or(Reason::Ignored)?;
                 self.learn(i, spa, sha, now);
                 Ok(())
             }
-            _ => Err(Drop::Malformed),
+            _ => Err(Reason::Malformed),
         }
     }
 
-    fn ipv4_in(&mut self, eth: &[u8], body: &[u8], ours: Mac) -> Result<(), Drop> {
-        let h = body.get(..IP).ok_or(Drop::Malformed)?;
+    fn ipv4_in(&mut self, eth: &[u8], body: &[u8], ours: Mac) -> Result<(), Reason> {
+        let h = body.get(..IP).ok_or(Reason::Malformed)?;
         let ihl = (h[0] & 15) as usize * 4;
         let total = u16::from_be_bytes([h[2], h[3]]) as usize;
         if h[0] >> 4 != 4 || ihl < IP || total < ihl || total > body.len() {
-            return Err(Drop::Malformed);
+            return Err(Reason::Malformed);
         }
         let (h, payload) = body[..total].split_at(ihl);
         if fold(sum(h)) != 0xffff {
-            return Err(Drop::Checksum);
+            return Err(Reason::Checksum);
         }
         // More fragments, or a fragment offset.
         if h[6] & 0x3f != 0 || h[7] != 0 {
-            return Err(Drop::Fragment);
+            return Err(Reason::Fragment);
         }
         let (src, dst) = (ip_at(&h[12..16]), ip_at(&h[16..20]));
         if dst != self.config.ip {
-            return Err(Drop::Ignored);
+            return Err(Reason::Ignored);
         }
         if !unicast(src) {
-            return Err(Drop::Malformed);
+            return Err(Reason::Malformed);
         }
         match h[9] {
             PROTO_ICMP => self.icmp_in(eth, src, payload, ours),
             PROTO_UDP => self.udp_in(src, payload),
-            _ => Err(Drop::Ignored),
+            _ => Err(Reason::Ignored),
         }
     }
 
-    fn icmp_in(&mut self, eth: &[u8], src: Ipv4Addr, msg: &[u8], ours: Mac) -> Result<(), Drop> {
+    fn icmp_in(&mut self, eth: &[u8], src: Ipv4Addr, msg: &[u8], ours: Mac) -> Result<(), Reason> {
         if msg.len() < ICMP {
-            return Err(Drop::Malformed);
+            return Err(Reason::Malformed);
         }
         match (msg[0], msg[1]) {
             (ECHO_REQUEST, 0) => {
                 let to: Mac = eth[6..12].try_into().unwrap();
                 let len = IP + msg.len();
                 if len > MAX_PACKET || !unicast_mac(to) {
-                    return Err(Drop::Malformed);
+                    return Err(Reason::Malformed);
                 }
                 let r = &mut self.reply[ETH + IP..ETH + len];
                 if fold(copy_sum(r, msg)) != 0xffff {
-                    return Err(Drop::Checksum);
+                    return Err(Reason::Checksum);
                 }
                 r[..4].copy_from_slice(&[ECHO_REPLY, 0, 0, 0]);
                 let c = !fold(sum(r)) as u16;
@@ -478,15 +476,15 @@ impl<'a> Stack<'a> {
                 let id = u16::from_be_bytes([msg[4], msg[5]]);
                 self.deliver(Proto::Icmp, id, SocketAddrV4::new(src, 0), msg, Some(0))
             }
-            _ => Err(Drop::Ignored),
+            _ => Err(Reason::Ignored),
         }
     }
 
-    fn udp_in(&mut self, src: Ipv4Addr, seg: &[u8]) -> Result<(), Drop> {
-        let h = seg.get(..UDP).ok_or(Drop::Malformed)?;
+    fn udp_in(&mut self, src: Ipv4Addr, seg: &[u8]) -> Result<(), Reason> {
+        let h = seg.get(..UDP).ok_or(Reason::Malformed)?;
         let len = u16::from_be_bytes([h[4], h[5]]);
         if (len as usize) < UDP || len as usize > seg.len() {
-            return Err(Drop::Malformed);
+            return Err(Reason::Malformed);
         }
         let base =
             (h[6..8] != [0, 0]).then(|| pseudo(src, self.config.ip, PROTO_UDP, len) + sum(h));
@@ -507,12 +505,12 @@ impl<'a> Stack<'a> {
         from: SocketAddrV4,
         data: &[u8],
         base: Option<u64>,
-    ) -> Result<(), Drop> {
+    ) -> Result<(), Reason> {
         let s = self
             .sockets
             .iter_mut()
             .find(|s| s.proto == Some(proto) && s.port == port)
-            .ok_or(Drop::NoSocket)?;
+            .ok_or(Reason::NoSocket)?;
         s.push(from, data, base)
     }
 
@@ -522,7 +520,7 @@ impl<'a> Stack<'a> {
             let i = self.slot().ok_or(Error::Unresolved)?;
             self.neighbors[i] = Neighbor {
                 ip,
-                asked: now,
+                at: now,
                 tries: 1,
                 used: now,
                 ..Neighbor::EMPTY
@@ -533,8 +531,8 @@ impl<'a> Stack<'a> {
         let n = &mut self.neighbors[i];
         n.used = now;
         let mac = n.mac.ok_or(Error::Unresolved)?;
-        if n.tries == 0 && now.saturating_sub(n.learned) >= ARP_STALE {
-            (n.asked, n.tries) = (now, 1);
+        if n.tries == 0 && now.saturating_sub(n.at) >= ARP_STALE {
+            (n.at, n.tries) = (now, 1);
             self.request(nic, ip);
         }
         Ok(mac)
@@ -550,7 +548,7 @@ impl<'a> Stack<'a> {
         self.neighbors[i] = Neighbor {
             ip,
             mac: Some(mac),
-            learned: now,
+            at: now,
             used: now,
             ..Neighbor::EMPTY
         };
@@ -692,7 +690,7 @@ fn sum(data: &[u8]) -> u64 {
         .fold(0, |acc, &w| acc + u32::from_be_bytes(w) as u64)
 }
 
-/// Copies `src` into `dst` (the same length) and returns `sum(src)`; fusing the two loops measured slower on the host.
+/// Copies `src` into `dst` (the same length) and returns `sum(src)`.
 fn copy_sum(dst: &mut [u8], src: &[u8]) -> u64 {
     dst.copy_from_slice(src);
     sum(src)

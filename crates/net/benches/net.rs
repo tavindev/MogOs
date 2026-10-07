@@ -124,7 +124,8 @@ fn receive_path(size: usize) -> f64 {
             },
             0,
         );
-        while let Some((_, n)) = b.recv_from(server, &mut buf) {
+        for _ in 0..BATCH {
+            let (_, n) = b.recv_from(server, &mut buf).unwrap();
             black_box(&buf[..n]);
         }
     }

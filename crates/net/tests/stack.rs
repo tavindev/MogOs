@@ -639,3 +639,54 @@ fn arp_never_learns_unasked_or_invalid_senders() {
         );
     }
 }
+
+#[test]
+fn arp_asks_a_stale_neighbour_again_and_drops_it_if_silent() {
+    let mut nb = [Neighbor::EMPTY; 2];
+    let mut bufs = [[0u8; 256]; 1];
+    let mut socks = bufs.each_mut().map(|b| Socket::new(b));
+    let mut a = Stack::new(config(IP_A), &mut nb, &mut socks);
+    let s = a.bind(Proto::Udp, 9).unwrap();
+    let mut tap = Tap::new(MAC_A);
+    feed_all(
+        &mut a,
+        &mut tap,
+        0,
+        [
+            arp(1, mac(2), ip(2), [0; 6], IP_A),
+            arp(1, mac(3), ip(3), [0; 6], IP_A),
+        ],
+    );
+    for n in [2, 3] {
+        let sent = tap.tx.len();
+        let r = a.send_to(&mut tap, 60 * SEC, s, SocketAddrV4::new(ip(n), 9), b"x");
+        assert_eq!(r, Ok(()));
+        assert_eq!(tap.tx.len(), sent + 2, "a refresh request and the datagram");
+        assert_eq!(&tap.tx[sent][12..14], &[0x08, 0x06]);
+    }
+    assert_eq!(a.poll(&mut tap, 60 * SEC), Some(61 * SEC));
+    feed_all(
+        &mut a,
+        &mut tap,
+        61 * SEC,
+        [arp(2, mac(2), ip(2), MAC_A, IP_A)],
+    );
+    assert_eq!(
+        a.poll(&mut tap, 62 * SEC),
+        Some(63 * SEC),
+        "only 10.0.0.3 still asked"
+    );
+    assert_eq!(a.poll(&mut tap, 63 * SEC), None);
+    let sent = tap.tx.len();
+    assert_eq!(
+        send(&mut a, &mut tap, 63 * SEC, s, ip(2)),
+        Some(mac(2)),
+        "refreshed"
+    );
+    assert_eq!(
+        send(&mut a, &mut tap, 63 * SEC, s, ip(3)),
+        None,
+        "freed after 3 unanswered requests"
+    );
+    assert_eq!(tap.tx.len(), sent + 2);
+}
