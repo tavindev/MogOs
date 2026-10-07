@@ -262,11 +262,20 @@ static long do_accept(int fd, struct sockaddr_in *addr, socklen_t *len, int flag
 	int new = free_fd(0), i;
 	if (!f) return fd_file(fd) ? -ENOTSOCK : -EBADF;
 	if (new < 0) return new;
-	long h = sock_op(f->handle, OP_ACCEPT, 0, 0);
+	register long x0 __asm__("x0") = svc(N_SUBMIT, f->handle, OP_ACCEPT, 0, 0, 0, 0, 0), x1 __asm__("x1"),
+		x2 __asm__("x2"), x8 __asm__("x8") = N_IO_WAIT;
+	if (x0 < 0) return x0;
+	/* io_wait: the handle in x0, the peer in x2 as ip << 16 | port. */
+	__asm__ __volatile__("svc 0" : "=r"(x0), "=r"(x1), "=r"(x2) : "r"(x8) : "memory");
+	long h = x0, peer = x2;
 	if (h < 0) return h;
 	if ((i = new_file(h, SOCKET, "")) < 0) return nclose(h), i;
-	/* The kernel does not report the peer's address. */
-	if (addr && len && *len >= sizeof *addr) *addr = (struct sockaddr_in){ .sin_family = AF_INET };
+	if (addr && len) {
+		struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(peer & 0xffff),
+			.sin_addr.s_addr = htonl(peer >> 16) };
+		memcpy(addr, &a, *len < sizeof a ? *len : sizeof a);
+		*len = sizeof a;
+	}
 	return install(new, i, flags & SOCK_CLOEXEC);
 }
 

@@ -32,10 +32,12 @@
 #![cfg_attr(not(test), no_std)]
 
 use core::cmp::min;
+use core::ops::{Add, Sub};
 use core::slice::{from_mut, from_ref};
 
 pub const BLOCK_SIZE: usize = 4096;
-pub type Block = [u8; BLOCK_SIZE];
+/// The contents of one block.
+pub type Buf = [u8; BLOCK_SIZE];
 pub const NAME_MAX: usize = 255;
 pub const MAX_FILE_SIZE: u64 = 1 << 52;
 /// Pages an extent maps at most.
@@ -71,17 +73,14 @@ const QUARTER: usize = CAP / 4;
 const INODE_LEN: usize = 56;
 const EXTENT_ITEM: usize = ITEM + 8 + 8 * EXTENT_MAX as usize;
 
-const INODE: u64 = 0;
-const DIRENT: u64 = 1;
-const EXTENT: u64 = 2;
 const OFFSET: u64 = (1 << 62) - 1;
 const FILE: u8 = 1;
 const DIR: u8 = 2;
 
 /// A pointer's block with this bit set names the dirty node in that cache slot.
 const TAG: u64 = 1 << 63;
-const EMPTY: u64 = u64::MAX;
-const NONE: u128 = u128::MAX;
+const EMPTY: Block = Block(u64::MAX);
+const NONE: Key = Key(u128::MAX);
 
 const LIVE: usize = 0;
 const NEWEST: usize = 1;
@@ -110,16 +109,60 @@ pub enum Error {
 
 /// A block device of 4 KiB blocks; a request covers `bufs.len()` consecutive blocks from `block`.
 pub trait Disk {
-    fn read(&mut self, block: u64, bufs: &mut [Block]) -> Result<(), Error>;
-    fn write(&mut self, block: u64, bufs: &[Block]) -> Result<(), Error>;
+    fn read(&mut self, block: u64, bufs: &mut [Buf]) -> Result<(), Error>;
+    fn write(&mut self, block: u64, bufs: &[Buf]) -> Result<(), Error>;
     /// Returns once every completed write is durable.
     fn flush(&mut self) -> Result<(), Error>;
     fn blocks(&self) -> u64;
 }
 
 /// A file or directory; its number is never reused.
+#[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Inode(u64);
+
+/// A block's number on the disk.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Block(pub u64);
+
+/// A page of a file: its bytes from `BLOCK_SIZE` times this number on.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Page(pub u64);
+
+/// A block's checksum; `map` gives a data page's for `verify`.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Sum(u64);
+
+impl Add<u64> for Block {
+    type Output = Block;
+    fn add(self, n: u64) -> Block {
+        Block(self.0 + n)
+    }
+}
+
+impl Sub for Block {
+    type Output = u64;
+    fn sub(self, b: Block) -> u64 {
+        self.0 - b.0
+    }
+}
+
+impl Add<u64> for Page {
+    type Output = Page;
+    fn add(self, n: u64) -> Page {
+        Page(self.0 + n)
+    }
+}
+
+impl Sub for Page {
+    type Output = u64;
+    fn sub(self, p: Page) -> u64 {
+        self.0 - p.0
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -149,7 +192,7 @@ pub const fn bitmap_words(blocks: u64) -> usize {
 }
 
 /// Whether `page` read from `block` matches the sum `map` gave for it.
-pub fn verify(block: u64, page: &Block, sum: u64) -> Result<(), Error> {
+pub fn verify(block: Block, page: &Buf, sum: Sum) -> Result<(), Error> {
     if checksum(block, page) == sum {
         Ok(())
     } else {
@@ -166,11 +209,77 @@ const fn pages(blocks: u64) -> usize {
     b.div_ceil(PAGE_BITS) as usize
 }
 
+/// An item key's low 62 bits: 0 for an inode, a name's chain slot for an entry, the first page for an extent.
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Offset(u64);
+
+impl Add<u64> for Offset {
+    type Output = Offset;
+    fn add(self, n: u64) -> Offset {
+        Offset(self.0 + n)
+    }
+}
+
+impl Sub for Offset {
+    type Output = u64;
+    fn sub(self, o: Offset) -> u64 {
+        self.0 - o.0
+    }
+}
+
+enum ItemKind {
+    Inode = 0,
+    Entry = 1,
+    Extent = 2,
+}
+
+/// A tree key: `inode << 64 | kind << 62 | offset`.
+#[repr(transparent)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct Key(u128);
+
+impl Key {
+    fn new(inode: Inode, kind: ItemKind, offset: Offset) -> Key {
+        debug_assert!(offset.0 <= OFFSET);
+        Key(((inode.0 as u128) << 64) + ((kind as u128) << 62) + offset.0 as u128)
+    }
+
+    fn inode(self) -> Inode {
+        Inode((self.0 >> 64) as u64)
+    }
+
+    fn kind(self) -> Option<ItemKind> {
+        match (self.0 as u64) >> 62 {
+            0 => Some(ItemKind::Inode),
+            1 => Some(ItemKind::Entry),
+            2 => Some(ItemKind::Extent),
+            _ => None,
+        }
+    }
+
+    fn offset(self) -> Offset {
+        Offset(self.0 as u64 & OFFSET)
+    }
+}
+
+/// The key of `inode`'s extent starting at `page`.
+fn extent_key(inode: Inode, page: Page) -> Key {
+    Key::new(inode, ItemKind::Extent, Offset(page.0))
+}
+
 #[derive(Clone, Copy)]
 struct Ptr {
-    block: u64,
-    sum: u64,
+    block: Block,
+    sum: Sum,
     generation: u64,
+}
+
+impl Ptr {
+    /// The cache slot of the dirty node it names, if it names one.
+    fn slot(self) -> Option<usize> {
+        (self.block.0 & TAG != 0).then_some((self.block.0 & !TAG) as usize)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -179,9 +288,9 @@ struct Item {
     mode: u16,
     links: u32,
     size: u64,
-    parent: u64,
+    parent: Inode,
     /// The offset of the one directory entry that names it.
-    entry: u64,
+    entry: Offset,
     mtime: u64,
     ctime: u64,
     btime: u64,
@@ -196,19 +305,19 @@ struct Super {
     seed: u64,
     root: Ptr,
     level: usize,
-    index: (u64, u64),
+    index: (Block, Sum),
 }
 
 /// A directory entry's offset, inode and kind.
-type Entry = (u64, Inode, u8);
+type Entry = (Offset, Inode, u8);
 
 /// The dirty nodes from the root down to a leaf: slot, child index taken, and key bounds at each level.
 #[derive(Default)]
 struct Path {
     slot: [usize; MAX_HEIGHT],
     idx: [usize; MAX_HEIGHT],
-    lo: [u128; MAX_HEIGHT],
-    hi: [u128; MAX_HEIGHT],
+    lo: [Key; MAX_HEIGHT],
+    hi: [Key; MAX_HEIGHT],
 }
 
 /// A file system on `D` with memory its caller gives: `cache` (bitmap staging and node slots, `cache_blocks`) and
@@ -216,7 +325,7 @@ struct Path {
 /// `mount` succeeds; after `Io` from `commit`, durability is unknown.
 pub struct Fs<'a, D> {
     disk: D,
-    cache: &'a mut [Block],
+    cache: &'a mut [Buf],
     bits: &'a mut [u64],
     blocks: u64,
     pages: usize,
@@ -228,7 +337,7 @@ pub struct Fs<'a, D> {
     root: Ptr,
     height: usize,
     /// The live root's bitmap index as of the last commit; its entries stay in `cache[0]`.
-    index: (u64, u64),
+    index: (Block, Sum),
     /// Bitmap pages changed since the last commit.
     dirty: [u64; 4],
     /// The live bitmap's words changed since the last commit (`lo..hi`), and those the last commit changed.
@@ -237,26 +346,26 @@ pub struct Fs<'a, D> {
     changed: bool,
     free: u64,
     /// Every block below it is in use.
-    hint: u64,
+    hint: Block,
     /// `cache[0]` holds the live bitmap index, `cache[1..base]` stage commits, `cache[base..top]` cache nodes.
     base: usize,
     top: usize,
     /// Each cache slot's block (`EMPTY` if none or not yet given), whether it holds a dirty node, and last use.
-    blk: [u64; MAX_CACHE],
+    blk: [Block; MAX_CACHE],
     dirt: [bool; MAX_CACHE],
     ndirty: usize,
     stamp: [u64; MAX_CACHE],
     clock: u64,
     /// `DATA` (a data page) and `META` (superblocks, and scratch for an extent's value).
-    bufs: [Block; 2],
+    bufs: [Buf; 2],
     /// The block and sum `bufs[DATA]` holds unchanged.
-    cached: Option<(u64, u64)>,
+    cached: Option<(Block, Sum)>,
     broken: bool,
 }
 
 impl<'a, D: Disk> Fs<'a, D> {
     /// An unmounted file system; `mount` or `format` it before use.
-    pub const fn new(disk: D, cache: &'a mut [Block], bits: &'a mut [u64]) -> Self {
+    pub const fn new(disk: D, cache: &'a mut [Buf], bits: &'a mut [u64]) -> Self {
         Self {
             disk,
             cache,
@@ -269,18 +378,18 @@ impl<'a, D: Disk> Fs<'a, D> {
             seed: 0,
             now: 0,
             root: Ptr {
-                block: 0,
-                sum: 0,
+                block: Block(0),
+                sum: Sum(0),
                 generation: 0,
             },
             height: 1,
-            index: (0, 0),
+            index: (Block(0), Sum(0)),
             dirty: [0; 4],
             span: (usize::MAX, 0),
             prev_span: (usize::MAX, 0),
             changed: false,
             free: 0,
-            hint: 0,
+            hint: Block(0),
             base: 0,
             top: 0,
             blk: [EMPTY; MAX_CACHE],
@@ -339,13 +448,13 @@ impl<'a, D: Disk> Fs<'a, D> {
             mode: 0o755,
             links: 1,
             size: 0,
-            parent: 0,
-            entry: 0,
+            parent: ROOT,
+            entry: Offset(0),
             mtime: self.now,
             ctime: self.now,
             btime: self.now,
         };
-        let (s, at) = self.insert(key(0, INODE, 0), INODE_LEN)?;
+        let (s, at) = self.insert(Key::new(ROOT, ItemKind::Inode, Offset(0)), INODE_LEN)?;
         encode(&mut self.cache[s][at..at + INODE_LEN], &root);
         self.commit()
     }
@@ -410,7 +519,7 @@ impl<'a, D: Disk> Fs<'a, D> {
                 .map(|i| (self.bits[i] | self.bits[COMMITTED * w + i]).count_ones() as u64)
                 .sum();
             self.free = self.blocks - used;
-            self.hint = 0;
+            self.hint = Block(0);
             self.broken = false;
             return Ok(());
         }
@@ -422,8 +531,8 @@ impl<'a, D: Disk> Fs<'a, D> {
             return Err(Error::InvalidName);
         }
         self.dir(dir)?;
-        let e = self.find_entry(dir.0, name)?.0.ok_or(Error::NotFound)?;
-        self.child(dir.0, e)?;
+        let e = self.find_entry(dir, name)?.0.ok_or(Error::NotFound)?;
+        self.child(dir, e)?;
         Ok(e.1)
     }
 
@@ -439,8 +548,8 @@ impl<'a, D: Disk> Fs<'a, D> {
         if cursor > OFFSET {
             return Ok(u64::MAX);
         }
-        let mut k = key(dir.0, DIRENT, cursor);
-        let end = key(dir.0, EXTENT, 0);
+        let mut k = Key::new(dir, ItemKind::Entry, Offset(cursor));
+        let end = Key::new(dir, ItemKind::Extent, Offset(0));
         loop {
             let (s, hi) = self.leaf(k)?;
             let n = &self.cache[s];
@@ -451,7 +560,7 @@ impl<'a, D: Disk> Fs<'a, D> {
                 }
                 let v = value(n, i);
                 if f(&v[9..], Inode(le64(v, 0)), kind_of(v[8])) {
-                    return Ok(k as u64 & OFFSET);
+                    return Ok(k.offset().0);
                 }
             }
             if hi >= end {
@@ -462,11 +571,11 @@ impl<'a, D: Disk> Fs<'a, D> {
     }
 
     pub fn kind(&mut self, inode: Inode) -> Result<Kind, Error> {
-        Ok(kind_of(self.inode(inode.0)?.kind))
+        Ok(kind_of(self.inode(inode)?.kind))
     }
 
     pub fn stat(&mut self, inode: Inode) -> Result<Stat, Error> {
-        let it = self.inode(inode.0)?;
+        let it = self.inode(inode)?;
         Ok(Stat {
             kind: kind_of(it.kind),
             size: it.size,
@@ -489,18 +598,21 @@ impl<'a, D: Disk> Fs<'a, D> {
 
     /// Reads from `offset` up to the end of the file; returns the byte count (0 at or past the end).
     pub fn read(&mut self, file: Inode, offset: u64, buf: &mut [u8]) -> Result<usize, Error> {
-        let it = self.file(file.0)?;
+        let it = self.file(file)?;
         let end = min(it.size, offset.saturating_add(buf.len() as u64));
         let mut pos = offset;
         while pos < end {
-            let (page, at) = (pos / BLOCK_SIZE as u64, (pos % BLOCK_SIZE as u64) as usize);
+            let (page, at) = (
+                Page(pos / BLOCK_SIZE as u64),
+                (pos % BLOCK_SIZE as u64) as usize,
+            );
             let n = min(BLOCK_SIZE - at, (end - pos) as usize);
             let out = &mut buf[(pos - offset) as usize..][..n];
-            match self.extent_at(file.0, page)? {
+            match self.extent_at(file, page)? {
                 None => out.fill(0),
                 Some((off, start, _)) => {
                     let j = page - off;
-                    self.load_page(start + j, le64(&self.bufs[META], 8 + 8 * j as usize))?;
+                    self.load_page(start + j, Sum(le64(&self.bufs[META], 8 + 8 * j as usize)))?;
                     out.copy_from_slice(&self.bufs[DATA][at..at + n]);
                 }
             }
@@ -510,14 +622,14 @@ impl<'a, D: Disk> Fs<'a, D> {
     }
 
     /// The block holding `page` of `file` and that page's sum (check it with `verify`), or `None` for a hole.
-    pub fn map(&mut self, file: Inode, page: u64) -> Result<Option<(u64, u64)>, Error> {
-        self.file(file.0)?;
-        if page >= MAX_FILE_SIZE / BLOCK_SIZE as u64 {
+    pub fn map(&mut self, file: Inode, page: Page) -> Result<Option<(Block, Sum)>, Error> {
+        self.file(file)?;
+        if page.0 >= MAX_FILE_SIZE / BLOCK_SIZE as u64 {
             return Ok(None);
         }
-        Ok(self.extent_at(file.0, page)?.map(|(off, start, _)| {
+        Ok(self.extent_at(file, page)?.map(|(off, start, _)| {
             let j = page - off;
-            (start + j, le64(&self.bufs[META], 8 + 8 * j as usize))
+            (start + j, Sum(le64(&self.bufs[META], 8 + 8 * j as usize)))
         }))
     }
 
@@ -526,7 +638,7 @@ impl<'a, D: Disk> Fs<'a, D> {
         if self.broken {
             return Err(Error::Io);
         }
-        let mut it = self.file(file.0)?;
+        let mut it = self.file(file)?;
         let end = offset
             .checked_add(data.len() as u64)
             .filter(|&e| e <= MAX_FILE_SIZE)
@@ -538,10 +650,10 @@ impl<'a, D: Disk> Fs<'a, D> {
         // Each page may add an extent or a sum; the extents at both ends may split.
         let bytes = (pages as usize + 2) * (ITEM + 16) * 2 + 2 * EXTENT_ITEM;
         self.reserve(pages, 3, bytes, false)?;
-        let r = self.write_pages(file.0, offset, data).and_then(|()| {
+        let r = self.write_pages(file, offset, data).and_then(|()| {
             it.size = it.size.max(end);
             (it.mtime, it.ctime) = (self.now, self.now);
-            self.set_inode(file.0, &it)
+            self.set_inode(file, &it)
         });
         self.broken |= r.is_err();
         r
@@ -552,16 +664,16 @@ impl<'a, D: Disk> Fs<'a, D> {
         if self.broken {
             return Err(Error::Io);
         }
-        let mut it = self.file(file.0)?;
-        let bytes = self.extent_bytes(file.0)?;
+        let mut it = self.file(file)?;
+        let bytes = self.extent_bytes(file)?;
         if it.size == 0 && bytes == 0 {
             return Ok(());
         }
         self.reserve(0, 2, bytes, true)?;
-        let r = self.remove_extents(file.0).and_then(|()| {
+        let r = self.remove_extents(file).and_then(|()| {
             it.size = 0;
             (it.mtime, it.ctime) = (self.now, self.now);
-            self.set_inode(file.0, &it)
+            self.set_inode(file, &it)
         });
         self.broken |= r.is_err();
         r
@@ -576,24 +688,24 @@ impl<'a, D: Disk> Fs<'a, D> {
             return Err(Error::InvalidName);
         }
         let mut d = self.dir(dir)?;
-        let e = self.find_entry(dir.0, name)?.0.ok_or(Error::NotFound)?;
+        let e = self.find_entry(dir, name)?.0.ok_or(Error::NotFound)?;
         let (off, inode, _) = e;
-        let it = self.child(dir.0, e)?;
+        let it = self.child(dir, e)?;
         if it.kind == DIR
-            && let Some((s, i, _)) = self.seek(key(inode.0, DIRENT, 0))?
-            && ikey(&self.cache[s], i) < key(inode.0, EXTENT, 0)
+            && let Some((s, i, _)) = self.seek(Key::new(inode, ItemKind::Entry, Offset(0)))?
+            && ikey(&self.cache[s], i) < Key::new(inode, ItemKind::Extent, Offset(0))
         {
             return Err(Error::NotEmpty);
         }
-        let bytes = self.extent_bytes(inode.0)?;
+        let bytes = self.extent_bytes(inode)?;
         self.reserve(0, 4, bytes, true)?;
         let r = self
-            .delete(key(dir.0, DIRENT, off))
-            .and_then(|()| self.remove_extents(inode.0))
-            .and_then(|()| self.delete(key(inode.0, INODE, 0)))
+            .delete(Key::new(dir, ItemKind::Entry, off))
+            .and_then(|()| self.remove_extents(inode))
+            .and_then(|()| self.delete(Key::new(inode, ItemKind::Inode, Offset(0))))
             .and_then(|()| {
                 (d.mtime, d.ctime) = (self.now, self.now);
-                self.set_inode(dir.0, &d)
+                self.set_inode(dir, &d)
             });
         self.broken |= r.is_err();
         r
@@ -616,35 +728,35 @@ impl<'a, D: Disk> Fs<'a, D> {
         }
         let mut from = self.dir(from_dir)?;
         let e = self
-            .find_entry(from_dir.0, from_name)?
+            .find_entry(from_dir, from_name)?
             .0
             .ok_or(Error::NotFound)?;
         let (off, inode, kind) = e;
-        let mut it = self.child(from_dir.0, e)?;
+        let mut it = self.child(from_dir, e)?;
         if from_dir == to_dir && from_name == to_name {
             return Ok(());
         }
         let mut to = self.dir(to_dir)?;
-        let (taken, slot) = self.find_entry(to_dir.0, to_name)?;
+        let (taken, slot) = self.find_entry(to_dir, to_name)?;
         if taken.is_some() {
             return Err(Error::Exists);
         }
         let slot = slot.ok_or(Error::Collision)?;
-        if from_dir != to_dir && kind == DIR && self.below(inode.0, to_dir.0)? {
+        if from_dir != to_dir && kind == DIR && self.below(inode, to_dir)? {
             return Err(Error::InvalidName);
         }
         self.reserve(0, 5, 0, false)?;
         let r = self
-            .delete(key(from_dir.0, DIRENT, off))
-            .and_then(|()| self.put_entry(to_dir.0, slot, inode.0, kind, to_name))
+            .delete(Key::new(from_dir, ItemKind::Entry, off))
+            .and_then(|()| self.put_entry(to_dir, slot, inode, kind, to_name))
             .and_then(|()| {
-                (it.ctime, it.parent, it.entry) = (self.now, to_dir.0, slot);
-                self.set_inode(inode.0, &it)?;
+                (it.ctime, it.parent, it.entry) = (self.now, to_dir, slot);
+                self.set_inode(inode, &it)?;
                 (from.mtime, from.ctime) = (self.now, self.now);
-                self.set_inode(from_dir.0, &from)?;
+                self.set_inode(from_dir, &from)?;
                 if to_dir != from_dir {
                     (to.mtime, to.ctime) = (self.now, self.now);
-                    self.set_inode(to_dir.0, &to)?;
+                    self.set_inode(to_dir, &to)?;
                 }
                 Ok(())
             });
@@ -667,7 +779,7 @@ impl<'a, D: Disk> Fs<'a, D> {
     }
 
     fn write_commit(&mut self, generation: u64) -> Result<(), Error> {
-        if self.index.0 != 0 {
+        if self.index.0 != Block(0) {
             self.release(self.index.0)?;
         }
         // Release the old copy of each page that changes, then find blocks for the index, the pages and the nodes;
@@ -676,8 +788,8 @@ impl<'a, D: Disk> Fs<'a, D> {
         let start = loop {
             while let Some(p) = (0..self.pages).find(|&p| bit(&self.dirty, p) && !bit(&done, p)) {
                 done[p / 64] |= 1 << (p % 64);
-                let b = le64(&self.cache[0], 16 * p);
-                if b != 0 {
+                let b = Block(le64(&self.cache[0], 16 * p));
+                if b != Block(0) {
                     self.release(b)?;
                 }
             }
@@ -689,10 +801,10 @@ impl<'a, D: Disk> Fs<'a, D> {
             let (mut b, mut more) = (start, false);
             for _ in 0..k {
                 b = self.next_free(b);
-                let p = (b / PAGE_BITS) as usize;
+                let p = (b.0 / PAGE_BITS) as usize;
                 more |= !bit(&self.dirty, p);
                 self.dirty[p / 64] |= 1 << (p % 64);
-                b += 1;
+                b = b + 1;
             }
             if !more {
                 break start;
@@ -719,8 +831,8 @@ impl<'a, D: Disk> Fs<'a, D> {
             page[len..].fill(0);
             let sum = checksum(self.blk[s], &page[..len]);
             let (b, entry) = (self.blk[s], &mut self.cache[0][16 * p..16 * p + 16]);
-            entry[..8].copy_from_slice(&b.to_le_bytes());
-            entry[8..].copy_from_slice(&sum.to_le_bytes());
+            entry[..8].copy_from_slice(&b.0.to_le_bytes());
+            entry[8..].copy_from_slice(&sum.0.to_le_bytes());
         }
         self.index = (
             self.blk[0],
@@ -740,17 +852,17 @@ impl<'a, D: Disk> Fs<'a, D> {
             0,
             0,
             1,
-            self.root.block,
-            self.root.sum,
+            self.root.block.0,
+            self.root.sum.0,
             self.root.generation,
             self.height as u64 - 1,
-            self.index.0,
-            self.index.1,
+            self.index.0.0,
+            self.index.1.0,
         ];
         for (i, f) in fields.iter().enumerate() {
             sb[8 * i..8 * i + 8].copy_from_slice(&f.to_le_bytes());
         }
-        seal(generation % 2, sb, SB_LEN);
+        seal(Block(generation % 2), sb, SB_LEN);
         let r = self.disk.write(generation % 2, from_ref(sb));
         self.broken |= r.is_err();
         r?;
@@ -772,7 +884,7 @@ impl<'a, D: Disk> Fs<'a, D> {
         }
         (self.prev_span, self.span) = (self.span, (usize::MAX, 0));
         self.dirty = [0; 4];
-        self.hint = 0;
+        self.hint = Block(0);
         self.changed = false;
         Ok(())
     }
@@ -788,7 +900,7 @@ impl<'a, D: Disk> Fs<'a, D> {
         }
         (self.blocks, self.pages, self.words) = (blocks, pages, pages * PAGE_WORDS);
         (self.base, self.top) = (base, base + pool);
-        (self.index, self.hint) = ((0, 0), 0);
+        (self.index, self.hint) = ((Block(0), Sum(0)), Block(0));
         self.blk.fill(EMPTY);
         self.dirt.fill(false);
         self.ndirty = 0;
@@ -808,10 +920,10 @@ impl<'a, D: Disk> Fs<'a, D> {
         } else {
             &mut self.bufs[DATA]
         };
-        self.disk.read(ix, from_mut(buf))?;
+        self.disk.read(ix.0, from_mut(buf))?;
         let (pages, words) = (pages(s.blocks), s.blocks.div_ceil(64) as usize);
         let len = 16 * pages;
-        if le64(buf, END) != sum
+        if Sum(le64(buf, END)) != sum
             || checksum(ix, &buf[..len]) != sum
             || buf[len..END].iter().any(|&b| b != 0)
         {
@@ -825,17 +937,17 @@ impl<'a, D: Disk> Fs<'a, D> {
             } else {
                 &self.bufs[DATA]
             };
-            let (b, sum) = (le64(buf, 16 * p), le64(buf, 16 * p + 8));
-            if b == 0 && sum == 0 {
+            let (b, sum) = (Block(le64(buf, 16 * p)), Sum(le64(buf, 16 * p + 8)));
+            if b == Block(0) && sum == Sum(0) {
                 continue;
             }
-            if !(2..s.blocks).contains(&b) {
+            if !(2..s.blocks).contains(&b.0) {
                 return Err(Error::Corrupt);
             }
-            if !live && p < self.pages && le64(&self.cache[0], 16 * p) == b {
+            if !live && p < self.pages && Block(le64(&self.cache[0], 16 * p)) == b {
                 continue;
             }
-            self.disk.read(b, from_mut(&mut self.cache[1]))?;
+            self.disk.read(b.0, from_mut(&mut self.cache[1]))?;
             let (page, n) = (&self.cache[1], min(PAGE_WORDS, words - p * PAGE_WORDS));
             let tail = le64(page, 8 * (n - 1)) >> (s.blocks % 64);
             if checksum(b, &page[..8 * n]) != sum
@@ -852,10 +964,10 @@ impl<'a, D: Disk> Fs<'a, D> {
         }
         // Pages shared with the live index were skipped: their bits are the live ones. Blocks past this disk's size
         // (the other slot may claim more) are never allocated, so need no check.
-        let has = |b: u64| {
-            let i = (b / 64) as usize;
-            b >= self.blocks
-                || (self.bits[map * w + i] | if live { 0 } else { self.bits[i] }) >> (b % 64) & 1
+        let has = |b: Block| {
+            let i = (b.0 / 64) as usize;
+            b.0 >= self.blocks
+                || (self.bits[map * w + i] | if live { 0 } else { self.bits[i] }) >> (b.0 % 64) & 1
                     != 0
         };
         let buf = if live {
@@ -864,10 +976,10 @@ impl<'a, D: Disk> Fs<'a, D> {
             &self.bufs[DATA]
         };
         let pages_held = (0..pages).all(|p| {
-            let b = le64(buf, 16 * p);
-            b == 0 || has(b)
+            let b = Block(le64(buf, 16 * p));
+            b == Block(0) || has(b)
         });
-        if !(has(0) && has(1) && has(ix) && has(s.root.block) && pages_held) {
+        if !(has(Block(0)) && has(Block(1)) && has(ix) && has(s.root.block) && pages_held) {
             return Err(Error::Corrupt);
         }
         Ok(())
@@ -875,13 +987,13 @@ impl<'a, D: Disk> Fs<'a, D> {
 
     /// The counter exceeds every inode number: the last item down the rightmost path has the largest.
     fn check_counter(&mut self) -> Result<(), Error> {
-        let (mut p, mut level, mut lo) = (self.root, self.height - 1, 0);
+        let (mut p, mut level, mut lo) = (self.root, self.height - 1, Key(0));
         loop {
             let s = self.node(p, level, lo, NONE)?;
             let n = &self.cache[s];
             let c = count(n);
             if level == 0 {
-                if c > 0 && (ikey(n, c - 1) >> 64) as u64 >= self.next_inode {
+                if c > 0 && ikey(n, c - 1).inode().0 >= self.next_inode {
                     return Err(Error::Corrupt);
                 }
                 return Ok(());
@@ -893,8 +1005,8 @@ impl<'a, D: Disk> Fs<'a, D> {
         }
     }
 
-    fn inode(&mut self, inode: u64) -> Result<Item, Error> {
-        let k = key(inode, INODE, 0);
+    fn inode(&mut self, inode: Inode) -> Result<Item, Error> {
+        let k = Key::new(inode, ItemKind::Inode, Offset(0));
         let (s, _) = self.leaf(k)?;
         let n = &self.cache[s];
         let i = search(n, k);
@@ -904,7 +1016,7 @@ impl<'a, D: Disk> Fs<'a, D> {
         Ok(decode(value(n, i)))
     }
 
-    fn file(&mut self, inode: u64) -> Result<Item, Error> {
+    fn file(&mut self, inode: Inode) -> Result<Item, Error> {
         let it = self.inode(inode)?;
         if it.kind == DIR {
             return Err(Error::IsDir);
@@ -913,7 +1025,7 @@ impl<'a, D: Disk> Fs<'a, D> {
     }
 
     fn dir(&mut self, inode: Inode) -> Result<Item, Error> {
-        let it = self.inode(inode.0)?;
+        let it = self.inode(inode)?;
         if it.kind != DIR {
             return Err(Error::NotDir);
         }
@@ -921,40 +1033,47 @@ impl<'a, D: Disk> Fs<'a, D> {
     }
 
     /// The inode entry `e` of `dir` names, if it records that entry back; `Corrupt` if not.
-    fn child(&mut self, dir: u64, e: Entry) -> Result<Item, Error> {
-        let it = self.inode(e.1.0).map_err(|_| Error::Corrupt)?;
+    fn child(&mut self, dir: Inode, e: Entry) -> Result<Item, Error> {
+        let it = self.inode(e.1).map_err(|_| Error::Corrupt)?;
         if it.parent != dir || it.entry != e.0 || it.kind != e.2 {
             return Err(Error::Corrupt);
         }
         Ok(it)
     }
 
-    fn set_inode(&mut self, inode: u64, it: &Item) -> Result<(), Error> {
-        let (s, at) = self.value_mut(key(inode, INODE, 0))?;
+    fn set_inode(&mut self, inode: Inode, it: &Item) -> Result<(), Error> {
+        let (s, at) = self.value_mut(Key::new(inode, ItemKind::Inode, Offset(0)))?;
         encode(&mut self.cache[s][at..at + INODE_LEN], it);
         Ok(())
     }
 
     /// `name`'s entry in `dir` (its offset, inode and kind), and the first free offset in its hash chain.
-    fn find_entry(&mut self, dir: u64, name: &[u8]) -> Result<(Option<Entry>, Option<u64>), Error> {
+    fn find_entry(
+        &mut self,
+        dir: Inode,
+        name: &[u8],
+    ) -> Result<(Option<Entry>, Option<Offset>), Error> {
         let base = name_hash(self.seed, name);
-        let (mut k, end) = (key(dir, DIRENT, base), key(dir, DIRENT, base + CHAIN));
+        let (mut k, last) = (
+            Key::new(dir, ItemKind::Entry, base),
+            Key::new(dir, ItemKind::Entry, base + (CHAIN - 1)),
+        );
         let mut used = 0u8;
         loop {
             let (s, hi) = self.leaf(k)?;
             let n = &self.cache[s];
             for i in search(n, k)..count(n) {
                 let ik = ikey(n, i);
-                if ik >= end {
+                if ik > last {
                     break;
                 }
                 let v = value(n, i);
                 if &v[9..] == name {
-                    return Ok((Some((ik as u64 & OFFSET, Inode(le64(v, 0)), v[8])), None));
+                    return Ok((Some((ik.offset(), Inode(le64(v, 0)), v[8])), None));
                 }
-                used |= 1 << ((ik as u64 & OFFSET) - base);
+                used |= 1 << (ik.offset() - base);
             }
-            if hi >= end {
+            if hi > last {
                 break;
             }
             k = hi;
@@ -968,9 +1087,9 @@ impl<'a, D: Disk> Fs<'a, D> {
             return Err(Error::InvalidName);
         }
         let mut d = self.dir(dir)?;
-        let (found, slot) = self.find_entry(dir.0, name)?;
+        let (found, slot) = self.find_entry(dir, name)?;
         match found {
-            Some(e) if kind == FILE => return self.child(dir.0, e).map(|_| e.1),
+            Some(e) if kind == FILE => return self.child(dir, e).map(|_| e.1),
             Some(_) => return Err(Error::Exists),
             None => {}
         }
@@ -978,15 +1097,15 @@ impl<'a, D: Disk> Fs<'a, D> {
             return Err(Error::Io);
         }
         let slot = slot.ok_or(Error::Collision)?;
-        let inode = self.next_inode;
-        let next = inode.checked_add(1).ok_or(Error::NoSpace)?;
+        let inode = Inode(self.next_inode);
+        let next = self.next_inode.checked_add(1).ok_or(Error::NoSpace)?;
         self.reserve(0, 3, ITEM + 9 + name.len() + ITEM + INODE_LEN, false)?;
         let it = Item {
             kind,
             mode: if kind == DIR { 0o755 } else { 0o644 },
             links: 1,
             size: 0,
-            parent: dir.0,
+            parent: dir,
             entry: slot,
             mtime: self.now,
             ctime: self.now,
@@ -994,41 +1113,41 @@ impl<'a, D: Disk> Fs<'a, D> {
         };
         self.next_inode = next;
         let r = self
-            .put_entry(dir.0, slot, inode, kind, name)
-            .and_then(|()| self.insert(key(inode, INODE, 0), INODE_LEN))
+            .put_entry(dir, slot, inode, kind, name)
+            .and_then(|()| self.insert(Key::new(inode, ItemKind::Inode, Offset(0)), INODE_LEN))
             .and_then(|(s, at)| {
                 encode(&mut self.cache[s][at..at + INODE_LEN], &it);
                 (d.mtime, d.ctime) = (self.now, self.now);
-                self.set_inode(dir.0, &d)
+                self.set_inode(dir, &d)
             });
         self.broken |= r.is_err();
-        r.map(|()| Inode(inode))
+        r.map(|()| inode)
     }
 
     fn put_entry(
         &mut self,
-        dir: u64,
-        off: u64,
-        inode: u64,
+        dir: Inode,
+        off: Offset,
+        inode: Inode,
         kind: u8,
         name: &[u8],
     ) -> Result<(), Error> {
-        let (s, at) = self.insert(key(dir, DIRENT, off), 9 + name.len())?;
+        let (s, at) = self.insert(Key::new(dir, ItemKind::Entry, off), 9 + name.len())?;
         let v = &mut self.cache[s][at..at + 9 + name.len()];
-        v[..8].copy_from_slice(&inode.to_le_bytes());
+        v[..8].copy_from_slice(&inode.0.to_le_bytes());
         v[8] = kind;
         v[9..].copy_from_slice(name);
         Ok(())
     }
 
     /// Whether `target` is `dir` or below it, walking up parents; a parent cycle is `Corrupt` (Brent's algorithm).
-    fn below(&mut self, dir: u64, target: u64) -> Result<bool, Error> {
+    fn below(&mut self, dir: Inode, target: Inode) -> Result<bool, Error> {
         let (mut hare, mut tortoise, mut power, mut steps) = (target, target, 1u64, 0u64);
         loop {
             if hare == dir {
                 return Ok(true);
             }
-            if hare == ROOT.0 {
+            if hare == ROOT {
                 return Ok(false);
             }
             hare = self.inode(hare)?.parent;
@@ -1042,18 +1161,21 @@ impl<'a, D: Disk> Fs<'a, D> {
         }
     }
 
-    fn write_pages(&mut self, inode: u64, offset: u64, data: &[u8]) -> Result<(), Error> {
+    fn write_pages(&mut self, inode: Inode, offset: u64, data: &[u8]) -> Result<(), Error> {
         let end = offset + data.len() as u64;
         let mut pos = offset;
         while pos < end {
-            let (page, at) = (pos / BLOCK_SIZE as u64, (pos % BLOCK_SIZE as u64) as usize);
+            let (page, at) = (
+                Page(pos / BLOCK_SIZE as u64),
+                (pos % BLOCK_SIZE as u64) as usize,
+            );
             let n = min(BLOCK_SIZE - at, (end - pos) as usize);
             let old = self.extent_at(inode, page)?;
-            let old_block = old.map(|(off, start, _)| start + page - off);
+            let old_block = old.map(|(off, start, _)| start + (page - off));
             match old {
                 Some((off, start, _)) if n < BLOCK_SIZE => {
-                    let sum = le64(&self.bufs[META], 8 + 8 * (page - off) as usize);
-                    self.load_page(start + page - off, sum)?;
+                    let sum = Sum(le64(&self.bufs[META], 8 + 8 * (page - off) as usize));
+                    self.load_page(start + (page - off), sum)?;
                 }
                 _ => self.bufs[DATA].fill(0),
             }
@@ -1064,7 +1186,7 @@ impl<'a, D: Disk> Fs<'a, D> {
                 _ => self.alloc()?,
             };
             let sum = checksum(b, &self.bufs[DATA]);
-            let r = self.disk.write(b, from_ref(&self.bufs[DATA]));
+            let r = self.disk.write(b.0, from_ref(&self.bufs[DATA]));
             self.broken |= r.is_err();
             r?;
             self.cached = Some((b, sum));
@@ -1077,59 +1199,59 @@ impl<'a, D: Disk> Fs<'a, D> {
     /// Maps `page` of `inode` to block `b` with `sum`; `old` is the extent that covered it, its value in scratch.
     fn set_page(
         &mut self,
-        inode: u64,
-        page: u64,
-        b: u64,
-        sum: u64,
-        old: Option<(u64, u64, u64)>,
+        inode: Inode,
+        page: Page,
+        b: Block,
+        sum: Sum,
+        old: Option<(Page, Block, u64)>,
     ) -> Result<(), Error> {
         if let Some((off, start, c)) = old {
             let j = page - off;
             if start + j == b {
-                let (s, at) = self.value_mut(key(inode, EXTENT, off))?;
-                self.cache[s][at + 8 + 8 * j as usize..][..8].copy_from_slice(&sum.to_le_bytes());
+                let (s, at) = self.value_mut(extent_key(inode, off))?;
+                self.cache[s][at + 8 + 8 * j as usize..][..8].copy_from_slice(&sum.0.to_le_bytes());
                 return Ok(());
             }
             self.release(start + j)?;
-            self.delete(key(inode, EXTENT, off))?;
+            self.delete(extent_key(inode, off))?;
             let j = j as usize;
             if j + 1 < c as usize {
                 // The tail's value: its first block over the replaced page's sum, then the sums after it.
                 self.bufs[META][8 + 8 * j..16 + 8 * j]
-                    .copy_from_slice(&(start + j as u64 + 1).to_le_bytes());
-                self.put_item(key(inode, EXTENT, page + 1), 8 + 8 * j, 8 + 8 * c as usize)?;
+                    .copy_from_slice(&(start + (j as u64 + 1)).0.to_le_bytes());
+                self.put_item(extent_key(inode, page + 1), 8 + 8 * j, 8 + 8 * c as usize)?;
             }
             if j > 0 {
-                self.put_item(key(inode, EXTENT, off), 0, 8 + 8 * j)?;
+                self.put_item(extent_key(inode, off), 0, 8 + 8 * j)?;
             }
         }
-        if page > 0
-            && let Some((off, start, c)) = self.extent_at(inode, page - 1)?
+        if page.0 > 0
+            && let Some((off, start, c)) = self.extent_at(inode, Page(page.0 - 1))?
             && off + c == page
             && start + c == b
             && c < EXTENT_MAX
         {
             let c = c as usize;
-            self.bufs[META][8 + 8 * c..16 + 8 * c].copy_from_slice(&sum.to_le_bytes());
-            self.delete(key(inode, EXTENT, off))?;
-            return self.put_item(key(inode, EXTENT, off), 0, 16 + 8 * c);
+            self.bufs[META][8 + 8 * c..16 + 8 * c].copy_from_slice(&sum.0.to_le_bytes());
+            self.delete(extent_key(inode, off))?;
+            return self.put_item(extent_key(inode, off), 0, 16 + 8 * c);
         }
-        self.bufs[META][..8].copy_from_slice(&b.to_le_bytes());
-        self.bufs[META][8..16].copy_from_slice(&sum.to_le_bytes());
-        self.put_item(key(inode, EXTENT, page), 0, 16)
+        self.bufs[META][..8].copy_from_slice(&b.0.to_le_bytes());
+        self.bufs[META][8..16].copy_from_slice(&sum.0.to_le_bytes());
+        self.put_item(extent_key(inode, page), 0, 16)
     }
 
     /// Inserts an item whose value is `bufs[META][from..to]`.
-    fn put_item(&mut self, k: u128, from: usize, to: usize) -> Result<(), Error> {
+    fn put_item(&mut self, k: Key, from: usize, to: usize) -> Result<(), Error> {
         let (s, at) = self.insert(k, to - from)?;
         self.cache[s][at..at + to - from].copy_from_slice(&self.bufs[META][from..to]);
         Ok(())
     }
 
     /// The extent of `inode` covering `page` (first page, first block, pages), its value copied to `bufs[META]`.
-    fn extent_at(&mut self, inode: u64, page: u64) -> Result<Option<(u64, u64, u64)>, Error> {
-        let mut k = key(inode, EXTENT, page.saturating_sub(EXTENT_MAX - 1));
-        let last = key(inode, EXTENT, page);
+    fn extent_at(&mut self, inode: Inode, page: Page) -> Result<Option<(Page, Block, u64)>, Error> {
+        let mut k = extent_key(inode, Page(page.0.saturating_sub(EXTENT_MAX - 1)));
+        let last = extent_key(inode, page);
         loop {
             let (s, hi) = self.leaf(k)?;
             let n = &self.cache[s];
@@ -1137,11 +1259,11 @@ impl<'a, D: Disk> Fs<'a, D> {
                 if ikey(n, i) > last {
                     return Ok(None);
                 }
-                let (off, v) = (ikey(n, i) as u64 & OFFSET, value(n, i));
+                let (off, v) = (Page(ikey(n, i).offset().0), value(n, i));
                 let c = (v.len() as u64 - 8) / 8;
                 if page < off + c {
                     self.bufs[META][..v.len()].copy_from_slice(v);
-                    return Ok(Some((off, le64(v, 0), c)));
+                    return Ok(Some((off, Block(le64(v, 0)), c)));
                 }
             }
             if hi > last {
@@ -1152,37 +1274,39 @@ impl<'a, D: Disk> Fs<'a, D> {
     }
 
     /// Bytes of `inode`'s extent items.
-    fn extent_bytes(&mut self, inode: u64) -> Result<usize, Error> {
-        let (mut k, end) = (key(inode, EXTENT, 0), key(inode, EXTENT, OFFSET) + 1);
+    fn extent_bytes(&mut self, inode: Inode) -> Result<usize, Error> {
+        let mut k = extent_key(inode, Page(0));
+        let last = Key::new(inode, ItemKind::Extent, Offset(OFFSET));
         let mut bytes = 0;
         loop {
             let (s, hi) = self.leaf(k)?;
             let n = &self.cache[s];
             for i in search(n, k)..count(n) {
-                if ikey(n, i) >= end {
+                if ikey(n, i) > last {
                     return Ok(bytes);
                 }
                 bytes += ITEM + value(n, i).len();
             }
-            if hi >= end {
+            if hi > last {
                 return Ok(bytes);
             }
             k = hi;
         }
     }
 
-    fn remove_extents(&mut self, inode: u64) -> Result<(), Error> {
-        let (first, end) = (key(inode, EXTENT, 0), key(inode, EXTENT, OFFSET) + 1);
+    fn remove_extents(&mut self, inode: Inode) -> Result<(), Error> {
+        let first = extent_key(inode, Page(0));
+        let last = Key::new(inode, ItemKind::Extent, Offset(OFFSET));
         while let Some((s, i, _)) = self.seek(first)? {
             let n = &self.cache[s];
             let k = ikey(n, i);
-            if k >= end {
+            if k > last {
                 break;
             }
             let v = value(n, i);
-            let (start, c) = (le64(v, 0), (v.len() as u64 - 8) / 8);
-            for b in start..start + c {
-                self.release(b)?;
+            let (start, c) = (Block(le64(v, 0)), (v.len() as u64 - 8) / 8);
+            for j in 0..c {
+                self.release(start + j)?;
             }
             self.delete(k)?;
         }
@@ -1205,36 +1329,36 @@ impl<'a, D: Disk> Fs<'a, D> {
         Ok(())
     }
 
-    fn has(&self, map: usize, b: u64) -> bool {
-        self.bits[map * self.words + (b / 64) as usize] >> (b % 64) & 1 != 0
+    fn has(&self, map: usize, b: Block) -> bool {
+        self.bits[map * self.words + (b.0 / 64) as usize] >> (b.0 % 64) & 1 != 0
     }
 
-    fn used(&self, b: u64) -> bool {
+    fn used(&self, b: Block) -> bool {
         self.has(LIVE, b) || self.has(COMMITTED, b)
     }
 
     /// A block in range that the live tree reaches.
-    fn live(&self, b: u64) -> bool {
-        (2..self.blocks).contains(&b) && self.has(LIVE, b)
+    fn live(&self, b: Block) -> bool {
+        (2..self.blocks).contains(&b.0) && self.has(LIVE, b)
     }
 
-    fn mark(&mut self, b: u64) {
-        self.bits[(b / 64) as usize] |= 1 << (b % 64);
+    fn mark(&mut self, b: Block) {
+        self.bits[(b.0 / 64) as usize] |= 1 << (b.0 % 64);
         self.touch(b);
         self.free -= 1;
         self.changed = true;
     }
 
     /// Notes that `b`'s live bit changed.
-    fn touch(&mut self, b: u64) {
-        let (p, i) = ((b / PAGE_BITS) as usize, (b / 64) as usize);
+    fn touch(&mut self, b: Block) {
+        let (p, i) = ((b.0 / PAGE_BITS) as usize, (b.0 / 64) as usize);
         self.dirty[p / 64] |= 1 << (p % 64);
         self.span = (min(self.span.0, i), self.span.1.max(i + 1));
     }
 
-    fn alloc(&mut self) -> Result<u64, Error> {
+    fn alloc(&mut self) -> Result<Block, Error> {
         let b = self.next_free(self.hint);
-        if b >= self.blocks {
+        if b.0 >= self.blocks {
             return Err(Error::NoSpace);
         }
         self.mark(b);
@@ -1243,28 +1367,28 @@ impl<'a, D: Disk> Fs<'a, D> {
     }
 
     /// The first free block at or after `b` (`blocks` if none).
-    fn next_free(&self, mut b: u64) -> u64 {
-        let w = self.words;
+    fn next_free(&self, b: Block) -> Block {
+        let (w, mut b) = (self.words, b.0);
         while b < self.blocks {
             let i = (b / 64) as usize;
             let used = (self.bits[i] | self.bits[COMMITTED * w + i]) >> (b % 64);
             if used == !0 >> (b % 64) {
                 b = (b | 63) + 1;
             } else {
-                return b + used.trailing_ones() as u64;
+                return Block(b + used.trailing_ones() as u64);
             }
         }
-        self.blocks
+        Block(self.blocks)
     }
 
     /// The start of the first run of `k` free blocks, or of the first free block if no run is that long.
-    fn start(&self, k: usize) -> u64 {
+    fn start(&self, k: usize) -> Block {
         let first = self.next_free(self.hint);
         let mut b = first;
-        while b < self.blocks {
+        while b.0 < self.blocks {
             let mut end = b;
-            while end < self.blocks && end - b < k as u64 && !self.used(end) {
-                end += 1;
+            while end.0 < self.blocks && end - b < k as u64 && !self.used(end) {
+                end = end + 1;
             }
             if end - b == k as u64 {
                 return b;
@@ -1275,11 +1399,11 @@ impl<'a, D: Disk> Fs<'a, D> {
     }
 
     /// `b` left the live tree: free at once if no slot reaches it, else once the commit after next replaces them.
-    fn release(&mut self, b: u64) -> Result<(), Error> {
+    fn release(&mut self, b: Block) -> Result<(), Error> {
         if !self.live(b) {
             return Err(Error::Corrupt);
         }
-        self.bits[(b / 64) as usize] &= !(1 << (b % 64));
+        self.bits[(b.0 / 64) as usize] &= !(1 << (b.0 % 64));
         self.touch(b);
         if !self.has(COMMITTED, b) {
             self.free += 1;
@@ -1292,12 +1416,12 @@ impl<'a, D: Disk> Fs<'a, D> {
         Ok(())
     }
 
-    fn load_page(&mut self, b: u64, sum: u64) -> Result<(), Error> {
+    fn load_page(&mut self, b: Block, sum: Sum) -> Result<(), Error> {
         if self.cached == Some((b, sum)) {
             return Ok(());
         }
         self.cached = None;
-        self.disk.read(b, from_mut(&mut self.bufs[DATA]))?;
+        self.disk.read(b.0, from_mut(&mut self.bufs[DATA]))?;
         verify(b, &self.bufs[DATA], sum)?;
         self.cached = Some((b, sum));
         Ok(())
@@ -1310,10 +1434,10 @@ impl<'a, D: Disk> Fs<'a, D> {
     }
 
     /// The cache slot holding the node `p` points to at `level`, read and checked against the bounds if not cached.
-    fn node(&mut self, p: Ptr, level: usize, lo: u128, hi: u128) -> Result<usize, Error> {
+    fn node(&mut self, p: Ptr, level: usize, lo: Key, hi: Key) -> Result<usize, Error> {
         self.clock += 1;
-        if p.block & TAG != 0 {
-            return Ok((p.block & !TAG) as usize);
+        if let Some(s) = p.slot() {
+            return Ok(s);
         }
         if let Some(s) = (self.base..self.top).find(|&s| self.blk[s] == p.block) {
             if self.cache[s][0] as usize != level {
@@ -1324,7 +1448,7 @@ impl<'a, D: Disk> Fs<'a, D> {
         }
         let s = self.victim();
         self.blk[s] = EMPTY;
-        self.disk.read(p.block, from_mut(&mut self.cache[s]))?;
+        self.disk.read(p.block.0, from_mut(&mut self.cache[s]))?;
         self.check(s, p, level, lo, hi)?;
         (self.blk[s], self.stamp[s]) = (p.block, self.clock);
         Ok(s)
@@ -1342,10 +1466,10 @@ impl<'a, D: Disk> Fs<'a, D> {
     }
 
     /// Checks a node just read into slot `s`: its sum, level, layout, keys within `lo..hi`, and values.
-    fn check(&self, s: usize, p: Ptr, level: usize, lo: u128, hi: u128) -> Result<(), Error> {
+    fn check(&self, s: usize, p: Ptr, level: usize, lo: Key, hi: Key) -> Result<(), Error> {
         let n = &self.cache[s];
         let c = count(n);
-        let bad = le64(n, END) != p.sum
+        let bad = Sum(le64(n, END)) != p.sum
             || checksum(p.block, &n[..END]) != p.sum
             || n[0] as usize != level
             || n[1] != 0
@@ -1370,7 +1494,7 @@ impl<'a, D: Disk> Fs<'a, D> {
             }
             return Ok(());
         }
-        let root = level == self.height - 1 && lo == 0 && hi == NONE;
+        let root = level == self.height - 1 && lo == Key(0) && hi == NONE;
         if c * ITEM > CAP || (c == 0 && !root) {
             return Err(Error::Corrupt);
         }
@@ -1385,10 +1509,10 @@ impl<'a, D: Disk> Fs<'a, D> {
                 return Err(Error::Corrupt);
             }
             prev = Some(k);
-            let (inode, kind, o) = ((k >> 64) as u64, (k as u64) >> 62, k as u64 & OFFSET);
+            let (inode, o) = (k.inode(), k.offset().0);
             let v = &n[off..off + len];
-            let ok = match kind {
-                INODE => {
+            let ok = match k.kind() {
+                Some(ItemKind::Inode) => {
                     o == 0
                         && len == INODE_LEN
                         && matches!(v[0], FILE | DIR)
@@ -1397,26 +1521,28 @@ impl<'a, D: Disk> Fs<'a, D> {
                         && le64(v, 8) <= MAX_FILE_SIZE
                         && le64(v, 24) <= OFFSET
                 }
-                DIRENT => {
+                Some(ItemKind::Entry) => {
                     (10..=9 + NAME_MAX).contains(&len)
-                        && le64(v, 0) != ROOT.0
-                        && le64(v, 0) != inode
+                        && Inode(le64(v, 0)) != ROOT
+                        && Inode(le64(v, 0)) != inode
                         && matches!(v[8], FILE | DIR)
                         && valid_name(&v[9..])
                 }
-                EXTENT => {
-                    let pages = (len as u64).saturating_sub(8) / 8;
+                Some(ItemKind::Extent) => {
+                    let (pages, start) = ((len as u64).saturating_sub(8) / 8, Block(le64(v, 0)));
                     let ok = len % 8 == 0
                         && (1..=EXTENT_MAX).contains(&pages)
                         && o + pages <= MAX_FILE_SIZE / BLOCK_SIZE as u64
                         && prev_end.is_none_or(|e| e <= k)
-                        && key(inode, EXTENT, o + pages - 1) < hi
-                        && le64(v, 0) < self.blocks
-                        && (le64(v, 0)..le64(v, 0) + pages).all(|b| self.live(b));
-                    prev_end = Some(key(inode, EXTENT, o + pages));
+                        && extent_key(inode, Page(o + pages - 1)) < hi
+                        && start.0 < self.blocks
+                        && (0..pages).all(|j| self.live(start + j));
+                    if ok {
+                        prev_end = Some(extent_key(inode, Page(o + pages)));
+                    }
                     ok
                 }
-                _ => false,
+                None => false,
             };
             if !ok {
                 return Err(Error::Corrupt);
@@ -1426,8 +1552,8 @@ impl<'a, D: Disk> Fs<'a, D> {
     }
 
     /// The leaf whose range holds `k`, and the leaf's upper bound (`NONE` for the last), without changing anything.
-    fn leaf(&mut self, k: u128) -> Result<(usize, u128), Error> {
-        let (mut p, mut level, mut lo, mut hi) = (self.root, self.height - 1, 0, NONE);
+    fn leaf(&mut self, k: Key) -> Result<(usize, Key), Error> {
+        let (mut p, mut level, mut lo, mut hi) = (self.root, self.height - 1, Key(0), NONE);
         loop {
             let s = self.node(p, level, lo, hi)?;
             if level == 0 {
@@ -1446,7 +1572,7 @@ impl<'a, D: Disk> Fs<'a, D> {
     }
 
     /// The first item at or after `k`: its slot, index and its leaf's upper bound.
-    fn seek(&mut self, mut k: u128) -> Result<Option<(usize, usize, u128)>, Error> {
+    fn seek(&mut self, mut k: Key) -> Result<Option<(usize, usize, Key)>, Error> {
         loop {
             let (s, hi) = self.leaf(k)?;
             let i = search(&self.cache[s], k);
@@ -1461,19 +1587,19 @@ impl<'a, D: Disk> Fs<'a, D> {
     }
 
     /// Makes the path to `k`'s leaf dirty, writing dirty nodes out first if the cache is short of slots.
-    fn cow(&mut self, k: u128) -> Result<Path, Error> {
+    fn cow(&mut self, k: Key) -> Result<Path, Error> {
         if self.top - self.base - self.ndirty < 3 * (self.height + 2) {
             self.spill()?;
         }
         let mut path = Path::default();
-        let (mut p, mut level, mut lo, mut hi) = (self.root, self.height - 1, 0, NONE);
+        let (mut p, mut level, mut lo, mut hi) = (self.root, self.height - 1, Key(0), NONE);
         let mut parent: Option<(usize, usize)> = None;
         loop {
             let s = self.node(p, level, lo, hi)?;
             self.make_dirty(s)?;
             match parent {
                 None => self.root = tagged(s),
-                Some((ps, i)) => set_eblock(&mut self.cache[ps], i, TAG | s as u64),
+                Some((ps, i)) => set_eblock(&mut self.cache[ps], i, tagged(s).block),
             }
             (path.slot[level], path.lo[level], path.hi[level]) = (s, lo, hi);
             if level == 0 {
@@ -1525,7 +1651,7 @@ impl<'a, D: Disk> Fs<'a, D> {
     }
 
     /// The slot and value offset of item `k`, on a dirty path.
-    fn value_mut(&mut self, k: u128) -> Result<(usize, usize), Error> {
+    fn value_mut(&mut self, k: Key) -> Result<(usize, usize), Error> {
         let s = self.cow(k)?.slot[0];
         let n = &self.cache[s];
         let i = search(n, k);
@@ -1536,7 +1662,7 @@ impl<'a, D: Disk> Fs<'a, D> {
     }
 
     /// Adds item `k` with a `len`-byte value to fill; returns its slot and value offset.
-    fn insert(&mut self, k: u128, len: usize) -> Result<(usize, usize), Error> {
+    fn insert(&mut self, k: Key, len: usize) -> Result<(usize, usize), Error> {
         let path = self.cow(k)?;
         let s = path.slot[0];
         let i = search(&self.cache[s], k);
@@ -1581,7 +1707,7 @@ impl<'a, D: Disk> Fs<'a, D> {
         &mut self,
         path: &Path,
         mut level: usize,
-        mut k: u128,
+        mut k: Key,
         mut child: usize,
     ) -> Result<(), Error> {
         loop {
@@ -1591,7 +1717,7 @@ impl<'a, D: Disk> Fs<'a, D> {
                 }
                 let r = self.new_node(level);
                 let old = path.slot[level - 1];
-                internal_insert(&mut self.cache[r], 0, 0, tagged(old));
+                internal_insert(&mut self.cache[r], 0, Key(0), tagged(old));
                 internal_insert(&mut self.cache[r], 1, k, tagged(child));
                 (self.root, self.height) = (tagged(r), self.height + 1);
                 return Ok(());
@@ -1615,7 +1741,7 @@ impl<'a, D: Disk> Fs<'a, D> {
     }
 
     /// Removes item `k`, merging nodes that fall below a quarter full into a sibling where they fit.
-    fn delete(&mut self, k: u128) -> Result<(), Error> {
+    fn delete(&mut self, k: Key) -> Result<(), Error> {
         let path = self.cow(k)?;
         let s = path.slot[0];
         let i = search(&self.cache[s], k);
@@ -1660,7 +1786,7 @@ impl<'a, D: Disk> Fs<'a, D> {
                 (s, sib, j)
             } else {
                 self.make_dirty(sib)?;
-                set_eblock(&mut self.cache[parent], j, TAG | sib as u64);
+                set_eblock(&mut self.cache[parent], j, tagged(sib).block);
                 (sib, s, i)
             };
             let at = count(&self.cache[l]);
@@ -1670,13 +1796,14 @@ impl<'a, D: Disk> Fs<'a, D> {
             } else {
                 internal_move(a, 0, b);
                 let sep = ekey(&self.cache[parent], ri);
-                self.cache[l][HDR + ENTRY * at..][..16].copy_from_slice(&sep.to_le_bytes());
+                self.cache[l][HDR + ENTRY * at..][..16].copy_from_slice(&sep.0.to_le_bytes());
             }
             self.drop_node(r)?;
             internal_remove(&mut self.cache[parent], ri);
         }
-        while self.height > 1 && self.root.block & TAG != 0 {
-            let r = (self.root.block & !TAG) as usize;
+        while self.height > 1
+            && let Some(r) = self.root.slot()
+        {
             match count(&self.cache[r]) {
                 0 => {
                     self.cache[r][..HDR].fill(0);
@@ -1723,11 +1850,11 @@ impl<'a, D: Disk> Fs<'a, D> {
     }
 
     /// The first free block at or after `b`, marked live; `b` moves past it.
-    fn claim(&mut self, b: &mut u64) -> u64 {
-        *b = self.next_free(*b);
-        self.mark(*b);
-        *b += 1;
-        *b - 1
+    fn claim(&mut self, b: &mut Block) -> Block {
+        let c = self.next_free(*b);
+        self.mark(c);
+        *b = c + 1;
+        c
     }
 
     /// Seals the dirty nodes bottom up, filling each parent's pointers with its children's blocks and sums.
@@ -1738,12 +1865,10 @@ impl<'a, D: Disk> Fs<'a, D> {
                     continue;
                 }
                 for i in 0..if level > 0 { count(&self.cache[s]) } else { 0 } {
-                    let b = eptr(&self.cache[s], i).block;
-                    if b & TAG != 0 {
-                        let c = (b & !TAG) as usize;
+                    if let Some(c) = eptr(&self.cache[s], i).slot() {
                         let p = Ptr {
                             block: self.blk[c],
-                            sum: le64(&self.cache[c], END),
+                            sum: Sum(le64(&self.cache[c], END)),
                             generation,
                         };
                         set_eptr(&mut self.cache[s], i, p);
@@ -1752,11 +1877,10 @@ impl<'a, D: Disk> Fs<'a, D> {
                 seal(self.blk[s], &mut self.cache[s], END);
             }
         }
-        if self.root.block & TAG != 0 {
-            let s = (self.root.block & !TAG) as usize;
+        if let Some(s) = self.root.slot() {
             self.root = Ptr {
                 block: self.blk[s],
-                sum: le64(&self.cache[s], END),
+                sum: Sum(le64(&self.cache[s], END)),
                 generation,
             };
         }
@@ -1789,7 +1913,7 @@ impl<'a, D: Disk> Fs<'a, D> {
             while b < end && self.blk[b] == self.blk[b - 1] + 1 {
                 b += 1;
             }
-            let r = self.disk.write(self.blk[a], &self.cache[a..b]);
+            let r = self.disk.write(self.blk[a].0, &self.cache[a..b]);
             self.broken |= r.is_err();
             r?;
             a = b;
@@ -1800,14 +1924,10 @@ impl<'a, D: Disk> Fs<'a, D> {
 
 fn tagged(s: usize) -> Ptr {
     Ptr {
-        block: TAG | s as u64,
-        sum: 0,
+        block: Block(TAG | s as u64),
+        sum: Sum(0),
         generation: 0,
     }
-}
-
-fn key(inode: u64, kind: u64, offset: u64) -> u128 {
-    ((inode as u128) << 64) + ((kind as u128) << 62) + offset as u128
 }
 
 fn kind_of(kind: u8) -> Kind {
@@ -1823,7 +1943,7 @@ fn bit(set: &[u64; 4], i: usize) -> bool {
 }
 
 /// Two distinct slots of `cache`, mutably.
-fn pair(cache: &mut [Block], a: usize, b: usize) -> (&mut Block, &mut Block) {
+fn pair(cache: &mut [Buf], a: usize, b: usize) -> (&mut Buf, &mut Buf) {
     if a < b {
         let (x, y) = cache.split_at_mut(b);
         (&mut x[a], &mut y[0])
@@ -1834,9 +1954,12 @@ fn pair(cache: &mut [Block], a: usize, b: usize) -> (&mut Block, &mut Block) {
 }
 
 /// Slot `slot`'s superblock if its sum, magic and generation hold; `valid` if every other field does too.
-fn superblock(sb: &Block, slot: u64, disk: u64) -> Option<Super> {
+fn superblock(sb: &Buf, slot: u64, disk: u64) -> Option<Super> {
     let f = |i: usize| le64(sb, 8 * i);
-    if le64(sb, END) != checksum(slot, &sb[..SB_LEN]) || f(0) != MAGIC || f(1) % 2 != slot {
+    if Sum(le64(sb, END)) != checksum(Block(slot), &sb[..SB_LEN])
+        || f(0) != MAGIC
+        || f(1) % 2 != slot
+    {
         return None;
     }
     let mut s = Super {
@@ -1847,12 +1970,12 @@ fn superblock(sb: &Block, slot: u64, disk: u64) -> Option<Super> {
         next_inode: f(4),
         seed: f(5),
         root: Ptr {
-            block: f(9),
-            sum: f(10),
+            block: Block(f(9)),
+            sum: Sum(f(10)),
             generation: f(11),
         },
         level: f(12) as usize,
-        index: (f(13), f(14)),
+        index: (Block(f(13)), Sum(f(14))),
     };
     s.valid = (MIN_BLOCKS..=disk).contains(&s.blocks)
         && s.next_inode >= 1
@@ -1861,8 +1984,8 @@ fn superblock(sb: &Block, slot: u64, disk: u64) -> Option<Super> {
         && f(8) == 1
         && f(12) < MAX_HEIGHT as u64
         && s.root.generation <= s.generation
-        && (2..s.blocks).contains(&s.root.block)
-        && (2..s.blocks).contains(&s.index.0)
+        && (2..s.blocks).contains(&s.root.block.0)
+        && (2..s.blocks).contains(&s.index.0.0)
         && sb[SB_LEN..END].iter().all(|&b| b == 0);
     Some(s)
 }
@@ -1872,9 +1995,16 @@ fn encode(v: &mut [u8], it: &Item) {
     v[1] = 0;
     v[2..4].copy_from_slice(&it.mode.to_le_bytes());
     v[4..8].copy_from_slice(&it.links.to_le_bytes());
-    for (i, f) in [it.size, it.parent, it.entry, it.mtime, it.ctime, it.btime]
-        .iter()
-        .enumerate()
+    for (i, f) in [
+        it.size,
+        it.parent.0,
+        it.entry.0,
+        it.mtime,
+        it.ctime,
+        it.btime,
+    ]
+    .iter()
+    .enumerate()
     {
         v[8 + 8 * i..16 + 8 * i].copy_from_slice(&f.to_le_bytes());
     }
@@ -1886,8 +2016,8 @@ fn decode(v: &[u8]) -> Item {
         mode: le16(v, 2) as u16,
         links: u32::from_le_bytes(v[4..8].try_into().unwrap()),
         size: le64(v, 8),
-        parent: le64(v, 16),
-        entry: le64(v, 24),
+        parent: Inode(le64(v, 16)),
+        entry: Offset(le64(v, 24)),
         mtime: le64(v, 32),
         ctime: le64(v, 40),
         btime: le64(v, 48),
@@ -1902,8 +2032,8 @@ fn set_count(n: &mut [u8], c: usize) {
     n[2..4].copy_from_slice(&(c as u16).to_le_bytes());
 }
 
-fn ikey(n: &[u8], i: usize) -> u128 {
-    le128(n, HDR + ITEM * i)
+fn ikey(n: &[u8], i: usize) -> Key {
+    Key(le128(n, HDR + ITEM * i))
 }
 
 fn voff(n: &[u8], i: usize) -> usize {
@@ -1918,28 +2048,28 @@ fn value(n: &[u8], i: usize) -> &[u8] {
     &n[voff(n, i)..voff(n, i) + vlen(n, i)]
 }
 
-fn ekey(n: &[u8], i: usize) -> u128 {
-    le128(n, HDR + ENTRY * i)
+fn ekey(n: &[u8], i: usize) -> Key {
+    Key(le128(n, HDR + ENTRY * i))
 }
 
 fn eptr(n: &[u8], i: usize) -> Ptr {
     let at = HDR + ENTRY * i;
     Ptr {
-        block: le64(n, at + 16),
-        sum: le64(n, at + 24),
+        block: Block(le64(n, at + 16)),
+        sum: Sum(le64(n, at + 24)),
         generation: le64(n, at + 32),
     }
 }
 
 fn set_eptr(n: &mut [u8], i: usize, p: Ptr) {
     let at = HDR + ENTRY * i + 16;
-    for (j, f) in [p.block, p.sum, p.generation].iter().enumerate() {
+    for (j, f) in [p.block.0, p.sum.0, p.generation].iter().enumerate() {
         n[at + 8 * j..at + 8 * j + 8].copy_from_slice(&f.to_le_bytes());
     }
 }
 
-fn set_eblock(n: &mut [u8], i: usize, block: u64) {
-    n[HDR + ENTRY * i + 16..][..8].copy_from_slice(&block.to_le_bytes());
+fn set_eblock(n: &mut [u8], i: usize, block: Block) {
+    n[HDR + ENTRY * i + 16..][..8].copy_from_slice(&block.0.to_le_bytes());
 }
 
 /// Bytes a node's items or entries take (with their values).
@@ -1953,7 +2083,7 @@ fn used(n: &[u8]) -> usize {
 }
 
 /// The first item at or after `k`.
-fn search(n: &[u8], k: u128) -> usize {
+fn search(n: &[u8], k: Key) -> usize {
     let (mut a, mut b) = (0, count(n));
     while a < b {
         let m = (a + b) / 2;
@@ -1967,7 +2097,7 @@ fn search(n: &[u8], k: u128) -> usize {
 }
 
 /// The child whose range holds `k`.
-fn route(n: &[u8], k: u128) -> usize {
+fn route(n: &[u8], k: Key) -> usize {
     let (mut a, mut b) = (1, count(n));
     while a < b {
         let m = (a + b) / 2;
@@ -1981,7 +2111,7 @@ fn route(n: &[u8], k: u128) -> usize {
 }
 
 /// Opens a `len`-byte value for item `k` at index `i`; returns its offset. The leaf must have room.
-fn leaf_insert(n: &mut [u8], i: usize, k: u128, len: usize) -> usize {
+fn leaf_insert(n: &mut [u8], i: usize, k: Key, len: usize) -> usize {
     let c = count(n);
     let top = if i == 0 { END } else { voff(n, i - 1) };
     let bottom = if c == 0 { END } else { voff(n, c - 1) };
@@ -1993,7 +2123,7 @@ fn leaf_insert(n: &mut [u8], i: usize, k: u128, len: usize) -> usize {
         n[at..at + 2].copy_from_slice(&(off as u16).to_le_bytes());
     }
     let at = HDR + ITEM * i;
-    n[at..at + 16].copy_from_slice(&k.to_le_bytes());
+    n[at..at + 16].copy_from_slice(&k.0.to_le_bytes());
     n[at + 16..at + 18].copy_from_slice(&((top - len) as u16).to_le_bytes());
     n[at + 18..at + 20].copy_from_slice(&(len as u16).to_le_bytes());
     set_count(n, c + 1);
@@ -2023,10 +2153,10 @@ fn leaf_move(src: &mut [u8], from: usize, dst: &mut [u8]) {
     set_count(src, from);
 }
 
-fn internal_insert(n: &mut [u8], i: usize, k: u128, p: Ptr) {
+fn internal_insert(n: &mut [u8], i: usize, k: Key, p: Ptr) {
     let c = count(n);
     n.copy_within(HDR + ENTRY * i..HDR + ENTRY * c, HDR + ENTRY * (i + 1));
-    n[HDR + ENTRY * i..][..16].copy_from_slice(&k.to_le_bytes());
+    n[HDR + ENTRY * i..][..16].copy_from_slice(&k.0.to_le_bytes());
     set_eptr(n, i, p);
     set_count(n, c + 1);
 }
@@ -2059,7 +2189,7 @@ fn mix(h: u64, w: u64) -> u64 {
 }
 
 /// The first offset of `name`'s hash chain: a seeded multiply-rotate hash with a final mix.
-fn name_hash(seed: u64, name: &[u8]) -> u64 {
+fn name_hash(seed: u64, name: &[u8]) -> Offset {
     let (words, rest) = name.as_chunks::<8>();
     let mut h = words.iter().fold(seed ^ name.len() as u64, |h, w| {
         mix(h, u64::from_le_bytes(*w))
@@ -2072,26 +2202,26 @@ fn name_hash(seed: u64, name: &[u8]) -> u64 {
     h ^= h >> 31;
     h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
     h ^= h >> 29;
-    (h >> 5) << 3
+    Offset((h >> 5) << 3)
 }
 
 /// Sixteen interleaved multiply-rotate lanes over 64-bit words; each step is a bijection, so any one-word change shows.
-fn checksum(block: u64, buf: &[u8]) -> u64 {
+fn checksum(block: Block, buf: &[u8]) -> Sum {
     let (words, _) = buf.as_chunks::<8>();
     let mut lanes: [u64; 16] = core::array::from_fn(|i| i as u64);
-    lanes[0] ^= block | 1 << 63;
+    lanes[0] ^= block.0 | 1 << 63;
     for chunk in words.chunks(16) {
         for (l, w) in lanes.iter_mut().zip(chunk) {
             *l = mix(*l, u64::from_le_bytes(*w));
         }
     }
-    lanes.into_iter().fold(0, mix)
+    Sum(lanes.into_iter().fold(0, mix))
 }
 
 /// Writes the sum of `block` and `n`'s first `len` bytes into its last 8; returns it.
-fn seal(block: u64, n: &mut Block, len: usize) -> u64 {
+fn seal(block: Block, n: &mut Buf, len: usize) -> Sum {
     let sum = checksum(block, &n[..len]);
-    n[END..].copy_from_slice(&sum.to_le_bytes());
+    n[END..].copy_from_slice(&sum.0.to_le_bytes());
     sum
 }
 

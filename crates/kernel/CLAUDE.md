@@ -36,7 +36,7 @@ touches memory through raw addresses: the board reads user buffers, copies pages
   for `test=sockets` / `test=bench-sockets`, `run` calls `Board::start_net` (the address, and the DTB's `rng-seed`
   from the same `Dtb::chosen` walk as the bootargs as the TCP key) before `start_cpus`; the board's net task probes
   the NIC (`net: no nic` without one) and builds the `Network` off the boot path, and `run` waits for it
-  (`with_net`) after the `boot:` line, before any scenario counts frames. `test=httpd` runs `httpd` with the `httpd=` and `fetch=`
+  (`with_net`) after the `boot:` line and prints `net: ready <N> us`, before any scenario counts frames. `test=httpd` runs `httpd` with the `httpd=` and `fetch=`
   bootargs as arguments, and alone implies `net=10.0.2.15/24,gw=10.0.2.2` (QEMU's user network). A socket is an entry reached by index and generation,
   counted by handles like a pipe. Every process holding a handle to it pays its `cost` (`SOCKET_FRAMES`, 8, plus 8 per
   backlog place of a listener; `Budget::charge`, accounting, as the memory is the fixed pool), tracked as a bitmask of
@@ -106,7 +106,8 @@ touches memory through raw addresses: the board reads user buffers, copies pages
 - `MAX_BUFFER` (4 KiB) and `MAX_MAP` (16 pages) bound the work a syscall does under the board's big lock (IRQs masked); `user_buffer` checks
   every user range lies in `USER` (4 GiB..512 GiB).
 - Errors are negated musl errno values; `KILLED` (256) sits outside `exit`'s 0..=255.
-- Syscalls 20-25 (phase 8 step 50): socket, bind, listen, io_submit, io_wait (result in x0, tag in x1), shutdown. A
+- Syscalls 20-25 (phase 8 step 50): socket, bind, listen, io_submit, io_wait (result in x0, tag in x1, an accept's
+  peer in x2 as `ip << 16 | port`; a loopback peer, `PEER`'s 127.0.0.2, reads 127.0.0.1), shutdown. A
   `NetStack` handle (`CONNECT`, `LISTEN`) makes sockets, which remember which of the two it held; socket handles carry
   read and write; `bind` and `listen` need write, `io_submit` read (receive, accept) or write (send, connect), and an
   accepted connection's handle gets no right the accepting handle lacks.

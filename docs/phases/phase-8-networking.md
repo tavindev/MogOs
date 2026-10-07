@@ -117,6 +117,14 @@ Decision: write `crates/net` fresh. smoltcp is a host-only dev-dependency of `cr
   (66.3-67.8 against 64.3-65.2) with no change on its path, and both builds match with loops aligned to 64 bytes
   (65.5-67.7 against 65.2-66.1), so it is code placement; `-C llvm-args=-align-loops=64` in the build config is the
   fix outside this crate; it is queued as its own experiment (every benchmark measured), and the row records it.
+- **47 (verification review).** The orphan probe limit counts only probes without progress (an ACK of new data
+  resets it), so a released connection to a slow but steady reader is not killed; only a SYN, never a SYN-ACK, takes
+  TIME_WAIT over, and the flags are checked before the listener scan; and a deadline's start time is set in one place
+  (`refresh`): an obligation appearing with no deadline before starts its timer then, so a FIN owed after a
+  `shutdown` no longer took a timeout when a peer segment arrived in the same `poll`. `tcp_info` reports
+  `timeouts`. Merged with main (steps 49-51) first; the kernel's network task builds unchanged.
+- **47 (newtypes).** Per the new rule (invalid states unrepresentable): `Seq(u32)` for sequence-space values and
+  `Key<P>` per keyed purpose from a `Seed`, at no run-time cost; `tcp_info` reports the peer address for accept.
 - **49.** `crates/board/qemu-virt/src/virtio_net.rs`: modern virtio-mmio only, `VIRTIO_NET_F_MAC` and
   `VIRTIO_F_VERSION_1` (12-byte header, no offloads), one RX and one TX queue of 64 descriptors, each owning a 2 KiB
   buffer of a 256 KiB pool taken from the frame allocator once when the network starts, never grown. Every RX buffer
@@ -192,3 +200,19 @@ Decision: write `crates/net` fresh. smoltcp is a host-only dev-dependency of `cr
   a second walk of the whole blob cost about 45000 instructions): boot with a NIC runs 164000 instructions against
   157000 without one (TCG `-icount`; main: 264000 against 156000); of that, the DTB walk is removed, the NIC and network setup is moved past the `boot:` stamp (a scenario waits for it). A `net=` without a NIC starts nothing (`Board::has_nic` reads device IDs only). Still open: `accept` cannot report the peer's
   address until `crates/net` exposes a connection's remote address (`TcpInfo` has none).
+- **Flake fix and checks.** `httpd_echoes_more_sequential_requests_than_its_tables_hold_and_fetch_gets_a_host_page`
+  failed once under load with "QEMU timed out": its client gave up after its own 25 s, counted from before `boot`,
+  which first waits for the kernel build shared by every test (`Once`); httpd then waited for requests nobody sent
+  until the boot's 30 s deadline. The client now sends exactly the requests httpd counts, retrying one only while
+  nothing listens behind the forward, without a read timeout (a retried request would be counted twice), and stops
+  only once QEMU has ended, so the boot's deadline is the only one. Under load (12 `yes`, the whole suite in a
+  loop) the old test passed 45 runs without reproducing it, while `oscb_runs_the_cross_os_benchmarks` timed out in 5
+  of 15 (a heavy C benchmark against the same 30 s, not networking); the new one passed 15 loaded suite runs with
+  every test green. `net: ready <N> us` reports boot to network ready (TCG
+  `-icount`: 226000 instructions, against main's 264000 with the setup inside `boot:`). e2e: a socket moved to a
+  child refunds its old holder (`nettest: moving a socket refunds its old holder`; it fails without the refund).
+- **Accept reports the peer.** With `TcpInfo::remote` from `crates/net`, `io_wait` returns an accept's peer in x2
+  (`ip << 16 | port`); a loopback peer (`PEER`'s 127.0.0.2) reads as 127.0.0.1. musl's `accept` fills `sockaddr_in`
+  and `*addrlen`; the user stub returns the peer from `io_wait` and `wait_for`. `httpd` logs `httpd: <ip>:<port>` per
+  connection. e2e: `tcpecho: served 5 bytes to 127.0.0.1, port set`, and every hostfwd request's `httpd: 10.0.2.2:`
+  line with a nonzero port; host: `an_accepted_handle_gets_no_more_rights_than_the_accepting_one` checks the peer.

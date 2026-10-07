@@ -642,11 +642,13 @@ unsafe fn syscall(kernel: &mut Kernel, cpu: usize, frame: &mut arch::TrapFrame) 
             Ok(false) => 0,
             Err(error) => error as u64,
         },
-        Ok(Call::Net(call)) => match net::syscall(sched, cpu, call, &mut frame.x[1]) {
-            Some(result) => result as u64,
-            // SAFETY: the caller masked IRQs, and `frame` is the current process's.
-            None => return unsafe { block(kernel, cpu, frame, Event::NetIo) },
-        },
+        Ok(Call::Net(call)) => {
+            match net::syscall(sched, cpu, call, (&mut frame.x[1..3]).try_into().unwrap()) {
+                Some(result) => result as u64,
+                // SAFETY: the caller masked IRQs, and `frame` is the current process's.
+                None => return unsafe { block(kernel, cpu, frame, Event::NetIo) },
+            }
+        }
         Err(error) => error as u64,
     };
     frame as *mut arch::TrapFrame as usize

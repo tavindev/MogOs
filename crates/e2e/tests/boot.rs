@@ -2,28 +2,36 @@ use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, Mutex, Once};
 use std::thread::{self, JoinHandle, sleep};
 use std::time::{Duration, Instant};
+
+/// A boot is killed (and fails) once QEMU prints nothing for this long, or at the cap: a slow scenario under load
+/// still passes while it makes progress, and a hang fails as fast as the old 30 s deadline. Silent phases (a timed
+/// benchmark loop, httpd serving) reached 15.6 s under 12 `yes` with the suite in parallel (several were killed at 10).
+const SILENCE: Duration = Duration::from_secs(30);
+const CAP: Duration = Duration::from_secs(300);
 
 /// Builds the kernel, boots it in QEMU with `extra` arguments, and returns the exit status and serial lines.
 fn boot(extra: &[&str]) -> (ExitStatus, Vec<String>) {
     boot_with_input(extra, None)
 }
 
-/// As `boot`, with a deadline of `secs` instead of 30 s.
+/// As `boot`, with a cap of `secs` instead of `CAP`.
 fn boot_for(secs: u64, extra: &[&str]) -> (ExitStatus, Vec<String>) {
-    boot_with(secs, extra, None)
+    boot_with(Duration::from_secs(secs), extra, None)
 }
 
 /// As `boot`; with `input` = (`ready`, `chunks`), writes chunk `i` to QEMU's stdin once the output contains `ready`
 /// `i + 1` times.
 fn boot_with_input(extra: &[&str], input: Option<(&str, &[&[u8]])>) -> (ExitStatus, Vec<String>) {
-    boot_with(30, extra, input)
+    boot_with(CAP, extra, input)
 }
 
 fn boot_with(
-    secs: u64,
+    cap: Duration,
     extra: &[&str],
     input: Option<(&str, &[&[u8]])>,
 ) -> (ExitStatus, Vec<String>) {
@@ -71,13 +79,20 @@ fn boot_with(
 
     let (out, out_reader) = drain(qemu.stdout.take().unwrap());
     let (err, err_reader) = drain(qemu.stderr.take().unwrap());
-    let deadline = Instant::now() + Duration::from_secs(secs);
+    let start = Instant::now();
+    let (mut seen, mut last, mut silence) = (0, start, Duration::ZERO);
     let mut sent = 0;
     let status = loop {
         if let Some(status) = qemu.try_wait().unwrap() {
             break Some(status);
         }
-        if Instant::now() > deadline {
+        let now = Instant::now();
+        let len = out.lock().unwrap().len();
+        if len != seen {
+            (seen, last) = (len, now);
+        }
+        silence = silence.max(now - last);
+        if now - last > SILENCE || now - start > cap {
             qemu.kill().unwrap();
             qemu.wait().unwrap();
             break None;
@@ -100,7 +115,10 @@ fn boot_with(
     let out = String::from_utf8_lossy(&out.lock().unwrap()).into_owned();
     let err = String::from_utf8_lossy(&err.lock().unwrap()).into_owned();
     // Captured, so a failing test shows how QEMU ended.
-    println!("QEMU status: {status:?}\nQEMU stderr:\n{err}\nQEMU stdout:\n{out}");
+    println!(
+        "QEMU status: {status:?}, longest silence {} ms\nQEMU stderr:\n{err}\nQEMU stdout:\n{out}",
+        silence.as_millis()
+    );
     let status = status.expect("QEMU timed out");
     let lines = out
         .lines()
@@ -532,13 +550,13 @@ fn pipe_bench_reports_round_trip() {
 
 #[test]
 fn lock_bench_reports_round_trips_and_an_exact_count() {
-    lock_bench(4, 30);
+    lock_bench(4, 300);
 }
 
 #[test]
 #[ignore = "the ticket lock convoys with 64 TCG vCPUs on 12 host cores: until step 32's queued lock"]
 fn every_one_of_sixty_four_cores_adds_under_the_lock_and_the_count_is_exact() {
-    lock_bench(64, 1200);
+    lock_bench(64, 1800);
 }
 
 /// `test=bench-lock` on `cpus` cores within `secs`.
@@ -627,25 +645,25 @@ fn console_reads_edited_lines_typed_ahead() {
 
 #[test]
 fn every_core_comes_online_runs_a_task_and_takes_a_timer_tick() {
-    every_core_runs(4, 30);
+    every_core_runs(4, 300);
 }
 
-/// TCG; about 10 s alone on a loaded host, so the deadline is several times that.
+/// TCG; about 7 s alone on a loaded host.
 #[test]
 fn sixty_four_cores_come_online_run_tasks_and_take_a_timer_tick() {
-    every_core_runs(64, 90);
+    every_core_runs(64, 300);
 }
 
 #[test]
 #[ignore = "TCG at 128 cores: run with --ignored --test-threads=1"]
 fn a_hundred_and_twenty_eight_cores_come_online_run_tasks_and_take_a_timer_tick() {
-    every_core_runs(128, 300);
+    every_core_runs(128, 600);
 }
 
 #[test]
 #[ignore = "TCG at 512 cores: run with --ignored --test-threads=1"]
 fn five_hundred_and_twelve_cores_come_online_run_tasks_and_take_a_timer_tick() {
-    every_core_runs(512, 1200);
+    every_core_runs(512, 1800);
 }
 
 /// `test=smp` on `cpus` cores within `secs`.
@@ -1459,10 +1477,9 @@ fn host_page(body: &'static str) -> u16 {
 /// Sends `request` to the host's `port` and reads the response to its end; `None` if the connection fails or closes
 /// at once (nothing listening behind QEMU's forward yet).
 fn exchange(port: u16, request: &str) -> Option<String> {
+    // No read timeout: a slow answer is waited for (a retry would be a request the server counts twice), and QEMU
+    // ending closes the connection.
     let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).ok()?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .ok()?;
     stream.write_all(request.as_bytes()).ok()?;
     let mut response = String::new();
     stream.read_to_string(&mut response).ok()?;
@@ -1488,39 +1505,49 @@ fn httpd_echoes_more_sequential_requests_than_its_tables_hold_and_fetch_gets_a_h
         .local_addr()
         .unwrap()
         .port();
-    let client = thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(25);
-        let mut echoed = 0;
-        while echoed < REQUESTS && Instant::now() < deadline {
-            let body = format!("hello {echoed}");
-            let request = format!(
-                "POST /anything HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
-                body.len()
-            );
-            match exchange(forward, &request) {
-                Some(response) => {
-                    let expected = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{request}",
-                        request.len()
-                    );
-                    assert_eq!(response, expected);
-                    echoed += 1;
-                    if echoed == 1 {
-                        for (header, status) in BAD {
-                            let request = format!("POST / HTTP/1.1\r\n{header}\r\n\r\n");
-                            let response = exchange(forward, &request).unwrap_or_default();
-                            let line = response.lines().next().unwrap_or_default();
-                            assert!(
-                                line.starts_with(&format!("HTTP/1.1 {status} ")),
-                                "{header}: {line}"
-                            );
-                        }
+    // Exactly the requests httpd counts, in order: one good one, the bad ones, the rest good. Each is retried only while
+    // nothing listens behind the forward (QEMU closes it at once), and the client stops only when QEMU has ended, so
+    // the server's count and the client's always agree and the boot's own deadline is the only one.
+    let good = |i: usize| {
+        let body = format!("hello {i}");
+        let request = format!(
+            "POST /anything HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let expected = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{request}",
+            request.len()
+        );
+        (request, expected)
+    };
+    let bad = BAD.map(|(header, status)| {
+        let request = format!("POST / HTTP/1.1\r\n{header}\r\n\r\n");
+        (request, format!("HTTP/1.1 {status} "))
+    });
+    let exchanges: Vec<_> = [good(0)]
+        .into_iter()
+        .chain(bad)
+        .chain((1..REQUESTS).map(good))
+        .collect();
+    let ended = Arc::new(AtomicBool::new(false));
+    let client = thread::spawn({
+        let (requests, ended) = (exchanges.clone(), ended.clone());
+        move || {
+            let mut responses = Vec::new();
+            for (request, _) in requests {
+                loop {
+                    if ended.load(Relaxed) {
+                        return responses;
                     }
+                    if let Some(response) = exchange(forward, &request) {
+                        responses.push(response);
+                        break;
+                    }
+                    sleep(Duration::from_millis(100));
                 }
-                None => sleep(Duration::from_millis(100)),
             }
+            responses
         }
-        echoed
     });
     let netdev = format!("user,id=n0,hostfwd=tcp:127.0.0.1:{forward}-10.0.2.15:80");
     let args = format!(
@@ -1535,11 +1562,23 @@ fn httpd_echoes_more_sequential_requests_than_its_tables_hold_and_fetch_gets_a_h
         "-append",
         &args,
     ]);
-    assert_eq!(client.join().unwrap(), REQUESTS, "requests echoed");
+    ended.store(true, Relaxed);
+    let responses = client.join().unwrap();
+    assert_eq!(responses.len(), exchanges.len(), "requests answered");
+    for (response, (request, expected)) in responses.iter().zip(&exchanges) {
+        assert!(response.starts_with(expected), "{request:?}: {response:?}");
+    }
     assert!(
         lines.iter().any(|l| l == "hello from the host"),
         "fetch did not print the host's page"
     );
+    // QEMU's user network connects to the guest from the host's address, 10.0.2.2, each time from a new port.
+    let peers: Vec<_> = lines
+        .iter()
+        .filter_map(|l| l.strip_prefix("httpd: 10.0.2.2:")?.parse::<u16>().ok())
+        .collect();
+    assert_eq!(peers.len(), exchanges.len(), "accept's peer addresses");
+    assert!(peers.iter().all(|&port| port != 0));
     assert_no_leak(&lines, "httpd");
     assert!(status.success(), "QEMU exited with {status}");
 }
@@ -1555,7 +1594,7 @@ fn sockets_echo_over_loopback_wait_for_any_and_need_the_net_handle_and_budget() 
     );
     for expected in [
         // Two C processes on musl's BSD sockets.
-        "tcpecho: served 5 bytes",
+        "tcpecho: served 5 bytes to 127.0.0.1, port set",
         "tcpecho: hello",
         // A C child inherits no network from its parent.
         "tcpecho: child socket: EBADF",
@@ -1571,6 +1610,7 @@ fn sockets_echo_over_loopback_wait_for_any_and_need_the_net_handle_and_budget() 
         "nettest: ENOBUFS after 3 sockets",
         // A socket's charge follows it to the process that holds it.
         "nettest: a moved socket is charged to its new holder",
+        "nettest: moving a socket refunds its old holder",
     ] {
         assert!(
             lines.iter().any(|l| l == expected),

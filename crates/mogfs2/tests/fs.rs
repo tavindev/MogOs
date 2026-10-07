@@ -1,16 +1,16 @@
 use std::cell::Cell;
 
 use mogfs2::{
-    BLOCK_SIZE, Block, Disk, Error, Fs, Inode, Kind, MAX_FILE_SIZE, NAME_MAX, ROOT, bitmap_words,
-    cache_blocks,
+    BLOCK_SIZE, Buf, Disk, Error, Fs, Inode, Kind, MAX_FILE_SIZE, NAME_MAX, Page, ROOT,
+    bitmap_words, cache_blocks,
 };
 
 /// In-memory disk with a write-back cache: writes stay pending until a flush makes them durable. After `cut` events
 /// (block writes, each block of a request counted, and flushes) every write and flush fails, as if power were lost.
 #[derive(Clone)]
 struct MemDisk {
-    durable: Vec<Block>,
-    pending: Vec<(usize, Block)>,
+    durable: Vec<Buf>,
+    pending: Vec<(usize, Buf)>,
     events: usize,
     cut: usize,
 }
@@ -54,7 +54,7 @@ impl MemDisk {
         }
     }
 
-    fn block(&mut self, b: usize) -> &mut Block {
+    fn block(&mut self, b: usize) -> &mut Buf {
         match self.pending.iter_mut().rev().find(|(p, _)| *p == b) {
             Some((_, data)) => data,
             None => &mut self.durable[b],
@@ -63,7 +63,7 @@ impl MemDisk {
 }
 
 impl Disk for &mut MemDisk {
-    fn read(&mut self, block: u64, bufs: &mut [Block]) -> Result<(), Error> {
+    fn read(&mut self, block: u64, bufs: &mut [Buf]) -> Result<(), Error> {
         for (i, buf) in bufs.iter_mut().enumerate() {
             let b = block as usize + i;
             if b >= self.durable.len() {
@@ -74,7 +74,7 @@ impl Disk for &mut MemDisk {
         Ok(())
     }
 
-    fn write(&mut self, block: u64, bufs: &[Block]) -> Result<(), Error> {
+    fn write(&mut self, block: u64, bufs: &[Buf]) -> Result<(), Error> {
         for (i, buf) in bufs.iter().enumerate() {
             let b = block as usize + i;
             if b >= self.durable.len() {
@@ -101,7 +101,7 @@ impl Disk for &mut MemDisk {
 
 /// The memory an `Fs` borrows: its cache (bitmap staging and a node pool) and bitmaps.
 struct Mem {
-    cache: Vec<Block>,
+    cache: Vec<Buf>,
     bits: Vec<u64>,
 }
 
@@ -416,12 +416,14 @@ fn map_gives_each_page_block_and_sum_for_verify() {
     let f = fs.create(ROOT, b"f").unwrap();
     fs.write(f, 0, &[1; 5000]).unwrap();
     fs.write(f, 3 * BLOCK_SIZE as u64, b"end").unwrap();
-    assert_eq!(fs.map(f, 2), Ok(None));
-    assert_eq!(fs.map(ROOT, 0), Err(Error::IsDir));
-    let pages: Vec<_> = [0, 1, 3].map(|p| fs.map(f, p).unwrap().unwrap()).to_vec();
+    assert_eq!(fs.map(f, Page(2)), Ok(None));
+    assert_eq!(fs.map(ROOT, Page(0)), Err(Error::IsDir));
+    let pages: Vec<_> = [0, 1, 3]
+        .map(|p| fs.map(f, Page(p)).unwrap().unwrap())
+        .to_vec();
     fs.commit().unwrap();
     for (i, (block, sum)) in pages.into_iter().enumerate() {
-        let page = disk.durable[block as usize];
+        let page = disk.durable[block.0 as usize];
         assert_eq!(mogfs2::verify(block, &page, sum), Ok(()));
         assert_eq!(page[0], if i < 2 { 1 } else { b'e' });
         assert_eq!(mogfs2::verify(block + 1, &page, sum), Err(Error::Corrupt));
@@ -555,7 +557,7 @@ fn the_last_generation_commits_and_then_commits_fail() {
 struct FailReads<'a>(&'a mut MemDisk, u64, usize);
 
 impl Disk for FailReads<'_> {
-    fn read(&mut self, block: u64, bufs: &mut [Block]) -> Result<(), Error> {
+    fn read(&mut self, block: u64, bufs: &mut [Buf]) -> Result<(), Error> {
         if block == self.1 && self.2 > 0 {
             self.2 -= 1;
             return Err(Error::Io);
@@ -563,7 +565,7 @@ impl Disk for FailReads<'_> {
         (&mut *self.0).read(block, bufs)
     }
 
-    fn write(&mut self, block: u64, bufs: &[Block]) -> Result<(), Error> {
+    fn write(&mut self, block: u64, bufs: &[Buf]) -> Result<(), Error> {
         (&mut *self.0).write(block, bufs)
     }
 
@@ -808,6 +810,52 @@ fn colliding(seed: u64, n: usize) -> Vec<[u8; 16]> {
     out
 }
 
+/// The inverse of an odd multiplier mod 2^64 (Newton's iteration).
+fn inverse(c: u64) -> u64 {
+    (0..6).fold(c, |x, _| {
+        x.wrapping_mul(2u64.wrapping_sub(c.wrapping_mul(x)))
+    })
+}
+
+/// The inverse of `h ^= h >> s`.
+fn unshift(y: u64, s: u32) -> u64 {
+    (0..64 / s).fold(y, |x, _| y ^ x >> s)
+}
+
+/// A sixteen-byte name whose hash chain under `seed` is the last one, its end at the largest offset.
+fn last_chain_name(seed: u64) -> [u8; 16] {
+    let mut h = unshift(u64::MAX, 29).wrapping_mul(inverse(0xbf58_476d_1ce4_e5b9));
+    h = unshift(h, 31);
+    let before = h
+        .rotate_right(29)
+        .wrapping_mul(inverse(0x9e37_79b9_7f4a_7c15));
+    let h0 = seed ^ 16;
+    for w1 in u64::from_le_bytes(*b"aaaaaaaa").. {
+        let w2 = before ^ mix(h0, w1);
+        let mut name = [0; 16];
+        name[..8].copy_from_slice(&w1.to_le_bytes());
+        name[8..].copy_from_slice(&w2.to_le_bytes());
+        if !name.contains(&0) && !name.contains(&b'/') {
+            return name;
+        }
+    }
+    unreachable!()
+}
+
+#[test]
+fn the_last_hash_chain_holds_its_names() {
+    let mut disk = MemDisk::new(64);
+    let mut mem = Mem::new(64, POOL);
+    let mut fs = format(&mut mem, &mut disk);
+    let name = last_chain_name(SEED);
+    let f = fs.create(ROOT, &name).unwrap();
+    assert_eq!(fs.lookup(ROOT, &name), Ok(f));
+    assert_eq!(fs.create(ROOT, &name), Ok(f));
+    fs.commit().unwrap();
+    fs.unlink(ROOT, &name).unwrap();
+    assert_eq!(fs.lookup(ROOT, &name), Err(Error::NotFound));
+}
+
 #[test]
 fn colliding_names_fill_a_bounded_chain() {
     let mut disk = MemDisk::new(64);
@@ -906,7 +954,7 @@ fn readdir_resumes_from_its_cursor_without_skipping_or_repeating() {
 }
 
 /// `disk` with slot 0's root leaf changed by `f`, resealed up to the superblock.
-fn crafted_leaf(mut disk: MemDisk, f: impl FnOnce(&mut Block)) -> MemDisk {
+fn crafted_leaf(mut disk: MemDisk, f: impl FnOnce(&mut Buf)) -> MemDisk {
     let b = le64(&disk.durable[0], 9 * 8) as usize;
     f(&mut disk.durable[b]);
     let s = sum(b as u64, &disk.durable[b][..BLOCK_SIZE - 8]);
@@ -915,7 +963,7 @@ fn crafted_leaf(mut disk: MemDisk, f: impl FnOnce(&mut Block)) -> MemDisk {
 }
 
 /// Where `name` starts in `block` (a directory entry's name; its inode is the 8 bytes 9 before).
-fn find(block: &Block, name: &[u8]) -> usize {
+fn find(block: &Buf, name: &[u8]) -> usize {
     block.windows(name.len()).position(|w| w == name).unwrap()
 }
 
@@ -981,9 +1029,9 @@ fn pages_past_the_largest_file_map_to_nothing() {
         .lookup(ROOT, b"docs")
         .and_then(|d| fs.lookup(d, b"a.txt"))
         .unwrap();
-    assert!(fs.map(a, 0).unwrap().is_some());
+    assert!(fs.map(a, Page(0)).unwrap().is_some());
     for page in [1 << 40, 1 << 62, 1 << 63, u64::MAX] {
-        assert_eq!(fs.map(a, page), Ok(None), "page {page}");
+        assert_eq!(fs.map(a, Page(page)), Ok(None), "page {page}");
     }
 }
 
@@ -999,12 +1047,12 @@ impl Counted<'_> {
 }
 
 impl Disk for Counted<'_> {
-    fn read(&mut self, block: u64, bufs: &mut [Block]) -> Result<(), Error> {
+    fn read(&mut self, block: u64, bufs: &mut [Buf]) -> Result<(), Error> {
         self.bump(0);
         (&mut *self.0).read(block, bufs)
     }
 
-    fn write(&mut self, block: u64, bufs: &[Block]) -> Result<(), Error> {
+    fn write(&mut self, block: u64, bufs: &[Buf]) -> Result<(), Error> {
         self.bump(1);
         (&mut *self.0).write(block, bufs)
     }
@@ -1139,14 +1187,14 @@ fn a_directory_of_100k_entries_lists_in_linear_requests() {
 struct FileDisk(std::fs::File, u64);
 
 impl Disk for FileDisk {
-    fn read(&mut self, block: u64, bufs: &mut [Block]) -> Result<(), Error> {
+    fn read(&mut self, block: u64, bufs: &mut [Buf]) -> Result<(), Error> {
         use std::os::unix::fs::FileExt;
         self.0
             .read_exact_at(bufs.as_flattened_mut(), block * BLOCK_SIZE as u64)
             .map_err(|_| Error::Io)
     }
 
-    fn write(&mut self, block: u64, bufs: &[Block]) -> Result<(), Error> {
+    fn write(&mut self, block: u64, bufs: &[Buf]) -> Result<(), Error> {
         use std::os::unix::fs::FileExt;
         self.0
             .write_all_at(bufs.as_flattened(), block * BLOCK_SIZE as u64)
@@ -1275,4 +1323,66 @@ fn format_can_run_again_on_the_same_fs() {
     fs.commit().unwrap();
     fs.format(3).unwrap();
     assert_eq!(snapshot(&mut disk), Ok(vec![]));
+}
+
+const IMAGE_BLOCKS: usize = 256;
+
+fn image_name(i: usize) -> String {
+    format!("{i:0>200}")
+}
+
+/// A fixed workload: a height-2 tree with leaf splits, nodes written out early, an extent split, a sum updated in
+/// place, a truncate, merges and a rename. `image.bin` is what it wrote at 5b7d427, before the newtypes.
+fn image_workload(disk: &mut MemDisk) {
+    let mut mem = Mem::new(IMAGE_BLOCKS, POOL);
+    let mut fs = mem.fs(disk);
+    fs.set_time(1_000);
+    fs.format(SEED).unwrap();
+    let docs = fs.mkdir(ROOT, b"docs").unwrap();
+    let big = fs.create(docs, b"big").unwrap();
+    fs.write(big, 0, &[7; 9000]).unwrap();
+    for i in 0..400 {
+        fs.create(ROOT, image_name(i).as_bytes()).unwrap();
+    }
+    assert_eq!(fs.height(), 2);
+    let t = fs.create(docs, b"t").unwrap();
+    fs.write(t, 0, &[1; 5000]).unwrap();
+    fs.commit().unwrap();
+    fs.set_time(2_000);
+    fs.write(big, 5000, b"mid").unwrap();
+    fs.write(big, 5100, b"again").unwrap();
+    fs.truncate(t).unwrap();
+    for i in (0..400).filter(|i| i % 4 != 0) {
+        fs.unlink(ROOT, image_name(i).as_bytes()).unwrap();
+    }
+    fs.rename(docs, b"big", ROOT, b"big").unwrap();
+    fs.commit().unwrap();
+}
+
+#[test]
+fn image_from_before_the_newtypes_mounts_and_is_rewritten_bit_for_bit() {
+    let image = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/image.bin")).unwrap();
+    let mut disk = MemDisk::new(IMAGE_BLOCKS);
+    image_workload(&mut disk);
+    let differs =
+        (0..IMAGE_BLOCKS).find(|&b| disk.durable[b][..] != image[b * BLOCK_SIZE..][..BLOCK_SIZE]);
+    assert_eq!(differs, None, "first block that differs");
+    let mut disk = MemDisk::new(IMAGE_BLOCKS);
+    for (b, block) in disk.durable.iter_mut().zip(image.chunks(BLOCK_SIZE)) {
+        b.copy_from_slice(block);
+    }
+    let mut big = vec![7; 9000];
+    big[5000..5003].copy_from_slice(b"mid");
+    big[5100..5105].copy_from_slice(b"again");
+    let mut want: Tree = (0..400)
+        .step_by(4)
+        .map(|i| entry(&format!("/{}", image_name(i)), b""))
+        .collect();
+    want.extend([
+        entry("/big", &big),
+        entry("/docs/", b""),
+        entry("/docs/t", b""),
+    ]);
+    want.sort();
+    assert_eq!(snapshot(&mut disk), Ok(want));
 }

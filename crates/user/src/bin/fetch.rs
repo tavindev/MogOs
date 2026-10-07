@@ -56,7 +56,7 @@ fn get(
     let sock = sock as u64;
     let result = (|| {
         match connect(sock, to.0, to.1, 0) {
-            0 => ok(wait_for(0))?,
+            0 => ok(wait_for(0).0)?,
             error => return Err(error),
         };
         for part in [b"GET ", path, b" HTTP/1.0\r\nHost: ", host, b"\r\n\r\n"] {

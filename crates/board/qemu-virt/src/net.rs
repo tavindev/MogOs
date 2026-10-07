@@ -159,10 +159,10 @@ impl UserMemory for User {
 
 const SOCKET_RIGHTS: u64 = READ | WRITE | DUPLICATE | TRANSFER;
 
-/// Runs a socket syscall for the current process: its result (an `io_wait`'s tag in `tag`), or `None` while
-/// `io_wait` must block. Out of line, so `board_syscall` stays as lean for every other call.
+/// Runs a socket syscall for the current process: its result (an `io_wait`'s tag and peer in `out`, x1 and x2), or
+/// `None` while `io_wait` must block. Out of line, so `board_syscall` stays as lean for every other call.
 #[inline(never)]
-pub fn syscall(sched: &mut Sched, cpu: usize, call: NetCall, tag: &mut u64) -> Option<i64> {
+pub fn syscall(sched: &mut Sched, cpu: usize, call: NetCall, out: &mut [u64; 2]) -> Option<i64> {
     Some(match call {
         NetCall::Socket(allowed) => socket(sched, cpu, allowed),
         NetCall::Bind {
@@ -193,8 +193,8 @@ pub fn syscall(sched: &mut Sched, cpu: usize, call: NetCall, tag: &mut u64) -> O
             rights.into(),
         ),
         NetCall::IoWait => {
-            let (result, done) = io_wait(sched, cpu)?;
-            *tag = done;
+            let (result, done, peer) = io_wait(sched, cpu)?;
+            (out[0], out[1]) = (done, peer);
             result
         }
     })
@@ -239,25 +239,28 @@ fn submit(
     status(result)
 }
 
-/// `io_wait`'s result and tag, or `None` while `cpu`'s current process's ops are all unfinished.
-fn io_wait(sched: &mut Sched, cpu: usize) -> Option<(i64, u64)> {
+/// `io_wait`'s result, tag and peer, or `None` while `cpu`'s current process's ops are all unfinished.
+fn io_wait(sched: &mut Sched, cpu: usize) -> Option<(i64, u64, u64)> {
     let current = (sched.process(cpu), sched.generation(cpu));
     let mut net = NET.lock();
     let Some((_, network)) = net.as_mut() else {
-        return Some((EINVAL, 0));
+        return Some((EINVAL, 0, 0));
     };
     let Some(done) = network.complete(current, sched, &mut User) else {
         let waiting = network.in_flight(current);
-        return (!waiting).then_some((EINVAL, 0));
+        return (!waiting).then_some((EINVAL, 0, 0));
     };
     drop(net);
     // Receiving opened the window and sending queued data: either may owe a segment.
     wake(sched);
-    let result = match done.accepted {
-        Some((sock, rights)) => handle(sched, cpu, sock, rights & SOCKET_RIGHTS),
-        None => done.result,
+    let (result, peer) = match done.accepted {
+        Some((sock, rights, peer)) => {
+            let peer = u64::from(u32::from(*peer.ip())) << 16 | u64::from(peer.port());
+            (handle(sched, cpu, sock, rights & SOCKET_RIGHTS), peer)
+        }
+        None => (done.result, 0),
     };
-    Some((result, done.tag))
+    Some((result, done.tag, peer))
 }
 
 /// Counts a new handle to `sock`.

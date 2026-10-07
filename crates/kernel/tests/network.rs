@@ -223,7 +223,11 @@ fn an_accepted_handle_gets_no_more_rights_than_the_accepting_one() {
     let (listener, _) = w.listen_and_connect(10, 1);
     w.submit_with(ME, listener, (OP_ACCEPT, 0, 0, 1), READ)
         .unwrap();
-    assert_eq!(w.complete(ME).accepted.unwrap().1, READ);
+    let (_, rights, peer) = w.complete(ME).accepted.unwrap();
+    assert_eq!(rights, READ);
+    // The peer is this host: `PEER`'s 127.0.0.2 reads as 127.0.0.1, from an ephemeral port.
+    assert_eq!(*peer.ip(), std::net::Ipv4Addr::LOCALHOST);
+    assert!(peer.port() >= 49152);
 }
 
 #[test]
