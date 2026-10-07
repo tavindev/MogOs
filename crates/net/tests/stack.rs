@@ -605,3 +605,37 @@ fn ipv4_fragments_are_dropped_and_counted() {
         Some((SocketAddrV4::new(IP_A, 9), 2))
     );
 }
+
+#[test]
+fn arp_never_learns_unasked_or_invalid_senders() {
+    let mut nb = [Neighbor::EMPTY; 8];
+    let mut bufs = [[0u8; 256]; 1];
+    let mut socks = bufs.each_mut().map(|b| Socket::new(b));
+    let mut a = Stack::new(config(IP_A), &mut nb, &mut socks);
+    let s = a.bind(Proto::Udp, 9).unwrap();
+    let mut tap = Tap::new(MAC_A);
+    let dropped = a.counters.ignored + a.counters.malformed;
+    feed_all(
+        &mut a,
+        &mut tap,
+        0,
+        [
+            arp(2, mac(5), ip(5), MAC_A, IP_A),
+            arp(1, [0xff; 6], ip(6), [0; 6], IP_A),
+            arp(1, [0; 6], ip(7), [0; 6], IP_A),
+            arp(1, [1, 0, 0x5e, 0, 0, 1], ip(8), [0; 6], IP_A),
+            arp(1, mac(9), IP_A, [0; 6], IP_A),
+            arp(1, mac(10), ip(255), [0; 6], IP_A),
+            arp(1, mac(11), Ipv4Addr::new(10, 0, 1, 11), [0; 6], IP_A),
+        ],
+    );
+    assert_eq!(a.counters.ignored + a.counters.malformed, dropped + 7);
+    assert!(tap.tx.is_empty(), "no reply to an invalid sender");
+    for n in 5..=8 {
+        assert_eq!(
+            send(&mut a, &mut tap, 0, s, ip(n)),
+            None,
+            "10.0.0.{n} not learned"
+        );
+    }
+}

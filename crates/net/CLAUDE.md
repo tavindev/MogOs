@@ -43,7 +43,10 @@ kernel, step 50), DHCP, DNS or IPv6 (phase 9), or IPv4 fragment reassembly.
   the ARP sender MAC must equal the Ethernet source and the sender IP must be an on-link unicast address other than
   ours. Everything else is `ignored`, so ARP traffic not aimed at us never evicts a neighbour. A full cache evicts
   its least recently used entry. ARP has no checksum; these checks are what keep a flipped bit from poisoning the
-  cache.
+  cache. Pending requests live in the same bounded table and are freed after 3 unanswered tries.
+- An echo reply goes to the request's Ethernet source; IP traffic never reads or writes the ARP cache.
+- Residual risk: plain ARP cannot stop an on-path attacker who answers our request first, or who sends a request
+  aimed at us claiming a neighbour's IP.
 - A full socket table is `TableFull`, a bound port `InUse`; nothing is evicted silently. A full socket buffer drops
   the datagram (`socket_full`).
 - Replies built while the received frame is borrowed (ARP reply, echo reply) go through one buffer, sent after the
@@ -62,7 +65,8 @@ kernel, step 50), DHCP, DNS or IPv6 (phase 9), or IPv4 fragment reassembly.
   corruption for 200 seeds, every reply checked byte for byte. A seeded mutation test feeds 100k mutated copies of
   the frames recorded from a clean run (bit flips, byte and 16-bit field overwrites, truncation, extension) and checks
   each is counted exactly once, and that a single checksum-detectable mutation never delivers changed data. ARP:
-  spoofed and unsolicited traffic, a 10k-frame flood not aimed at us, LRU eviction, retries and the `poll` deadline.
+  spoofed and unsolicited traffic, unasked and invalid senders (broadcast, zero, multicast MAC; our IP; off-link),
+  a 10k-frame flood not aimed at us, LRU eviction, retries and the `poll` deadline.
   Also routing, named socket errors, a full socket buffer, fragments. `src/lib.rs` unit-tests the socket ring's
   wrap-around checksum.
 - Benchmark: `cargo bench-host` runs `benches/net.rs` (includes `tests/sim/mod.rs`); baseline rows in
