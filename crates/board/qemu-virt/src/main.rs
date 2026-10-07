@@ -27,14 +27,14 @@ use dtb::Dtb;
 use fs::FsDisk;
 use kernel::console::Line;
 use kernel::elf::Segment;
-use kernel::handle::{Handles, INIT_ARCHIVE, MAX_HANDLES, Rights};
+use kernel::handle::{INIT_ARCHIVE, MAX_HANDLES, Rights};
 use kernel::mutex::Mutexes;
 use kernel::network::Network;
 use kernel::pipe::Pipes;
-use kernel::syscall::ENOENT;
-use kernel::{Event, FRAME_WORDS, Full, Memory, PRIORITIES, Program, Scheduler};
+use kernel::syscall::{ENOENT, MAX_BUFFER};
+use kernel::{Event, FRAME_WORDS, Full, PRIORITIES, Program, Scheduler};
 use linked_list_allocator::Heap;
-use mm::{Budget, FrameAllocator, PhysAddr};
+use mm::{FrameAllocator, PhysAddr};
 use mogfs::{Error, Fs};
 use process::{executable, spawn_init, user_program};
 use uart::Uart;
@@ -92,14 +92,17 @@ static DISK_TAKEN: AtomicBool = AtomicBool::new(false);
 const VIRTIO: PhysAddr = PhysAddr(0x0a00_0000);
 const VIRTIO_STRIDE: u64 = 0x200;
 const VIRTIO_COUNT: u64 = 32;
-/// Boot context included; a task's slot is its ASID (8 bits).
+/// Threads, the boot context included.
 const MAX_TASKS: usize = 8;
-const _: () = assert!(MAX_TASKS <= 256);
+/// The kernel included; a process's index is its ASID (8 bits).
+const MAX_PROCESSES: usize = 8;
+const _: () = assert!(MAX_PROCESSES <= 256);
+type Sched = Scheduler<MAX_TASKS, MAX_PROCESSES>;
 /// Kernel stack per task: 16 KiB.
 const TASK_STACK_FRAMES: usize = 4;
 const MAX_PIPES: usize = 16;
 /// Each live mutex has a handle, so the handle tables are the per-process quota.
-const MAX_MUTEXES: usize = MAX_TASKS * MAX_HANDLES;
+const MAX_MUTEXES: usize = MAX_PROCESSES * MAX_HANDLES;
 
 #[global_allocator]
 static HEAP: KernelHeap = KernelHeap(Lock::new(Heap::empty()));
@@ -124,7 +127,8 @@ unsafe impl GlobalAlloc for KernelHeap {
     }
 }
 
-/// The big lock over task contexts, free frames, pipes, mutexes, console input and the file system. Every trap hook
+/// The big lock over threads and processes, free frames, pipes, mutexes, console input, the file system and the
+/// buffer user inputs are copied into. Every trap hook
 /// takes it and returns holding it, and the trap exit releases it (`board_unlock`). Lock order: `KERNEL`, then `HEAP`
 /// or `CONSOLE`. File system calls do their disk I/O under it, so a `sync` holds it for its flushes.
 static KERNEL: Lock<Kernel> = Lock::new(Kernel {
@@ -135,10 +139,11 @@ static KERNEL: Lock<Kernel> = Lock::new(Kernel {
     line: Line::new(),
     fs: Fs::new(FsDisk(None)),
     mounted: false,
+    buf: [0; 2 * MAX_BUFFER as usize],
 });
 
 struct Kernel {
-    sched: Scheduler<MAX_TASKS>,
+    sched: Sched,
     frames: FrameAllocator<FRAME_WORDS>,
     pipes: Pipes<MAX_PIPES>,
     mutexes: Mutexes<MAX_MUTEXES>,
@@ -146,6 +151,8 @@ struct Kernel {
     fs: Fs<FsDisk>,
     /// `fs` is mounted: boot-spawned processes get its root as handle 3.
     mounted: bool,
+    /// Where a syscall copies user inputs and stages outputs: room for `rename`'s two paths.
+    buf: [u8; 2 * MAX_BUFFER as usize],
 }
 
 /// `Board::console` output on `UART0`, a leaf lock. Panic, fault, echo and user `write` output go straight to `UART0`,
@@ -251,12 +258,7 @@ impl kernel::Board for QemuVirt {
             unsafe { (start as *mut Start).write(Start { board, entry, arg }) };
             // SAFETY: `start` is 16-byte aligned and the stack below it is fresh and owned by the new task.
             let frame = unsafe { arch::new_task(start, task_start, start) };
-            let memory = Memory {
-                stack: stack.start,
-                budget: Budget::new(0),
-                next: 0,
-            };
-            sched.add(slot, frame, PhysAddr(0), memory, Handles::new(), 0);
+            sched.add(slot, 0, (frame, stack.start), 0);
             Ok(())
         })
     }

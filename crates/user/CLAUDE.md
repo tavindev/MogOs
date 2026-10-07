@@ -14,7 +14,7 @@ board crate).
   `docs/DEVELOPMENT.md`. `cargo test-host` builds it only for its lib's host test (the command
   table), through `crates/e2e/tests/user.rs`, which runs the `cargo test --manifest-path` command there.
 - `#![no_std]` (the lib `cfg_attr(not(test))`), `#![no_main]`, no dependencies. `unsafe` only in `src/lib.rs` for
-  `svc`, `map`'s slice and `start`'s argument slice, and in bins for `#[unsafe(no_mangle)]`, the one call to the
+  `svc`, the `mrs` of `now_ns` and `tls`, `map`'s slice and `start`'s argument slice, and in bins for `#[unsafe(no_mangle)]`, the one call to the
   `unsafe fn start`, and `fuzz`'s and `sysbench`'s calls to `unsafe fn raw` (any syscall, all seven arguments; the caller keeps what the
   kernel may write unreferenced), and `nettest`'s calls to `unsafe fn io_submit` (a receive buffer stays unreferenced
   until `io_wait` reports it; `receive` and `send` wrap it safely for a process with one op in flight); each block with
@@ -35,8 +35,11 @@ board crate).
   change both together.
 - `link.ld` and `build.rs`: static ELFs at 4 GiB, one RX and one RW `PT_LOAD`, `-zmax-page-size=4096`. Everything
   must fit in the board's `IMAGE` (below a guard page and the top two stack pages, which end at 4 GiB + 2 MiB) or `spawn` returns `ENOEXEC`.
-- Child budgets (`CHILD_BUDGET`, `A_BUDGET`, `PONG_BUDGET`, ...) are sized deliberately, some exact, some with slack,
-  as their comments say; they must fit in the kernel's `BOOT_BUDGET`, `WAITER_BUDGET`, `PI_BUDGET`. `ROUND_TRIPS` in
+- Threads: `thread(entry, stack, tls, arg)` starts `entry(arg)` on a stack the caller mapped, with TPIDR_EL0 = `tls`
+  (`tls()` reads it back); `wait` on its handle joins it, `thread_exit` ends one thread, `exit` the whole process. Its
+  kernel stack (4 frames) comes out of the process's budget.
+- Child budgets (`CHILD_BUDGET`, `A_BUDGET`, `PONG_BUDGET`, `VICTIM_BUDGET`, ...) are sized deliberately, some exact, some with slack,
+  as their comments say; they must fit in the kernel's `BOOT_BUDGET`, `WAITER_BUDGET`, `PI_BUDGET`, `THREADS_BUDGET`. `ROUND_TRIPS` in
   `ping.rs` must equal the kernel's `PIPE_ROUND_TRIPS`.
 - Least privilege (security rule): msh runs only the programs in `COMMANDS` (`src/lib.rs`; anything else, even in
   the archive, is `command not found`), resolves every path argument itself, against its root handle and current
@@ -65,10 +68,11 @@ board crate).
   (`shell_files_survive_a_reboot_only_once_synced`, `sync_reports_a_failed_flush`), and `sh` (the musl tests in `c/CLAUDE.md`),
   `fsbench` (`fs_bench_reports_round_trips`), `spawnbench` / `nop` (`spawn_bench_reports_round_trip`), `fuzz` / `nop`
   (`fuzzer_never_crashes_the_kernel_or_leaks_frames`), `sysbench` / `nop` (`syscall_benches_report_every_call`),
-  `shellsetup` / `msh` with arguments (`shell_bench_times_each_command_from_spawn_to_reap`), `nettest` and the C
-  `tcpecho` (`sockets_echo_over_loopback_wait_for_any_and_need_the_net_handle_and_budget`), `httpd` and `fetch`
-  (`httpd_echoes_more_sequential_requests_than_its_tables_hold_and_fetch_gets_a_host_page`), all in
-  `crates/e2e/tests/boot.rs`.
+  `shellsetup` / `msh` with arguments (`shell_bench_times_each_command_from_spawn_to_reap`), `threads` / `victim`
+  (`threads_share_a_counter_keep_their_tls_and_end_with_their_process`), `threadbench`
+  (`thread_bench_reports_round_trips`), `nettest` and the C `tcpecho`
+  (`sockets_echo_over_loopback_wait_for_any_and_need_the_net_handle_and_budget`), `httpd` and `fetch`
+  (`httpd_echoes_more_sequential_requests_than_its_tables_hold_and_fetch_gets_a_host_page`), all in `crates/e2e/tests/boot.rs`.
 - Clippy and fmt via the `crates/user` commands in `docs/DEVELOPMENT.md` must be clean.
 
 ---

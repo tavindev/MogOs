@@ -103,7 +103,7 @@ Decision: write `crates/net` fresh. smoltcp is a host-only dev-dependency of `cr
 - **50.** Without phase 7 step 42 (no general non-blocking submit yet) and step 28: the completion ops are socket
   ops only. `kernel::network` (design notes at its top): a NetStack handle (`CONNECT`, `LISTEN`) makes sockets, which
   are kernel table entries reached by index and generation and counted by handles (a stale value never reaches a
-  later socket; the stack's bare `TcpId` is never used after its socket closes). Syscalls 18-23: `socket`, `bind`,
+  later socket; the stack's bare `TcpId` is never used after its socket closes). Syscalls 20-25 (18 and 19 are threads): `socket`, `bind`,
   `listen`, `io_submit` (receive, send, accept, connect), `io_wait` (result in x0, tag in x1; wait-any) and
   `shutdown`, the one typed option. Buffers can be touched only in the submitter's address space, so an op is tried at
   submit (an accept only in `io_wait`, which makes its handle at once) and again by each `io_wait` until it finishes;

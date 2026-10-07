@@ -29,7 +29,7 @@ fn dup_fails_when_the_table_is_full() {
     assert_eq!(
         handles.get(1, KILL),
         Ok(Object::Process {
-            slot: 1,
+            index: 1,
             generation: 1
         })
     );

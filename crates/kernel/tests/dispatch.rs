@@ -5,8 +5,8 @@ use mogfs::ROOT;
 const SYNC: u64 = 15;
 const UNLINK: u64 = 16;
 const RENAME: u64 = 17;
-const BIND: u64 = 19;
-const LISTEN: u64 = 20;
+const BIND: u64 = 21;
+const LISTEN: u64 = 22;
 const USER: u64 = 1 << 32;
 
 #[test]

@@ -24,7 +24,7 @@ use net::{
 use crate::handle::{CONNECT, LISTEN, Rights};
 use crate::syscall::{
     EACCES, EADDRINUSE, EAGAIN, EBADF, EBUSY, ECONNREFUSED, ECONNRESET, EFAULT, EHOSTUNREACH,
-    EINVAL, EISCONN, ENETUNREACH, ENFILE, ENOBUFS, ENOTCONN, EPIPE, ETIMEDOUT,
+    EINVAL, EISCONN, ENETUNREACH, ENFILE, ENOBUFS, ENOTCONN, EPIPE, ETIMEDOUT, MAX_BUFFER,
 };
 use crate::{Board, Scheduler};
 
@@ -104,7 +104,7 @@ pub trait Budgets {
     fn alive(&mut self, owner: Owner) -> bool;
 }
 
-impl<const N: usize> Budgets for Scheduler<N> {
+impl<const N: usize, const P: usize> Budgets for Scheduler<N, P> {
     fn charge(&mut self, (slot, generation): Owner, frames: usize) -> bool {
         self.budget(slot, generation)
             .is_some_and(|b| b.charge(frames))
@@ -121,10 +121,13 @@ impl<const N: usize> Budgets for Scheduler<N> {
     }
 }
 
-/// Reads and writes the submitting process's memory.
+/// Copies to and from the submitting process's memory (never a reference: a sibling thread may write it).
 pub trait UserMemory {
-    fn bytes(&self, ptr: u64, len: usize) -> Option<&[u8]>;
-    fn bytes_mut(&mut self, ptr: u64, len: usize) -> Option<&mut [u8]>;
+    /// Copies the `dst.len()` bytes at `ptr` into `dst`; false if the process may not read them.
+    fn read(&mut self, ptr: u64, dst: &mut [u8]) -> bool;
+    fn writable(&mut self, ptr: u64, len: usize) -> bool;
+    /// Copies `src` to `ptr`; false, copying nothing, if the process may not write there.
+    fn write(&mut self, ptr: u64, src: &[u8]) -> bool;
 }
 
 #[derive(Clone, Copy)]
@@ -546,15 +549,17 @@ impl Network {
             return Some(ENOTCONN);
         };
         let stack = self.stack(s);
+        // Data stages here: user memory is only copied, never borrowed.
+        let mut buf = [0; MAX_BUFFER as usize];
         let result = match op.kind {
-            Kind::Receive { ptr, len } => match user.bytes_mut(ptr, len) {
-                Some(buf) => stack.recv(id, buf),
-                None => return Some(EFAULT),
-            },
-            Kind::Send { ptr, len } => match user.bytes(ptr, len) {
-                Some(data) => stack.send(id, data),
-                None => return Some(EFAULT),
-            },
+            Kind::Receive { ptr, len } if user.writable(ptr, len) => {
+                let n = stack.recv(id, &mut buf[..len]);
+                n.inspect(|&n| _ = user.write(ptr, &buf[..n]))
+            }
+            Kind::Send { ptr, len } if user.read(ptr, &mut buf[..len]) => {
+                stack.send(id, &buf[..len])
+            }
+            Kind::Receive { .. } | Kind::Send { .. } => return Some(EFAULT),
             Kind::Connect => match stack.tcp_info(id) {
                 Some(info) if info.error.is_some() => Err(info.error.unwrap()),
                 Some(info) if matches!(info.state, State::SynSent | State::SynReceived) => {

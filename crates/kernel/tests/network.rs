@@ -20,12 +20,18 @@ const ALL: Rights = u64::MAX;
 struct Arena(Vec<u8>);
 
 impl UserMemory for Arena {
-    fn bytes(&self, ptr: u64, len: usize) -> Option<&[u8]> {
-        self.0.get(ptr as usize..ptr as usize + len)
+    fn read(&mut self, ptr: u64, dst: &mut [u8]) -> bool {
+        let src = self.0.get(ptr as usize..ptr as usize + dst.len());
+        src.map(|src| dst.copy_from_slice(src)).is_some()
     }
 
-    fn bytes_mut(&mut self, ptr: u64, len: usize) -> Option<&mut [u8]> {
-        self.0.get_mut(ptr as usize..ptr as usize + len)
+    fn writable(&mut self, ptr: u64, len: usize) -> bool {
+        ptr as usize + len <= self.0.len()
+    }
+
+    fn write(&mut self, ptr: u64, src: &[u8]) -> bool {
+        let dst = self.0.get_mut(ptr as usize..ptr as usize + src.len());
+        dst.map(|dst| dst.copy_from_slice(src)).is_some()
     }
 }
 

@@ -7,12 +7,12 @@ use arch::Lock;
 use kernel::handle::{DUPLICATE, Object, READ, TRANSFER, WRITE};
 use kernel::network::{Network, Sock, UserMemory};
 use kernel::syscall::{EINVAL, NetCall};
-use kernel::{Board, Event, Scheduler};
+use kernel::{Board, Event};
 use mm::PhysAddr;
 
-use crate::usermem::{user_bytes, user_bytes_mut};
+use crate::usermem::{UserIn, UserOut};
 use crate::virtio_net::{POOL_FRAMES, VirtioNet};
-use crate::{CPUS, GIC_DIST, KERNEL, MAX_TASKS, QemuVirt, VIRTIO, VIRTIO_COUNT, VIRTIO_STRIDE};
+use crate::{CPUS, GIC_DIST, KERNEL, QemuVirt, Sched, VIRTIO, VIRTIO_COUNT, VIRTIO_STRIDE};
 
 /// QEMU `virt` wires virtio-mmio transport `i` to SPI `16 + i`.
 const VIRTIO_IRQ: u32 = 48;
@@ -87,7 +87,7 @@ pub fn with<R>(f: impl FnOnce(&mut Network, Option<&mut VirtioNet>, u64) -> R) -
 }
 
 /// Runs `f` on the network (started, since a socket handle exists) and wakes the net task. Under `KERNEL`.
-fn net<R>(sched: &mut Scheduler<MAX_TASKS>, f: impl FnOnce(&mut Network) -> R) -> R {
+fn net<R>(sched: &mut Sched, f: impl FnOnce(&mut Network) -> R) -> R {
     let result = f(NET.lock().as_mut().expect("a socket without a network").1);
     wake(sched);
     result
@@ -96,12 +96,20 @@ fn net<R>(sched: &mut Scheduler<MAX_TASKS>, f: impl FnOnce(&mut Network) -> R) -
 struct User;
 
 impl UserMemory for User {
-    fn bytes(&self, ptr: u64, len: usize) -> Option<&[u8]> {
-        user_bytes(ptr, len)
+    fn read(&mut self, ptr: u64, dst: &mut [u8]) -> bool {
+        UserIn::new(ptr, dst.len())
+            .map(|user| user.read(0, dst))
+            .is_some()
     }
 
-    fn bytes_mut(&mut self, ptr: u64, len: usize) -> Option<&mut [u8]> {
-        user_bytes_mut(ptr, len)
+    fn writable(&mut self, ptr: u64, len: usize) -> bool {
+        UserOut::new(ptr, len).is_some()
+    }
+
+    fn write(&mut self, ptr: u64, src: &[u8]) -> bool {
+        UserOut::new(ptr, src.len())
+            .map(|user| user.write(0, src))
+            .is_some()
     }
 }
 
@@ -110,7 +118,7 @@ const SOCKET_RIGHTS: u64 = READ | WRITE | DUPLICATE | TRANSFER;
 /// Runs a socket syscall for the current process: its result (an `io_wait`'s tag in `tag`), or `None` while
 /// `io_wait` must block. Out of line, so `board_syscall` stays as lean for every other call.
 #[inline(never)]
-pub fn syscall(sched: &mut Scheduler<MAX_TASKS>, call: NetCall, tag: &mut u64) -> Option<i64> {
+pub fn syscall(sched: &mut Sched, call: NetCall, tag: &mut u64) -> Option<i64> {
     Some(match call {
         NetCall::Socket(allowed) => socket(sched, allowed),
         NetCall::Bind { sock, port } => status(net(sched, |n| n.bind(sock, port))),
@@ -138,8 +146,8 @@ pub fn syscall(sched: &mut Scheduler<MAX_TASKS>, call: NetCall, tag: &mut u64) -
 }
 
 /// A socket of the current process with NetStack rights `allowed`, and its handle.
-fn socket(sched: &mut Scheduler<MAX_TASKS>, allowed: u64) -> i64 {
-    let owner = (sched.current().0, sched.generation());
+fn socket(sched: &mut Sched, allowed: u64) -> i64 {
+    let owner = (sched.process(), sched.generation());
     let mut net = NET.lock();
     let network = &mut net.as_mut().expect("a NetStack without a network").1;
     let made = network.socket(owner, allowed, sched);
@@ -151,7 +159,7 @@ fn socket(sched: &mut Scheduler<MAX_TASKS>, allowed: u64) -> i64 {
 }
 
 /// A handle with `rights` to the new `sock` in the current process's table; closes it if the table is full.
-fn handle(sched: &mut Scheduler<MAX_TASKS>, sock: Sock, rights: u64) -> i64 {
+fn handle(sched: &mut Sched, sock: Sock, rights: u64) -> i64 {
     match sched.handles().insert(Object::Socket(sock), rights) {
         Ok(handle) => handle as i64,
         Err(error) => {
@@ -162,13 +170,8 @@ fn handle(sched: &mut Scheduler<MAX_TASKS>, sock: Sock, rights: u64) -> i64 {
 }
 
 /// `io_submit` of `op` on `sock` for the current process.
-fn submit(
-    sched: &mut Scheduler<MAX_TASKS>,
-    sock: Sock,
-    op: (u64, u64, usize, u64),
-    rights: u64,
-) -> i64 {
-    let current = (sched.current().0, sched.generation());
+fn submit(sched: &mut Sched, sock: Sock, op: (u64, u64, usize, u64), rights: u64) -> i64 {
+    let current = (sched.process(), sched.generation());
     let mut net = NET.lock();
     let network = &mut net.as_mut().expect("a socket without a network").1;
     let result = network.submit(sock, op, rights, (current, now()), sched, &mut User);
@@ -178,8 +181,8 @@ fn submit(
 }
 
 /// `io_wait`'s result and tag, or `None` while the current process's ops are all unfinished.
-fn io_wait(sched: &mut Scheduler<MAX_TASKS>) -> Option<(i64, u64)> {
-    let current = (sched.current().0, sched.generation());
+fn io_wait(sched: &mut Sched) -> Option<(i64, u64)> {
+    let current = (sched.process(), sched.generation());
     let mut net = NET.lock();
     let Some((_, network)) = net.as_mut() else {
         return Some((EINVAL, 0));
@@ -206,7 +209,7 @@ pub fn open(sock: Sock) {
 }
 
 /// Drops a handle to `sock`; the last one refunds its owner, if it still runs.
-pub fn close(sched: &mut Scheduler<MAX_TASKS>, sock: Sock) {
+pub fn close(sched: &mut Sched, sock: Sock) {
     if let Some((_, network)) = NET.lock().as_mut() {
         network.close(sock, sched);
     }
@@ -218,7 +221,7 @@ fn status(result: Result<(), i64>) -> i64 {
 }
 
 /// The NIC's interrupt: acknowledges it and wakes the net task. Under `KERNEL`.
-pub fn interrupt(sched: &mut Scheduler<MAX_TASKS>) {
+pub fn interrupt(sched: &mut Sched) {
     if let Some((Some(nic), _)) = &mut *NET.lock() {
         nic.ack();
     }
@@ -226,14 +229,14 @@ pub fn interrupt(sched: &mut Scheduler<MAX_TASKS>) {
 }
 
 /// A timer tick: wakes the net task once the deadline passed. Under `KERNEL`.
-pub fn tick(sched: &mut Scheduler<MAX_TASKS>) {
+pub fn tick(sched: &mut Sched) {
     if now() >= DEADLINE.load(Relaxed) {
         DEADLINE.store(u64::MAX, Relaxed);
         wake(sched);
     }
 }
 
-fn wake(sched: &mut Scheduler<MAX_TASKS>) {
+fn wake(sched: &mut Sched) {
     PENDING.store(true, Relaxed);
     sched.wake(Event::Net);
 }

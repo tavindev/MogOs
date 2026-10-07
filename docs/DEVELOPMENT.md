@@ -87,7 +87,7 @@ cargo run -- -append test=mmu-fault  # reads an unmapped address after MMU on; p
 cargo run -- -append test=yield      # tasks a and b print 0..2 in turn via `svc` yield
 cargo run -- -append test=bench      # prints the yield round trip in ns
 cargo run -- -append test=preempt    # timer preempts spinning task a; task b prints 0..2
-cargo run -- -append test=user       # EL0 process A writes A: 0..9 to its console handle; B reads A's address, then C (B's slot) kernel RAM: both killed (fault: 2 ec=0x24 far=...)
+cargo run -- -append test=user       # EL0 process A writes A: 0..9 to its console handle; B reads A's address, then C (B's process index) kernel RAM: both killed (fault: 2 ec=0x24 far=...)
 cargo run -- -append test=bench-syscall  # EL0 loop of no-op syscalls, prints the round trip in ns
 cargo run -- -append test=handles    # EL0 process writes via its console handle, then a no-write duplicate, a closed and a stale handle fail (H: lines)
 cargo run -- -append test=budget     # EL0 process maps pages until ENOMEM (M: lines), exits; free frames before/after its lifetime match
@@ -98,6 +98,8 @@ cargo run -- -append test=pi         # timer on: L (priority 1) holds a mutex H 
 cargo run -- -append test=echo       # readlines prints E: ready, reads two lines typed on the console (echoed, backspace erases), prints got: <line> for each
 cargo run -- -append test=bench-spawn # spawnbench spawns nop, waits and closes it 1000 times without and then with two arguments; prints each round trip in ns
 cargo run -- -append test=bench-pipe # ping and pong echo one byte over two pipes 100000 times; prints the round trip in ns
+cargo run -- -append test=threads    # timer on: four threads add to a shared counter (T: count 400000) and are joined with their TLS as exit codes; a process with a spinning and a blocked thread is killed; free frames before/after match
+cargo run -- -append test=bench-threads # threadbench: thread create + join + close 1000 times, then one byte to a thread of the same process and back over two pipes 100000 times; prints each round trip in ns
 cargo run -- -append test=bench-lock # uncontended acquire + release of the ticket and a test-and-set lock in ns; two timer-preempted tasks add 10^7 each under the lock (lock: count 20000000)
 cargo run -- -smp 4 -append test=smp  # cores 1-3 start (PSCI CPU_ON) and print cpu <n>: online; once every core took a timer tick, smp: 4 cpus ticked
 cargo run -p mogfs --example mkfs --target aarch64-apple-darwin -- b.img 1024; cargo run -- -drive file=b.img,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0 -append test=bench-syscalls  # fresh image; prints `bench <call>: <ns> ns` for every syscall's fast path

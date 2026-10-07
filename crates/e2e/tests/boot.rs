@@ -1154,6 +1154,55 @@ fn fuzzer_never_crashes_the_kernel_or_leaks_frames() {
     }
 }
 
+#[test]
+fn threads_share_a_counter_keep_their_tls_and_end_with_their_process() {
+    let (status, lines) = boot(&["-append", "test=threads"]);
+    assert!(
+        !lines.iter().any(|l| l.starts_with("panic:")),
+        "kernel panicked"
+    );
+    let t: Vec<_> = lines.iter().filter(|l| l.starts_with("T: ")).collect();
+    // Each `ldxr`/`stxr` addition counts once, and each joined thread's exit code is the TPIDR_EL0 it started with.
+    // The boot waits for every task, so a thread left running or blocked after a kill, or a process outliving its last
+    // thread, would hang it.
+    assert_eq!(
+        t,
+        [
+            "T: joined 1 2 3 4",
+            "T: count 400000",
+            "T: killed a process with a spinning and a blocked thread",
+            "T: a killed thread joins with KILLED",
+            "T: a thread stays a zombie until its last handle closes",
+            "T: the main thread exits first",
+            "T: the last thread ends the process",
+        ]
+    );
+    assert_no_leak(&lines, "threads");
+    assert!(status.success(), "QEMU exited with {status}");
+}
+
+#[test]
+fn thread_bench_reports_round_trips() {
+    let (status, lines) = boot(&["-append", "test=bench-threads"]);
+    assert!(
+        !lines.iter().any(|l| l.starts_with("panic:")),
+        "kernel panicked"
+    );
+    for op in ["thread", "thread pipe"] {
+        lines
+            .iter()
+            .find_map(|l| {
+                l.strip_prefix(&format!("{op}: "))?
+                    .strip_suffix(" ns/round-trip")
+            })
+            .unwrap_or_else(|| panic!("missing {op} line"))
+            .parse::<u64>()
+            .unwrap();
+    }
+    assert_no_leak(&lines, "bench-threads");
+    assert!(status.success(), "QEMU exited with {status}");
+}
+
 /// QEMU's user networking (guest 10.0.2.15, host 10.0.2.2) with a virtio-net device, then `extra`.
 fn boot_with_nic(extra: &[&str]) -> (ExitStatus, Vec<String>) {
     let nic = [

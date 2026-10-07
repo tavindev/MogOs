@@ -37,8 +37,13 @@ pub const SHELL_ARCHIVE: Rights = INIT_ARCHIVE | DUPLICATE | TRANSFER;
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Object {
     Console,
-    /// The process in this scheduler slot with this generation; a later process in the slot has another.
+    /// The process at this index of the process table with this generation; a later process there has another.
     Process {
+        index: usize,
+        generation: u64,
+    },
+    /// The thread in this scheduler slot with this generation; a later thread in the slot has another.
+    Thread {
         slot: usize,
         generation: u64,
     },
@@ -68,12 +73,12 @@ impl Handles {
         Self([(0, None); MAX_HANDLES])
     }
 
-    /// init's handles: 0 is the console (read, write, duplicate, transfer), 1 is the process itself (kill), in `slot`
+    /// init's handles: 0 is the console (read, write, duplicate, transfer), 1 is the process itself (kill), at `index`
     /// with `generation`, 2 is the boot archive with `archive` (`INIT_ARCHIVE`, or `SHELL_ARCHIVE` for msh).
-    pub fn init(slot: usize, generation: u64, archive: Rights) -> Self {
+    pub fn init(index: usize, generation: u64, archive: Rights) -> Self {
         let mut handles = Self::new();
         handles.0[0].1 = Some((Object::Console, READ | WRITE | DUPLICATE | TRANSFER));
-        handles.0[1].1 = Some((Object::Process { slot, generation }, KILL));
+        handles.0[1].1 = Some((Object::Process { index, generation }, KILL));
         handles.0[2].1 = Some((Object::Archive, archive));
         handles
     }

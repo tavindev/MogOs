@@ -30,7 +30,7 @@ lines and the exit status. `tests/user.rs` runs `crates/user`'s host tests (outs
 - Console input (`boot_with_input`) writes chunk `i` once the output holds the ready marker `i + 1` times, so `shell`
   types one command per `msh> ` prompt and no echo interleaves with msh's output.
 - `assert_no_leak` checks that a scenario's `<test>: free frames <n> before, <n> after` counts match; every scenario
-  of `budget`, `spawn`, `pipe`, `wait`, `pi`, `echo`, `shell`, `bench-fs`, `bench-spawn`, `fuzz`, `bench-syscalls`, `bench-shell` and `sockets` uses it; a new scenario that frees frames should too.
+  of `budget`, `spawn`, `pipe`, `wait`, `pi`, `echo`, `shell`, `bench-fs`, `bench-spawn`, `fuzz`, `bench-syscalls`, `bench-shell`, `threads`, `bench-threads`, `sockets` and `httpd` uses it; a new scenario that frees frames should too.
 - Network scenarios boot with QEMU's user network and a `virtio-net-device` (`boot_with_nic`, devices after `extra`);
   the host side (a UDP echo, `udp_echo`) binds `127.0.0.1:0` so parallel tests never share a port, and the guest
   reaches it as 10.0.2.2. The httpd test forwards a free host port (bound to `127.0.0.1:0`, then released) to the

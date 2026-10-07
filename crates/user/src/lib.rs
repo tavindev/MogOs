@@ -12,6 +12,7 @@ pub const WRITE: u64 = 1 << 1;
 pub const DUPLICATE: u64 = 1 << 3;
 pub const TRANSFER: u64 = 1 << 4;
 pub const EXEC: u64 = 1 << 5;
+pub const WAIT: u64 = 1 << 6;
 /// A NetStack handle's: open connections, and listen.
 pub const CONNECT: u64 = 1 << 8;
 pub const LISTEN: u64 = 1 << 9;
@@ -95,6 +96,7 @@ pub unsafe fn raw(nr: u64, args: [u64; 7]) -> (i64, u64) {
     (x0, x1)
 }
 
+/// Ends the whole process, every thread.
 pub fn exit(code: u64) -> ! {
     syscall(0, [code, 0, 0, 0]);
     loop {
@@ -244,9 +246,9 @@ pub fn pipe() -> (i64, u64) {
     (read, write)
 }
 
-/// Blocks until `process` exits; returns its exit code.
-pub fn wait(process: u64) -> i64 {
-    syscall(8, [process, 0, 0, 0])
+/// Blocks until `handle`'s process exits, or its thread (a join); returns the exit code.
+pub fn wait(handle: u64) -> i64 {
+    syscall(8, [handle, 0, 0, 0])
 }
 
 pub fn mutex() -> i64 {
@@ -262,8 +264,31 @@ pub fn unlock(mutex: u64) -> i64 {
     syscall(11, [mutex, 0, 0, 0])
 }
 
-pub fn kill(process: u64) -> i64 {
-    syscall(12, [process, 0, 0, 0])
+/// Ends a process, or a thread (its process ends with its last thread); `wait` then reports `KILLED`.
+pub fn kill(handle: u64) -> i64 {
+    syscall(12, [handle, 0, 0, 0])
+}
+
+/// Starts a thread of this process at `entry(arg)` with SP = `stack` and TPIDR_EL0 = `tls`, at the caller's
+/// priority; returns a handle to it (wait joins it, kill, duplicate, transfer).
+pub fn thread(entry: extern "C" fn(u64) -> !, stack: u64, tls: u64, arg: u64) -> i64 {
+    syscall(18, [entry as usize as u64, stack, tls, arg])
+}
+
+/// Ends the calling thread; its process ends with its last thread. A join reports the low 8 bits of `code`.
+pub fn thread_exit(code: u64) -> ! {
+    syscall(19, [code, 0, 0, 0]);
+    loop {
+        core::hint::spin_loop()
+    }
+}
+
+/// This thread's TPIDR_EL0, as `thread` set it.
+pub fn tls() -> u64 {
+    let tls;
+    // SAFETY: reading TPIDR_EL0 has no side effects.
+    unsafe { asm!("mrs {}, tpidr_el0", out(reg) tls, options(nomem, nostack)) };
+    tls
 }
 
 pub fn mkdir(dir: u64, path: &[u8]) -> i64 {
@@ -299,17 +324,17 @@ pub fn rename(from_dir: u64, from: &[u8], to_dir: u64, to: &[u8]) -> i64 {
 
 /// A new TCP socket on the NetStack `net`, with its `CONNECT` and `LISTEN` rights.
 pub fn socket(net: u64) -> i64 {
-    syscall(18, [net, 0, 0, 0])
+    syscall(20, [net, 0, 0, 0])
 }
 
 /// Sets the local port.
 pub fn bind(socket: u64, port: u16) -> i64 {
-    syscall(19, [socket, port.into(), 0, 0])
+    syscall(21, [socket, port.into(), 0, 0])
 }
 
 /// Listens on the bound port.
 pub fn listen(socket: u64) -> i64 {
-    syscall(20, [socket, 0, 0, 0])
+    syscall(22, [socket, 0, 0, 0])
 }
 
 /// Starts `op` on `socket`; `io_wait` reports its result with `tag`. `ptr` and `len` are its buffer (`OP_CONNECT`:
@@ -324,7 +349,7 @@ pub unsafe fn io_submit(socket: u64, op: u64, ptr: u64, len: usize, tag: u64) ->
     // SAFETY: as in `syscall`; the caller keeps the buffer as the kernel needs it.
     unsafe {
         asm!("svc #0", inlateout("x0") socket => result, in("x1") op, in("x2") ptr, in("x3") len,
-            in("x4") tag, in("x8") 21, options(nostack))
+            in("x4") tag, in("x8") 23, options(nostack))
     };
     result
 }
@@ -347,7 +372,7 @@ pub fn io_wait() -> (i64, u64) {
     let (result, tag);
     // SAFETY: as in `syscall`; `io_wait` writes only x0 and x1.
     unsafe {
-        asm!("svc #0", lateout("x0") result, lateout("x1") tag, in("x8") 22, options(nostack))
+        asm!("svc #0", lateout("x0") result, lateout("x1") tag, in("x8") 24, options(nostack))
     };
     (result, tag)
 }
@@ -404,7 +429,7 @@ pub fn net_handle() -> u64 {
 
 /// Ends the send side of `socket`'s connection.
 pub fn shutdown(socket: u64) -> i64 {
-    syscall(23, [socket, 0, 0, 0])
+    syscall(25, [socket, 0, 0, 0])
 }
 
 /// Nanoseconds on the virtual counter.
