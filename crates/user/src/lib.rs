@@ -9,6 +9,7 @@ pub const CONSOLE: u64 = 0;
 
 pub const READ: u64 = 1 << 0;
 pub const WRITE: u64 = 1 << 1;
+pub const DUPLICATE: u64 = 1 << 3;
 pub const TRANSFER: u64 = 1 << 4;
 
 /// `open` flags: create a missing file; empty the file.
@@ -26,6 +27,7 @@ pub const EIO: i64 = -5;
 pub const E2BIG: i64 = -7;
 pub const ENOEXEC: i64 = -8;
 pub const EBADF: i64 = -9;
+pub const EAGAIN: i64 = -11;
 pub const ENOMEM: i64 = -12;
 pub const EACCES: i64 = -13;
 pub const EFAULT: i64 = -14;
@@ -34,11 +36,15 @@ pub const EEXIST: i64 = -17;
 pub const ENOTDIR: i64 = -20;
 pub const EISDIR: i64 = -21;
 pub const EINVAL: i64 = -22;
+pub const ENFILE: i64 = -23;
 pub const EMFILE: i64 = -24;
 pub const EFBIG: i64 = -27;
 pub const ENOSPC: i64 = -28;
 pub const EROFS: i64 = -30;
+pub const EPIPE: i64 = -32;
 pub const EDEADLK: i64 = -35;
+pub const ENAMETOOLONG: i64 = -36;
+pub const ENOSYS: i64 = -38;
 pub const ENOTEMPTY: i64 = -39;
 
 /// The exit code `wait` reports for a killed process.
@@ -52,6 +58,22 @@ fn syscall(nr: u64, args: [u64; 4]) -> i64 {
             in("x3") args[3], in("x8") nr, options(nostack))
     };
     result
+}
+
+/// Syscall `nr` with `args` in x0-x6; returns x0 and x1. For the fuzzer and the syscall benchmark.
+///
+/// # Safety
+///
+/// The kernel writes whatever user memory `nr` and `args` name: none of it may be memory Rust references.
+pub unsafe fn raw(nr: u64, args: [u64; 7]) -> (i64, u64) {
+    let (x0, x1);
+    // SAFETY: the caller keeps the memory the kernel writes unreferenced; the kernel clobbers only x0 and x1.
+    unsafe {
+        asm!("svc #0", inlateout("x0") args[0] => x0, inlateout("x1") args[1] => x1, in("x2") args[2],
+            in("x3") args[3], in("x4") args[4], in("x5") args[5], in("x6") args[6], in("x8") nr,
+            options(nostack))
+    };
+    (x0, x1)
 }
 
 pub fn exit(code: u64) -> ! {

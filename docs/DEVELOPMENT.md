@@ -65,6 +65,7 @@ cargo run -- -append test=pi         # timer on: L (priority 1) holds a mutex H 
 cargo run -- -append test=echo       # readlines prints E: ready, reads two lines typed on the console (echoed, backspace erases), prints got: <line> for each
 cargo run -- -append test=bench-spawn # spawnbench spawns nop, waits and closes it 1000 times without and then with two arguments; prints each round trip in ns
 cargo run -- -append test=bench-pipe # ping and pong echo one byte over two pipes 100000 times; prints the round trip in ns
+cargo run -p mogfs --example mkfs --target aarch64-apple-darwin -- fuzz.img 1024; cargo run -- -drive file=fuzz.img,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0 -append "test=fuzz fuzz=7,1000000"  # syscall fuzzer on a fresh image: seed 7, a million calls ("Testing strategy")
 cargo run -- -drive file=disk.img,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0 -append test=disk  # attach a raw image (`truncate -s 1M disk.img`); every boot prints `disk: <n> blocks` (`disk: none` without a disk); the first writes blocks 1-2 and flushes (disk: wrote), the next reads them back (disk: read ok); a failed flush prints disk: flush failed
 cargo run -- -drive file=disk.img,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0 -append test=bench-disk  # image of at least 8 MiB; sequential write+flush and read throughput in MiB/s, 4 KiB and 256 KiB per request
 cargo run -p mogfs --example mkfs --target aarch64-apple-darwin -- disk.img 16384  # empty 64 MiB MogFS image
@@ -75,6 +76,23 @@ cargo build --release  # LTO release image
 ```
 
 Quit a hung QEMU with `Ctrl-A` then `X`.
+
+## Testing strategy
+
+- End to end first: a behavior is proven by a QEMU boot scenario in `crates/e2e/tests/boot.rs` that asserts exact
+  serial lines. Host tests (a crate's public API, `cargo test-host`) cover the edge cases a boot reaches only slowly or
+  not at all: corrupt and crafted images, power cuts, table limits, argument checks.
+- Fuzzing: `test=fuzz` boots `crates/user/src/bin/fuzz.rs`, which makes seeded random syscalls (every number, unknown
+  ones too) with boundary and random arguments and handles, and fails on any result that is not a count or a known
+  errno. `fuzzer_never_crashes_the_kernel_or_leaks_frames` runs seeds 1-3, 20000 calls each, each on a fresh
+  1024-block image, and asserts no `panic:`, no `fault:`, the `fuzz: seed <s>: <n> calls ok` line and no leak.
+  Longer runs by hand: the `fuzz=<seed>,<calls>[,<from>]` bootarg (inner loop above); `<from>` prints every call from
+  that one on with its result, before making it, so a crash's last `fuzz: call` line is the culprit. The same seed and
+  calls on a fresh image of the same size replay the same calls. A kernel bug the fuzzer finds is fixed with a
+  failing scenario first, never skipped in the fuzzer.
+- Leak checks: every scenario that frees frames prints `<test>: free frames <n> before, <n> after` around all it
+  spawned, and its e2e test asserts the two match (`assert_no_leak`).
+- Speed: per-call benchmarks run base and new kernels interleaved; any per-call slowdown fails (`docs/BENCHMARKS.md`).
 
 ## Using the shell
 

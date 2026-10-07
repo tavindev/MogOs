@@ -512,12 +512,14 @@ fn executable(
     Ok((file, elf.segments(), entry))
 }
 
-/// Queues `executable` from boot context with init's handles, a budget of `budget` frames and `priority`.
+/// Queues `executable` from boot context with init's handles, a budget of `budget` frames, `priority` and `args`.
 fn spawn_init(
     executable: (&[u8], impl Iterator<Item = Segment>, u64),
     budget: usize,
     priority: u8,
+    args: &[u8],
 ) -> Result<(), i64> {
+    let argc = kernel::syscall::argc(args)?;
     let irq = arch::irq::disable();
     // SAFETY: IRQs are masked on the only core, so this is the sole reference.
     let Kernel {
@@ -538,7 +540,7 @@ fn spawn_init(
             executable,
             Budget::new(budget),
             init,
-            (&[], 0),
+            (args, argc),
         )
     });
     arch::irq::restore(irq);
@@ -807,12 +809,12 @@ impl kernel::Board for QemuVirt {
             size: code.len() as u64,
             writable: false,
         };
-        spawn_init((code, [segment].into_iter(), entry), budget, 0)
+        spawn_init((code, [segment].into_iter(), entry), budget, 0, &[])
     }
 
-    fn spawn_archived(&mut self, name: &str, budget: usize) -> Result<(), i64> {
+    fn spawn_archived(&mut self, name: &str, budget: usize, args: &[u8]) -> Result<(), i64> {
         let file = kernel::cpio::find(ARCHIVE, name.as_bytes()).ok_or(ENOENT)?;
-        spawn_init(executable(file)?, budget, PRIORITIES - 1)
+        spawn_init(executable(file)?, budget, PRIORITIES - 1, args)
     }
 
     fn tasks(&self) -> usize {

@@ -843,3 +843,30 @@ fn spawn_bench_reports_round_trip() {
     assert_no_leak(&lines, "bench-spawn");
     assert!(status.success(), "QEMU exited with {status}");
 }
+
+/// Calls the fuzzer makes per seed, sized to the test-host time budget under TCG.
+const FUZZ_CALLS: u64 = 20000;
+
+#[test]
+fn fuzzer_never_crashes_the_kernel_or_leaks_frames() {
+    for seed in [1, 2, 3] {
+        // Each seed boots on a fresh image, so `test=fuzz fuzz=<seed>,<calls>` reproduces it exactly.
+        let image = mogfs_image(&format!("fuzz-{seed}"), 1024);
+        let (status, lines) =
+            boot_with_disk(&image, &format!("test=fuzz fuzz={seed},{FUZZ_CALLS}"));
+        std::fs::remove_file(&image).unwrap();
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.starts_with("panic:") || l.starts_with("fault:")),
+            "seed {seed}: the kernel panicked or the fuzzer faulted"
+        );
+        let ok = format!("fuzz: seed {seed}: {FUZZ_CALLS} calls ok");
+        assert!(
+            lines.iter().any(|l| l.starts_with(&ok)),
+            "seed {seed}: missing line: {ok}"
+        );
+        assert_no_leak(&lines, "fuzz");
+        assert!(status.success(), "QEMU exited with {status}");
+    }
+}

@@ -14,8 +14,9 @@ board crate).
   `docs/DEVELOPMENT.md`. `cargo test-host` does not build it; its lib's host test (the command table) runs with the
   `cargo test --manifest-path` command there.
 - `#![no_std]` (the lib `cfg_attr(not(test))`), `#![no_main]`, no dependencies. `unsafe` only in `src/lib.rs` for
-  `svc`, `map`'s slice and `start`'s argument slice, and in bins for `#[unsafe(no_mangle)]` and the one call to the
-  `unsafe fn start`; each block with a `// SAFETY:`.
+  `svc`, `map`'s slice and `start`'s argument slice, and in bins for `#[unsafe(no_mangle)]`, the one call to the
+  `unsafe fn start`, and `fuzz`'s calls to `unsafe fn raw` (any syscall, all seven arguments; the caller keeps what the
+  kernel may write unreferenced); each block with a `// SAFETY:`.
 - A program that takes arguments defines `_start(argc, _, len)` and calls `unsafe { start(argc, len, main) }` with
   its x0 and x2, which hands `main` the arguments as `&[&[u8]]` (the kernel puts them at the end of the top stack page,
   `STACK_TOP`) and exits with its result; boot-spawned programs get none.
@@ -55,7 +56,8 @@ board crate).
   `ping` / `pong` (`pipe_bench_reports_round_trip`), `readlines` (`console_reads_edited_lines_typed_ahead`), `msh`
   and its programs `ls`, `mkdir`, `touch`, `write`, `cat`, `rm`, `mv`, `echo`, `sync`
   (`shell_files_survive_a_reboot_only_once_synced`, `sync_reports_a_failed_flush`),
-  `fsbench` (`fs_bench_reports_round_trips`), `spawnbench` / `nop` (`spawn_bench_reports_round_trip`), all in `crates/e2e/tests/boot.rs`.
+  `fsbench` (`fs_bench_reports_round_trips`), `spawnbench` / `nop` (`spawn_bench_reports_round_trip`), `fuzz` / `nop`
+  (`fuzzer_never_crashes_the_kernel_or_leaks_frames`), all in `crates/e2e/tests/boot.rs`.
 - Clippy and fmt via the `crates/user` commands in `docs/DEVELOPMENT.md` must be clean.
 
 ---

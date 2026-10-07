@@ -58,9 +58,10 @@ pub trait Board {
     /// its tables, pages and kernel stack, and init's handles (`Handles::init`), at priority 0 like the boot context;
     /// `ENOMEM` or `EAGAIN` (no free slot).
     fn spawn_user(&mut self, program: Program, budget: usize) -> Result<(), i64>;
-    /// As `spawn_user`, for the boot archive's executable `name`, at the top priority (`PRIORITIES - 1`); `ENOENT` or
-    /// `ENOEXEC` if it is missing or invalid.
-    fn spawn_archived(&mut self, name: &str, budget: usize) -> Result<(), i64>;
+    /// As `spawn_user`, for the boot archive's executable `name`, at the top priority (`PRIORITIES - 1`), with `args`
+    /// as `spawn` passes them (each ending in a NUL); `ENOENT` or `ENOEXEC` if it is missing or invalid, `E2BIG` or
+    /// `EINVAL` for bad `args`.
+    fn spawn_archived(&mut self, name: &str, budget: usize, args: &[u8]) -> Result<(), i64>;
     /// Tasks in the run queue, the boot context included.
     fn tasks(&self) -> usize;
     /// The board's block device, set up with memory from the frame allocator; call once, after `init_frames`.
@@ -108,6 +109,8 @@ const BOOT_BUDGET: usize = 25;
 const WAITER_BUDGET: usize = 28;
 /// `pi`'s 9 frames, its two pipes' pages and its three children's 9 each.
 const PI_BUDGET: usize = 38;
+/// `fuzz`'s own frames, its scratch memory and `map`s, its pipes and the `nop` children it spawns.
+const FUZZ_BUDGET: usize = 160;
 
 /// `reserved` lists physical ranges in use (kernel image, DTB).
 pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> ! {
@@ -183,6 +186,7 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
                 run_archived(board, "pi", "pi", PI_BUDGET);
             }
             "test=bench-pipe" => pipe_bench(board),
+            "test=fuzz" => fuzz(board, bootargs),
             "test=budget" => {
                 let before = board.free_frames();
                 run_alone(board, Program::Budget);
@@ -269,13 +273,43 @@ fn user_demo<B: Board>(board: &mut B) {
 /// and after as `<test>: free frames <n> before, <n> after`.
 fn run_archived<B: Board>(board: &mut B, test: &str, program: &str, budget: usize) {
     let before = board.free_frames();
-    board.spawn_archived(program, budget).expect("spawn");
+    board.spawn_archived(program, budget, &[]).expect("spawn");
     wait(board);
     let after = board.free_frames();
     let _ = writeln!(
         board.console(),
         "{test}: free frames {before} before, {after} after"
     );
+}
+
+/// Runs `start`, then the other tasks until every one has exited; prints the free frames before and after as
+/// `run_archived` does.
+fn run_checked<B: Board>(board: &mut B, test: &str, start: impl FnOnce(&mut B)) {
+    let before = board.free_frames();
+    start(board);
+    wait(board);
+    let after = board.free_frames();
+    let _ = writeln!(
+        board.console(),
+        "{test}: free frames {before} before, {after} after"
+    );
+}
+
+/// Runs the boot archive's `fuzz` with the bootarg `fuzz=<seed>,<calls>[,<trace from>]` as its arguments (its
+/// defaults without one).
+fn fuzz<B: Board>(board: &mut B, bootargs: &str) {
+    let mut args = b"fuzz\0".to_vec();
+    if let Some(value) = bootargs
+        .split_whitespace()
+        .find_map(|a| a.strip_prefix("fuzz="))
+    {
+        args.extend(value.split(',').flat_map(|v| v.bytes().chain([0])));
+    }
+    run_checked(board, "fuzz", |board| {
+        board
+            .spawn_archived("fuzz", FUZZ_BUDGET, &args)
+            .expect("spawn")
+    });
 }
 
 /// Runs `program` until it exits; the timer stays off so nothing preempts it.
@@ -308,7 +342,9 @@ fn yield_bench<B: Board>(board: &mut B) {
 /// and exit are well under 1% of it.
 fn pipe_bench<B: Board>(board: &mut B) {
     let start = board.uptime_us();
-    board.spawn_archived("ping", BOOT_BUDGET).expect("spawn");
+    board
+        .spawn_archived("ping", BOOT_BUDGET, &[])
+        .expect("spawn");
     wait(board);
     let ns = (board.uptime_us() - start) * 1000 / PIPE_ROUND_TRIPS;
     let _ = writeln!(board.console(), "pipe: {ns} ns/round-trip");
