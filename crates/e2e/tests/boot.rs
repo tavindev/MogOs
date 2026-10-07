@@ -6,7 +6,8 @@ use std::sync::{Arc, Mutex, Once};
 use std::thread::{self, JoinHandle, sleep};
 use std::time::{Duration, Instant};
 
-/// Builds the kernel, boots it in QEMU with `extra` arguments, and returns the exit status and serial lines.
+/// Builds the kernel, boots it in QEMU with `extra` arguments (`-cpu cortex-a72` unless they name a `-cpu`), and
+/// returns the exit status and serial lines.
 fn boot(extra: &[&str]) -> (ExitStatus, Vec<String>) {
     boot_with_input(extra, None)
 }
@@ -26,12 +27,14 @@ fn boot_with_input(extra: &[&str], input: Option<(&str, &[&[u8]])>) -> (ExitStat
         assert!(build.success(), "kernel build failed");
     });
 
+    let cpu = match extra.contains(&"-cpu") {
+        true => &[][..],
+        false => &["-cpu", "cortex-a72"][..],
+    };
     let mut qemu = Command::new("qemu-system-aarch64")
+        .args(["-M", "virt"])
+        .args(cpu)
         .args([
-            "-M",
-            "virt",
-            "-cpu",
-            "cortex-a72",
             "-m",
             "128M",
             "-global",
@@ -126,6 +129,7 @@ fn boots_and_powers_off() {
         "mmu: on",
         "heap: ok",
         "disk: none",
+        "spec: v1 vulnerable, v2 vulnerable, bhb not mitigated (v2 vulnerable), ssb vulnerable, meltdown not affected, bse vulnerable, table plain on 1/1 cores",
     ] {
         assert!(
             lines.iter().any(|l| l == expected),
@@ -271,6 +275,44 @@ fn syscall_bench_reports_round_trip() {
         .parse::<u64>()
         .unwrap();
     assert!(status.success(), "QEMU exited with {status}");
+}
+
+/// Lines from QEMU 9.2.1's models (`target/arm/tcg/cpu64.c`): cortex-a72 is r0p3 without CSV2 or firmware, cortex-a76
+/// has CSV2, CSV3 and SSBS but no SB, max has CSV2_3, CSV3, SSBS2 and SB.
+#[test]
+fn spec_line_matches_the_cpu() {
+    for (cpu, spec) in [
+        (
+            "cortex-a72",
+            "v2 vulnerable, bhb not mitigated (v2 vulnerable), ssb vulnerable, meltdown not affected, bse vulnerable, table plain",
+        ),
+        (
+            "cortex-a76",
+            "v2 not affected, bhb mitigated, ssb mitigated, meltdown not affected, bse not affected, table loop24-dsb",
+        ),
+        (
+            "max",
+            "v2 not affected, bhb not affected, ssb mitigated, meltdown not affected, bse not affected, table plain",
+        ),
+    ] {
+        let args = [
+            "-cpu",
+            cpu,
+            "-smp",
+            "4",
+            "-append",
+            "test=bench-syscall test=pipe",
+        ];
+        let (status, lines) = boot(&args);
+        let expected = format!("spec: v1 vulnerable, {spec} on 4/4 cores");
+        assert!(lines.contains(&expected), "{cpu}: missing line: {expected}");
+        assert!(
+            lines.iter().any(|l| l.starts_with("syscall: ")),
+            "{cpu}: missing syscall line"
+        );
+        assert_no_leak(&lines, "pipe");
+        assert!(status.success(), "{cpu}: QEMU exited with {status}");
+    }
 }
 
 #[test]

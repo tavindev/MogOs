@@ -18,9 +18,9 @@ use core::panic::PanicInfo;
 use core::ptr::{self, NonNull};
 use core::slice;
 use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize};
 
-use arch::{Guard, Lock, MemoryType, l1_block};
+use arch::{Conduit, Guard, Lock, MemoryType, l1_block};
 use dtb::Dtb;
 use fs::FsDisk;
 use kernel::console::Line;
@@ -82,6 +82,8 @@ static TICKED: AtomicUsize = AtomicUsize::new(0);
 static SMP_TEST: AtomicBool = AtomicBool::new(false);
 /// The DTB's cores, at most `MAX_CPUS`; `start_cpus` starts them all or panics.
 static CPUS: AtomicUsize = AtomicUsize::new(1);
+/// The DT's PSCI conduit for SMCCC calls: 0 none, 1 `hvc`, 2 `smc`; stored before any secondary starts.
+static CONDUIT: AtomicU8 = AtomicU8::new(0);
 /// Set once `Board::disk` handed out the block device.
 static DISK_TAKEN: AtomicBool = AtomicBool::new(false);
 /// QEMU `virt`'s 32 virtio-mmio transports: the first one's base, and the stride between them.
@@ -374,6 +376,26 @@ impl kernel::Board for QemuVirt {
     fn ticked_cpus(&self) -> usize {
         TICKED.load(Relaxed).count_ones() as usize
     }
+
+    fn report_speculation(&mut self) {
+        arch::record_speculation(conduit());
+        let spec = loop {
+            if let Some(spec) = arch::speculation(CPUS.load(Relaxed)) {
+                break spec;
+            }
+            spin_loop();
+        };
+        let _ = writeln!(self.console, "spec: {spec}");
+    }
+}
+
+/// The conduit `kmain` stored in `CONDUIT`.
+fn conduit() -> Option<Conduit> {
+    match CONDUIT.load(Relaxed) {
+        1 => Some(Conduit::Hvc),
+        2 => Some(Conduit::Smc),
+        _ => None,
+    }
 }
 
 unsafe extern "C" {
@@ -387,8 +409,6 @@ extern "C" fn kmain() -> ! {
     let entry_us = arch::uptime_us();
     // SAFETY: core 0, MMU off, before any atomic RMW; MMIO is in GiB 0, the image, stacks and DTB in RAM in GiB 1.
     unsafe { arch::enable_mmu(&KERNEL_L1) };
-    arch::install_vectors();
-    arch::timer::allow_user_counter();
 
     // SAFETY: RAM base is mapped RAM; we only read the 8-byte FDT header there.
     let header = unsafe { slice::from_raw_parts(DTB.0 as *const u8, 8) };
@@ -401,6 +421,14 @@ extern "C" fn kmain() -> ! {
     let dtb_range = DTB..PhysAddr(DTB.0 + size as u64);
 
     let dtb = Dtb::new(blob).expect("bad DTB");
+    let method = match dtb.psci_method() {
+        Some("hvc") => 1,
+        Some("smc") => 2,
+        _ => 0,
+    };
+    CONDUIT.store(method, Relaxed);
+    arch::install_vectors(conduit());
+    arch::timer::allow_user_counter();
     let gic = dtb.gic().expect("no GICv2 in DTB");
     GIC_DIST.store(gic.0.0, Relaxed);
     GIC_CPU.store(gic.1.0, Relaxed);
@@ -453,7 +481,8 @@ fn start_cpu(cpu: usize) {
 /// its GIC CPU interface, timer PPI and reschedule SGI, and sleeps; it runs no task yet.
 #[unsafe(no_mangle)]
 extern "C" fn kmain_secondary() -> ! {
-    arch::install_vectors();
+    arch::install_vectors(conduit());
+    arch::record_speculation(conduit());
     if arch::cpu() == 1 {
         (2..CPUS.load(Relaxed)).for_each(start_cpu);
     }

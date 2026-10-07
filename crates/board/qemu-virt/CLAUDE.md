@@ -14,10 +14,11 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
 
 ## Responsibilities
 
-- `kmain`: turns on the MMU (`arch::enable_mmu`, first), reads the DTB at RAM base and its core count (at most
+- `kmain`: turns on the MMU (`arch::enable_mmu`, first), reads the DTB at RAM base, stores its PSCI `method` (`CONDUIT`)
+  and installs core 0's vectors with it (`arch::install_vectors`), reads its core count (at most
   `MAX_CPUS`), routes `UART_IRQ` to core 0 (`GICD_ITARGETSR`, else a GIC with several cores delivers it nowhere), builds
   `QemuVirt`, calls `kernel::run` with the image and DTB reserved. `Board::start_cpus`, the last step of boot, starts core 1
-  with PSCI `CPU_ON` without waiting, and core 1 starts the rest (a refused `CPU_ON` panics). `kmain_secondary`: a started core enables its GIC CPU
+  with PSCI `CPU_ON` without waiting, and core 1 starts the rest (a refused `CPU_ON` panics). `kmain_secondary`: a started core installs its own vectors and records them, enables its GIC CPU
   interface, timer PPI and `RESCHEDULE_SGI` (its banked `ISENABLER0`) and idles in `wfi`; only under `test=smp`
   (`SMP_TEST`) does it print `cpu <n>: online` and arm its timer. It runs no task yet (step 25b).
 - `KERNEL: Lock<Kernel>` (`Scheduler` with its process table, `FrameAllocator`, `Pipes`, `Mutexes`, console `Line`,
@@ -29,7 +30,8 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
   that `dispatch` returns (user buffers, pages, frames, wake/block). `board_unlock`, called by the trap exit, releases `KERNEL`.
 - `Board::console` writes (`Console`) hold `CONSOLE` for a whole `write_fmt`, so no other `Console` line splits it (the unlocked writers below can); it is the PL011
   at `UART0`, like every other UART access. `test=bench-lock`'s `lock_round_trips` (ticket vs test-and-set) and `add_locked`;
-  `test=smp`'s `cpus` and `ticked_cpus` (`TICKED`, a bit per core set on each tick).
+  `test=smp`'s `cpus` and `ticked_cpus` (`TICKED`, a bit per core set on each tick). `report_speculation` records core 0's
+  vectors, waits until every started core has recorded its own (`arch::speculation`), then prints `spec: ...`.
 - Processes and threads: `spawn_process`, `spawn`, `thread`, `map` (`src/process.rs`); `end_thread`, `end_process`,
   `exit_thread`, `exit_process`, `kill`, `release`, and `switch`, which moves SP_EL0 and TPIDR_EL0 on every switch with
   a user thread on either side and writes TTBR0 only when the process changes (`src/trap.rs`).
@@ -73,7 +75,7 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
 - Locks need the MMU on (exclusives), so `kmain` calls `enable_mmu` first, before any output, trap or secondary core.
 - Only core 0 runs tasks: `board_irq` switches only there, since the scheduler has one `current`. Every core still
   takes `KERNEL` in its trap hooks. IRQs dispatch on `iar & 0x3ff` and EOI the full IAR.
-- Everything a secondary reads (`GIC_DIST`, `GIC_CPU`, `CPUS`, `SMP_TEST`) is stored before its `CPU_ON`, which `dsb ish` precedes.
+- Everything a secondary reads (`GIC_DIST`, `GIC_CPU`, `CPUS`, `SMP_TEST`, `CONDUIT`) is stored before its `CPU_ON`, which `dsb ish` precedes.
 - A process's index is its ASID (`MAX_PROCESSES <= 256`, const-asserted); index 0 is the kernel, whose boot table
   keeps ASID 0 (`switch`). Tables: `MAX_TASKS` (8) threads, the boot context included, and `MAX_PROCESSES` (8)
   processes, the kernel included.

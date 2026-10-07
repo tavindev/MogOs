@@ -127,3 +127,49 @@ run.
 ## What was done
 
 Filled in as each step lands.
+
+- Step 60a, speculation report and Spectre-BHB: `arch`'s vectors (`trap.rs`) are 16 static tables built by `.irp`
+  macros, 2 KiB apart in `spec::TABLES` order: plain, `clrbhb` (`hint #22; isb`), firmware workaround 3 by `hvc` and
+  by `smc` (a static table cannot be patched for the conduit, so one per conduit; x2 and x3 go back from their frame
+  slots), and the branch loop for each of Linux's k (8, 11, 24, 32, 38, 132) with `dsb nsh; isb` and with `sb`. Only
+  entries 8-15 run the mitigation, after `stp x0, x1` and before the first branch, the count an immediate (checked
+  in the disassembly: 16 tables, entries 0-7 identical to plain, one shared `.Ltrap`). `arch::install_vectors(conduit)`
+  (`spec.rs`) runs on each core: it decides in Linux v6.18's order (`proton-pack.c`, read 2026-10-07) from that
+  core's MIDR and ID registers, reading each register and asking the firmware only when the decision reaches it, writes
+  `VBAR_EL1` once and runs `msr ssbs, #0` where FEAT_SSBS exists (`SCTLR_EL1.DSSBS` stays 0). Firmware discovery is
+  Linux's `arm_smccc_1_1_get_conduit`: PSCI_FEATURES(SMCCC_VERSION), then SMCCC_VERSION at least 1.1, then
+  ARCH_FEATURES, over the DT's `/psci` `method` (`Dtb::psci_method`, kept in the board's `CONDUIT` for the
+  secondaries). One reconciliation of the step text with its invariant: Linux v6.18 gives an unlisted MIDR k = 0, then
+  tries workaround 3, then reports vulnerable; here the order is listed k, then workaround 3, then the largest k (132,
+  printed as "unlisted cpu, largest k"), so A73 and A75 (on no k list, and Arm's BSE bulletin names workaround 3 as
+  their fix) take the firmware. Workarounds 1 and 2 are discovered but not called until phase 11, so they print as
+  "vulnerable (firmware workaround 1 not called)" and "vulnerable"; workaround 2 answering not required prints "not
+  affected". Meltdown uses Linux's `kpti_safe_list` and CSV3 (no KPTI exists, so anything else is vulnerable); BSE
+  follows Arm bulletin 110360 (A57, A72 before r1p0, A73, A75; mitigated only by the firmware table).
+  `arch::record_speculation` stores each core's record (the table read back from `VBAR_EL1`, the v2, BHB, SSB,
+  Meltdown and BSE states, packed so the worst core's record is the largest); secondaries record right after they
+  install, core 0 in the new `Board::report_speculation`, which `kernel::run` calls after the `boot:` line: it waits
+  until every started core has recorded and prints `spec: ... table <name> on <same>/<cores> cores` for the worst
+  core. `kmain` now reads the DTB before installing core 0's vectors. e2e `spec_line_matches_the_cpu` (TCG, `-smp 4`,
+  then `test=bench-syscall test=pipe`; the harness passes `-cpu cortex-a72` only when a scenario names no `-cpu`):
+  `cortex-a72` prints `v2 vulnerable, bhb not mitigated (v2 vulnerable), ssb vulnerable, meltdown not affected, bse
+  vulnerable, table plain on 4/4 cores`, `cortex-a76` `v2 not affected, bhb mitigated, ssb mitigated, meltdown not
+  affected, bse not affected, table loop24-dsb on 4/4 cores`, `max` `v2 not affected, bhb not affected, ssb
+  mitigated, meltdown not affected, bse not affected, table plain on 4/4 cores` (each after `v1 vulnerable`, which
+  60b turns); `boots_and_powers_off` pins the `cortex-a72` line at one core. The `clrbhb` and firmware tables are
+  chosen by no QEMU model, so the disassembly is their only check. Under hvf the guest shows MIDR `0x410fd083` (A72
+  r0p3) and the M4's `ID_AA64PFR0_EL1` `0x1101000010110011` (CSV2 1, CSV3 1), with PFR1, ISAR1, ISAR2 and MMFR1 0,
+  so it prints `v2 not affected, bhb mitigated, ssb vulnerable, meltdown not affected, bse vulnerable, table
+  loop8-dsb`. Benchmarks (hvf, base `b08f7fd`, 63 interleaved boots per core count, load 6 to 12; median/min
+  before -> after; the hvf numbers are the A72 k = 8 loop with `dsb nsh; isb` run on the M4, not an A72's cost):
+  `-smp 1` syscall 32/31 -> 45/44 ns, every `bench-syscalls` call about +13 ns (`enosys` 35.1/33.8 -> 48.4/46.5,
+  `open` 84.3/81.0 -> 102.5/94.9, `readdir` 90.8/87.3 -> 106.1/101.6, `file-read` 75.5/71.9 -> 89.1/85.4), pipe
+  357/352 -> 437/430 ns (six traps per round trip), yield 80/78 -> 80/78 ns (EL1 traps run no loop), boot 213/192 ->
+  222/201 us; `-smp 4` syscall 32/30 -> 45/44, pipe 358/351 -> 436/428, yield 80/77 -> 80/77, boot 237/212 -> 242/209.
+  Pre-declared at or a little under Linux's 22.4 ns per trap: measured 13 ns. Boot: core 0's install costs 5.2 us cold
+  (3.6 us warm), of which 3.5 us are the five ID-register reads the decision needs on this CPU (PFR0, MMFR1, ISAR2,
+  ISAR1, PFR1), each an hvf trap of about 0.7 us; the first cut also asked the firmware on the boot path (one
+  PSCI_FEATURES `hvc`, 5.5 us) and measured +16 us, so the report-only work (SSB's workaround 2, the record) moved
+  after the `boot:` line. TCG instructions (`-icount shift=0`, exact): `cortex-a76` syscall 218 -> 293 (+75: `mov`,
+  24 x 3, `dsb`, `isb`), pipe 2480 -> 2930 (six traps); `cortex-a72` picks the plain table, so 218 -> 218; the hvf
+  k = 8 table runs 27 more instructions per EL0 trap.

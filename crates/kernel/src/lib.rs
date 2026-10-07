@@ -88,6 +88,9 @@ pub trait Board {
     fn cpus(&self) -> usize;
     /// Cores that have taken a timer tick.
     fn ticked_cpus(&self) -> usize;
+    /// Prints the `spec:` line (speculative-execution vulnerabilities and the vector table) for the worst core, once
+    /// every core `start_cpus` started has installed its vectors.
+    fn report_speculation(&mut self);
 }
 
 /// Hand-written asm user programs the board provides; newer ones are ELF files in the boot archive.
@@ -192,6 +195,7 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
     board.start_cpus(bootargs.split_whitespace().any(|a| a == "test=smp"));
     let boot_us = board.uptime_us();
     let _ = writeln!(board.console(), "boot: {boot_us} us");
+    board.report_speculation();
     match blocks {
         Some(blocks) => writeln!(board.console(), "disk: {blocks} blocks"),
         None => writeln!(board.console(), "disk: none"),

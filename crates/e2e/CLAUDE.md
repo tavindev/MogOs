@@ -3,9 +3,9 @@
 ## What this crate is
 
 Host-only integration tests: `tests/boot.rs` builds `qemu-virt`, boots `mog_os` in `qemu-system-aarch64`
-(`virt`, `cortex-a72`, 128 MiB, `-global virtio-mmio.force-legacy=false`, `-global virtio-mmio.ioeventfd=off`;
-`-append test=<name>` for every scenario but plain boot; one core, except `-smp 4` for `test=smp` and the second echo
-scenario), and asserts on the serial
+(`virt`, `cortex-a72` unless the scenario passes its own `-cpu`, 128 MiB, `-global virtio-mmio.force-legacy=false`, `-global virtio-mmio.ioeventfd=off`;
+`-append test=<name>` for every scenario but plain boot; one core, except `-smp 4` for `test=smp`, the second echo
+scenario and `spec_line_matches_the_cpu`, which boots TCG `cortex-a72`, `cortex-a76` and `max`), and asserts on the serial
 lines and the exit status. `tests/user.rs` runs `crates/user`'s host tests (outside the workspace) through a nested
 `cargo test`, so `cargo test-host` covers them.
 `src/lib.rs` is an empty placeholder (`[lib] test = false`). It is the main test of the project, not a library.
