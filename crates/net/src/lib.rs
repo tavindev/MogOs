@@ -118,8 +118,10 @@ pub struct Counters {
     pub unacceptable: u64,
     /// Challenge ACKs sent (RFC 5961), at most `CHALLENGES` per second per connection.
     pub challenge_acks: u64,
-    /// Half-open connections evicted by a newer SYN.
-    pub syn_evicted: u64,
+    /// SYN-ACKs sent as SYN cookies, because the half-open table was full.
+    pub syn_cookies: u64,
+    /// ACKs to a listener whose cookie failed: forged, for another SYN or expired.
+    pub bad_cookies: u64,
     /// TIME_WAIT entries reused before they expired because the table was full.
     pub time_wait_reused: u64,
 }
@@ -371,7 +373,8 @@ impl<'a> Stack<'a> {
                 self.count_tx(sent);
             }
         }
-        let mut next = None::<u64>;
+        // TCP first: its sends may start an ARP request, whose retry deadline the walk below then reports.
+        let mut next = self.tcp_poll(nic, now);
         for i in 0..self.neighbors.len() {
             let n = self.neighbors[i];
             if n.ip.is_unspecified() || n.tries == 0 {
@@ -390,7 +393,7 @@ impl<'a> Stack<'a> {
             }
             next = Some(next.map_or(due, |t| t.min(due)));
         }
-        earliest(next, self.tcp_poll(nic, now))
+        next
     }
 
     fn handle(&mut self, frame: &[u8], ours: Mac, now: u64, mss: u16) -> Result<(), Reason> {

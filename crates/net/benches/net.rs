@@ -136,14 +136,14 @@ fn receive_path(size: usize) -> f64 {
     start.elapsed().as_nanos() as f64 / (rounds * BATCH) as f64
 }
 
-/// Binds `$stack` to a TCP stack at `$ip` with `$slots` connections of `$ring`-byte rings.
+/// Binds `$stack` to a TCP stack at `$ip` with `$slots` connections of `$ring`-byte rings and `$half_open` entries.
 macro_rules! host {
-    ($stack:ident, $ip:expr, $key:expr, $slots:expr, $ring:expr) => {
+    ($stack:ident, $ip:expr, $key:expr, $slots:expr, $ring:expr, $half_open:expr) => {
         let mut neighbors = [Neighbor::EMPTY; 4];
         let (mut rx, mut tx) = (vec![vec![0u8; $ring]; $slots], vec![vec![0u8; $ring]; $slots]);
         let mut socks: Vec<TcpSocket> =
             rx.iter_mut().zip(tx.iter_mut()).map(|(r, t)| TcpSocket::new(r, t)).collect();
-        let (mut half_open, mut time_wait) = ([HalfOpen::EMPTY; 4], [TimeWait::EMPTY; 4]);
+        let (mut half_open, mut time_wait) = (vec![HalfOpen::EMPTY; $half_open], [TimeWait::EMPTY; 4]);
         let mut $stack = Stack::new(config($ip), &mut neighbors, &mut []).with_tcp(Tcp::new(
             $key,
             &mut socks,
@@ -193,8 +193,8 @@ fn connect(link: &mut sim::Link, a: &mut Stack, b: &mut Stack, listener: TcpId) 
 /// A sends `bytes` to B, which reads as it goes; returns the wall time in ns and the virtual time it took.
 fn tcp_transfer(faults: sim::Faults, seed: u64, ring: usize, bytes: usize) -> (f64, u64) {
     let mut link = sim::Link::new(seed, faults, [MAC_A, MAC_B]);
-    host!(a, IP_A, [seed, 1], 1, ring);
-    host!(b, IP_B, [seed, 2], 2, ring);
+    host!(a, IP_A, [seed, 1], 1, ring, 4);
+    host!(b, IP_B, [seed, 2], 2, ring, 4);
     let listener = b.listen(80).unwrap();
     let (ca, cb) = connect(&mut link, &mut a, &mut b, listener);
     let (data, mut buf) = (vec![0x5a; 1 << 16], vec![0u8; 1 << 16]);
@@ -249,12 +249,12 @@ impl Nic for Replay<'_> {
 
 /// B's receive path per TCP data segment (nearly all 1460 bytes) (checksum, demux, sequence checks, copy into the ring, the ACK, and the
 /// copy out with `recv`): A's segments recorded from a transfer, replayed into the same connection.
-fn tcp_receive_path(frames: &[Vec<u8>]) -> f64 {
+fn tcp_receive_path(frames: &[Vec<u8>], idle: usize) -> f64 {
     let mut link = sim::Link::new(1, sim::Faults::default(), [MAC_A, MAC_B]);
-    host!(a, IP_A, [1, 1], 1, 1 << 16);
-    host!(b, IP_B, [1, 2], 2, 1 << 16);
+    host!(a, IP_A, [1, 1], idle + 1, 1 << 16, 4);
+    host!(b, IP_B, [1, 2], idle + 2, 1 << 16, 4);
     let listener = b.listen(80).unwrap();
-    let (_, cb) = connect(&mut link, &mut a, &mut b, listener);
+    let (_, cb) = connect_after(&mut link, &mut a, &mut b, listener, idle);
     let mut buf = vec![0u8; 1 << 16];
     let mut nic = Replay {
         frames: &[],
@@ -279,13 +279,27 @@ fn tcp_receive_path(frames: &[Vec<u8>]) -> f64 {
     ns
 }
 
-/// A's data segments from a 4 MiB transfer over the loss-free link.
-fn record_segments() -> Vec<Vec<u8>> {
+/// A connects to B `idle` times, leaving those connections idle in the earlier slots, then once more.
+fn connect_after(
+    link: &mut sim::Link,
+    a: &mut Stack,
+    b: &mut Stack,
+    listener: TcpId,
+    idle: usize,
+) -> (TcpId, TcpId) {
+    for _ in 0..idle {
+        connect(link, a, b, listener);
+    }
+    connect(link, a, b, listener)
+}
+
+/// A's data segments from a 4 MiB transfer over the loss-free link, after `idle` other connections.
+fn record_segments(idle: usize) -> Vec<Vec<u8>> {
     let mut link = sim::Link::new(1, sim::Faults::default(), [MAC_A, MAC_B]);
-    host!(a, IP_A, [1, 1], 1, 1 << 16);
-    host!(b, IP_B, [1, 2], 2, 1 << 16);
+    host!(a, IP_A, [1, 1], idle + 1, 1 << 16, 4);
+    host!(b, IP_B, [1, 2], idle + 2, 1 << 16, 4);
     let listener = b.listen(80).unwrap();
-    let (ca, cb) = connect(&mut link, &mut a, &mut b, listener);
+    let (ca, cb) = connect_after(&mut link, &mut a, &mut b, listener, idle);
     link.record = Some(Vec::new());
     let (data, mut buf, bytes) = (vec![0x5a; 1 << 16], vec![0u8; 1 << 16], 4 << 20);
     let (mut sent, mut got) = (0, 0);
@@ -312,11 +326,70 @@ fn record_segments() -> Vec<Vec<u8>> {
     frames
 }
 
-/// Connect, accept, a close from each side and the TIME_WAIT entry, over the loss-free link; ns per connection.
-fn handshake_and_close() -> f64 {
+/// SYN frames from `n` connects by A, to B's port 80.
+fn record_syns(n: usize) -> Vec<Vec<u8>> {
     let mut link = sim::Link::new(1, sim::Faults::default(), [MAC_A, MAC_B]);
-    host!(a, IP_A, [1, 1], 1, 4096);
-    host!(b, IP_B, [1, 2], 2, 4096);
+    host!(a, IP_A, [1, 1], n + 1, 64, 4);
+    host!(b, IP_B, [1, 2], 2, 64, 4);
+    let listener = b.listen(80).unwrap();
+    connect(&mut link, &mut a, &mut b, listener);
+    link.record = Some(Vec::new());
+    for _ in 0..n {
+        a.connect(0, 0, SocketAddrV4::new(IP_B, 80)).unwrap();
+    }
+    let now = link.now;
+    a.poll(&mut link.end(0), now);
+    let syns = link.record.take().unwrap();
+    assert_eq!(syns.len(), n);
+    syns
+}
+
+/// B answering SYNs with SYN-ACKs until a fresh `table`-entry half-open table is full, or 64 per batch with cookies
+/// when `table` is 0; ns per SYN, and the share of SYNs answered with a cookie.
+fn syn_answer(syns: &[Vec<u8>], table: usize) -> (f64, f64) {
+    let (mut ns, mut cookies) = (0, 0);
+    for batch in syns.chunks(table.max(64)) {
+        host!(b, IP_B, [1, 2], 2, 4096, table);
+        b.listen(80).unwrap();
+        let mut nic = Replay {
+            frames: batch,
+            next: 0,
+            scratch: vec![0; 2048],
+        };
+        let start = Instant::now();
+        b.poll(&mut nic, 0);
+        ns += start.elapsed().as_nanos();
+        assert_eq!(b.counters.tcp, batch.len() as u64);
+        cookies += b.counters.syn_cookies;
+    }
+    (
+        ns as f64 / syns.len() as f64,
+        cookies as f64 / syns.len() as f64,
+    )
+}
+
+/// One `poll` with nothing to do on a listener with a `half_open`-entry table and 2 slots; ns per poll.
+fn idle_poll(half_open: usize) -> f64 {
+    host!(b, IP_B, [1, 2], 2, 4096, half_open);
+    b.listen(80).unwrap();
+    let mut nic = Replay {
+        frames: &[],
+        next: 0,
+        scratch: vec![0; 2048],
+    };
+    let n = 100_000;
+    let start = Instant::now();
+    for i in 0..n {
+        black_box(b.poll(&mut nic, i));
+    }
+    start.elapsed().as_nanos() as f64 / n as f64
+}
+
+/// Connect, accept, a close from each side and the TIME_WAIT entry, over the loss-free link; ns per connection.
+fn handshake_and_close(half_open: usize) -> f64 {
+    let mut link = sim::Link::new(1, sim::Faults::default(), [MAC_A, MAC_B]);
+    host!(a, IP_A, [1, 1], 1, 4096, 4);
+    host!(b, IP_B, [1, 2], 2, 4096, half_open);
     let listener = b.listen(80).unwrap();
     let n = 10_000;
     let mut start = Instant::now();
@@ -356,15 +429,42 @@ fn main() {
             mibs[RUNS / 2]
         );
     }
-    let frames = record_segments();
+    let frames = record_segments(0);
     report(
         "tcp receive path per data segment",
-        (0..RUNS).map(|_| tcp_receive_path(&frames)).collect(),
+        (0..RUNS).map(|_| tcp_receive_path(&frames, 0)).collect(),
+    );
+    let frames = record_segments(63);
+    report(
+        "tcp receive path per data segment, 63 idle connections in earlier slots",
+        (0..RUNS).map(|_| tcp_receive_path(&frames, 63)).collect(),
     );
     report(
         "tcp connect + accept + close both ways",
-        (0..RUNS).map(|_| handshake_and_close()).collect(),
+        (0..RUNS).map(|_| handshake_and_close(4)).collect(),
     );
+    report(
+        "tcp connect + accept + close both ways through a SYN cookie",
+        (0..RUNS).map(|_| handshake_and_close(0)).collect(),
+    );
+    for h in [4, 64, 4096] {
+        report(
+            &format!("tcp idle poll, {h}-entry half-open table"),
+            (0..RUNS).map(|_| idle_poll(h)).collect(),
+        );
+    }
+    let syns = record_syns(4096);
+    for table in [64, 4096, 0] {
+        let runs: Vec<_> = (0..RUNS).map(|_| syn_answer(&syns, table)).collect();
+        let name = match table {
+            0 => "tcp SYN answered with a cookie".to_string(),
+            n => format!(
+                "tcp SYN answered while filling a {n}-entry half-open table ({:.0}% cookies)",
+                runs[0].1 * 100.0
+            ),
+        };
+        report(&name, runs.iter().map(|r| r.0).collect());
+    }
     for (loss, delay) in [(10, 5), (10, 25), (50, 5), (50, 25)] {
         let faults = sim::Faults {
             loss,

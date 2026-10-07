@@ -106,6 +106,7 @@ fn interop(seed: u64, loss: u64, bytes: usize, we_connect: bool) {
         reorder: 20,
         corrupt: 5,
         delay: MS,
+        arp_loss: 300,
     };
     let mut link = Link::new(seed, faults, [MAC_A, MAC_B]);
     let mut neighbors = [Neighbor::EMPTY; 4];
@@ -172,9 +173,15 @@ fn interop(seed: u64, loss: u64, bytes: usize, we_connect: bool) {
                 && let Ok(n) = a.send(ca, &src[fa.sent..])
             {
                 (fa.sent, progress) = (fa.sent + n, true);
-                if fa.sent == bytes {
-                    a.shutdown(ca);
-                }
+            }
+            // smoltcp 0.12 drops its retransmission timer when a FIN moves it to CLOSE-WAIT or CLOSING, so a FIN
+            // goes to it only once its data has all arrived.
+            if fa.sent == bytes
+                && fa.received == bytes
+                && a.tcp_info(ca).unwrap().state == State::Established
+            {
+                a.shutdown(ca);
+                progress = true;
             }
             loop {
                 match a.recv(ca, &mut buf) {
@@ -185,7 +192,12 @@ fn interop(seed: u64, loss: u64, bytes: usize, we_connect: bool) {
                     }
                     Ok(n) => (fa.check(&buf[..n]), progress = true).1,
                     Err(Error::WouldBlock) => break,
-                    Err(e) => panic!("seed {seed}: our recv: {e:?}"),
+                    Err(e) => panic!(
+                        "seed {seed} loss {loss}: our recv: {e:?} {:?} {:?} smol {:?}",
+                        a.tcp_info(ca),
+                        a.counters,
+                        sockets.get::<tcp::Socket>(hb).state()
+                    ),
                 };
             }
         }
@@ -202,8 +214,7 @@ fn interop(seed: u64, loss: u64, bytes: usize, we_connect: bool) {
         if !s.may_recv() && !fb.eof && fb.received == bytes {
             (fb.eof, progress) = (true, true);
         }
-        // smoltcp 0.12 drops its retransmission timer on entering CLOSING, so it closes only once its data is
-        // acknowledged and ours has ended (no simultaneous close).
+        // For the same reason smoltcp closes only once its data is acknowledged and ours has ended.
         if fb.eof && fb.sent == bytes && s.send_queue() == 0 && s.state() == tcp::State::CloseWait {
             s.close();
             progress = true;
