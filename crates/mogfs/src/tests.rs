@@ -14,13 +14,13 @@ pub(crate) fn reachable(disk: &[Buf]) -> Vec<bool> {
 }
 
 /// Slot `slot`'s superblock fields, if they keep the format's rules.
-fn superblock_fields(disk: &[Buf], slot: u64) -> Option<[u64; 17]> {
+fn superblock_fields(disk: &[Buf], slot: u64) -> Option<[u64; 18]> {
     let sb = &disk[slot as usize];
-    let f: [u64; 17] = std::array::from_fn(|i| le64(sb, 8 * i));
+    let f: [u64; 18] = std::array::from_fn(|i| le64(sb, 8 * i));
     let blocks = f[2];
-    let pages = pages(blocks.min(MAX_BLOCKS));
-    let h = ix_height(pages);
-    let list = if h == 0 { pages } else { 1 };
+    let lp = 2 * pages(blocks.min(MAX_BLOCKS));
+    let h = ix_height(lp);
+    let list = if h == 0 { lp } else { 1 };
     let end = SB_HDR as u128 + 16 * (list as u128 + f[13] as u128);
     let ok = le64(sb, END) == checksum(Block(slot), &sb[..END]).0
         && f[0] == MAGIC
@@ -32,7 +32,8 @@ fn superblock_fields(disk: &[Buf], slot: u64) -> Option<[u64; 17]> {
         && f[11] <= f[1]
         && (2..blocks).contains(&f[9])
         && f[14] == h as u64
-        && (h == 0 || (2..blocks).contains(&f[15]))
+        && f[15] == 0
+        && (h == 0 || (2..blocks).contains(&f[16]))
         && end <= END as u128
         && sb[end as usize..END].iter().all(|&b| b == 0);
     ok.then_some(f)
@@ -47,9 +48,9 @@ type At = Option<(u64, usize)>;
 #[allow(clippy::type_complexity)]
 fn page_list(
     disk: &[Buf],
-    f: &[u64; 17],
+    f: &[u64; 18],
 ) -> Option<(Vec<((u64, u64), At)>, Vec<(u64, At, usize)>)> {
-    let (pages, h) = (pages(f[2]), f[14] as usize);
+    let (pages, h) = (2 * pages(f[2]), f[14] as usize);
     let sb = &disk[(f[1] % 2) as usize];
     if h == 0 {
         let list = (0..pages).map(|p| {
@@ -60,7 +61,7 @@ fn page_list(
         });
         return Some((list.collect(), vec![]));
     }
-    let (mut level, mut ix): (Vec<((u64, u64), At)>, _) = (vec![((f[15], f[16]), None)], vec![]);
+    let (mut level, mut ix): (Vec<((u64, u64), At)>, _) = (vec![((f[16], f[17]), None)], vec![]);
     for l in (1..=h).rev() {
         let mut next = vec![];
         for (i, &((b, sum), at)) in level.iter().enumerate() {
@@ -88,17 +89,18 @@ fn page_list(
 
 /// The bitmap page and index blocks of a slot, if they verify, its log is well formed and the bitmap marks them and
 /// the root.
-fn bitmap_blocks(disk: &[Buf], slot: u64, f: &[u64; 17]) -> Option<Vec<u64>> {
+fn bitmap_blocks(disk: &[Buf], slot: u64, f: &[u64; 18]) -> Option<Vec<u64>> {
     let (sb, blocks) = (&disk[slot as usize], f[2]);
     let (pages, words) = (pages(blocks), blocks.div_ceil(64) as usize);
+    let ws = pages * PAGE_WORDS;
     let (list, ix) = page_list(disk, f)?;
-    let mut bits = vec![0u64; pages * PAGE_WORDS];
+    let mut bits = vec![0u64; 2 * ws];
     let mut held: Vec<u64> = ix.iter().map(|x| x.0).collect();
     for (p, &((b, sum), _)) in list.iter().enumerate() {
         if (b, sum) == (0, 0) {
             continue;
         }
-        let n = PAGE_WORDS.min(words - p * PAGE_WORDS);
+        let n = page_words(blocks, p);
         if !(2..blocks).contains(&b)
             || checksum(Block(b), &disk[b as usize][..8 * n]).0 != sum
             || disk[b as usize][8 * n..].iter().any(|&b| b != 0)
@@ -110,18 +112,19 @@ fn bitmap_blocks(disk: &[Buf], slot: u64, f: &[u64; 17]) -> Option<Vec<u64>> {
         }
         held.push(b);
     }
-    let at = SB_HDR + 16 * if f[14] == 0 { pages } else { 1 };
+    let at = SB_HDR + 16 * if f[14] == 0 { 2 * pages } else { 1 };
     let mut last = None;
     for j in 0..f[13] as usize {
         let (i, v) = (le64(sb, at + 16 * j), le64(sb, at + 16 * j + 8));
-        if i as usize >= words || last.is_some_and(|l| l >= i) {
+        if i as usize >= 2 * ws || i as usize % ws >= words || last.is_some_and(|l| l >= i) {
             return None;
         }
         bits[i as usize] = v;
         last = Some(i);
     }
     let has = |b: u64| bits[(b / 64) as usize] >> (b % 64) & 1 != 0;
-    let tail = (blocks..(words as u64 * 64)).any(has);
+    let pinned = |b: u64| bits[ws + (b / 64) as usize] >> (b % 64) & 1 != 0;
+    let tail = (blocks..(words as u64 * 64)).any(|b| has(b) || pinned(b));
     (!tail && [0, 1, f[9]].iter().chain(&held).all(|&b| has(b))).then_some(held)
 }
 
@@ -353,12 +356,12 @@ fn check<D: Disk>(fs: &mut Fs<D>, ctx: &str) {
         }
     }
     blocks.extend([0, 1]);
-    for p in 0..fs.pages {
+    for p in 0..fs.lpages() {
         let (s, at) = fs.page_entry(p);
         blocks.insert(le64(&fs.cache[s], at));
     }
     for l in 1..=fs.ix_h {
-        for i in 0..ix_count(fs.pages, l) {
+        for i in 0..ix_count(fs.lpages(), l) {
             blocks.insert(match fs.ix_parent(l, i) {
                 Some((s, at)) => le64(&fs.cache[s], at),
                 None => fs.ix.0.0,
@@ -671,7 +674,7 @@ fn mutate(disk: &mut [Buf], rng: &mut u64) -> bool {
         return true;
     };
     let (list, ix) = page_list(disk, &f).unwrap();
-    let inline = if f[14] == 0 { pages(f[2]) } else { 1 };
+    let inline = if f[14] == 0 { 2 * pages(f[2]) } else { 1 };
     match next(rng, 9) {
         0 => {
             write(disk, slot as u64, 8 * next(rng, 15) as usize, 8, rng);

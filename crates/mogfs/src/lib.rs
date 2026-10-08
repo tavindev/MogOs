@@ -83,8 +83,8 @@ const MAX_CACHE: usize = 1 + STAGE + MAX_POOL;
 /// they hold the bitmap page and the root beside the superblocks (8 blocks measured slower at boot).
 const AHEAD: usize = 4;
 const AHEAD_AT: usize = STAGE - AHEAD;
-/// Superblock bytes before the page list: the header and a root table of one root.
-const SB_HDR: usize = 120;
+/// Superblock bytes before the page list: the header, a root table of one root and the newest snapshot's generation.
+const SB_HDR: usize = 128;
 /// Log entries the superblock has room for beside one page.
 const LOG_MAX: usize = (END - SB_HDR) / 16 - 1;
 const MIN_BLOCKS: u64 = 16;
@@ -113,9 +113,15 @@ const TAG: u64 = 1 << 63;
 const EMPTY: Block = Block(u64::MAX);
 const NONE: Key = Key(u128::MAX);
 
+// Bitmaps in `bits`, `words` each: the live tree's and pinned (blocks the live tree freed that a snapshot holds),
+// adjacent so the page list covers both; their copies as last committed; every block either slot reaches; the newest
+// snapshot's. The page-dirty bits follow.
 const LIVE: usize = 0;
-const NEWEST: usize = 1;
-const COMMITTED: usize = 2;
+const PINNED: usize = 1;
+const NEWEST: usize = 2;
+const COMMITTED: usize = 4;
+const SNAP: usize = 5;
+const MAPS: usize = 6;
 const DATA: usize = 0;
 const META: usize = 1;
 
@@ -220,13 +226,13 @@ pub struct Stat {
 
 /// Cache blocks `Fs` needs for a disk of `blocks` blocks with `pool` node slots (at least `MIN_POOL`).
 pub const fn cache_blocks(blocks: u64, pool: usize) -> usize {
-    1 + STAGE + pool + ix_blocks(pages(blocks))
+    1 + STAGE + pool + ix_blocks(2 * pages(blocks))
 }
 
 /// Bitmap words `Fs` needs for a disk of `blocks` blocks.
 pub const fn bitmap_words(blocks: u64) -> usize {
     let pages = pages(blocks);
-    3 * pages * PAGE_WORDS + pages.div_ceil(64)
+    MAPS * pages * PAGE_WORDS + (2 * pages).div_ceil(64)
 }
 
 /// Whether `page` read from `block` matches the sum `map` gave for it.
@@ -240,6 +246,14 @@ pub fn verify(block: Block, page: &Buf, sum: Sum) -> Result<(), Error> {
 
 const fn pages(blocks: u64) -> usize {
     blocks.div_ceil(PAGE_BITS) as usize
+}
+
+/// Words list page `p` holds on a disk of `blocks` blocks: the live bitmap's pages, then pinned's.
+fn page_words(blocks: u64, p: usize) -> usize {
+    min(
+        PAGE_WORDS,
+        blocks.div_ceil(64) as usize - p % pages(blocks) * PAGE_WORDS,
+    )
 }
 
 /// Levels of the bitmap index for `pages` pages (0: the superblock lists them).
@@ -387,6 +401,8 @@ struct Super {
     /// Bitmap index height, and its root if it has levels.
     ix_h: usize,
     ix: (Block, Sum),
+    /// The newest snapshot's generation, 0 for none.
+    newest: u64,
 }
 
 /// A directory entry's offset, inode and kind.
@@ -420,15 +436,21 @@ pub struct Fs<'a, D> {
     /// Bitmap index height, and its root's block and sum (zero for an inline list).
     ix_h: usize,
     ix: (Block, Sum),
-    /// The live bitmap's words changed since its pages were last written, sorted, unless `full`: the next commit
-    /// writes the pages. `bits` marks the pages changed since they were written, after the three bitmaps.
+    /// The newest snapshot's generation, 0 for none.
+    newest: u64,
+    /// The page list covers the live bitmap's words, then pinned's (word `words + i` is pinned's word `i`). The words
+    /// changed since its pages were last written, sorted, unless `full`: the next commit writes the pages. `bits`
+    /// marks the pages changed since they were written, after the bitmaps.
     log: [u64; LOG_MAX],
     nlog: usize,
     full: bool,
-    /// The live bitmap's words changed since the last commit (`lo..hi`), and those the last commit changed.
+    /// The block words whose live or pinned word changed since the last commit (`lo..hi`), and those the last
+    /// commit changed.
     span: (usize, usize),
     prev_span: (usize, usize),
     changed: bool,
+    /// The older slot reaches blocks the newest does not, so a commit writes a superblock even with no change.
+    lag: bool,
     free: u64,
     /// Every block below it is in use.
     hint: Block,
@@ -489,12 +511,14 @@ impl<'a, D: Disk> Fs<'a, D> {
             height: 1,
             ix_h: 0,
             ix: (Block(0), Sum(0)),
+            newest: 0,
             log: [0; LOG_MAX],
             nlog: 0,
             full: false,
             span: (usize::MAX, 0),
             prev_span: (usize::MAX, 0),
             changed: false,
+            lag: false,
             free: 0,
             hint: Block(0),
             base: 0,
@@ -553,11 +577,11 @@ impl<'a, D: Disk> Fs<'a, D> {
             self.bits[map * self.words] = 0b11;
         }
         self.free = self.blocks - 2;
-        let top = self.top;
-        for b in &mut self.cache[top..top + ix_blocks(self.pages)] {
+        let (top, lp) = (self.top, self.lpages());
+        for b in &mut self.cache[top..top + ix_blocks(lp)] {
             b.fill(0);
         }
-        self.ix = (Block(0), Sum(0));
+        (self.ix, self.newest, self.lag) = ((Block(0), Sum(0)), 0, false);
         (self.generation, self.next_inode, self.seed) = (0, 1, seed);
         let s = self.new_node(0);
         self.root = tagged(s);
@@ -637,34 +661,43 @@ impl<'a, D: Disk> Fs<'a, D> {
                 Err(Error::Corrupt) => continue,
                 Err(e) => return Err(e),
             }
-            // The other slot's blocks stay reserved while its bitmap holds, even if its tree failed above.
+            // The other slot's blocks (its live and pinned bitmaps, loaded into `COMMITTED` and `SNAP`) stay reserved
+            // while its bitmap holds, even if its tree failed above.
             let w = self.words;
-            self.bits[COMMITTED * w..3 * w].fill(0);
+            self.bits[COMMITTED * w..(SNAP + 1) * w].fill(0);
             if let Some(o) = &slots[1 - i]
                 && o.valid
                 && let Err(e) = self.load_bitmap(o, COMMITTED)
             {
-                self.bits[COMMITTED * w..3 * w].fill(0);
+                self.bits[COMMITTED * w..(SNAP + 1) * w].fill(0);
                 if e != Error::Corrupt {
                     return Err(e);
                 }
             }
-            self.bits.copy_within(..w, NEWEST * w);
+            self.bits.copy_within(..2 * w, NEWEST * w);
             for i in 0..w {
-                self.bits[COMMITTED * w + i] |= self.bits[i];
+                let (l, p, s) = (self.bits[i], self.bits[w + i], self.bits[SNAP * w + i]);
+                self.bits[COMMITTED * w + i] |= l | p | s;
             }
-            let d = 3 * w;
-            self.bits[d..d + self.pages.div_ceil(64)].fill(0);
+            self.bits[SNAP * w..(SNAP + 1) * w].fill(0);
+            self.newest = s.newest;
+            let d = MAPS * w..MAPS * w + self.lpages().div_ceil(64);
+            self.bits[d.clone()].fill(0);
+            let d = d.start;
             for j in 0..self.nlog {
                 let p = self.log[j] as usize / PAGE_WORDS;
                 self.bits[d + p / 64] |= 1 << (p % 64);
             }
             self.prev_span = (0, w);
             self.changed = false;
-            let used: u64 = (0..w)
-                .map(|i| (self.bits[i] | self.bits[COMMITTED * w + i]).count_ones() as u64)
-                .sum();
-            self.free = self.blocks - used;
+            self.lag = (0..w).any(|i| {
+                self.bits[COMMITTED * w + i]
+                    != self.bits[NEWEST * w + i] | self.bits[(NEWEST + 1) * w + i]
+            });
+            self.free = self.blocks
+                - (0..w)
+                    .map(|i| self.reach(i).count_ones() as u64)
+                    .sum::<u64>();
             self.hint = Block(0);
             (self.broken, self.torn) = (false, false);
             return Ok(());
@@ -964,12 +997,13 @@ impl<'a, D: Disk> Fs<'a, D> {
         r
     }
 
-    /// Makes every change so far durable, atomically; does nothing if nothing changed.
+    /// Makes every change so far durable, atomically; does nothing if nothing changed and the older slot reaches no
+    /// block the newest does not (else it writes only a superblock, so those blocks come free).
     pub fn commit(&mut self) -> Result<(), Error> {
         if self.broken {
             return Err(Error::Io);
         }
-        if !self.changed {
+        if !self.changed && !self.lag {
             return Ok(());
         }
         let generation = self.generation.checked_add(1).ok_or(Error::Corrupt)?;
@@ -998,7 +1032,7 @@ impl<'a, D: Disk> Fs<'a, D> {
             // Release the old copies of the pages that change and of the index blocks above them (each pointer zeroed
             // once released), then find blocks for them and the nodes; releasing or claiming blocks may change more
             // pages, so repeat until neither does.
-            let d = 3 * self.words..3 * self.words + self.pages.div_ceil(64);
+            let d = MAPS * self.words..MAPS * self.words + self.lpages().div_ceil(64);
             let changed =
                 |bits: &[u64]| bits[d.clone()].iter().map(|w| w.count_ones()).sum::<u32>();
             loop {
@@ -1038,7 +1072,7 @@ impl<'a, D: Disk> Fs<'a, D> {
                     b = self.next_free(b);
                     let p = (b.0 / PAGE_BITS) as usize;
                     more |= !self.page_dirty(p);
-                    self.bits[3 * self.words + p / 64] |= 1 << (p % 64);
+                    self.bits[MAPS * self.words + p / 64] |= 1 << (p % 64);
                     b = b + 1;
                 }
                 if !more {
@@ -1101,11 +1135,10 @@ impl<'a, D: Disk> Fs<'a, D> {
         }
         self.finalize(generation);
         if pages {
-            let words = self.blocks.div_ceil(64) as usize;
             let mut p = self.next_dirty(0);
             while let Some(q) = p {
                 let d = self.stage(&mut first, &mut n)?;
-                let len = 8 * min(PAGE_WORDS, words - q * PAGE_WORDS);
+                let len = 8 * page_words(self.blocks, q);
                 let page = &mut self.cache[d];
                 for (i, word) in self.bits[q * PAGE_WORDS..][..len / 8].iter().enumerate() {
                     page[8 * i..8 * i + 8].copy_from_slice(&word.to_le_bytes());
@@ -1123,7 +1156,7 @@ impl<'a, D: Disk> Fs<'a, D> {
                 while let Some(j) = i {
                     let d = self.stage(&mut first, &mut n)?;
                     let slot = self.ix_level(l).0 + j;
-                    let len = 16 * ix_children(self.pages, l, j);
+                    let len = 16 * ix_children(self.lpages(), l, j);
                     let parent = self.ix_parent(l, j);
                     let c = match parent {
                         Some((s, at)) => Block(le64(&self.cache[s], at)),
@@ -1143,9 +1176,12 @@ impl<'a, D: Disk> Fs<'a, D> {
                 }
             }
         }
-        self.write_out(first, n)?;
-        self.unwritten &= !staged;
-        self.flush()?;
+        // A superblock-only generation writes nothing before the superblock.
+        if n > first || self.ndirty > 0 {
+            self.write_out(first, n)?;
+            self.unwritten &= !staged;
+            self.flush()?;
+        }
         let list = 16 * self.list_entries();
         let sb = &mut self.bufs[META];
         sb.fill(0);
@@ -1165,6 +1201,7 @@ impl<'a, D: Disk> Fs<'a, D> {
             self.height as u64 - 1,
             if pages { 0 } else { self.nlog as u64 },
             self.ix_h as u64,
+            self.newest,
         ];
         for (i, f) in fields.iter().enumerate() {
             sb[8 * i..8 * i + 8].copy_from_slice(&f.to_le_bytes());
@@ -1189,23 +1226,23 @@ impl<'a, D: Disk> Fs<'a, D> {
         self.flush()?;
         self.generation = generation;
         self.clean();
-        // Elsewhere the live, newest and older bitmaps agree, so the committed one (newest | older) is unchanged.
+        // Elsewhere the list's words and their committed copies agree, so the reach of both slots (the newest's live
+        // and pinned, and the older's) is unchanged.
         let w = self.words;
-        for i in min(self.span.0, self.prev_span.0)..self.span.1.max(self.prev_span.1) {
-            let (l, n, c) = (
-                self.bits[i],
-                self.bits[NEWEST * w + i],
-                &mut self.bits[COMMITTED * w + i],
-            );
-            let before = (l | *c).count_ones();
-            *c = n | l;
-            self.free = self.free + before as u64 - (l | *c).count_ones() as u64;
-            self.bits[NEWEST * w + i] = l;
+        let mut lag = false;
+        for j in min(self.span.0, self.prev_span.0)..self.span.1.max(self.prev_span.1) {
+            let before = self.reach(j).count_ones();
+            let older = self.bits[NEWEST * w + j] | self.bits[(NEWEST + 1) * w + j];
+            let (l, p) = (self.bits[j], self.bits[w + j]);
+            (self.bits[NEWEST * w + j], self.bits[(NEWEST + 1) * w + j]) = (l, p);
+            self.bits[COMMITTED * w + j] = older | l | p;
+            lag |= older & !(l | p) != 0;
+            self.free = self.free + before as u64 - self.reach(j).count_ones() as u64;
         }
-        (self.prev_span, self.span) = (self.span, (usize::MAX, 0));
+        (self.prev_span, self.span, self.lag) = (self.span, (usize::MAX, 0), lag);
         if pages {
-            let d = 3 * w;
-            self.bits[d..d + self.pages.div_ceil(64)].fill(0);
+            let d = MAPS * w..MAPS * w + self.lpages().div_ceil(64);
+            self.bits[d].fill(0);
             (self.nlog, self.full) = (0, false);
         }
         self.hint = Block(0);
@@ -1219,21 +1256,21 @@ impl<'a, D: Disk> Fs<'a, D> {
         let pages = pages(blocks);
         let base = 1 + STAGE;
         let pool = min(
-            self.cache.len().saturating_sub(base + ix_blocks(pages)),
+            self.cache.len().saturating_sub(base + ix_blocks(2 * pages)),
             MAX_POOL,
         );
         if pool < MIN_POOL || self.bits.len() < bitmap_words(blocks) {
             return Err(Error::TooBig);
         }
         (self.blocks, self.pages, self.words) = (blocks, pages, pages * PAGE_WORDS);
-        (self.base, self.top, self.ix_h) = (base, base + pool, ix_height(pages));
+        (self.base, self.top, self.ix_h) = (base, base + pool, ix_height(2 * pages));
         self.hint = Block(0);
-        (self.nlog, self.full) = (0, false);
+        (self.nlog, self.full, self.lag) = (0, false, false);
         self.blk.fill(EMPTY);
         self.dirt.fill(false);
         self.ndirty = 0;
-        let d = 3 * self.words;
-        self.bits[d..d + pages.div_ceil(64)].fill(0);
+        let d = MAPS * self.words;
+        self.bits[d..d + (2 * pages).div_ceil(64)].fill(0);
         (self.span, self.prev_span) = ((usize::MAX, 0), (0, pages * PAGE_WORDS));
         (self.cached, self.unwritten, self.items) = (None, false, [None; 2]);
         (self.finger, self.start) = (None, (NONE, 0));
@@ -1241,22 +1278,25 @@ impl<'a, D: Disk> Fs<'a, D> {
         Ok(())
     }
 
-    /// Reads `s`'s bitmap into `map` (the words of this disk's size): its index, its pages, then its log. For `LIVE`
-    /// it keeps the page list in `cache[top..]`, the log's words in `log` and the words they replace in the last
-    /// staging slot; another slot takes a page it shares with the live list from those, and its index blocks through
-    /// the staging slots one level each. The bitmap must mark its pages, its index blocks and the root.
+    /// Reads `s`'s page list into `map` and the map after it (its live and pinned bitmaps, the words of this disk's
+    /// size): its index, its pages, then its log. For `LIVE` it keeps the page list in `cache[top..]`, the log's words
+    /// in `log` and the words they replace in the last staging slot; another slot takes a page it shares with the live
+    /// list from those, and its index blocks through the staging slots one level each. The live bitmap must mark its
+    /// pages, its index blocks and the root.
     fn load_bitmap(&mut self, s: &Super, map: usize) -> Result<(), Error> {
         let (live, sb) = (map == LIVE, (s.generation % 2) as usize);
         let (pages, w) = (pages(s.blocks), self.words);
+        let (lp, ws) = (2 * pages, pages * PAGE_WORDS);
+        // Where list word `i` of `s` goes in `bits`, if within this disk's size.
+        let to = |i: usize| (i % ws < w).then_some((map + i / ws) * w + i % ws);
         if s.ix_h >= AHEAD_AT {
             self.ahead = 0;
         }
-        let words = s.blocks.div_ceil(64) as usize;
         let saved = self.base - 1;
         if live {
             self.ix = (Block(0), Sum(0));
             if s.ix_h == 0 {
-                let list = 16 * pages;
+                let list = 16 * lp;
                 let top = self.top;
                 let (sbuf, list_buf) = (&self.bufs[sb], &mut self.cache[top]);
                 list_buf[..list].copy_from_slice(&sbuf[SB_HDR..SB_HDR + list]);
@@ -1264,7 +1304,7 @@ impl<'a, D: Disk> Fs<'a, D> {
             } else {
                 self.ix = s.ix;
                 let root = self.ix_level(s.ix_h).0;
-                self.read_ix(root, s.ix, 16 * ix_children(pages, s.ix_h, 0), s.blocks)?;
+                self.read_ix(root, s.ix, 16 * ix_children(lp, s.ix_h, 0), s.blocks)?;
                 for l in (1..s.ix_h).rev() {
                     let (at, n) = self.ix_level(l);
                     for i in 0..n {
@@ -1273,14 +1313,14 @@ impl<'a, D: Disk> Fs<'a, D> {
                             Block(le64(&self.cache[ps], pat)),
                             Sum(le64(&self.cache[ps], pat + 8)),
                         );
-                        self.read_ix(at + i, ptr, 16 * ix_children(pages, l, i), s.blocks)?;
+                        self.read_ix(at + i, ptr, 16 * ix_children(lp, l, i), s.blocks)?;
                     }
                 }
             }
         }
-        self.bits[map * w..(map + 1) * w].fill(0);
+        self.bits[map * w..(map + 2) * w].fill(0);
         let mut held = [usize::MAX; MAX_IX + 1];
-        for p in 0..pages {
+        for p in 0..lp {
             let (b, sum) = self.list_entry(s, live, &mut held, p, None)?;
             if b == Block(0) && sum == Sum(0) {
                 continue;
@@ -1288,57 +1328,58 @@ impl<'a, D: Disk> Fs<'a, D> {
             if !(2..s.blocks).contains(&b.0) {
                 return Err(Error::Corrupt);
             }
-            if !live && p < self.pages && self.list_entry(s, true, &mut held, p, None)? == (b, sum)
+            let (lo, n) = (p * PAGE_WORDS, page_words(s.blocks, p));
+            if !live
+                && pages == self.pages
+                && self.list_entry(s, true, &mut held, p, None)? == (b, sum)
             {
-                let lo = p * PAGE_WORDS;
-                let hi = min(lo + PAGE_WORDS, w);
-                self.bits.copy_within(lo..hi, map * w + lo);
+                self.bits.copy_within(lo..lo + n, map * w + lo);
                 for j in 0..self.nlog {
                     let i = self.log[j] as usize;
-                    if (lo..hi).contains(&i) {
+                    if (lo..lo + n).contains(&i) {
                         self.bits[map * w + i] = le64(&self.cache[saved], 8 * j);
                     }
                 }
                 continue;
             }
             self.fetch(b, 0)?;
-            let (page, n) = (&self.cache[0], min(PAGE_WORDS, words - p * PAGE_WORDS));
+            let page = &self.cache[0];
             let tail = le64(page, 8 * (n - 1)) >> (s.blocks % 64);
             if checksum(b, &page[..8 * n]) != sum
                 || page[8 * n..].iter().any(|&b| b != 0)
-                || (p == pages - 1 && !s.blocks.is_multiple_of(64) && tail != 0)
+                || (p % pages == pages - 1 && !s.blocks.is_multiple_of(64) && tail != 0)
             {
                 return Err(Error::Corrupt);
             }
-            for (i, word) in page[..8 * n].as_chunks::<8>().0.iter().enumerate() {
-                if p * PAGE_WORDS + i < w {
-                    self.bits[map * w + p * PAGE_WORDS + i] = u64::from_le_bytes(*word);
+            for i in 0..n {
+                if let Some(at) = to(lo + i) {
+                    self.bits[at] = le64(&self.cache[0], 8 * i);
                 }
             }
         }
-        let at = SB_HDR + 16 * if s.ix_h == 0 { pages } else { 1 };
+        let at = SB_HDR + 16 * if s.ix_h == 0 { lp } else { 1 };
         for j in 0..s.log {
             let (i, v) = (
-                le64(&self.bufs[sb], at + 16 * j),
+                le64(&self.bufs[sb], at + 16 * j) as usize,
                 le64(&self.bufs[sb], at + 16 * j + 8),
             );
             // A log word past this disk's size (the other slot may claim more) marks no block it allocates.
-            let Some(i) = Some(i as usize).filter(|&i| i < w) else {
+            let Some(m) = to(i) else {
                 continue;
             };
             if live {
-                let old = self.bits[i].to_le_bytes();
+                let old = self.bits[m].to_le_bytes();
                 self.cache[saved][8 * j..8 * j + 8].copy_from_slice(&old);
                 self.log[j] = i as u64;
             }
-            self.bits[map * w + i] = v;
+            self.bits[m] = v;
         }
         if live {
             self.nlog = s.log;
         }
-        // Every page and index block the list reaches, and the superblocks and the root, are marked.
+        // Every page and index block the list reaches, and the superblocks and the root, are marked live.
         let mut held = [usize::MAX; MAX_IX + 1];
-        for p in 0..pages {
+        for p in 0..lp {
             let (b, _) = self.list_entry(s, live, &mut held, p, Some(map))?;
             if b != Block(0) && !self.marked(map, b) {
                 return Err(Error::Corrupt);
@@ -1352,7 +1393,7 @@ impl<'a, D: Disk> Fs<'a, D> {
         }
         if live {
             for l in 1..=s.ix_h {
-                for i in 0..ix_count(pages, l) {
+                for i in 0..ix_count(lp, l) {
                     let b = match self.ix_parent(l, i) {
                         Some((ps, pat)) => Block(le64(&self.cache[ps], pat)),
                         None => self.ix.0,
@@ -1429,7 +1470,7 @@ impl<'a, D: Disk> Fs<'a, D> {
         } else if s.ix_h == 0 {
             (usize::MAX, SB_HDR + 16 * p)
         } else {
-            let pages = pages(s.blocks);
+            let pages = 2 * pages(s.blocks);
             let mut ptr = s.ix;
             for l in (1..=s.ix_h).rev() {
                 let i = (0..l).fold(p, |i, _| i / FAN);
@@ -1832,9 +1873,9 @@ impl<'a, D: Disk> Fs<'a, D> {
         let ix = if self.ix_h == 0 {
             0
         } else {
-            ix_blocks(self.pages)
+            ix_blocks(self.lpages())
         };
-        let need = data + (nodes(paths, bytes) + floor + self.ndirty + self.pages + ix) as u64;
+        let need = data + (nodes(paths, bytes) + floor + self.ndirty + self.lpages() + ix) as u64;
         if need > self.free {
             return Err(Error::NoSpace);
         }
@@ -1846,7 +1887,18 @@ impl<'a, D: Disk> Fs<'a, D> {
     }
 
     fn used(&self, b: Block) -> bool {
-        self.has(LIVE, b) || self.has(COMMITTED, b)
+        self.reach((b.0 / 64) as usize) >> (b.0 % 64) & 1 != 0
+    }
+
+    /// Word `i` of the blocks in use: live, pinned or reached by either slot.
+    fn reach(&self, i: usize) -> u64 {
+        let w = self.words;
+        self.bits[i] | self.bits[PINNED * w + i] | self.bits[COMMITTED * w + i]
+    }
+
+    /// Pages in the list: the live bitmap's, then pinned's.
+    fn lpages(&self) -> usize {
+        2 * self.pages
     }
 
     /// A block in range that the live tree reaches.
@@ -1856,16 +1908,16 @@ impl<'a, D: Disk> Fs<'a, D> {
 
     fn mark(&mut self, b: Block) {
         self.bits[(b.0 / 64) as usize] |= 1 << (b.0 % 64);
-        self.touch(b);
+        self.touch((b.0 / 64) as usize);
         self.free -= 1;
         self.changed = true;
     }
 
-    /// Notes that `b`'s live bit changed.
-    fn touch(&mut self, b: Block) {
-        let (p, i) = ((b.0 / PAGE_BITS) as usize, (b.0 / 64) as usize);
-        self.bits[3 * self.words + p / 64] |= 1 << (p % 64);
-        self.span = (min(self.span.0, i), self.span.1.max(i + 1));
+    /// Notes that list word `i` (`words + j` for pinned's word `j`) changed.
+    fn touch(&mut self, i: usize) {
+        let (p, j) = (i / PAGE_WORDS, i % self.words);
+        self.bits[MAPS * self.words + p / 64] |= 1 << (p % 64);
+        self.span = (min(self.span.0, j), self.span.1.max(j + 1));
         if self.full {
             return;
         }
@@ -1881,7 +1933,7 @@ impl<'a, D: Disk> Fs<'a, D> {
 
     /// Entries the superblock's page list takes: each page's, or the index root's.
     fn list_entries(&self) -> usize {
-        if self.ix_h == 0 { self.pages } else { 1 }
+        if self.ix_h == 0 { self.lpages() } else { 1 }
     }
 
     /// Log entries the superblock has room for after the page list.
@@ -1890,20 +1942,20 @@ impl<'a, D: Disk> Fs<'a, D> {
     }
 
     fn page_dirty(&self, p: usize) -> bool {
-        self.bits[3 * self.words + p / 64] >> (p % 64) & 1 != 0
+        self.bits[MAPS * self.words + p / 64] >> (p % 64) & 1 != 0
     }
 
     /// The first page from `p` on changed since the pages were written.
     fn next_dirty(&self, p: usize) -> Option<usize> {
-        let d = 3 * self.words;
+        let d = MAPS * self.words;
         let mut i = p / 64;
         let mut w = self.bits.get(d + i)? & (!0u64 << (p % 64));
         loop {
             if w != 0 {
-                return Some(64 * i + w.trailing_zeros() as usize).filter(|&q| q < self.pages);
+                return Some(64 * i + w.trailing_zeros() as usize).filter(|&q| q < self.lpages());
             }
             i += 1;
-            if 64 * i >= self.pages {
+            if 64 * i >= self.lpages() {
                 return None;
             }
             w = self.bits[d + i];
@@ -1921,9 +1973,9 @@ impl<'a, D: Disk> Fs<'a, D> {
     fn ix_level(&self, l: usize) -> (usize, usize) {
         let mut at = self.top;
         for j in 1..l {
-            at += ix_count(self.pages, j);
+            at += ix_count(self.lpages(), j);
         }
-        (at, ix_count(self.pages, l))
+        (at, ix_count(self.lpages(), l))
     }
 
     /// Where page `p`'s (block, sum) sits: a cache slot and offset.
@@ -1975,10 +2027,9 @@ impl<'a, D: Disk> Fs<'a, D> {
 
     /// The first free block at or after `b` (`blocks` if none).
     fn next_free(&self, b: Block) -> Block {
-        let (w, mut b) = (self.words, b.0);
+        let mut b = b.0;
         while b < self.blocks {
-            let i = (b / 64) as usize;
-            let used = (self.bits[i] | self.bits[COMMITTED * w + i]) >> (b % 64);
+            let used = self.reach((b / 64) as usize) >> (b % 64);
             if used == !0 >> (b % 64) {
                 b = (b | 63) + 1;
             } else {
@@ -2037,14 +2088,19 @@ impl<'a, D: Disk> Fs<'a, D> {
         first
     }
 
-    /// `b` left the live tree: free at once if no slot reaches it, else once the commit after next replaces them.
+    /// `b` left the live tree: pinned if the newest snapshot holds it, else free at once if no slot reaches it, else
+    /// once the commit after next replaces them.
     fn release(&mut self, b: Block) -> Result<(), Error> {
         if !self.live(b) {
             return Err(Error::Corrupt);
         }
-        self.bits[(b.0 / 64) as usize] &= !(1 << (b.0 % 64));
-        self.touch(b);
-        if !self.has(COMMITTED, b) {
+        let (i, bit) = ((b.0 / 64) as usize, 1 << (b.0 % 64));
+        self.bits[i] &= !bit;
+        self.touch(i);
+        if self.bits[SNAP * self.words + i] & bit != 0 {
+            self.bits[PINNED * self.words + i] |= bit;
+            self.touch(self.words + i);
+        } else if !self.has(COMMITTED, b) {
             self.free += 1;
             self.hint = min(self.hint, b);
         }
@@ -2648,20 +2704,28 @@ fn superblock(sb: &Buf, slot: u64, disk: u64) -> Option<Super> {
         level: f(12) as usize,
         log: 0,
         ix_h: f(14).min(MAX_IX as u64 + 1) as usize,
-        ix: (Block(f(15)), Sum(f(16))),
+        ix: (Block(f(16)), Sum(f(17))),
+        newest: f(15),
     };
     let (pages, words) = (pages(s.blocks.min(MAX_BLOCKS)), s.blocks.div_ceil(64));
-    let list = if s.ix_h == 0 { min(pages, INLINE) } else { 1 };
+    let ws = (pages * PAGE_WORDS) as u64;
+    let list = if s.ix_h == 0 {
+        min(2 * pages, INLINE)
+    } else {
+        1
+    };
     let log = f(13).min(LOG_MAX as u64 + 1) as usize;
     let end = SB_HDR + 16 * (list + log);
     let at = SB_HDR + 16 * list;
-    // Entries in increasing word order within the disk's size, the last word's bits past it clear.
+    // Entries in increasing word order within the disk's size in either bitmap, the last word's bits past it clear.
     let log_ok = end <= END
         && (0..log).all(|j| {
             let (i, v) = (le64(sb, at + 16 * j), le64(sb, at + 16 * j + 8));
+            let k = if i >= ws { i - ws } else { i };
             (j == 0 || le64(sb, at + 16 * j - 16) < i)
-                && i < words
-                && (i + 1 < words || s.blocks.is_multiple_of(64) || v >> (s.blocks % 64) == 0)
+                && i < 2 * ws
+                && k < words
+                && (k + 1 < words || s.blocks.is_multiple_of(64) || v >> (s.blocks % 64) == 0)
         });
     s.valid = (MIN_BLOCKS..=disk).contains(&s.blocks)
         && s.next_inode >= 1
@@ -2672,8 +2736,9 @@ fn superblock(sb: &Buf, slot: u64, disk: u64) -> Option<Super> {
         && s.root.generation <= s.generation
         && (2..s.blocks).contains(&s.root.block.0)
         && s.blocks <= MAX_BLOCKS
-        && s.ix_h == ix_height(pages)
+        && s.ix_h == ix_height(2 * pages)
         && (s.ix_h == 0 || (2..s.blocks).contains(&s.ix.0.0))
+        && s.newest == 0
         && log_ok
         && sb[end..END].iter().all(|&b| b == 0);
     s.log = if s.valid { log } else { 0 };

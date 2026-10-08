@@ -161,7 +161,7 @@ fn entry(path: &str, data: &[u8]) -> (String, Vec<u8>) {
 
 const SEED: u64 = 0x5eed;
 /// Superblock bytes before the live page list.
-const SB_HDR: usize = 120;
+const SB_HDR: usize = 128;
 
 #[test]
 fn round_trip_survives_remount_and_drops_uncommitted_changes() {
@@ -1220,6 +1220,9 @@ fn block_io_per_operation() {
     // changes, between two flushes.
     fs.commit().unwrap();
     assert_eq!(io.take(), [0, 2, 2]);
+    // The older slot still reaches the nodes that commit replaced: a superblock alone frees them, then nothing.
+    fs.commit().unwrap();
+    assert_eq!(io.take(), [0, 1, 1]);
     fs.commit().unwrap();
     assert_eq!(io.take(), [0, 0, 0]);
     let a = fs.lookup(docs, b"a.txt").unwrap();
@@ -1420,18 +1423,19 @@ fn an_older_slot_larger_than_the_memory_is_reserved_without_reading_past_it() {
     let mut fs = format(&mut mem, &mut disk);
     fs.create(ROOT, b"a").unwrap();
     fs.commit().unwrap();
-    // Slot 0 (generation 2) shrinks to 16384 blocks: one bitmap page whose sum covers 256 words, its log folded in.
+    // Slot 0 (generation 2) shrinks to 16384 blocks: one bitmap page whose sum covers 256 words, its log folded in,
+    // and an empty pinned page.
     let sb = disk.durable[0];
     let page = le64(&sb, SB_HDR) as usize;
     for j in 0..le64(&sb, 13 * 8) as usize {
-        let at = SB_HDR + 16 * 3 + 16 * j;
+        let at = SB_HDR + 16 * 6 + 16 * j;
         let w = le64(&sb, at) as usize;
         disk.durable[page][8 * w..8 * w + 8].copy_from_slice(&sb[at + 8..at + 16]);
     }
     disk.durable[0][SB_HDR + 16..BLOCK_SIZE - 8].fill(0);
     let s = sum(page as u64, &disk.durable[page][..2048]);
     let disk = crafted(disk, &[0], 13, 0);
-    let disk = crafted(disk, &[0], 16, s);
+    let disk = crafted(disk, &[0], 17, s);
     let disk = crafted(disk, &[0], 2, 16384);
     // Slot 1 keeps 70000 blocks but puts its root past what memory for 16384 blocks holds.
     let mut disk = crafted(disk, &[1], 9, 69000);
