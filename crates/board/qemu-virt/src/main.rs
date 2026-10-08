@@ -424,7 +424,7 @@ impl kernel::Board for QemuVirt {
         let mut kernel = KERNEL.lock();
         let blocks = kernel::Disk::blocks(&disk).min(MAX_BLOCKS);
         let (cache, words) = (cache_blocks(blocks, FS_POOL), bitmap_words(blocks));
-        let frames = cache + words * 8 / BLOCK_SIZE;
+        let frames = cache + (words * 8).div_ceil(BLOCK_SIZE);
         let memory = kernel
             .frames
             .alloc_contiguous(frames)

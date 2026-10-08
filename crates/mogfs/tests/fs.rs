@@ -160,7 +160,7 @@ fn entry(path: &str, data: &[u8]) -> (String, Vec<u8>) {
 
 const SEED: u64 = 0x5eed;
 /// Superblock bytes before the live page list.
-const SB_HDR: usize = 112;
+const SB_HDR: usize = 120;
 
 #[test]
 fn round_trip_survives_remount_and_drops_uncommitted_changes() {
@@ -500,7 +500,7 @@ fn uncommitted_changes_leave_the_older_slot_intact() {
 #[test]
 fn crafted_superblocks_are_rejected() {
     // A block count too small or past the disk; a root table of two roots; a tree too tall; a root at a superblock; a
-    // log past the superblock's room, or one whose words are out of order or past the disk.
+    // log past the superblock's room, or one whose words are out of order or past the disk; a wrong index height.
     for (i, value) in [
         (2, 0),
         (2, 15),
@@ -510,7 +510,8 @@ fn crafted_superblocks_are_rejected() {
         (9, 1),
         (13, 248),
         (13, 2),
-        (16, 1),
+        (14, 1),
+        (17, 1),
     ] {
         let mut disk = crafted(hello(), &[0], i, value);
         assert_eq!(snapshot(&mut disk), Ok(vec![]), "field {i} = {value}");
@@ -1365,7 +1366,7 @@ fn an_older_slot_larger_than_the_memory_is_reserved_without_reading_past_it() {
     disk.durable[0][SB_HDR + 16..BLOCK_SIZE - 8].fill(0);
     let s = sum(page as u64, &disk.durable[page][..2048]);
     let disk = crafted(disk, &[0], 13, 0);
-    let disk = crafted(disk, &[0], 15, s);
+    let disk = crafted(disk, &[0], 16, s);
     let disk = crafted(disk, &[0], 2, 16384);
     // Slot 1 keeps 70000 blocks but puts its root past what memory for 16384 blocks holds.
     let mut disk = crafted(disk, &[1], 9, 69000);
@@ -1476,4 +1477,92 @@ fn image_mounts_and_is_rewritten_bit_for_bit() {
     ]);
     want.sort();
     assert_eq!(snapshot(&mut disk), Ok(want));
+}
+
+/// A sparse in-memory disk of `.1` blocks: unwritten blocks read as zeros. Counts [reads, writes, flushes].
+struct Sparse(std::collections::HashMap<u64, Buf>, u64, [usize; 3]);
+
+impl Disk for &mut Sparse {
+    fn read(&mut self, block: u64, bufs: &mut [Buf]) -> Result<(), Error> {
+        self.2[0] += 1;
+        for (i, buf) in bufs.iter_mut().enumerate() {
+            *buf = self
+                .0
+                .get(&(block + i as u64))
+                .copied()
+                .unwrap_or([0; BLOCK_SIZE]);
+        }
+        Ok(())
+    }
+
+    fn write(&mut self, block: u64, bufs: &[Buf]) -> Result<(), Error> {
+        self.2[1] += 1;
+        for (i, buf) in bufs.iter().enumerate() {
+            self.0.insert(block + i as u64, *buf);
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<(), Error> {
+        self.2[2] += 1;
+        Ok(())
+    }
+
+    fn blocks(&self) -> u64 {
+        self.1
+    }
+}
+
+#[test]
+fn a_300_gib_file_system_lists_its_bitmap_through_an_index() {
+    // 2400 bitmap pages: two index levels, 10 blocks under the root.
+    let blocks = 300 << 18;
+    let mut disk = Sparse(Default::default(), blocks, [0; 3]);
+    let mut mem = Mem::new(blocks as usize, POOL);
+    let mut fs = mem.fs(&mut disk);
+    fs.format(SEED).unwrap();
+    // Enough commits to fill the log more than once, so pages and index blocks are rewritten.
+    let mut files = vec![];
+    for i in 0..400 {
+        let f = fs.create(ROOT, format!("f{i}").as_bytes()).unwrap();
+        fs.write(f, 0, &[i as u8; 5000]).unwrap();
+        fs.commit().unwrap();
+        files.push(f);
+    }
+    // 70 MiB touch more bitmap words than the log holds: the commit rewrites the page and the index above it.
+    let root = |d: &Sparse| {
+        let sb = (0..2).max_by_key(|&s| le64(&d.0[&s], 8)).unwrap();
+        (le64(&d.0[&sb], 14 * 8), le64(&d.0[&sb], SB_HDR))
+    };
+    let before = root(fs.disk());
+    let big = fs.create(ROOT, b"big").unwrap();
+    for i in 0..70u64 {
+        fs.write(big, i << 20, &[i as u8 + 1; 1 << 20]).unwrap();
+    }
+    fs.commit().unwrap();
+    let after = root(fs.disk());
+    assert!(
+        before.0 == 2 && after.0 == 2 && after.1 != before.1,
+        "{before:?} {after:?}"
+    );
+    fs.disk().2 = [0; 3];
+    fs.write(files[7], 0, b"small").unwrap();
+    fs.commit().unwrap();
+    // The data page rewritten, then a small commit: the nodes in one request, the superblock between two flushes.
+    assert_eq!(fs.disk().2[1..], [3, 2]);
+    let mut mem = Mem::new(blocks as usize, POOL);
+    let mut fs = mem.fs(&mut disk);
+    fs.mount().unwrap();
+    let mut buf = [0; 5000];
+    for i in 0..400 {
+        let name = format!("f{i}");
+        let f = fs.lookup(ROOT, name.as_bytes()).unwrap();
+        assert_eq!(fs.read(f, 0, &mut buf), Ok(5000));
+        assert_eq!(buf[4], if i == 7 { b'l' } else { i as u8 }, "{name}");
+    }
+    let big = fs.lookup(ROOT, b"big").unwrap();
+    for i in [0u64, 33, 69] {
+        assert_eq!(fs.read(big, (i << 20) + 7, &mut buf[..1]), Ok(1));
+        assert_eq!(buf[0], i as u8 + 1);
+    }
 }

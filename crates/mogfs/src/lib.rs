@@ -5,16 +5,20 @@
 //!   the highest generation. Superblock: magic u64, generation u64, block count u64, incompatible features u64 (none
 //!   are known yet; a set bit refuses the mount), next inode u64, name-hash seed u64, pinned bitmap index (block u64,
 //!   sum u64; zero until snapshots), root count u32 (1: the live root), 4 zero bytes, the live root (tree root block
-//!   u64, sum u64, birth generation u64, level u64), log length u64, then the live bitmap's page list, (block u64,
-//!   sum u64) for each 128 MiB page of the disk (block 0: an all-zero page), then the log, (word u64, value u64) in
-//!   increasing word order, and zeros. Snapshot roots (step 40) take bitmap index blocks; only the live list is inline.
-//! - Superblocks and tree nodes end in a 64-bit hash of their block number and first 4088 bytes, and every pointer to
-//!   one holds that hash (a node pointer also its birth generation), so a lost or misdirected write of a valid old
-//!   block reads as corrupt.
+//!   u64, sum u64, birth generation u64, level u64), log length u64, bitmap index height u64, then the live bitmap's
+//!   page list: for height 0 (at most 128 pages) a (block u64, sum u64) for each 128 MiB page of the disk (block 0:
+//!   an all-zero page), else the (block, sum) of the index root; then the log, (word u64, value u64) in increasing
+//!   word order, and zeros. An index block at level 1 lists up to 255 pages' (block, sum), one at level `l` up to 255
+//!   level `l - 1` blocks', zeros after them (block 0: all of its pages are zero); the root is the one block at the
+//!   top level, the height the fewest levels that list every page.
+//! - Superblocks, tree nodes and index blocks end in a 64-bit hash of their block number and their bytes (an index
+//!   block's entries), and every pointer to one holds that hash (a node pointer also its birth generation), so a lost
+//!   or misdirected write of a valid old block reads as corrupt.
 //! - Data and bitmap pages are whole 4096-byte blocks; the hash of each (block number and page) lives in the extent
 //!   or page list pointing at it.
 //! - Free space is stored: bit `b % 64` of u64 word `b / 64` is set if the root reaches block `b` (the superblocks,
-//!   its tree nodes and data, its bitmap pages); a word is its log entry's value if it has one, else its page's.
+//!   its tree nodes and data, its bitmap pages and index blocks); a word is its log entry's value if it has one,
+//!   else its page's.
 //! - Tree: one B+tree keyed by u128 `inode << 64 | kind << 62 | offset`. Node header: level u8 (0 = leaf), zero u8,
 //!   count u16, 4 zero bytes. Leaf: `count` items (key u128, value offset u16, value length u16), values packed down
 //!   from byte 4088 in item order. Internal: `count` entries (key u128, block u64, sum u64, birth generation u64);
@@ -29,7 +33,8 @@
 //! - Copy-on-write: no block reachable from either slot is written. Data pages are written at once to free blocks
 //!   (or over one written since the last commit). `commit` gives the dirty nodes consecutive free blocks, writes them
 //!   in one request, flushes, writes the other slot with every word changed since the pages were written in its log,
-//!   and flushes; when the log would overflow, the changed pages join the nodes' request and the log empties.
+//!   and flushes; when the log would overflow, the changed pages and the index blocks above them join the nodes'
+//!   request and the log empties.
 //!   Contract: the committed state is always a consistent snapshot of the file system as of a `commit` call.
 #![cfg_attr(not(test), no_std)]
 
@@ -44,22 +49,37 @@ pub const NAME_MAX: usize = 255;
 pub const MAX_FILE_SIZE: u64 = 1 << 52;
 /// Pages an extent maps at most.
 pub const EXTENT_MAX: u64 = 128;
-/// Largest file system, in blocks (16 GiB); `format` uses at most this much of a bigger disk.
-pub const MAX_BLOCKS: u64 = MAX_PAGES as u64 * PAGE_BITS;
+/// Largest file system, in blocks: block numbers keep their top bit clear. `format` uses at most this much of a disk.
+pub const MAX_BLOCKS: u64 = 1 << 62;
 /// Fewest node cache slots `Fs` accepts.
 pub const MIN_POOL: usize = 32;
 /// The root directory.
 pub const ROOT: Inode = Inode(0);
 
+// Unit tests shrink pages, index blocks and the inline list, so small disks reach several index levels.
+#[cfg(not(test))]
 const PAGE_BITS: u64 = 8 * BLOCK_SIZE as u64;
-const PAGE_WORDS: usize = BLOCK_SIZE / 8;
-const MAX_PAGES: usize = 128;
+#[cfg(test)]
+const PAGE_BITS: u64 = 512;
+const PAGE_WORDS: usize = (PAGE_BITS / 64) as usize;
+/// Entries an index block lists.
+#[cfg(not(test))]
+const FAN: usize = (BLOCK_SIZE - 8) / 16;
+#[cfg(test)]
+const FAN: usize = 4;
+/// Pages the superblock lists itself; more take an index.
+#[cfg(not(test))]
+const INLINE: usize = 128;
+#[cfg(test)]
+const INLINE: usize = 2;
+/// Index levels `mount` accepts; past `MAX_BLOCKS` with real sizes.
+const MAX_IX: usize = 24;
 const MAX_POOL: usize = 512;
-/// Cache slots that stage the dirty nodes of a commit request, after the bitmap pages.
+/// Cache slots that stage a commit's request (the last also the mount's pre-log words), after the scratch slot.
 const STAGE: usize = 32;
-const MAX_CACHE: usize = 1 + MAX_PAGES + STAGE + MAX_POOL;
+const MAX_CACHE: usize = 1 + STAGE + MAX_POOL;
 /// Superblock bytes before the page list: the header and a root table of one root.
-const SB_HDR: usize = 112;
+const SB_HDR: usize = 120;
 /// Log entries the superblock has room for beside one page.
 const LOG_MAX: usize = (END - SB_HDR) / 16 - 1;
 const MIN_BLOCKS: u64 = 16;
@@ -193,12 +213,13 @@ pub struct Stat {
 
 /// Cache blocks `Fs` needs for a disk of `blocks` blocks with `pool` node slots (at least `MIN_POOL`).
 pub const fn cache_blocks(blocks: u64, pool: usize) -> usize {
-    1 + pages(blocks) + STAGE + pool
+    1 + STAGE + pool + ix_blocks(pages(blocks))
 }
 
 /// Bitmap words `Fs` needs for a disk of `blocks` blocks.
 pub const fn bitmap_words(blocks: u64) -> usize {
-    3 * pages(blocks) * PAGE_WORDS
+    let pages = pages(blocks);
+    3 * pages * PAGE_WORDS + pages.div_ceil(64)
 }
 
 /// Whether `page` read from `block` matches the sum `map` gave for it.
@@ -211,12 +232,43 @@ pub fn verify(block: Block, page: &Buf, sum: Sum) -> Result<(), Error> {
 }
 
 const fn pages(blocks: u64) -> usize {
-    let b = if blocks < MAX_BLOCKS {
-        blocks
-    } else {
-        MAX_BLOCKS
-    };
-    b.div_ceil(PAGE_BITS) as usize
+    blocks.div_ceil(PAGE_BITS) as usize
+}
+
+/// Levels of the bitmap index for `pages` pages (0: the superblock lists them).
+const fn ix_height(pages: usize) -> usize {
+    let (mut n, mut h) = (pages, 0);
+    if pages <= INLINE {
+        return 0;
+    }
+    while n > 1 {
+        n = n.div_ceil(FAN);
+        h += 1;
+    }
+    h
+}
+
+/// Cache slots the live page list takes: its index blocks, or one for an inline list.
+const fn ix_blocks(pages: usize) -> usize {
+    let (mut n, mut t) = (pages, 0);
+    if pages <= INLINE {
+        return 1;
+    }
+    while n > 1 {
+        n = n.div_ceil(FAN);
+        t += n;
+    }
+    t
+}
+
+/// Blocks at index level `l` (0: the pages themselves) of `pages` pages.
+fn ix_count(pages: usize, l: usize) -> usize {
+    (0..l).fold(pages, |n, _| n.div_ceil(FAN))
+}
+
+/// Entries index block `i` at level `l` holds.
+fn ix_children(pages: usize, l: usize, i: usize) -> usize {
+    min(FAN, ix_count(pages, l - 1) - FAN * i)
 }
 
 /// An item key's low 62 bits: 0 for an inode, a name's chain slot for an entry, the first page for an extent.
@@ -325,6 +377,9 @@ struct Super {
     level: usize,
     /// Log entries after the page list.
     log: usize,
+    /// Bitmap index height, and its root if it has levels.
+    ix_h: usize,
+    ix: (Block, Sum),
 }
 
 /// A directory entry's offset, inode and kind.
@@ -339,7 +394,7 @@ struct Path {
     hi: [Key; MAX_HEIGHT],
 }
 
-/// A file system on `D` with memory its caller gives: `cache` (bitmap staging and node slots, `cache_blocks`) and
+/// A file system on `D` with memory its caller gives: `cache` (staging, node slots and the page list, `cache_blocks`) and
 /// `bits` (`bitmap_words`). `Io` from any change, or a failed `mount`, leaves it refusing writes and commits until a
 /// `mount` succeeds; after `Io` from `commit`, durability is unknown.
 pub struct Fs<'a, D> {
@@ -355,11 +410,12 @@ pub struct Fs<'a, D> {
     now: u64,
     root: Ptr,
     height: usize,
-    /// Bitmap pages changed since they were last written.
-    dirty: [u64; 4],
+    /// Bitmap index height, and its root's block and sum (zero for an inline list).
+    ix_h: usize,
+    ix: (Block, Sum),
     /// The live bitmap's words changed since its pages were last written, sorted, unless `full`: the next commit
-    /// writes the pages.
-    log: [u32; LOG_MAX],
+    /// writes the pages. `bits` marks the pages changed since they were written, after the three bitmaps.
+    log: [u64; LOG_MAX],
     nlog: usize,
     full: bool,
     /// The live bitmap's words changed since the last commit (`lo..hi`), and those the last commit changed.
@@ -369,8 +425,9 @@ pub struct Fs<'a, D> {
     free: u64,
     /// Every block below it is in use.
     hint: Block,
-    /// `cache[0]` holds the live page list, `cache[1..base]` stage commits (the last also the mount's pre-log words),
-    /// `cache[base..top]` cache nodes.
+    /// `cache[0]` is scratch, `cache[1..base]` stage commits (the last also the mount's pre-log words),
+    /// `cache[base..top]` cache nodes, and `cache[top..]` the live page list: its index blocks, level 1 first, or one
+    /// slot for an inline list.
     base: usize,
     top: usize,
     /// Each cache slot's block (`EMPTY` if none or not yet given), whether it holds a dirty node, and last use.
@@ -416,7 +473,8 @@ impl<'a, D: Disk> Fs<'a, D> {
                 generation: 0,
             },
             height: 1,
-            dirty: [0; 4],
+            ix_h: 0,
+            ix: (Block(0), Sum(0)),
             log: [0; LOG_MAX],
             nlog: 0,
             full: false,
@@ -478,7 +536,11 @@ impl<'a, D: Disk> Fs<'a, D> {
             self.bits[map * self.words] = 0b11;
         }
         self.free = self.blocks - 2;
-        self.cache[0].fill(0);
+        let top = self.top;
+        for b in &mut self.cache[top..top + ix_blocks(self.pages)] {
+            b.fill(0);
+        }
+        self.ix = (Block(0), Sum(0));
         (self.generation, self.next_inode, self.seed) = (0, 1, seed);
         let s = self.new_node(0);
         self.root = tagged(s);
@@ -555,10 +617,11 @@ impl<'a, D: Disk> Fs<'a, D> {
             for i in 0..w {
                 self.bits[COMMITTED * w + i] |= self.bits[i];
             }
-            self.dirty = [0; 4];
+            let d = 3 * w;
+            self.bits[d..d + self.pages.div_ceil(64)].fill(0);
             for j in 0..self.nlog {
                 let p = self.log[j] as usize / PAGE_WORDS;
-                self.dirty[p / 64] |= 1 << (p % 64);
+                self.bits[d + p / 64] |= 1 << (p % 64);
             }
             self.prev_span = (0, w);
             self.changed = false;
@@ -866,19 +929,33 @@ impl<'a, D: Disk> Fs<'a, D> {
         // Each node claimed adds at most one word to the log.
         let pages = self.full || self.nlog + self.ndirty > self.log_cap();
         let start = if pages {
-            // Release the old copy of each page that changes, then find blocks for the pages and the nodes; claiming
-            // those blocks may change more pages, so repeat until it does not.
-            let mut done = [0u64; 4];
+            // Release the old copies of the pages that change and of the index blocks above them (each pointer zeroed
+            // once released), then find blocks for them and the nodes; claiming those blocks may change more pages,
+            // so repeat until it does not.
             loop {
-                while let Some(p) = (0..self.pages).find(|&p| bit(&self.dirty, p) && !bit(&done, p))
-                {
-                    done[p / 64] |= 1 << (p % 64);
-                    let b = Block(le64(&self.cache[0], 16 * p));
-                    if b != Block(0) {
-                        self.release(b)?;
+                let mut k = self.ndirty;
+                let mut p = self.next_dirty(0);
+                while let Some(q) = p {
+                    let (s, at) = self.page_entry(q);
+                    self.release_entry(s, at)?;
+                    k += 1;
+                    p = self.next_dirty(q + 1);
+                }
+                for l in 1..=self.ix_h {
+                    let mut i = self.next_ix(l, 0);
+                    while let Some(j) = i {
+                        match self.ix_parent(l, j) {
+                            Some((s, at)) => self.release_entry(s, at)?,
+                            None if self.ix.0 != Block(0) => {
+                                self.release(self.ix.0)?;
+                                self.ix = (Block(0), Sum(0));
+                            }
+                            None => {}
+                        }
+                        k += 1;
+                        i = self.next_ix(l, j + 1);
                     }
                 }
-                let k = count_set(&self.dirty) + self.ndirty;
                 if (self.free as usize) < k {
                     return Err(Error::NoSpace);
                 }
@@ -887,8 +964,8 @@ impl<'a, D: Disk> Fs<'a, D> {
                 for _ in 0..k {
                     b = self.next_free(b);
                     let p = (b.0 / PAGE_BITS) as usize;
-                    more |= !bit(&self.dirty, p);
-                    self.dirty[p / 64] |= 1 << (p % 64);
+                    more |= !self.page_dirty(p);
+                    self.bits[3 * self.words + p / 64] |= 1 << (p % 64);
                     b = b + 1;
                 }
                 if !more {
@@ -901,10 +978,30 @@ impl<'a, D: Disk> Fs<'a, D> {
             }
             self.start(self.ndirty)
         };
-        let changed = if pages { count_set(&self.dirty) } else { 0 };
+        // Blocks in the order they are written: the pages, the index bottom up, the nodes. A page's or index block's
+        // goes into the pointer to it until its sum is known.
         let mut b = start;
-        for s in 1..=changed {
-            self.blk[s] = self.claim(&mut b);
+        if pages {
+            let mut p = self.next_dirty(0);
+            while let Some(q) = p {
+                let c = self.claim(&mut b);
+                let (s, at) = self.page_entry(q);
+                self.cache[s][at..at + 8].copy_from_slice(&c.0.to_le_bytes());
+                p = self.next_dirty(q + 1);
+            }
+            for l in 1..=self.ix_h {
+                let mut i = self.next_ix(l, 0);
+                while let Some(j) = i {
+                    let c = self.claim(&mut b);
+                    match self.ix_parent(l, j) {
+                        Some((s, at)) => {
+                            self.cache[s][at..at + 8].copy_from_slice(&c.0.to_le_bytes())
+                        }
+                        None => self.ix.0 = c,
+                    }
+                    i = self.next_ix(l, j + 1);
+                }
+            }
         }
         for s in self.base..self.top {
             if self.dirt[s] {
@@ -912,21 +1009,53 @@ impl<'a, D: Disk> Fs<'a, D> {
             }
         }
         self.finalize(generation);
-        let words = self.blocks.div_ceil(64) as usize;
-        for (s, p) in (1..).zip((0..self.pages).filter(|&p| pages && bit(&self.dirty, p))) {
-            let len = 8 * min(PAGE_WORDS, words - p * PAGE_WORDS);
-            let page = &mut self.cache[s];
-            for (i, word) in self.bits[p * PAGE_WORDS..][..len / 8].iter().enumerate() {
-                page[8 * i..8 * i + 8].copy_from_slice(&word.to_le_bytes());
+        let (mut first, mut n) = (1, 1);
+        if pages {
+            let words = self.blocks.div_ceil(64) as usize;
+            let mut p = self.next_dirty(0);
+            while let Some(q) = p {
+                let d = self.stage(&mut first, &mut n)?;
+                let len = 8 * min(PAGE_WORDS, words - q * PAGE_WORDS);
+                let page = &mut self.cache[d];
+                for (i, word) in self.bits[q * PAGE_WORDS..][..len / 8].iter().enumerate() {
+                    page[8 * i..8 * i + 8].copy_from_slice(&word.to_le_bytes());
+                }
+                page[len..].fill(0);
+                let (s, at) = self.page_entry(q);
+                let c = Block(le64(&self.cache[s], at));
+                let sum = checksum(c, &self.cache[d][..len]);
+                self.cache[s][at + 8..at + 16].copy_from_slice(&sum.0.to_le_bytes());
+                self.blk[d] = c;
+                p = self.next_dirty(q + 1);
             }
-            page[len..].fill(0);
-            let sum = checksum(self.blk[s], &page[..len]);
-            let (b, entry) = (self.blk[s], &mut self.cache[0][16 * p..16 * p + 16]);
-            entry[..8].copy_from_slice(&b.0.to_le_bytes());
-            entry[8..].copy_from_slice(&sum.0.to_le_bytes());
+            for l in 1..=self.ix_h {
+                let mut i = self.next_ix(l, 0);
+                while let Some(j) = i {
+                    let d = self.stage(&mut first, &mut n)?;
+                    let slot = self.ix_level(l).0 + j;
+                    let len = 16 * ix_children(self.pages, l, j);
+                    let parent = self.ix_parent(l, j);
+                    let c = match parent {
+                        Some((s, at)) => Block(le64(&self.cache[s], at)),
+                        None => self.ix.0,
+                    };
+                    let sum = seal(c, &mut self.cache[slot], len);
+                    let (src, dst) = pair(self.cache, slot, d);
+                    dst.copy_from_slice(src);
+                    self.blk[d] = c;
+                    match parent {
+                        Some((s, at)) => {
+                            self.cache[s][at + 8..at + 16].copy_from_slice(&sum.0.to_le_bytes())
+                        }
+                        None => self.ix.1 = sum,
+                    }
+                    i = self.next_ix(l, j + 1);
+                }
+            }
         }
-        self.write_out(1, changed + 1)?;
+        self.write_out(first, n)?;
         self.flush()?;
+        let list = 16 * self.list_entries();
         let sb = &mut self.bufs[META];
         sb.fill(0);
         let fields = [
@@ -944,16 +1073,21 @@ impl<'a, D: Disk> Fs<'a, D> {
             self.root.generation,
             self.height as u64 - 1,
             if pages { 0 } else { self.nlog as u64 },
+            self.ix_h as u64,
         ];
         for (i, f) in fields.iter().enumerate() {
             sb[8 * i..8 * i + 8].copy_from_slice(&f.to_le_bytes());
         }
-        let list = 16 * self.pages;
-        sb[SB_HDR..SB_HDR + list].copy_from_slice(&self.cache[0][..list]);
+        if self.ix_h == 0 {
+            sb[SB_HDR..SB_HDR + list].copy_from_slice(&self.cache[self.top][..list]);
+        } else {
+            sb[SB_HDR..SB_HDR + 8].copy_from_slice(&self.ix.0.0.to_le_bytes());
+            sb[SB_HDR + 8..SB_HDR + 16].copy_from_slice(&self.ix.1.0.to_le_bytes());
+        }
         if !pages {
             for (j, &i) in self.log[..self.nlog].iter().enumerate() {
                 let at = SB_HDR + list + 16 * j;
-                sb[at..at + 8].copy_from_slice(&(i as u64).to_le_bytes());
+                sb[at..at + 8].copy_from_slice(&i.to_le_bytes());
                 sb[at + 8..at + 16].copy_from_slice(&self.bits[i as usize].to_le_bytes());
             }
         }
@@ -979,7 +1113,9 @@ impl<'a, D: Disk> Fs<'a, D> {
         }
         (self.prev_span, self.span) = (self.span, (usize::MAX, 0));
         if pages {
-            (self.dirty, self.nlog, self.full) = ([0; 4], 0, false);
+            let d = 3 * w;
+            self.bits[d..d + self.pages.div_ceil(64)].fill(0);
+            (self.nlog, self.full) = (0, false);
         }
         self.hint = Block(0);
         self.changed = false;
@@ -990,19 +1126,23 @@ impl<'a, D: Disk> Fs<'a, D> {
     fn setup(&mut self, blocks: u64) -> Result<(), Error> {
         self.broken = true;
         let pages = pages(blocks);
-        let base = 1 + pages + STAGE;
-        let pool = min(self.cache.len().saturating_sub(base), MAX_POOL);
+        let base = 1 + STAGE;
+        let pool = min(
+            self.cache.len().saturating_sub(base + ix_blocks(pages)),
+            MAX_POOL,
+        );
         if pool < MIN_POOL || self.bits.len() < bitmap_words(blocks) {
             return Err(Error::TooBig);
         }
         (self.blocks, self.pages, self.words) = (blocks, pages, pages * PAGE_WORDS);
-        (self.base, self.top) = (base, base + pool);
+        (self.base, self.top, self.ix_h) = (base, base + pool, ix_height(pages));
         self.hint = Block(0);
         (self.nlog, self.full) = (0, false);
         self.blk.fill(EMPTY);
         self.dirt.fill(false);
         self.ndirty = 0;
-        self.dirty = [0; 4];
+        let d = 3 * self.words;
+        self.bits[d..d + pages.div_ceil(64)].fill(0);
         (self.span, self.prev_span) = ((usize::MAX, 0), (0, pages * PAGE_WORDS));
         (self.cached, self.items) = (None, [None; 2]);
         (self.finger, self.start) = (None, (NONE, 0));
@@ -1010,36 +1150,51 @@ impl<'a, D: Disk> Fs<'a, D> {
         Ok(())
     }
 
-    /// Reads `s`'s bitmap into `map` (the words of this disk's size): its pages, then its log. For `LIVE` it keeps the
-    /// page list in `cache[0]`, the log's words in `log` and the words they replace in the last staging slot; another
-    /// slot takes a page it shares with the live list from those. The bitmap must mark its pages and the root.
+    /// Reads `s`'s bitmap into `map` (the words of this disk's size): its index, its pages, then its log. For `LIVE`
+    /// it keeps the page list in `cache[top..]`, the log's words in `log` and the words they replace in the last
+    /// staging slot; another slot takes a page it shares with the live list from those, and its index blocks through
+    /// the staging slots one level each. The bitmap must mark its pages, its index blocks and the root.
     fn load_bitmap(&mut self, s: &Super, map: usize) -> Result<(), Error> {
         let (live, sb) = (map == LIVE, (s.generation % 2) as usize);
         let (pages, w) = (pages(s.blocks), self.words);
         let words = s.blocks.div_ceil(64) as usize;
         let saved = self.base - 1;
         if live {
-            let list = 16 * pages;
-            self.cache[0][..list].copy_from_slice(&self.bufs[sb][SB_HDR..SB_HDR + list]);
-            self.cache[0][list..].fill(0);
+            self.ix = (Block(0), Sum(0));
+            if s.ix_h == 0 {
+                let list = 16 * pages;
+                let top = self.top;
+                let (sbuf, list_buf) = (&self.bufs[sb], &mut self.cache[top]);
+                list_buf[..list].copy_from_slice(&sbuf[SB_HDR..SB_HDR + list]);
+                list_buf[list..].fill(0);
+            } else {
+                self.ix = s.ix;
+                let root = self.ix_level(s.ix_h).0;
+                self.read_ix(root, s.ix, 16 * ix_children(pages, s.ix_h, 0), s.blocks)?;
+                for l in (1..s.ix_h).rev() {
+                    let (at, n) = self.ix_level(l);
+                    for i in 0..n {
+                        let (ps, pat) = self.ix_parent(l, i).unwrap_or((0, 0));
+                        let ptr = (
+                            Block(le64(&self.cache[ps], pat)),
+                            Sum(le64(&self.cache[ps], pat + 8)),
+                        );
+                        self.read_ix(at + i, ptr, 16 * ix_children(pages, l, i), s.blocks)?;
+                    }
+                }
+            }
         }
         self.bits[map * w..(map + 1) * w].fill(0);
+        let mut held = [usize::MAX; MAX_IX + 1];
         for p in 0..pages {
-            let at = SB_HDR + 16 * p;
-            let (b, sum) = (
-                Block(le64(&self.bufs[sb], at)),
-                Sum(le64(&self.bufs[sb], at + 8)),
-            );
+            let (b, sum) = self.list_entry(s, live, &mut held, p, None)?;
             if b == Block(0) && sum == Sum(0) {
                 continue;
             }
             if !(2..s.blocks).contains(&b.0) {
                 return Err(Error::Corrupt);
             }
-            if !live
-                && p < self.pages
-                && Block(le64(&self.cache[0], 16 * p)) == b
-                && Sum(le64(&self.cache[0], 16 * p + 8)) == sum
+            if !live && p < self.pages && self.list_entry(s, true, &mut held, p, None)? == (b, sum)
             {
                 let lo = p * PAGE_WORDS;
                 let hi = min(lo + PAGE_WORDS, w);
@@ -1052,8 +1207,8 @@ impl<'a, D: Disk> Fs<'a, D> {
                 }
                 continue;
             }
-            self.disk.read(b.0, from_mut(&mut self.cache[1]))?;
-            let (page, n) = (&self.cache[1], min(PAGE_WORDS, words - p * PAGE_WORDS));
+            self.disk.read(b.0, from_mut(&mut self.cache[0]))?;
+            let (page, n) = (&self.cache[0], min(PAGE_WORDS, words - p * PAGE_WORDS));
             let tail = le64(page, 8 * (n - 1)) >> (s.blocks % 64);
             if checksum(b, &page[..8 * n]) != sum
                 || page[8 * n..].iter().any(|&b| b != 0)
@@ -1067,7 +1222,7 @@ impl<'a, D: Disk> Fs<'a, D> {
                 }
             }
         }
-        let at = SB_HDR + 16 * pages;
+        let at = SB_HDR + 16 * if s.ix_h == 0 { pages } else { 1 };
         for j in 0..s.log {
             let (i, v) = (
                 le64(&self.bufs[sb], at + 16 * j),
@@ -1080,26 +1235,125 @@ impl<'a, D: Disk> Fs<'a, D> {
             if live {
                 let old = self.bits[i].to_le_bytes();
                 self.cache[saved][8 * j..8 * j + 8].copy_from_slice(&old);
-                self.log[j] = i as u32;
+                self.log[j] = i as u64;
             }
             self.bits[map * w + i] = v;
         }
         if live {
             self.nlog = s.log;
         }
-        // Blocks past this disk's size are never allocated, so need no check.
-        let has = |b: Block| {
-            let i = (b.0 / 64) as usize;
-            b.0 >= self.blocks || self.bits[map * w + i] >> (b.0 % 64) & 1 != 0
-        };
-        let pages_held = (0..pages).all(|p| {
-            let b = Block(le64(&self.bufs[sb], SB_HDR + 16 * p));
-            b == Block(0) || has(b)
-        });
-        if !(has(Block(0)) && has(Block(1)) && has(s.root.block) && pages_held) {
+        // Every page and index block the list reaches, and the superblocks and the root, are marked.
+        let mut held = [usize::MAX; MAX_IX + 1];
+        for p in 0..pages {
+            let (b, _) = self.list_entry(s, live, &mut held, p, Some(map))?;
+            if b != Block(0) && !self.marked(map, b) {
+                return Err(Error::Corrupt);
+            }
+        }
+        if !(self.marked(map, Block(0))
+            && self.marked(map, Block(1))
+            && self.marked(map, s.root.block))
+        {
+            return Err(Error::Corrupt);
+        }
+        if live {
+            for l in 1..=s.ix_h {
+                for i in 0..ix_count(pages, l) {
+                    let b = match self.ix_parent(l, i) {
+                        Some((ps, pat)) => Block(le64(&self.cache[ps], pat)),
+                        None => self.ix.0,
+                    };
+                    if b != Block(0) && !self.marked(map, b) {
+                        return Err(Error::Corrupt);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `map` marks `b`; another slot's map holds only the words its own pages gave, the rest are the live
+    /// ones. Blocks past this disk's size are never allocated, so need no mark.
+    fn marked(&self, map: usize, b: Block) -> bool {
+        let (w, i) = (self.words, (b.0 / 64) as usize);
+        b.0 >= self.blocks
+            || (self.bits[map * w + i] | if map == LIVE { 0 } else { self.bits[i] }) >> (b.0 % 64)
+                & 1
+                != 0
+    }
+
+    /// Reads index block `ptr` into slot `slot`; it lists `len` bytes of entries. A zero pointer is an all-zero block.
+    fn read_ix(
+        &mut self,
+        slot: usize,
+        ptr: (Block, Sum),
+        len: usize,
+        blocks: u64,
+    ) -> Result<(), Error> {
+        if ptr == (Block(0), Sum(0)) {
+            self.cache[slot].fill(0);
+            return Ok(());
+        }
+        if !(2..blocks).contains(&ptr.0.0) {
+            return Err(Error::Corrupt);
+        }
+        self.disk.read(ptr.0.0, from_mut(&mut self.cache[slot]))?;
+        let n = &self.cache[slot];
+        if Sum(le64(n, END)) != ptr.1
+            || checksum(ptr.0, &n[..len]) != ptr.1
+            || n[len..END].iter().any(|&b| b != 0)
+        {
             return Err(Error::Corrupt);
         }
         Ok(())
+    }
+
+    /// Page `p`'s (block, sum) in slot `s`'s list: the live one from `cache[top..]`, another from its superblock or
+    /// by reading its index down from the root, one level per staging slot (`held` notes which block each holds).
+    /// With `check`, each index block read must be marked in that map.
+    fn list_entry(
+        &mut self,
+        s: &Super,
+        live: bool,
+        held: &mut [usize; MAX_IX + 1],
+        p: usize,
+        check: Option<usize>,
+    ) -> Result<(Block, Sum), Error> {
+        let sb = (s.generation % 2) as usize;
+        let (slot, at) = if live {
+            self.page_entry(p)
+        } else if s.ix_h == 0 {
+            (usize::MAX, SB_HDR + 16 * p)
+        } else {
+            let pages = pages(s.blocks);
+            let mut ptr = s.ix;
+            for l in (1..=s.ix_h).rev() {
+                let i = (0..l).fold(p, |i, _| i / FAN);
+                if held[l] != i {
+                    self.read_ix(l, ptr, 16 * ix_children(pages, l, i), s.blocks)?;
+                    if let Some(map) = check
+                        && ptr.0 != Block(0)
+                        && !self.marked(map, ptr.0)
+                    {
+                        return Err(Error::Corrupt);
+                    }
+                    held[l] = i;
+                    held[..l].fill(usize::MAX);
+                }
+                let at = 16 * ((0..l - 1).fold(p, |i, _| i / FAN) % FAN);
+                ptr = (
+                    Block(le64(&self.cache[l], at)),
+                    Sum(le64(&self.cache[l], at + 8)),
+                );
+            }
+            return Ok(ptr);
+        };
+        let b = if slot == usize::MAX {
+            &self.bufs[sb]
+        } else {
+            &self.cache[slot]
+        };
+        Ok((Block(le64(b, at)), Sum(le64(b, at + 8))))
     }
 
     /// The counter exceeds every inode number: the last item down the rightmost path has the largest.
@@ -1455,7 +1709,7 @@ impl<'a, D: Disk> Fs<'a, D> {
     }
 
     /// Fails with `NoSpace` unless `data` blocks, the nodes `paths` tree changes touching `bytes` of items may dirty
-    /// or add, and what commit needs (every dirty node and the bitmap pages) are free. A change that is not
+    /// or add, and what commit needs (every dirty node, the bitmap pages and index blocks) are free. A change that is not
     /// a `removal` also leaves room for one, so a full disk can still be emptied.
     fn reserve(&self, data: u64, paths: usize, bytes: usize, removal: bool) -> Result<(), Error> {
         // Adjacent leaves together hold at least a quarter leaf, and internal nodes are at least a quarter full.
@@ -1463,7 +1717,12 @@ impl<'a, D: Disk> Fs<'a, D> {
             2 * (paths * (self.height + 1) + 2 * bytes.div_ceil(QUARTER))
         };
         let floor = if removal { 0 } else { nodes(4, 0) };
-        let need = data + (nodes(paths, bytes) + floor + self.ndirty + self.pages) as u64;
+        let ix = if self.ix_h == 0 {
+            0
+        } else {
+            ix_blocks(self.pages)
+        };
+        let need = data + (nodes(paths, bytes) + floor + self.ndirty + self.pages + ix) as u64;
         if need > self.free {
             return Err(Error::NoSpace);
         }
@@ -1493,24 +1752,100 @@ impl<'a, D: Disk> Fs<'a, D> {
     /// Notes that `b`'s live bit changed.
     fn touch(&mut self, b: Block) {
         let (p, i) = ((b.0 / PAGE_BITS) as usize, (b.0 / 64) as usize);
-        self.dirty[p / 64] |= 1 << (p % 64);
+        self.bits[3 * self.words + p / 64] |= 1 << (p % 64);
         self.span = (min(self.span.0, i), self.span.1.max(i + 1));
         if self.full {
             return;
         }
-        if let Err(at) = self.log[..self.nlog].binary_search(&(i as u32)) {
+        if let Err(at) = self.log[..self.nlog].binary_search(&(i as u64)) {
             if self.nlog == self.log_cap() {
                 self.full = true;
             } else {
                 self.log.copy_within(at..self.nlog, at + 1);
-                (self.log[at], self.nlog) = (i as u32, self.nlog + 1);
+                (self.log[at], self.nlog) = (i as u64, self.nlog + 1);
             }
         }
     }
 
+    /// Entries the superblock's page list takes: each page's, or the index root's.
+    fn list_entries(&self) -> usize {
+        if self.ix_h == 0 { self.pages } else { 1 }
+    }
+
     /// Log entries the superblock has room for after the page list.
     fn log_cap(&self) -> usize {
-        (END - SB_HDR) / 16 - self.pages
+        (END - SB_HDR) / 16 - self.list_entries()
+    }
+
+    fn page_dirty(&self, p: usize) -> bool {
+        self.bits[3 * self.words + p / 64] >> (p % 64) & 1 != 0
+    }
+
+    /// The first page from `p` on changed since the pages were written.
+    fn next_dirty(&self, p: usize) -> Option<usize> {
+        let d = 3 * self.words;
+        let mut i = p / 64;
+        let mut w = self.bits.get(d + i)? & (!0u64 << (p % 64));
+        loop {
+            if w != 0 {
+                return Some(64 * i + w.trailing_zeros() as usize).filter(|&q| q < self.pages);
+            }
+            i += 1;
+            if 64 * i >= self.pages {
+                return None;
+            }
+            w = self.bits[d + i];
+        }
+    }
+
+    /// The first index block from `i` on at level `l` above a changed page.
+    fn next_ix(&self, l: usize, i: usize) -> Option<usize> {
+        let span = (0..l).fold(1usize, |n, _| n * FAN);
+        let q = self.next_dirty(i.checked_mul(span)?)?;
+        Some(q / span)
+    }
+
+    /// Level `l` of the live index (1: the blocks listing pages): its first cache slot and block count.
+    fn ix_level(&self, l: usize) -> (usize, usize) {
+        let mut at = self.top;
+        for j in 1..l {
+            at += ix_count(self.pages, j);
+        }
+        (at, ix_count(self.pages, l))
+    }
+
+    /// Where page `p`'s (block, sum) sits: a cache slot and offset.
+    fn page_entry(&self, p: usize) -> (usize, usize) {
+        if self.ix_h == 0 {
+            (self.top, 16 * p)
+        } else {
+            (self.top + p / FAN, 16 * (p % FAN))
+        }
+    }
+
+    /// Where the pointer to live index block `i` at level `l` sits; `None` for the root.
+    fn ix_parent(&self, l: usize, i: usize) -> Option<(usize, usize)> {
+        (l < self.ix_h).then(|| (self.ix_level(l + 1).0 + i / FAN, 16 * (i % FAN)))
+    }
+
+    /// Releases the block a list entry points to, if any, and zeroes the entry.
+    fn release_entry(&mut self, s: usize, at: usize) -> Result<(), Error> {
+        let b = Block(le64(&self.cache[s], at));
+        if b != Block(0) {
+            self.release(b)?;
+        }
+        self.cache[s][at..at + 16].fill(0);
+        Ok(())
+    }
+
+    /// The next staging slot, writing the staged ones out first if none is left.
+    fn stage(&mut self, first: &mut usize, n: &mut usize) -> Result<usize, Error> {
+        if *n == self.base {
+            self.write_slots(*first, *n)?;
+            (*first, *n) = (1, 1);
+        }
+        *n += 1;
+        Ok(*n - 1)
     }
 
     fn alloc(&mut self) -> Result<Block, Error> {
@@ -2106,14 +2441,6 @@ fn kind_of(kind: u8) -> Kind {
     if kind == DIR { Kind::Dir } else { Kind::File }
 }
 
-fn count_set(set: &[u64; 4]) -> usize {
-    set.iter().map(|w| w.count_ones() as usize).sum()
-}
-
-fn bit(set: &[u64; 4], i: usize) -> bool {
-    set[i / 64] >> (i % 64) & 1 != 0
-}
-
 /// Two distinct slots of `cache`, mutably.
 fn pair(cache: &mut [Buf], a: usize, b: usize) -> (&mut Buf, &mut Buf) {
     if a < b {
@@ -2146,11 +2473,14 @@ fn superblock(sb: &Buf, slot: u64, disk: u64) -> Option<Super> {
         },
         level: f(12) as usize,
         log: 0,
+        ix_h: f(14).min(MAX_IX as u64 + 1) as usize,
+        ix: (Block(f(15)), Sum(f(16))),
     };
     let (pages, words) = (pages(s.blocks.min(MAX_BLOCKS)), s.blocks.div_ceil(64));
+    let list = if s.ix_h == 0 { min(pages, INLINE) } else { 1 };
     let log = f(13).min(LOG_MAX as u64 + 1) as usize;
-    let end = SB_HDR + 16 * (pages + log);
-    let at = SB_HDR + 16 * pages;
+    let end = SB_HDR + 16 * (list + log);
+    let at = SB_HDR + 16 * list;
     // Entries in increasing word order within the disk's size, the last word's bits past it clear.
     let log_ok = end <= END
         && (0..log).all(|j| {
@@ -2167,6 +2497,9 @@ fn superblock(sb: &Buf, slot: u64, disk: u64) -> Option<Super> {
         && f(12) < MAX_HEIGHT as u64
         && s.root.generation <= s.generation
         && (2..s.blocks).contains(&s.root.block.0)
+        && s.blocks <= MAX_BLOCKS
+        && s.ix_h == ix_height(pages)
+        && (s.ix_h == 0 || (2..s.blocks).contains(&s.ix.0.0))
         && log_ok
         && sb[end..END].iter().all(|&b| b == 0);
     s.log = if s.valid { log } else { 0 };

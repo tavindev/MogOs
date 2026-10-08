@@ -22,9 +22,11 @@ or a device driver.
   `commit`.
 - One copy-on-write B+tree of inode, directory entry and extent items; every pointer holds its child's sum and birth
   generation; data pages are whole 4096-byte blocks whose sums live in their extent (at most 128 pages).
-- Free space stored per root as a bitmap: pages of 128 MiB listed in the superblock (at most 128, so 16 GiB; a larger
-  format takes an incompatible feature flag), and after them a log of the words changed since the pages were
-  written, so a small commit writes no bitmap block. The other slot's bitmap is kept reserved.
+- Free space stored per root as a bitmap: pages of 128 MiB listed in the superblock (up to 128 pages, 16 GiB), or past
+  that through an index of blocks listing 255 entries each, the superblock holding its root; after the list a log of
+  the words changed since the pages were written, so a small commit writes no bitmap or index block. The format's
+  only size bound is the block number width (`MAX_BLOCKS`, 2^62); the caller's memory decides what mounts. The
+  other slot's bitmap is kept reserved.
 - Directory entries keyed by a seeded name hash with a collision chain of 8; a full chain is `Collision`. The bound,
   not the hash's strength, is the guarantee (the hash is a seeded multiply-rotate; tests build collisions from the
   seed).
@@ -34,9 +36,11 @@ or a device driver.
 
 - `#![cfg_attr(not(test), no_std)]`, no dependencies, no `alloc`, workspace `forbid(unsafe_code)`.
 - Leaf crate: `kernel`, `qemu-virt` and `e2e` (dev) depend on it; it depends on none of them.
-- `Fs` is about 22 KiB plus the caller's memory: `cache` (the live page list, the bitmap pages, 32 commit staging slots and
-  a node pool of 32 to 512 slots) and `bits` (three bitmaps), neither needing to be zeroed. A disk past that memory is
-  `TooBig` at mount.
+- `Fs` is about 22 KiB plus the caller's memory: `cache` (a scratch slot, 32 commit staging slots, a node pool of 32 to
+  512 slots, and the live page list: its index blocks, or one slot) and `bits` (three bitmaps and a bit per page),
+  neither needing to be zeroed. A disk past that memory is `TooBig` at mount. Unit tests (`src/tests.rs`) build the
+  crate with small pages (512 blocks), index blocks of 4 entries and an inline list of 2, so their small disks reach
+  several index levels; the integration tests use the real sizes.
 
 ## Invariants & rules
 
@@ -46,10 +50,12 @@ or a device driver.
 - No block reachable from either slot is written. Dirty nodes stay in their cache slots; `commit` gives them one free
   run, copies them into the staging slots and writes them in one request, flushes, writes the other slot with the
   log, flushes (`[0, 2, 2]` while a run fits and the staging slots hold them). When the log would overflow, the
-  pages changed since they were last written join that request (after their old copies are released) and the log
-  empties. Mount reads both superblocks, each live page, and the rightmost path; the older slot's pages only where
-  it does not share them (same block and sum), rebuilding a shared page's older words from the live log's replaced
-  values. When the pool runs short, dirty nodes are written out early (not a commit) at the start of a tree operation,
+  pages changed since they were last written, then the index blocks above them bottom up, join that request ahead of
+  the nodes (after their old copies are released, each pointer zeroed so it is released once) and the log empties.
+  Mount reads both superblocks, the live index, each live page that is not all zero, and the rightmost path; the
+  older slot's pages only where it does not share them (same block and sum), rebuilding a shared page's older words
+  from the live log's replaced values, and its index one block per level in the staging slots (twice: once for the
+  pages, once to check its bitmap marks each index block). When the pool runs short, dirty nodes are written out early (not a commit) at the start of a tree operation,
   never in the middle of one.
 - Every on-disk value is checked once when decoded: a node's sum, level, layout, sorted keys within its bounds, every
   pointer in range and set in the live bitmap, birth generations, value shapes (extents within the disk, not
@@ -86,10 +92,11 @@ or a device driver.
 - Host: `cargo test --target aarch64-apple-darwin -p mogfs`. `tests/fs.rs`: round trip, v1's suite ported (unlink,
   rename, truncate, corruption and fallback, crafted superblocks, `Io` handling, limits, `NoSpace`), stat and times,
   map and verify, a mount on memory that is not zeroed, colliding names filling a chain, a name in the last hash chain, 255-byte names, the readdir cursor across unlinks, crafted entries,
-  the counter check, power cut at every write and flush with subsets of pending writes landing (three workloads, one
+  the counter check, a 300 GiB sparse file system whose bitmap goes through two index levels (small commits at
+  `[_, 3, 2]` with the data page, a 70 MiB write rewriting the index, every file read back after a remount), power cut at every write and flush with subsets of pending writes landing (three workloads, one
   writing nodes out early), the exact I/O table at height 2, 100k entries in one directory (each looked up; listing
   in about one read per leaf; nine in ten unlinked), and a 1 GiB file on a sparse host file with every byte checked
-  (about 7 s), and `image.bin` (written at 5b7d427 by a height-2 workload) mounted and rewritten bit for bit.
+  (about 7 s), and `image.bin` (written by a height-2 workload, regenerated when the format changed in step 39b) mounted and rewritten bit for bit.
 - `src/tests.rs`: 200 seeds of random changes, commits and remounts with the smallest cache through a disk that panics
   on a write to a block a valid slot reaches, checking the tree and the live bitmap after every step and a fresh
   mount's free space after every commit; and the seeded mutation test (1 to 3 decoded fields changed and resealed up

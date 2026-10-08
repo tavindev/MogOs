@@ -74,8 +74,11 @@ Filled in as each step lands.
   (nodes, bitmap page, index, superblock) against v1's two: the index block is gone, the live bitmap's page list sits
   in the superblock, and after it a log of the bitmap words changed since the pages were written (247 entries beside
   one page, at least 120 at 128 pages), so a small commit writes the nodes and the superblock; the pages are written, and the log
-  empties, only when it would overflow. `MAX_BLOCKS` drops to 16 GiB (128 pages) to leave the log room; snapshots
-  (step 40) take index blocks, only the live list is inline. Mount reads 3 requests on a fresh image, v1's count.
+  empties, only when it would overflow. Up to 128 pages (16 GiB) the superblock lists them; past
+  that it holds the root of an index of blocks listing 255 entries each, at any height, so the format is bounded
+  only by the block number width (`MAX_BLOCKS`, 2^62) and the caller's memory decides what mounts (a 300 GiB sparse
+  host test runs through two index levels). The index is rewritten only with the pages, so small commits stay at two
+  block writes at any size. Mount reads 3 requests on a fresh image, v1's count.
   (2) `compiler_builtins`' `memcpy`/`memmove` assembled each unaligned word from bytes; `crates/arch` now provides
   both (`mem.s`, 16 bytes per unaligned `ldp`/`stp`, no FP/SIMD), which also cut `pipe` 20% and `spawn` 19%.
   (3) `open`, `open(TRUNC)` and `readdir` at opt-level 1: a memo of the last four lookups, the last leaf reached with
