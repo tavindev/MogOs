@@ -41,7 +41,7 @@ pub(crate) struct ProcessEntry {
 impl ProcessEntry {
     /// Whether the calling thread is its process's only one. Then nothing else writes the process's table or reaches
     /// its lock's data (a sibling that ended released the lock before the end that lowered the count), so the call
-    /// may skip that lock and the recheck of its lookups.
+    /// may skip that lock and the recheck of its lookups, if it read this before them: a sibling may end between.
     #[inline(always)]
     pub(crate) fn alone(&self) -> bool {
         self.threads.load(Acquire) == 1

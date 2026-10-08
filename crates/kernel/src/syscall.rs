@@ -120,7 +120,6 @@ const IO_WAIT: u64 = 24;
 /// connected.
 const SHUTDOWN: u64 = 25;
 
-/// Most arguments a `spawn` passes.
 /// The syscalls that write no handle table and are not process-local, a bit per number: a board may take its lock over
 /// the shared state before `dispatch` for them, so their lookups need no recheck.
 pub const SHARED_CALLS: u64 = 1 << EXIT
@@ -144,6 +143,7 @@ pub const SHARED_CALLS: u64 = 1 << EXIT
 pub const TABLE_CALLS: u64 =
     1 << OPEN | 1 << PIPE | 1 << MUTEX | 1 << SPAWN | 1 << THREAD | 1 << SOCKET | 1 << IO_WAIT;
 
+/// Most arguments a `spawn` passes.
 pub const MAX_ARGS: usize = 32;
 
 /// The exit code `wait` reports for a process a fault killed: outside `exit`'s 0..=255.

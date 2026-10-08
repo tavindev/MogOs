@@ -11,7 +11,7 @@ pub const PRIORITIES: u8 = 4;
 pub struct Full;
 
 /// What a process's own lock guards: where its next `map` goes (and, from step 27, its futex waiters). `&mut Process`
-/// is also the proof that a handle-table write holds a process lock (`handle::Table`).
+/// is also the proof that a handle-table write holds a process lock or is its process's only thread (`handle::Table`).
 pub struct Process {
     pub next: u64,
 }

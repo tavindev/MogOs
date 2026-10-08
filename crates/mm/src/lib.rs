@@ -178,7 +178,7 @@ impl<const WORDS: usize> FrameAllocator<WORDS> {
 pub const MAX_FRAMES: usize = u32::MAX as usize;
 
 /// Frames a process may hold; every frame taken through it is charged at allocation time. The limit (high half) and
-/// the frames used (low half) share one word and each change is one CAS on both, so a check and its update never see
+/// the frames used (low half) share one word and each checked change is one CAS on both (an unchecked one an add), so a check and its update never see
 /// two different limits, and any core may charge or refund it without a lock.
 pub struct Budget(AtomicU64);
 

@@ -42,7 +42,8 @@ It is **NOT** board-specific: no MMIO addresses, no memory map, no drivers, no s
   entered masked; `lock_leaf()` (the heap's `Leaf` level) takes no witness. `Guard::parts` hands out the data and the
   witness for locks taken under it, both borrowing the guard; `Guard::leak` keeps the lock held until the `unsafe`
   `Lock::unlock` (how trap hooks return holding the board's kernel lock) and returns the data and witness for the
-  witness's lifetime; `unsafe` `Lock::unpublished` reaches data nothing else can reach yet (a spawn's child); `unsafe`
+  witness's lifetime; `unsafe` `Lock::unshared` reaches data nothing else can reach (a spawn's child, a released process's, the data of a
+  process with one thread); `unsafe`
   `root()` makes the witness of a context holding no lock. TPIDR_EL1 holds the core's dense index in bits 48-63 and its per-CPU area's
   signed offset from the `.percpu` template in bits 0-47 (0 on core 0 until `enter_percpu`): `cpu()` is `mrs` + `lsr`,
   `PerCpu<T>::with` (a `RefCell<T>` template static in `.percpu`, its `new` `unsafe`) is `mrs` + `sbfx` + add, IRQs

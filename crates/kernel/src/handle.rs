@@ -216,7 +216,8 @@ const PIPE: u8 = 8;
 const MUTEX: u8 = 9;
 
 /// A handle table read without a lock: each entry is its words behind a 64-bit sequence (no wrap), a seqlock. Writers
-/// (every method taking `&mut Process`, the proof that the caller holds a process lock, this table's) store the
+/// (every method taking `&mut Process`, the proof that the caller holds this table's process lock or is the process's
+/// only thread) store the
 /// sequence odd, then the words, then the sequence even; a lookup that sees the sequence change or odd retries, so it
 /// stores nothing and sibling threads' lookups share the line.
 pub struct Table([Entry; MAX_HANDLES]);

@@ -44,10 +44,15 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
   for its writes and two flushes. Boot-spawned processes get the root directory as handle 3 once mounted (`spawn_init`).
 - Trap hooks `task_switch`, `board_irq`, `board_syscall`, `board_user_fault`: execute the `kernel::syscall::Call`
   that `dispatch` returns (user buffers, pages, frames, wake/block). `board_syscall` looks the caller's handles up
-  without a lock: a console write takes only `CONSOLE` and `map` only its process's lock and `FRAMES`; a call that
-  writes the table (`dup`, `close`, `pipe`, `mutex`, `open`, `spawn`, `thread`, `socket`, `io_wait`) takes the process
-  lock, then `KERNEL`, and releases both before it returns; the rest take `KERNEL` and return holding it, after
-  rechecking the entries they read (a change reruns the call). `board_unlock` and `board_unlock_work`, called by the
+  without a lock: a console write takes only `CONSOLE` and `map` only its process's lock and `FRAMES`; a call on
+  shared state alone (`SHARED_CALLS`: `exit`, `wait`, `lock`, `kill`, the file and socket calls but `open`, ...) takes
+  `KERNEL` before its lookups (no recheck) and returns holding it; a call that writes the table (`dup`, `close`,
+  `pipe`, `mutex`, `open`, `spawn`, `thread`, `socket`, `io_wait`) takes the process lock, then `KERNEL`, and releases
+  both before it returns, rechecking the entries it read (a change reruns the call); `io` on a pipe, console read or
+  file takes `KERNEL` and returns holding it after the same recheck. A process's only thread (`ProcessEntry::alone`,
+  read before `dispatch`: only the caller's own `thread` raises the count) skips the process lock and the recheck:
+  its `TABLE_CALLS` take `KERNEL` first like the shared ones, its `dup` of a stateless object and its `close` take
+  no lock but what the object's release needs. `board_unlock` and `board_unlock_work`, called by the
   trap exit, release `KERNEL`, the second after the hook's deferred work.
 - `Board::console` writes (`Console`) hold `CONSOLE` for a whole `write_fmt`, so no other `Console` line splits it (the unlocked writers below can); it is the PL011
   at `UART0`, like every other UART access. `test=bench-lock`'s `round_trips` (ticket vs test-and-set lock, `cpu()`, `PerCpu::with`) and `add_locked`; `test=bench-ipi`'s `ipi_round_trips` (`PING_SGI`, answered in `board_irq`);
@@ -109,7 +114,7 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
 - Kernel state is reached only through `arch::Lock`s, in one order, which the lock levels check at compile time
   (`crates/lock-order`): a process's lock, then `KERNEL`, then `NET` and `SETUP`, then `FRAMES`, then `CONSOLE`;
   `HEAP` is the only leaf (no witness, nothing taken under it). No step holds two locks of one level: `spawn` holds
-  only the parent's and writes the unpublished child through `Lock::unpublished`. Each trap hook and `Board` method
+  only the parent's and writes the unpublished child through `Lock::unshared`. Each trap hook and `Board` method
   starts from `arch::root()`. A hook that switches takes `KERNEL` and returns holding it; the trap exit releases it
   after `mov sp, x0`. A frame is never freed by the core running on it: a thread's own stack is deferred per-CPU work
   (`DEFERRED`) the trap exit's `board_unlock_work` runs after `mov sp, x0` in the same trap; an ended process is
@@ -146,7 +151,7 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
 - A thread's end frees a kernel stack no core runs on at once, and parks the one its own core runs on (`DEFERRED`)
   until the trap exit has left it. A process's last thread leaves its release to the end of the hook that ended it,
   after that hook's switch away from it (`finish_release`), in the same hold of `KERNEL`: its handles (its lock is
-  reached through `Lock::unpublished`, as no thread of it is left to take it), then its memory (`flush_asid`,
+  reached through `Lock::unshared`, as no thread of it is left to take it), then its memory (`flush_asid`,
   `free_space`), then `Scheduler::exited`, so it is reapable, and its index free, only once nothing of it is left, and
   no other core sees it half released. A core that ended its own process's last thread goes to its idle context for
   the release (`switch_after_end`, `Scheduler::to_idle`) and then picks a task, which the release may have woken,

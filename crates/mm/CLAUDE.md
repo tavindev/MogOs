@@ -10,14 +10,15 @@ or the policy of who gets how many frames (`crates/kernel`, board `spawn`).
 
 ## Responsibilities
 
-- `FrameAllocator`: `new` over a RAM range, `reserve`, `alloc`, `alloc_contiguous`, `alloc_many` (any frames, all or
-  none, one pass over the bitmap), `free`, `free_count`. `alloc`, `alloc_contiguous` and `alloc_many` start their
+- `FrameAllocator`: `new` over a RAM range, `reserve`, `alloc`, `alloc_contiguous`, `alloc_many` (`count` frames,
+  any, handed to a closure; counts the free bits first, so all or none, then one pass over the bitmap), `free`, `free_count`. `alloc`, `alloc_contiguous` and `alloc_many` start their
   first-fit scan at `hint`, below which every word is full: `free` lowers it, `alloc` and `alloc_many` move it to the
   word they took from last (`WORDS` when none is free), `alloc_contiguous` past the full words at it. Results are first
   fit's for every `count >= 1` (`matches_a_bit_by_bit_model`); only the scan over the full prefix (the reserved image,
   then the frames in use) is skipped.
-- `Budget`: limit and frames used, each a `u32` (`MAX_FRAMES`, 16 TiB), packed in one `AtomicU64`; every change is one
-  CAS on both, so any core charges or refunds a budget without a lock. `alloc` / `alloc_contiguous` / `free` against a
+- `Budget`: limit and frames used, each a `u32` (`MAX_FRAMES`, 16 TiB), packed in one `AtomicU64`; every checked change
+  is one CAS on both (`refund` and `grow`, which cannot fail, one atomic add), so any core charges or refunds a budget
+  without a lock. `alloc` / `alloc_contiguous` / `free` against a
   `FrameAllocator`; `charge` / `refund`; `shrink` / `grow` when frames move between parent and child; `reset` (an
   index's next process) and `take` (a reaped child's limit).
 
