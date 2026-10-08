@@ -346,7 +346,7 @@ impl Table {
         let entry = &self.0[handle.index];
         let (sequence, words) = loop {
             let sequence = entry.sequence.load(Acquire);
-            let words = entry.words.each_ref().map(|w| w.load(Relaxed));
+            let words = load(&entry.words);
             // `dmb ishld`: the words are read before the sequence is read again.
             fence(Acquire);
             if sequence & 1 == 0 && entry.sequence.load(Relaxed) == sequence {
@@ -397,19 +397,17 @@ impl Table {
 
     /// The first `N` free entries, to `fill` once every step that can fail is done; `EMFILE` with fewer.
     pub fn reserve<const N: usize>(&self, _: &mut impl Writer) -> Result<[usize; N], i64> {
+        // Index loops here and below: the dev build (`opt-level` 1) leaves iterator adapters as calls.
         let (mut found, mut n) = ([0; N], 0);
-        for (i, entry) in self.0.iter().enumerate() {
-            if n == N {
-                break;
-            }
-            if free(entry.words[0].load(Relaxed)) {
+        for i in 0..MAX_HANDLES {
+            if free(self.0[i].words[0].load(Relaxed)) {
                 (found[n], n) = (i, n + 1);
+                if n == N {
+                    return Ok(found);
+                }
             }
         }
-        if n < N {
-            return Err(EMFILE);
-        }
-        Ok(found)
+        Err(EMFILE)
     }
 
     /// A handle to `object` with `rights` in the free entry `i` (from `reserve`); returns its value.
@@ -426,7 +424,13 @@ impl Table {
         object: Object,
         rights: Rights,
     ) -> Result<u64, i64> {
-        let [i] = self.reserve(process)?;
+        let mut i = 0;
+        while !free(self.0[i].words[0].load(Relaxed)) {
+            i += 1;
+            if i == MAX_HANDLES {
+                return Err(EMFILE);
+            }
+        }
         Ok(self.fill(process, i, object, rights))
     }
 
@@ -434,7 +438,7 @@ impl Table {
     pub fn close<P: Writer>(&self, _: &mut P, handle: Handle) -> Result<Object, i64> {
         match decode(self.words(handle.index)) {
             (generation, Some((object, _))) if handle.valid(generation) => {
-                self.store::<P>(handle.index, encode((generation + 1, None)));
+                self.store::<P>(handle.index, [u64::from(generation + 1), 0, 0]);
                 Ok(object)
             }
             _ => Err(EBADF),
@@ -443,7 +447,7 @@ impl Table {
 
     /// Entry `i`'s words, for a writer (the process lock holds every other writer off).
     fn words(&self, i: usize) -> Words {
-        self.0[i].words.each_ref().map(|w| w.load(Relaxed))
+        load(&self.0[i].words)
     }
 
     /// Empties the table for the next process at its index, handing `f` each object it held.
@@ -462,18 +466,14 @@ impl Table {
     fn store<P: Writer>(&self, i: usize, words: Words) {
         let entry = &self.0[i];
         if !P::SEQUENCED {
-            for (word, value) in entry.words.iter().zip(words) {
-                word.store(value, Relaxed);
-            }
+            store(&entry.words, words);
             return;
         }
         let sequence = entry.sequence.load(Relaxed);
         entry.sequence.store(sequence + 1, Relaxed);
         // `dmb ishst`: the odd sequence is seen before any of the new words.
         fence(Release);
-        for (word, value) in entry.words.iter().zip(words) {
-            word.store(value, Relaxed);
-        }
+        store(&entry.words, words);
         entry.sequence.store(sequence + 2, Release);
     }
 }
@@ -484,9 +484,29 @@ impl Default for Table {
     }
 }
 
+/// The words, each with a relaxed load.
+#[inline(always)]
+fn load(words: &[AtomicU64; 3]) -> Words {
+    [
+        words[0].load(Relaxed),
+        words[1].load(Relaxed),
+        words[2].load(Relaxed),
+    ]
+}
+
+/// Stores `value` into the words, each with a relaxed store.
+#[inline(always)]
+fn store(words: &[AtomicU64; 3], value: Words) {
+    words[0].store(value[0], Relaxed);
+    words[1].store(value[1], Relaxed);
+    words[2].store(value[2], Relaxed);
+}
+
 /// Whether the entry whose first word is `head` is empty and not retired.
+#[inline(always)]
 fn free(head: u64) -> bool {
-    head >> 32 == 0 && (head as u32) < RETIRED
+    // No tag or rights above the generation: one compare.
+    head < u64::from(RETIRED)
 }
 
 /// An entry as words: its handle generation (bits 0-31), object tag (32-39, 0 for none) and rights (40-63), then the
