@@ -532,14 +532,57 @@ unsafe extern "C" fn board_syscall(frame: &mut arch::TrapFrame) -> Resume {
     frame.x[0] = match call {
         Ok(Call::Write { ptr, len }) => write(&mut root, ptr, len),
         Ok(Call::Map { pages }) => map(entry, &mut root, pages).unwrap_or(ENOMEM as u64),
+        Ok(
+            ref call @ (Call::Dup { .. }
+            | Call::Close(_)
+            | Call::NewPipe
+            | Call::NewMutex
+            | Call::Open { .. }
+            | Call::Spawn { .. }
+            | Call::Thread { .. }
+            | Call::Net(NetCall::Socket(_) | NetCall::IoWait)),
+        ) => return table_call(&mut root, entry, &seen, frame, call),
+        Ok(Call::Pipe { end, ptr, len }) => {
+            return pipe_call(&mut root, entry, &seen, frame, (end, ptr, len));
+        }
         Ok(ref call) => return kernel_call(&mut root, entry, &seen, frame, call),
         Err(error) => error as u64,
     };
     Resume::unlocked(at)
 }
 
-/// A call that needs more than its own process: a table call (`table_call`), or one under `KERNEL` alone, which
-/// returns holding it.
+/// Pipe I/O, as `kernel_call`, an arm of its own so the call goes straight from `dispatch` to it.
+#[inline(always)]
+fn pipe_call(
+    root: &mut W<'_, level::Unlocked>,
+    entry: &ProcessEntry,
+    seen: &Seen,
+    frame: &mut arch::TrapFrame,
+    (end, ptr, len): (End, u64, usize),
+) -> Resume {
+    let (kernel, mut w) = Guard::leak(KERNEL.lock_masked(root));
+    let at = frame as *mut arch::TrapFrame as usize;
+    if !entry.handles.unchanged(seen) {
+        frame.restart();
+        return Resume::locked(at, false);
+    }
+    let cpu = arch::cpu();
+    let next = match pipe_io(&mut kernel.pipes, end, ptr, len) {
+        Some(moved) => {
+            if moved > 0 {
+                kernel.sched.wake(Event::Pipe(end.index as usize));
+            }
+            frame.x[0] = moved as u64;
+            at
+        }
+        // SAFETY: trap context, and `frame` the current process's (`board_syscall`'s contract).
+        None => unsafe { block(kernel, &mut w, cpu, frame, Event::Pipe(end.index as usize)) },
+    };
+    kick(&mut kernel.sched, cpu);
+    Resume::locked(next, core::mem::take(&mut kernel.deferred))
+}
+
+/// A call under `KERNEL` alone, which returns holding it.
 #[inline(always)]
 fn kernel_call(
     root: &mut W<'_, level::Unlocked>,
@@ -548,19 +591,6 @@ fn kernel_call(
     frame: &mut arch::TrapFrame,
     call: &Call,
 ) -> Resume {
-    if matches!(
-        *call,
-        Call::Dup { .. }
-            | Call::Close(_)
-            | Call::NewPipe
-            | Call::NewMutex
-            | Call::Open { .. }
-            | Call::Spawn { .. }
-            | Call::Thread { .. }
-            | Call::Net(NetCall::Socket(_) | NetCall::IoWait)
-    ) {
-        return table_call(root, entry, seen, frame, call);
-    }
     let (kernel, mut w) = Guard::leak(KERNEL.lock_masked(root));
     if !entry.handles.unchanged(seen) {
         frame.restart();
@@ -832,18 +862,6 @@ unsafe fn syscall(
             Some(n) => n,
             // SAFETY: the caller masked IRQs, and `frame` is the current process's.
             None => return unsafe { block(kernel, w, cpu, frame, Event::Console) },
-        },
-        Call::Pipe { end, ptr, len } => match pipe_io(pipes, end, ptr, len) {
-            Some(moved) => {
-                if moved > 0 {
-                    sched.wake(Event::Pipe(end.index as usize));
-                }
-                moved as u64
-            }
-            None => {
-                // SAFETY: the caller masked IRQs, and `frame` is the current process's.
-                return unsafe { block(kernel, w, cpu, frame, Event::Pipe(end.index as usize)) };
-            }
         },
         Call::Wait { index, generation } => match sched.reap(index, generation) {
             Ok(Some(code)) => {

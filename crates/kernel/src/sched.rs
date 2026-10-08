@@ -160,10 +160,10 @@ fn bit(i: usize) -> u64 {
 /// `Scheduler::woken`'s flag for core 0's signal.
 const RESUME_BOOT: usize = 1 << (usize::BITS - 1);
 
-/// What one core runs, on a cache line of its own (other cores write `kicked`): a slot (`IDLE` for its idle context), that slot's process (0, the boot table, while idle), the
+/// What one core runs, on a 128-byte line of its own (the M4 host's; other cores write `kicked`): a slot (`IDLE` for its idle context), that slot's process (0, the boot table, while idle), the
 /// idle context's saved frame, and whether it was signalled since it last went idle.
 #[derive(Clone, Copy)]
-#[repr(align(64))]
+#[repr(align(128))]
 struct Core {
     current: usize,
     process: usize,
