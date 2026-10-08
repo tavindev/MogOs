@@ -79,6 +79,18 @@ pub trait Disk {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Inode(u32);
 
+impl Inode {
+    /// Its number, for a table that stores it in a word (the kernel's lock-free handle table).
+    pub fn raw(self) -> u64 {
+        u64::from(self.0)
+    }
+
+    /// The inode `raw` returned this number for.
+    pub fn from_raw(raw: u64) -> Self {
+        Self(raw as u32)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     File,

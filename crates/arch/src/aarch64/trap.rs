@@ -110,7 +110,17 @@ aarch64_vectors:
     bl aarch64_exception
     mov sp, x0
     // Only once off the old stack: with the board's kernel lock free, another core may run the task that owns it.
+1:  cbz x1, 3f
+    cmp x1, #1
+    b.ne 2f
     bl board_unlock
+    b 3f
+    // Work the hook left: it may pick another frame, which holds the lock again.
+2:  mov x0, sp
+    bl board_unlock_work
+    mov sp, x0
+    b 1b
+3:
     ldp x30, x2, [sp, #240]
     msr elr_el1, x2
     ldr x2, [sp, #256]
@@ -156,29 +166,49 @@ const SPSR_EL0T_IRQ_ON: u64 = 0x340;
 unsafe extern "C" {
     /// The board's scheduler: saves the yielding task's frame address and returns the next task's; entered and left like
     /// the hooks below.
-    fn task_switch(frame: usize) -> usize;
+    fn task_switch(frame: usize) -> Resume;
+}
+
+/// What a trap hook returns: the frame to resume, and whether the hook holds the board's kernel lock, which the trap
+/// exit then releases once it has moved to that frame: 0 not held, 1 held (`board_unlock`), 2 held with work left
+/// (`board_unlock_work`, which returns the frame to resume after it, as a hook does).
+#[repr(C)]
+pub struct Resume {
+    frame: usize,
+    locked: usize,
+}
+
+impl Resume {
+    /// Resumes `frame`, the hook holding the kernel lock, with `work` for `board_unlock_work`.
+    pub fn locked(frame: usize, work: bool) -> Self {
+        Self {
+            frame,
+            locked: 1 + work as usize,
+        }
+    }
+
+    /// Resumes `frame`, the hook holding no lock.
+    pub fn unlocked(frame: usize) -> Self {
+        Self { frame, locked: 0 }
+    }
 }
 
 /// Executes `brk #0`, which the handler skips; returning proves it was caught. Call after `install_vectors`.
-///
-/// # Safety
-///
-/// The caller holds the board's kernel lock through a leaked guard: the trap exit releases it, as after every trap.
-pub unsafe fn breakpoint_self_test() {
+pub fn breakpoint_self_test() {
     // SAFETY: the installed sync handler skips `brk #0` and resumes after it.
     unsafe { asm!("brk #0", clobber_abi("C")) };
 }
 
-// SAFETY: the board defines these with these signatures. Each is entered with IRQs masked and returns holding the board's
-// kernel lock, which the trap exit releases through `board_unlock` once it has moved to the returned frame.
+// SAFETY: the board defines these with these signatures. Each is entered with IRQs masked and says in its `Resume`
+// whether it returns holding the board's kernel lock; one that switched tasks always does.
 unsafe extern "C" {
-    /// Handles the pending IRQ; returns the frame to resume, `frame` or the next task's.
-    fn board_irq(frame: usize) -> usize;
-    /// Runs the syscall a process made with `svc`; returns the frame to resume.
-    fn board_syscall(frame: &mut TrapFrame) -> usize;
-    /// Kills the process whose instruction faulted at EL0 with exception class `ec` at address `far`; returns
-    /// the next task's frame.
-    fn board_user_fault(frame: usize, ec: u64, far: u64) -> usize;
+    /// Handles the pending IRQ; resumes `frame` or the next task's.
+    fn board_irq(frame: usize) -> Resume;
+    /// Runs the syscall a process made with `svc`; resumes `frame` or the next task's.
+    fn board_syscall(frame: &mut TrapFrame) -> Resume;
+    /// Kills the process whose instruction faulted at EL0 with exception class `ec` at address `far`; resumes the next
+    /// task's frame.
+    fn board_user_fault(frame: usize, ec: u64, far: u64) -> Resume;
 }
 
 /// Writes a frame just below `stack_top` that starts `entry(arg)` at EL1h with IRQs unmasked; returns its address for the scheduler.
@@ -262,7 +292,7 @@ pub fn yield_now() {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn aarch64_exception(frame: &mut TrapFrame, index: u64) -> usize {
+extern "C" fn aarch64_exception(frame: &mut TrapFrame, index: u64) -> Resume {
     if index == IRQ_CURRENT_SPX || index == IRQ_LOWER64 {
         // SAFETY: exception entry masked IRQs.
         return unsafe { board_irq(frame as *mut TrapFrame as usize) };
@@ -285,7 +315,7 @@ extern "C" fn aarch64_exception(frame: &mut TrapFrame, index: u64) -> usize {
     }
     if index == SYNC_CURRENT_SPX && ec == EC_BRK64 && esr & 0xffff == 0 {
         frame.elr += 4;
-        return frame as *mut TrapFrame as usize;
+        return Resume::unlocked(frame as *mut TrapFrame as usize);
     }
     panic!(
         "unhandled {} exception from {}: ESR_EL1={esr:#x} FAR_EL1={far:#x} ELR_EL1={:#x}",

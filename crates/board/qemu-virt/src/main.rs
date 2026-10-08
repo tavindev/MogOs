@@ -22,11 +22,12 @@ use core::slice;
 use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize};
 
-use arch::{Conduit, Guard, KernelMap, Lock, PerCpu};
+use arch::{Conduit, KernelMap, Lock, PerCpu};
 use dtb::Dtb;
 use fs::FsDisk;
 use kernel::console::Line;
 use kernel::elf::Segment;
+use kernel::file::Opens;
 use kernel::handle::{INIT_ARCHIVE, MAX_HANDLES, Rights};
 use kernel::mutex::Mutexes;
 use kernel::network::Network;
@@ -166,32 +167,48 @@ unsafe impl GlobalAlloc for KernelHeap {
     }
 }
 
-/// The big lock over threads and processes, free frames, pipes, mutexes, console input, the file system and the
-/// buffer user inputs are copied into. Every trap hook takes it and returns holding it, and the trap exit releases it
-/// (`board_unlock`). File system calls do their disk I/O under it, so a `sync` holds it for its flushes.
+/// The big lock over threads and processes, pipes, mutexes, console input, the file system and its open counts. A
+/// trap hook that switches takes it and returns holding it, and the trap exit releases it (`board_unlock`); a call that
+/// touches only its own process takes it not at all. File system calls do their disk I/O under it, so a `sync` holds
+/// it for its flushes.
 static KERNEL: Lock<Kernel, level::Kernel> = Lock::new(Kernel {
     sched: Scheduler::new(),
-    frames: FrameAllocator::empty(),
     pipes: Pipes::new(),
     mutexes: Mutexes::new(),
     line: Line::new(),
     fs: Fs::new(FsDisk(None)),
     mounted: false,
-    buf: [0; 2 * MAX_BUFFER as usize],
+    opens: Opens::new(),
+    deferred: false,
 });
 
 struct Kernel {
     sched: Sched,
-    frames: FrameAllocator<FRAME_WORDS>,
     pipes: Pipes<MAX_PIPES>,
     mutexes: Mutexes<MAX_MUTEXES>,
     line: Line,
     fs: Fs<FsDisk>,
     /// `fs` is mounted: boot-spawned processes get its root as handle 3.
     mounted: bool,
-    /// Where a syscall copies user inputs and stages outputs: room for `rename`'s two paths.
-    buf: [u8; 2 * MAX_BUFFER as usize],
+    opens: Opens,
+    /// This hold left `trap::Deferred` work for the trap exit; taken by the hook's `Resume`.
+    deferred: bool,
 }
+
+/// The free frames: one pass of the bitmap per `spawn` or `map`, which take every frame they need at once.
+static FRAMES: Lock<FrameAllocator<FRAME_WORDS>, level::Frames> =
+    Lock::new(FrameAllocator::empty());
+
+#[unsafe(link_section = ".percpu")]
+// SAFETY: in `.percpu`.
+/// This core's current process index, written by its own switches only, so a syscall finds its table without `KERNEL`.
+static CURRENT: PerCpu<usize> = unsafe { PerCpu::new(0) };
+#[unsafe(link_section = ".percpu")]
+// SAFETY: in `.percpu`.
+/// Where a syscall copies user inputs and stages outputs: room for `rename`'s two paths. A hook never switches while it
+/// uses it.
+static BUF: PerCpu<[u8; 2 * MAX_BUFFER as usize]> =
+    unsafe { PerCpu::new([0; 2 * MAX_BUFFER as usize]) };
 
 /// Every console write and read on `UART0`, the last lock in the order, except panic output, which goes straight to
 /// `UART0` so a panic under this lock still prints.
@@ -249,11 +266,7 @@ impl kernel::Board for QemuVirt {
     }
 
     fn breakpoint_self_test(&mut self) {
-        // SAFETY: a `Board` method, which the kernel crate calls holding no lock.
-        let mut root = unsafe { arch::root() };
-        let _ = Guard::leak(KERNEL.lock(&mut root));
-        // SAFETY: `KERNEL` is held through the guard leaked above, which the trap exit releases.
-        unsafe { arch::breakpoint_self_test() }
+        arch::breakpoint_self_test()
     }
 
     fn read_unmapped(&mut self) {
@@ -312,9 +325,11 @@ impl kernel::Board for QemuVirt {
         // SAFETY: a `Board` method, which the kernel crate calls holding no lock.
         let mut root = unsafe { arch::root() };
         let mut kernel = KERNEL.lock(&mut root);
-        let Kernel { sched, frames, .. } = &mut *kernel;
+        let (kernel, mut w) = kernel.parts();
+        let sched = &mut kernel.sched;
         sched.free_slot().ok_or(Full).and_then(|slot| {
-            let stack = frames.alloc_contiguous(TASK_STACK_FRAMES).ok_or(Full)?;
+            let stack = FRAMES.lock(&mut w).alloc_contiguous(TASK_STACK_FRAMES);
+            let stack = stack.ok_or(Full)?;
             let start = (stack.end.0 as usize - size_of::<Start>()) & !15;
             // SAFETY: `start` is 16-byte aligned and inside the fresh stack, which nothing else references.
             unsafe { (start as *mut Start).write(Start { board, entry, arg }) };
@@ -356,15 +371,17 @@ impl kernel::Board for QemuVirt {
         let idle = unsafe { arch::new_task(area(0) as usize, idle, 0) };
         // SAFETY: a `Board` method, which the kernel crate calls holding no lock.
         let mut root = unsafe { arch::root() };
-        let mut kernel = KERNEL.lock(&mut root);
-        kernel.frames = frames;
-        kernel.sched.start_cores(CPUS.load(Relaxed), idle);
+        *FRAMES.lock(&mut root) = frames;
+        KERNEL
+            .lock(&mut root)
+            .sched
+            .start_cores(CPUS.load(Relaxed), idle);
     }
 
     fn free_frames(&self) -> usize {
         // SAFETY: a `Board` method, which the kernel crate calls holding no lock.
         let mut root = unsafe { arch::root() };
-        KERNEL.lock(&mut root).frames.free_count()
+        FRAMES.lock(&mut root).free_count()
     }
 
     fn spawn_user(&mut self, program: Program, budget: usize) -> Result<(), i64> {
@@ -381,7 +398,7 @@ impl kernel::Board for QemuVirt {
             writable: false,
         };
         spawn_init(
-            (code, [segment].into_iter(), entry),
+            (code, core::iter::once(segment), entry),
             (budget, next),
             0,
             INIT_ARCHIVE,
@@ -414,7 +431,7 @@ impl kernel::Board for QemuVirt {
 
     fn disk(&mut self) -> Option<VirtioBlk> {
         // SAFETY: a `Board` method, which the kernel crate calls holding no lock.
-        let alloc = || KERNEL.lock(&mut unsafe { arch::root() }).frames.alloc();
+        let alloc = || FRAMES.lock(&mut unsafe { arch::root() }).alloc();
         if DISK_TAKEN.swap(true, Relaxed) {
             return None;
         }

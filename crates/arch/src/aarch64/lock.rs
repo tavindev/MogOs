@@ -85,6 +85,17 @@ impl<T, L> Lock<T, L> {
         }
     }
 
+    /// The data, without taking the lock.
+    ///
+    /// # Safety
+    ///
+    /// Nothing else reaches the data while the reference lives: it is not yet published to another core or task.
+    #[allow(clippy::mut_from_ref)]
+    pub unsafe fn unpublished(&self) -> &mut T {
+        // SAFETY: the caller's contract.
+        unsafe { &mut *self.data.get() }
+    }
+
     /// Masks IRQs, then acquires under the witness `w`; the guard releases, then restores the mask.
     pub fn lock<'a, P>(&'a self, w: &'a mut W<'_, P>) -> Guard<'a, T, L>
     where
@@ -239,13 +250,26 @@ impl<T> PerCpu<T> {
     /// borrow could end on another core.
     pub fn with<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
         let irq = irq::disable();
+        // SAFETY: IRQs are masked above.
+        let result = unsafe { self.with_masked(f) };
+        irq::restore(irq);
+        result
+    }
+
+    /// As `with`, without touching DAIF.
+    ///
+    /// # Safety
+    ///
+    /// IRQs must be masked (trap context), so the task stays on its core while `f` runs.
+    #[inline(always)]
+    pub unsafe fn with_masked<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
         let offset: isize;
         // SAFETY: reading TPIDR_EL1 has no side effects; `sbfx` sign-extends its offset bits.
         unsafe {
             asm!("mrs {0}, tpidr_el1", "sbfx {0}, {0}, #0, #48", out(reg) offset, options(nomem, nostack, preserves_flags))
         };
         // SAFETY: `new`'s contract puts `self` in the template, and `enter_percpu` made this core's copy at `offset` from
-        // it, which only this core reaches, with IRQs masked.
+        // it, which only this core reaches, with IRQs masked (the caller's contract).
         let copy = unsafe {
             &*core::ptr::with_exposed_provenance::<Self>(
                 (self as *const Self)
@@ -253,10 +277,6 @@ impl<T> PerCpu<T> {
                     .wrapping_add_signed(offset),
             )
         };
-        let mut slot = copy.0.borrow_mut();
-        let result = f(&mut slot);
-        drop(slot);
-        irq::restore(irq);
-        result
+        f(&mut copy.0.borrow_mut())
     }
 }

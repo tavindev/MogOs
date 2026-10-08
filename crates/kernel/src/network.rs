@@ -21,12 +21,12 @@ use net::{
     Tcp, TcpId, TcpSocket, TimeWait,
 };
 
+use crate::Board;
 use crate::handle::{CONNECT, LISTEN, Rights};
 use crate::syscall::{
     EACCES, EADDRINUSE, EAGAIN, EBADF, EBUSY, ECONNREFUSED, ECONNRESET, EFAULT, EHOSTUNREACH,
     EINVAL, EISCONN, ENETUNREACH, ENFILE, ENOBUFS, ENOTCONN, EPIPE, ETIMEDOUT, MAX_BUFFER,
 };
-use crate::{Board, Scheduler};
 
 const NEIGHBORS: usize = 8;
 const UDP_SOCKETS: usize = 4;
@@ -103,20 +103,6 @@ pub trait Budgets {
     fn charge(&mut self, index: usize, frames: usize) -> bool;
     fn refund(&mut self, index: usize, frames: usize);
     fn alive(&mut self, owner: Owner) -> bool;
-}
-
-impl<const N: usize, const P: usize> Budgets for Scheduler<N, P> {
-    fn charge(&mut self, index: usize, frames: usize) -> bool {
-        self.memory(index).budget.charge(frames)
-    }
-
-    fn refund(&mut self, index: usize, frames: usize) {
-        self.memory(index).budget.refund(frames);
-    }
-
-    fn alive(&mut self, (slot, generation): Owner) -> bool {
-        self.budget(slot, generation).is_some()
-    }
 }
 
 /// Copies to and from the submitting process's memory (never a reference: a sibling thread may write it).

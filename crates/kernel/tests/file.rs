@@ -150,3 +150,20 @@ fn unlink_refuses_an_inode_a_handle_reaches() {
     assert_eq!(fs.read(file, 0, &mut buf), Ok(4));
     assert_eq!(&buf[..4], b"mine");
 }
+
+#[test]
+fn opens_count_dir_and_node_handles_until_the_last_closes() {
+    use kernel::file::Opens;
+    use kernel::handle::Object;
+    use mogfs::ROOT;
+
+    let mut opens = Opens::new();
+    opens.open(Object::Console);
+    assert!(!opens.held(ROOT));
+    opens.open(Object::Dir(ROOT));
+    opens.open(Object::Dir(ROOT));
+    opens.close(Object::Dir(ROOT));
+    assert!(opens.held(ROOT), "one left");
+    opens.close(Object::Dir(ROOT));
+    assert!(!opens.held(ROOT));
+}

@@ -1,6 +1,6 @@
-use mm::{Budget, PhysAddr};
+use mm::PhysAddr;
 
-use crate::handle::{Handles, Object};
+use crate::handle::Object;
 use crate::syscall::EBADF;
 
 /// Priority levels: 0 (lowest; the boot context and kernel tasks) to `PRIORITIES - 1`.
@@ -10,17 +10,11 @@ pub const PRIORITIES: u8 = 4;
 #[derive(Debug)]
 pub struct Full;
 
-/// A process's budget, which pays for its threads' kernel stacks too, and where its next `map` goes. Handle tables
-/// are fixed arrays in the process table, so they are not charged.
-pub struct Memory {
-    pub budget: Budget,
+/// What a process's own lock guards: where its next `map` goes (and, from step 27, its futex waiters). `&mut Process`
+/// is also the proof that a handle-table write holds a process lock (`handle::Table`).
+pub struct Process {
     pub next: u64,
 }
-
-const NO_MEMORY: Memory = Memory {
-    budget: Budget::new(0),
-    next: 0,
-};
 
 /// What a blocked task waits for; `wake` makes every task waiting for it ready.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -142,16 +136,17 @@ impl<const M: usize> Entries<M> {
     }
 }
 
-/// The process table: per index, an address space (its level-1 table; `PhysAddr(0)` is the boot table), handles,
-/// memory and live threads. Index 0 is the kernel: the boot context and kernel tasks, in the boot table.
+/// The process table: per index, an address space (its level-1 table; `PhysAddr(0)` is the boot table) and live
+/// threads. Index 0 is the kernel: the boot context and kernel tasks, in the boot table. A process whose last thread
+/// ended is released (its handles and memory) before `exited` makes it reapable; until then it is neither live nor
+/// reapable.
 pub struct Processes<const P: usize> {
     space: [PhysAddr; P],
-    handles: [Handles; P],
-    /// An ended process's budget stays here until `reap`.
-    memory: [Memory; P],
     /// A bit per slot of its live threads.
     threads: [u64; P],
     entries: Entries<P>,
+    /// Processes whose last thread ended, not yet `exited`.
+    releasing: usize,
 }
 
 /// A core's current slot while it runs its idle context.
@@ -232,10 +227,9 @@ impl<const N: usize, const P: usize> Scheduler<N, P> {
             sleepers: 0,
             processes: Processes {
                 space: [PhysAddr(0); P],
-                handles: [Handles::new(); P],
-                memory: [NO_MEMORY; P],
                 threads,
                 entries: Entries::new(),
+                releasing: 0,
             },
         }
     }
@@ -260,18 +254,10 @@ impl<const N: usize, const P: usize> Scheduler<N, P> {
     }
 
     /// Starts a process with no threads yet at `index` with `generation` (from `free_process`), in address space
-    /// `space`, with `memory` and `handles`.
-    pub fn add_process(
-        &mut self,
-        (index, generation): (usize, u64),
-        space: PhysAddr,
-        memory: Memory,
-        handles: Handles,
-    ) {
+    /// `space`; its first thread is added in the same hold of the lock.
+    pub fn add_process(&mut self, (index, generation): (usize, u64), space: PhysAddr) {
         let p = &mut self.processes;
         p.space[index] = space;
-        p.handles[index] = handles;
-        p.memory[index] = memory;
         p.threads[index] = 0;
         p.entries.start((index, generation));
     }
@@ -364,6 +350,19 @@ impl<const N: usize, const P: usize> Scheduler<N, P> {
         (self.frame[next], from, core.process)
     }
 
+    /// Saves `cpu`'s current task's `frame` and moves `cpu` to its idle context, whatever is ready: a core that ended a
+    /// process's last thread releases it before it picks a task, since the release may wake a better one. Returns as
+    /// `switch` does.
+    pub fn to_idle(&mut self, cpu: usize, frame: usize) -> (usize, usize, usize) {
+        let core = &mut self.cores[cpu];
+        let from = core.process;
+        self.frame[core.current] = frame;
+        self.on_core[core.current] = false;
+        (core.current, core.process, core.kicked) = (IDLE, 0, false);
+        self.sleepers += 1;
+        (core.idle, from, 0)
+    }
+
     /// Whether every core but `cpu` idles.
     fn others_idle(&self, cpu: usize) -> bool {
         (self.cores.iter().enumerate()).all(|(i, c)| i == cpu || c.current == IDLE)
@@ -452,9 +451,9 @@ impl<const N: usize, const P: usize> Scheduler<N, P> {
     }
 
     /// Ends the live thread in `slot` (never slot 0) with `code`, a zombie while a handle reaches it, and wakes its
-    /// joiners; returns its kernel stack and the event it was blocked on. With its last thread its process ends alike,
-    /// so its own handles must already be released (`take_handles`).
-    pub fn end(&mut self, slot: usize, code: u64) -> (PhysAddr, Option<Event>) {
+    /// joiners; returns its kernel stack, the event it was blocked on, and whether it was its process's last thread,
+    /// which leaves the process to be released and then `exited`.
+    pub fn end(&mut self, slot: usize, code: u64) -> (PhysAddr, Option<Event>, bool) {
         assert!(slot != 0, "the boot context cannot exit");
         self.marked &= !(1 << slot);
         let blocked = match self.slots.state[slot] {
@@ -469,16 +468,17 @@ impl<const N: usize, const P: usize> Scheduler<N, P> {
             "slot {slot} ended twice"
         );
         self.processes.threads[index] &= !(1 << slot);
-        if self.processes.threads[index] == 0 {
-            self.processes.entries.end(index, code);
-            self.wake(Event::Exit(index));
-        }
-        (self.stack[slot], blocked)
+        let last = self.processes.threads[index] == 0;
+        self.processes.releasing += last as usize;
+        (self.stack[slot], blocked, last)
     }
 
-    /// Whether any process's handle table holds a handle to an object `f` matches.
-    pub fn holds(&self, f: impl Fn(Object) -> bool) -> bool {
-        self.processes.handles.iter().any(|h| h.objects().any(&f))
+    /// The process at `index`, its last thread ended and its handles and memory released, ends with `code`: a zombie
+    /// while a handle reaches it, else free, and its waiters wake.
+    pub fn exited(&mut self, index: usize, code: u64) {
+        self.processes.releasing -= 1;
+        self.processes.entries.end(index, code);
+        self.wake(Event::Exit(index));
     }
 
     /// A new handle reaches `object`: a process or thread it names stays a zombie, once it ends, until it closes.
@@ -491,16 +491,10 @@ impl<const N: usize, const P: usize> Scheduler<N, P> {
         }
     }
 
-    /// For the process at `index` with `generation`: `None` while it runs; once it ended, its code and its budget's
-    /// limit, which only the first call gets (later ones get 0), and its index is freed; `EBADF` once a newer process
-    /// took the index.
-    pub fn reap(&mut self, index: usize, generation: u64) -> Result<Option<(u64, usize)>, i64> {
-        let p = &mut self.processes;
-        let Some(code) = p.entries.reap(index, generation)? else {
-            return Ok(None);
-        };
-        let budget = core::mem::replace(&mut p.memory[index].budget, Budget::new(0));
-        Ok(Some((code, budget.limit())))
+    /// For the process at `index` with `generation`: `None` until it `exited`; then its code, and its index is freed
+    /// (the caller takes its budget in the same hold); `EBADF` once a newer process took the index.
+    pub fn reap(&mut self, index: usize, generation: u64) -> Result<Option<u64>, i64> {
+        self.processes.entries.reap(index, generation)
     }
 
     /// For the thread in `slot` with `generation`: `None` while it runs; once it ended, its code, and its slot is
@@ -509,17 +503,12 @@ impl<const N: usize, const P: usize> Scheduler<N, P> {
         self.slots.reap(slot, generation)
     }
 
-    /// A handle to the process at `index` with `generation` was closed: if it was the last one to the ended process,
-    /// frees its index and returns its budget's limit, as `reap` would; otherwise 0.
+    /// A handle to the process at `index` with `generation` was closed: whether it was the last one to the exited
+    /// process, which freed its index as `reap` would.
     #[inline]
-    pub fn close(&mut self, index: usize, generation: u64) -> usize {
-        if !self.processes.entries.dropped(index, generation) {
-            return 0;
-        }
-        match self.reap(index, generation) {
-            Ok(Some((_, limit))) => limit,
-            _ => 0,
-        }
+    pub fn close(&mut self, index: usize, generation: u64) -> bool {
+        self.processes.entries.dropped(index, generation)
+            && matches!(self.reap(index, generation), Ok(Some(_)))
     }
 
     /// A handle to the thread in `slot` with `generation` was closed: if it was the last one to the ended thread,
@@ -530,20 +519,15 @@ impl<const N: usize, const P: usize> Scheduler<N, P> {
         }
     }
 
-    /// Whether the process at `index` with `generation` still runs; `EBADF` once a newer process took the index.
+    /// Whether the process at `index` with `generation` still runs (not once its last thread ended); `EBADF` once a
+    /// newer process took the index.
     pub fn process_live(&self, index: usize, generation: u64) -> Result<bool, i64> {
-        self.processes.entries.live(index, generation)
+        Ok(self.processes.entries.live(index, generation)? && self.processes.threads[index] != 0)
     }
 
     /// Whether the thread in `slot` with `generation` still runs; `EBADF` once a newer thread took the slot.
     pub fn thread_live(&self, slot: usize, generation: u64) -> Result<bool, i64> {
         self.slots.live(slot, generation)
-    }
-
-    /// The budget of the process at `index` with `generation`, unless it ended.
-    pub fn budget(&mut self, index: usize, generation: u64) -> Option<&mut Budget> {
-        let live = self.process_live(index, generation) == Ok(true);
-        live.then_some(&mut self.processes.memory[index].budget)
     }
 
     /// `cpu`'s current task's slot and generation.
@@ -641,27 +625,11 @@ impl<const N: usize, const P: usize> Scheduler<N, P> {
         })
     }
 
-    /// The memory of the process at `index`.
-    #[inline]
-    pub fn memory(&mut self, index: usize) -> &mut Memory {
-        &mut self.processes.memory[index]
-    }
-
-    /// `cpu`'s current process's handles.
-    #[inline(always)]
-    pub fn handles(&mut self, cpu: usize) -> &mut Handles {
-        &mut self.processes.handles[self.cores[cpu].process]
-    }
-
-    /// Empties the handle table of the process at `index`; returns what it held.
-    pub fn take_handles(&mut self, index: usize) -> Handles {
-        core::mem::take(&mut self.processes.handles[index])
-    }
-
-    /// Threads in the queue, the boot context included.
+    /// Threads in the queue, the boot context included, and processes whose last thread ended that are not yet
+    /// released (`exited`).
     pub fn count(&self) -> usize {
         let queued = |s: &&State| matches!(s, State::Ready | State::Blocked(_));
-        self.slots.state[..self.end].iter().filter(queued).count()
+        self.slots.state[..self.end].iter().filter(queued).count() + self.processes.releasing
     }
 }
 

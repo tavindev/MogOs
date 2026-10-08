@@ -121,6 +121,18 @@ pub trait Disk {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Inode(u64);
 
+impl Inode {
+    /// Its number, for a table that stores it in a word (the kernel's lock-free handle table).
+    pub fn raw(self) -> u64 {
+        self.0
+    }
+
+    /// The inode `raw` returned this number for.
+    pub fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+}
+
 /// A block's number on the disk.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]

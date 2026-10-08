@@ -1,33 +1,78 @@
 //! Process construction: address spaces, ELF and asm programs, spawn and its arguments.
 
+use alloc::vec;
 use core::arch::global_asm;
-use core::ops::Range;
+use core::ops::{Deref, Range};
 use core::ptr;
 use core::slice;
 use core::sync::atomic::Ordering::Relaxed;
 
-use arch::{UserAccess, user_page};
+use arch::{Lock, UserAccess, user_page};
 use kernel::elf::{Elf, Segment};
 use kernel::handle::{
-    CONNECT, DUPLICATE, Handles, KILL, LISTEN, MAX_HANDLES, Object, READ, Rights, TRANSFER, WAIT,
-    WRITE,
+    CONNECT, DUPLICATE, Handles, KILL, LISTEN, MAX_HANDLES, Object, READ, Rights, TRANSFER, Table,
+    WAIT, WRITE,
 };
-use kernel::syscall::{EAGAIN, EFAULT, ENOEXEC, ENOMEM, MAX_BUFFER};
-use kernel::{FRAME_WORDS, Memory, Program};
+use kernel::syscall::{EAGAIN, EFAULT, EMFILE, ENOBUFS, ENOEXEC, ENOMEM, MAX_BUFFER, MAX_MAP};
+use kernel::{FRAME_WORDS, Process, Program};
 use lock_order::{self as level, W};
-use mm::{Budget, FrameAllocator, PhysAddr};
+use mm::{Budget, FrameAllocator, MAX_FRAMES, PhysAddr};
 use mogfs::ROOT;
 
 use crate::usermem::copy_in;
 use crate::{
-    ARCHIVE, IMAGE, KERNEL, KERNEL_ENTRIES, Kernel, MAP_BASE, Nospec, PAGE, Sched,
-    TASK_STACK_FRAMES, USER_BASE, USER_END, USER_STACK_TOP, gic_gibs,
+    ARCHIVE, FRAMES, IMAGE, KERNEL, KERNEL_ENTRIES, Kernel, MAP_BASE, MAX_PROCESSES, Nospec, PAGE,
+    Sched, TASK_STACK_FRAMES, USER_BASE, USER_END, USER_STACK_TOP, gic_gibs,
 };
+
+/// What a process index has outside `KERNEL`: its lock, budget and handle table, each starting a 128-byte line (the M4
+/// host's) so a sibling's charge or lookup does not bounce the lock's. An index's entry serves one process from its
+/// spawn until its release frees the index.
+#[repr(C)]
+pub(crate) struct ProcessEntry {
+    pub(crate) lock: Line<Lock<Process, level::Process>>,
+    pub(crate) budget: Line<Budget>,
+    pub(crate) handles: Line<Table>,
+}
+
+#[repr(align(128))]
+pub(crate) struct Line<T>(T);
+
+impl<T> Deref for Line<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+pub(crate) static PROCESSES: [ProcessEntry; MAX_PROCESSES] = [const {
+    ProcessEntry {
+        lock: Line(Lock::new(Process { next: 0 })),
+        budget: Line(Budget::new(0)),
+        handles: Line(Table::new()),
+    }
+}; MAX_PROCESSES];
+
+/// The process at `index` before its spawn publishes it, filled in under `KERNEL` by that spawn alone: its first `map`
+/// at `next`, `budget` frames (nothing charged), and `handles`.
+///
+/// # Safety
+/// `index` is allocated to the calling spawn (`free_process`, under `KERNEL`, which it holds) and not yet added, so no
+/// handle names it and no thread runs in it.
+unsafe fn start_entry(index: usize, next: u64, budget: usize, handles: &Handles) {
+    let entry = &PROCESSES[index];
+    // SAFETY: the caller's contract: nothing else reaches the unpublished process's data.
+    let process = unsafe { entry.lock.unpublished() };
+    process.next = next;
+    entry.budget.reset(budget);
+    entry.handles.commit(process, handles);
+}
 
 /// Returns a thread's kernel stack at `stack` to `frames`, refunding `budget`.
 pub(crate) fn free_stack(
     frames: &mut FrameAllocator<FRAME_WORDS>,
-    budget: &mut Budget,
+    budget: &Budget,
     stack: PhysAddr,
 ) {
     for i in 0..TASK_STACK_FRAMES {
@@ -35,35 +80,20 @@ pub(crate) fn free_stack(
     }
 }
 
-/// A zeroed frame charged to `budget`.
-fn zeroed(frames: &mut FrameAllocator<FRAME_WORDS>, budget: &mut Budget) -> Option<PhysAddr> {
-    let page = budget.alloc(frames)?;
+/// `page`, zeroed.
+fn zeroed(page: PhysAddr) -> PhysAddr {
     // SAFETY: a fresh frame from the allocator: identity-mapped RAM that nothing else uses.
     unsafe { ptr::write_bytes(page.0 as *mut u8, 0, PAGE) };
-    Some(page)
+    page
 }
 
-/// Maps a zeroed frame at `va` under `l1` with `access`, the frame and any new table charged to `budget`; `None`
-/// (the frame refunded) if either is out of budget or frames.
-fn map_zeroed(
-    frames: &mut FrameAllocator<FRAME_WORDS>,
-    budget: &mut Budget,
-    l1: PhysAddr,
-    va: u64,
-    access: UserAccess,
-) -> Option<PhysAddr> {
-    map_filled(frames, budget, (l1, va, access), (0, &[]))
-}
-
-/// As `map_zeroed`, with `bytes` at offset `at` of the frame (`at + bytes.len()` at most a page); only the rest is
-/// zeroed.
+/// Maps `page` at `va` under `l1` with `access`, holding `bytes` at offset `at` (`at + bytes.len()` at most a page) and
+/// zeroes elsewhere, any new table from `take`.
 fn map_filled(
-    frames: &mut FrameAllocator<FRAME_WORDS>,
-    budget: &mut Budget,
+    (page, take): (PhysAddr, &mut impl FnMut() -> PhysAddr),
     (l1, va, access): (PhysAddr, u64, UserAccess),
     (at, bytes): (usize, &[u8]),
-) -> Option<PhysAddr> {
-    let page = budget.alloc(frames)?;
+) {
     let base = page.0 as *mut u8;
     let end = at + bytes.len();
     // SAFETY: a fresh frame from the allocator: identity-mapped RAM that nothing else uses, and `end <= PAGE`.
@@ -72,61 +102,94 @@ fn map_filled(
     unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), base.wrapping_add(at), bytes.len()) };
     // SAFETY: as above.
     unsafe { ptr::write_bytes(base.wrapping_add(end), 0, PAGE - end) };
-    let leaf = user_page(page, access);
     // SAFETY: `l1` is a process's table built from zeroed frames like these, and `va` is a user address it leaves
-    // unmapped, from 4 GiB up to `USER_END`.
-    if unsafe { arch::map_page(l1, va, leaf, || zeroed(frames, budget)) }.is_none() {
-        budget.free(frames, page);
-        return None;
-    }
-    Some(page)
+    // unmapped, from 4 GiB up to `USER_END`, below every GiB a kernel block maps.
+    let mapped =
+        unsafe { arch::map_page(l1, va, user_page(page, access), || Some(zeroed(take()))) };
+    mapped.expect("no kernel block below USER_END");
 }
 
-/// Maps `pages` zeroed read-write pages at `cpu`'s current process's next map address, charged to its budget; returns
-/// their address, or `None` with nothing mapped if the budget or the frames run out or the pages would reach
-/// `USER_END`.
+/// Maps `pages` zeroed read-write pages at the current process's next map address, charged to its budget, taking the
+/// frames and any new tables in one pass of the bitmap; returns their address, or `None` with nothing mapped if the
+/// budget or the frames run out or the pages would reach `USER_END`. Under the process's lock only.
+#[inline(never)]
 pub(crate) fn map(
-    sched: &mut Sched,
-    cpu: usize,
-    frames: &mut FrameAllocator<FRAME_WORDS>,
+    entry: &ProcessEntry,
+    root: &mut W<'_, level::Unlocked>,
     pages: usize,
 ) -> Option<u64> {
-    let asid = sched.process(cpu);
-    let l1 = sched.space(asid);
-    let memory = sched.memory(asid);
-    let start = memory.next;
+    let mut guard = entry.lock.lock_masked(root);
+    let (process, mut w) = guard.parts();
+    let l1 = arch::user_table();
+    let start = process.next;
     let end = start + (pages * PAGE) as u64;
-    if pages > memory.budget.remaining() || end > USER_END.load(Relaxed) {
+    if end > USER_END.load(Relaxed) {
         return None;
     }
-    for va in (start..end).step_by(PAGE) {
-        if map_zeroed(frames, &mut memory.budget, l1, va, UserAccess::ReadWrite).is_none() {
-            for va in (start..va).step_by(PAGE) {
-                // SAFETY: this call mapped `va` under `l1` above.
-                let page = unsafe { arch::unmap_page(l1, va) };
-                memory.budget.free(frames, page);
-            }
-            arch::flush_asid(asid);
-            return None;
-        }
+    // SAFETY: `l1` is the current process's table (TTBR0 during its syscall), changed only under its lock, and
+    // `start..end` is page-aligned user space below `USER_END`.
+    let count = pages + unsafe { arch::missing_tables(l1, start, end) };
+    if !entry.budget.charge(count) {
+        return None;
     }
-    memory.next = end;
+    let mut taken = [PhysAddr(0); MAP_FRAMES];
+    if !FRAMES.lock_masked(&mut w).alloc_many(&mut taken[..count]) {
+        entry.budget.refund(count);
+        return None;
+    }
+    let mut taken = taken.into_iter();
+    let mut take = || taken.next().expect("counted");
+    for va in (start..end).step_by(PAGE) {
+        let page = take();
+        map_filled((page, &mut take), (l1, va, UserAccess::ReadWrite), (0, &[]));
+    }
+    process.next = end;
     Some(start)
 }
 
+/// Frames a `map` takes at most: its pages, and a level-2 and level-3 table for each of the two GiBs and regions it
+/// may touch.
+const MAP_FRAMES: usize = (MAX_MAP / PAGE as u64) as usize + 4;
+
 /// Builds a process from `file`'s `segments` (entered at `entry`): address space, pages and its first thread's kernel
-/// stack, all charged to `memory`'s budget, its first `map` at `memory`'s `next`, and queues it at the free index `process`, its thread in the free `slot`, with
-/// `handles` at `priority`; on failure (`ENOMEM`) returns every frame it took. With `args` (`argc` of them, at most a
-/// page), the top stack page holds them and the stack gets a page below it.
+/// stack, all charged with `sockets` more frames to a budget of `budget` frames and taken in one pass of the bitmap, its
+/// first `map` at `next`,
+/// and queues it at the free index `process`, its thread in the free `slot`, with `handles` at `priority`; on failure
+/// (`ENOMEM`) takes nothing. With `args` (`argc` of them, at most a page), the top stack page holds them and the stack
+/// gets a page below it.
 fn spawn_process(
-    sched: &mut Sched,
-    frames: &mut FrameAllocator<FRAME_WORDS>,
-    (file, segments, entry): (&[u8], impl Iterator<Item = Segment>, u64),
-    Memory { mut budget, next }: Memory,
-    (process, slot, handles, priority): ((usize, u64), (usize, u64), Handles, u8),
+    (sched, w): (&mut Sched, &mut W<'_, level::Kernel>),
+    (file, segments, entry): (&[u8], impl Iterator<Item = Segment> + Clone, u64),
+    (budget, sockets, next): (usize, usize, u64),
+    (process, slot, handles, priority): ((usize, u64), (usize, u64), &Handles, u8),
     (args, argc): (&[u8], usize),
 ) -> Result<(), i64> {
-    let l1 = zeroed(frames, &mut budget).ok_or(ENOMEM)?;
+    let pages = segments
+        .clone()
+        .map(|s| s.size.div_ceil(PAGE as u64) as usize);
+    // The level-1 table, one level-2 and one level-3 table (every user page is in one region), and the stack pages.
+    let count = 3 + pages.sum::<usize>() + 1 + !args.is_empty() as usize;
+    if count + TASK_STACK_FRAMES + sockets > budget {
+        return Err(ENOMEM);
+    }
+    let mut taken = vec![PhysAddr(0); count];
+    let stack = {
+        let mut frames = FRAMES.lock_masked(w);
+        let stack = frames.alloc_contiguous(TASK_STACK_FRAMES);
+        match stack {
+            Some(stack) if !frames.alloc_many(&mut taken) => {
+                (stack.start.0..stack.end.0)
+                    .step_by(PAGE)
+                    .for_each(|f| frames.free(PhysAddr(f)));
+                None
+            }
+            stack => stack,
+        }
+    };
+    let stack = stack.ok_or(ENOMEM)?;
+    let mut taken = taken.into_iter();
+    let mut take = || taken.next().expect("counted");
+    let l1 = zeroed(take());
     // SAFETY: `l1` is a fresh frame; the boot table's kernel entries stay fixed after `kmain`.
     unsafe {
         ptr::copy_nonoverlapping(
@@ -142,51 +205,47 @@ fn spawn_process(
         // SAFETY: as above, the fresh frame.
         unsafe { (l1.0 as *mut u64).wrapping_add(gib).write(entry) };
     }
-    let stack = (|| {
-        for segment in segments {
-            let data = &file[segment.data];
-            // No read-only non-executable access kind yet, so a read-only segment (flags R) maps executable.
-            let access = match segment.writable {
-                true => UserAccess::ReadWrite,
-                false => UserAccess::ReadExecute,
-            };
-            for offset in (0..segment.size as usize).step_by(PAGE) {
-                let va = segment.vaddr + offset as u64;
-                let bytes = data.get(offset..).unwrap_or_default();
-                let bytes = &bytes[..bytes.len().min(PAGE)];
-                let page = map_filled(frames, &mut budget, (l1, va, access), (0, bytes))?;
-                if !segment.writable {
-                    // SAFETY: `page` is identity-mapped RAM.
-                    unsafe { arch::clean_dcache(page.0 as usize, PAGE) };
-                }
+    for segment in segments {
+        let data = &file[segment.data];
+        // No read-only non-executable access kind yet, so a read-only segment (flags R) maps executable.
+        let access = match segment.writable {
+            true => UserAccess::ReadWrite,
+            false => UserAccess::ReadExecute,
+        };
+        for offset in (0..segment.size as usize).step_by(PAGE) {
+            let va = segment.vaddr + offset as u64;
+            let bytes = data.get(offset..).unwrap_or_default();
+            let bytes = &bytes[..bytes.len().min(PAGE)];
+            let page = take();
+            map_filled((page, &mut take), (l1, va, access), (0, bytes));
+            if !segment.writable {
+                // SAFETY: `page` is identity-mapped RAM.
+                unsafe { arch::clean_dcache(page.0 as usize, PAGE) };
             }
         }
-        let stack_page = USER_STACK_TOP - PAGE as u64;
-        let top = (l1, stack_page, UserAccess::ReadWrite);
-        map_filled(frames, &mut budget, top, (PAGE - args.len(), args))?;
-        if !args.is_empty() {
-            map_zeroed(
-                frames,
-                &mut budget,
-                l1,
-                stack_page - PAGE as u64,
-                UserAccess::ReadWrite,
-            )?;
-        }
-        budget.alloc_contiguous(frames, TASK_STACK_FRAMES)
-    })();
-    let Some(stack) = stack else {
-        // SAFETY: no TTBR0 ever used `l1`, and its tables hold only frames taken above.
-        unsafe { arch::free_space(l1, |f| frames.free(f)) };
-        return Err(ENOMEM);
-    };
+    }
+    let stack_page = USER_STACK_TOP - PAGE as u64;
+    let top = (l1, stack_page, UserAccess::ReadWrite);
+    let page = take();
+    map_filled((page, &mut take), top, (PAGE - args.len(), args));
+    if !args.is_empty() {
+        let below = (l1, stack_page - PAGE as u64, UserAccess::ReadWrite);
+        let page = take();
+        map_filled((page, &mut take), below, (0, &[]));
+    }
     arch::invalidate_icache();
     let at = USER_STACK_TOP - args.len() as u64;
     let x = [argc as u64, at, args.len() as u64];
     // SAFETY: the kernel stack below `stack.end` is fresh and owned by the new process.
     let frame = unsafe { arch::new_user_task(stack.end.0 as usize, entry, (at & !15, 0), x) };
-    let memory = Memory { budget, next };
-    sched.add_process(process, l1, memory, handles);
+    // SAFETY: `process` came from `free_process` under the `KERNEL` this spawn holds, and is added only below.
+    unsafe { start_entry(process.0, next, budget, handles) };
+    assert!(
+        PROCESSES[process.0]
+            .budget
+            .charge(count + TASK_STACK_FRAMES + sockets)
+    );
+    sched.add_process(process, l1);
     sched.add(slot, process.0, (frame, stack.start), priority);
     // Its one handle: the spawner's, or init's own.
     let (index, generation) = process;
@@ -194,10 +253,15 @@ fn spawn_process(
     Ok(())
 }
 
+const _: () = assert!(
+    USER_BASE >> 21 == (USER_STACK_TOP - 1) >> 21,
+    "one level-3 table"
+);
+
 /// The boot archive's executable at `file` (byte offsets), checked, as `spawn_process` takes it.
 pub(crate) fn executable(
     file: Range<usize>,
-) -> Result<(&'static [u8], impl Iterator<Item = Segment>, u64), i64> {
+) -> Result<(&'static [u8], impl Iterator<Item = Segment> + Clone, u64), i64> {
     let file = &ARCHIVE[file];
     let elf = Elf::parse(file, IMAGE).ok_or(ENOEXEC)?;
     let entry = elf.entry;
@@ -207,7 +271,7 @@ pub(crate) fn executable(
 /// Queues `executable` from boot context with init's handles, a budget of `budget` frames, its first `map` at `next`,
 /// `priority` and `args`.
 pub(crate) fn spawn_init(
-    executable: (&[u8], impl Iterator<Item = Segment>, u64),
+    executable: (&[u8], impl Iterator<Item = Segment> + Clone, u64),
     (budget, next): (usize, u64),
     priority: u8,
     archive: Rights,
@@ -217,39 +281,42 @@ pub(crate) fn spawn_init(
     // SAFETY: called from `Board` methods, which the kernel crate calls holding no lock.
     let mut root = unsafe { arch::root() };
     let mut kernel = KERNEL.lock(&mut root);
+    let (kernel, mut w) = kernel.parts();
     let Kernel {
         sched,
-        frames,
         mounted,
+        opens,
         ..
-    } = &mut *kernel;
-    let ids = sched.free_process().zip(sched.free_slot()).ok_or(EAGAIN);
-    ids.and_then(|(process, slot)| {
-        let mut handles = Handles::init(process.0, process.1, archive);
-        if *mounted {
-            handles.insert(Object::Dir(ROOT), READ | WRITE | DUPLICATE | TRANSFER)?;
-        }
-        if crate::net::STARTED.load(Relaxed) {
-            let rights = CONNECT | LISTEN | DUPLICATE | TRANSFER;
-            handles.insert(Object::NetStack, rights)?;
-        }
-        let init = (process, slot, handles, priority);
-        let memory = Memory {
-            budget: Budget::new(budget),
-            next,
-        };
-        spawn_process(sched, frames, executable, memory, init, (args, argc))?;
-        crate::kick(sched, arch::cpu());
-        Ok(())
-    })
+    } = kernel;
+    let (process, slot) = sched.free_process().zip(sched.free_slot()).ok_or(EAGAIN)?;
+    let mut handles = Handles::init(process.0, process.1, archive);
+    if *mounted {
+        handles.insert(Object::Dir(ROOT), READ | WRITE | DUPLICATE | TRANSFER)?;
+    }
+    if crate::net::STARTED.load(Relaxed) {
+        let rights = CONNECT | LISTEN | DUPLICATE | TRANSFER;
+        handles.insert(Object::NetStack, rights)?;
+    }
+    let init = (process, slot, &handles, priority);
+    spawn_process(
+        (sched, &mut w),
+        executable,
+        (budget, 0, next),
+        init,
+        (args, argc),
+    )?;
+    handles.objects().for_each(|o| opens.open(o));
+    crate::kick(sched, arch::cpu());
+    Ok(())
 }
 
 /// Spawns the boot archive's executable at `file` with the `len` handles at user address `ptr` and `budget` frames
 /// moved from `cpu`'s current process, which gets a handle to the child, at `priority` capped at that process's own,
-/// with the arguments at user address `args`, both copied in through `buf`; on failure nothing moves.
+/// with the arguments at user address `args`, both copied in through `buf`; on failure nothing moves. The parent's
+/// table (`table`, under its lock) changes last, once the child is complete.
 pub(crate) fn spawn(
     (sched, w, cpu): (&mut Sched, &mut W<'_, level::Kernel>, usize),
-    frames: &mut FrameAllocator<FRAME_WORDS>,
+    (table, parent): (&Table, &mut Process),
     buf: &mut [u8],
     file: Range<usize>,
     (ptr, len): (u64, usize),
@@ -266,40 +333,41 @@ pub(crate) fn spawn(
         *handle = u64::from_le_bytes(*bytes);
     }
     // `len` is at most `MAX_HANDLES` (`dispatch`); the modulo keeps the slice in bounds on a mispredicted path too.
-    let (mut parent, child) = sched
-        .handles(cpu)
-        .split::<Nospec>(&list[..len % (MAX_HANDLES + 1)])?;
-    let current = sched.process(cpu);
-    if budget > sched.memory(current).budget.remaining() {
-        return Err(ENOMEM);
-    }
+    let (mut rest, child) =
+        (table.snapshot(parent)).split::<Nospec>(&list[..len % (MAX_HANDLES + 1)])?;
     let (process, slot) = sched.free_process().zip(sched.free_slot()).ok_or(EAGAIN)?;
     let (index, generation) = process;
-    let handle = parent.insert(Object::Process { index, generation }, WAIT | KILL)?;
+    let handle = rest.insert(Object::Process { index, generation }, WAIT | KILL)?;
     let priority = priority.min(sched.priority(cpu));
-    let mut child_budget = Budget::new(budget);
-    crate::net::spawn_charge(&child, &mut child_budget, w)?;
-    let moved = child;
-    let child = (process, slot, child, priority);
-    let memory = Memory {
-        budget: child_budget,
-        next: MAP_BASE,
+    let current = &PROCESSES[sched.process(cpu)].budget;
+    if budget > MAX_FRAMES || !current.shrink(budget) {
+        return Err(ENOMEM);
+    }
+    let sockets = crate::net::sockets_cost(&child, w);
+    let child_entry = (process, slot, &child, priority);
+    let spawned = match sockets > budget {
+        true => Err(ENOBUFS),
+        false => {
+            let memory = (budget, sockets, MAP_BASE);
+            spawn_process((sched, w), executable, memory, child_entry, (args, argc))
+        }
     };
-    spawn_process(sched, frames, executable, memory, child, (args, argc))?;
-    sched.memory(current).budget.shrink(budget);
-    *sched.handles(cpu) = parent;
-    crate::net::spawned((sched, w), cpu, index, &moved);
+    if let Err(error) = spawned {
+        current.grow(budget);
+        return Err(error);
+    }
+    table.commit(parent, &rest);
+    crate::net::spawned((sched, w), cpu, index, &child, &rest);
     Ok(handle)
 }
 
 /// Starts a thread of `cpu`'s current process at user address `entry` with SP_EL0 = `sp`, TPIDR_EL0 = `tls` and x0 =
 /// `arg`, at the caller's priority, its kernel stack charged to the process's budget; returns a handle to it (wait,
-/// kill, duplicate, transfer). On failure nothing changes. A caller marked to end gets `EAGAIN`, so a process being
-/// ended gains no thread.
+/// kill, duplicate, transfer), written to `table` (under its lock) last. On failure nothing changes. A caller marked to
+/// end gets `EAGAIN`, so a process being ended gains no thread.
 pub(crate) fn thread(
-    sched: &mut Sched,
-    cpu: usize,
-    frames: &mut FrameAllocator<FRAME_WORDS>,
+    (sched, w, cpu): (&mut Sched, &mut W<'_, level::Kernel>, usize),
+    (table, process): (&Table, &mut Process),
     entry: u64,
     (sp, tls): (u64, u64),
     arg: u64,
@@ -308,21 +376,22 @@ pub(crate) fn thread(
         return Err(EAGAIN);
     }
     let (slot, generation) = sched.free_slot().ok_or(EAGAIN)?;
-    let mut handles = *sched.handles(cpu);
-    let thread = Object::Thread { slot, generation };
-    let handle = handles.insert(thread, WAIT | KILL | DUPLICATE | TRANSFER)?;
+    if table.vacant(process) == 0 {
+        return Err(EMFILE);
+    }
     let index = sched.process(cpu);
-    let budget = &mut sched.memory(index).budget;
-    let stack = budget
-        .alloc_contiguous(frames, TASK_STACK_FRAMES)
+    let stack = (PROCESSES[index].budget)
+        .alloc_contiguous(&mut FRAMES.lock_masked(w), TASK_STACK_FRAMES)
         .ok_or(ENOMEM)?;
     // SAFETY: the kernel stack below `stack.end` is fresh and owned by the new thread.
     let frame = unsafe { arch::new_user_task(stack.end.0 as usize, entry, (sp, tls), [arg, 0, 0]) };
     let priority = sched.priority(cpu);
     sched.add((slot, generation), index, (frame, stack.start), priority);
+    let thread = Object::Thread { slot, generation };
     sched.held(thread);
-    *sched.handles(cpu) = handles;
-    Ok(handle)
+    Ok(table
+        .insert(process, thread, WAIT | KILL | DUPLICATE | TRANSFER)
+        .expect("vacant"))
 }
 
 global_asm!(include_str!("user.s"), USER_BASE = const USER_BASE);

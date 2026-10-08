@@ -687,6 +687,23 @@ fn lock_bench(cpus: usize, secs: u64) {
 }
 
 #[test]
+fn process_local_calls_run_while_another_core_holds_the_big_lock() {
+    let (status, lines) = boot(&["-smp", "4", "-append", "test=lock-split"]);
+    assert!(
+        !lines.iter().any(|l| l == "lock-split: late"),
+        "the boot context took the big lock after the start time"
+    );
+    let released = lines
+        .iter()
+        .position(|l| l == "lock-split: released")
+        .expect("missing line: lock-split: released");
+    let done = lines[..released].iter().filter(|l| *l == "W: done").count();
+    assert_eq!(done, 3, "workers done while the big lock was held");
+    assert_no_leak(&lines, "lock-split");
+    assert!(status.success(), "QEMU exited with {status}");
+}
+
+#[test]
 fn smp_bench_reports_throughput_and_contention_for_each_worker_count() {
     let (status, lines) = boot(&["-append", "test=bench-smp"]);
     assert!(
@@ -1458,6 +1475,23 @@ fn threads_share_a_counter_keep_their_tls_and_end_with_their_process() {
         ]
     );
     assert_no_leak(&lines, "threads");
+    assert!(status.success(), "QEMU exited with {status}");
+}
+
+#[test]
+fn a_wait_or_kill_racing_a_childs_release_on_another_core_sees_it_whole() {
+    // Children end on other cores while their parent waits or kills them: a wait returns only once the release freed
+    // the child's frames and index, and a kill during the release finds nothing left to end.
+    let (status, lines) = boot(&["-smp", "4", "-append", "test=reap-race"]);
+    assert!(
+        !lines.iter().any(|l| l.starts_with("panic:")),
+        "kernel panicked"
+    );
+    assert!(
+        lines.iter().any(|l| l == "reap-race: done"),
+        "missing line: reap-race: done"
+    );
+    assert_no_leak(&lines, "reap-race");
     assert!(status.success(), "QEMU exited with {status}");
 }
 

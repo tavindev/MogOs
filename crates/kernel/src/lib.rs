@@ -14,7 +14,7 @@ mod sched;
 pub mod syscall;
 
 pub use mogfs::{BLOCK_SIZE, Disk};
-pub use sched::{Event, Full, Memory, PRIORITIES, Scheduler};
+pub use sched::{Event, Full, PRIORITIES, Process, Scheduler};
 
 use alloc::string::ToString;
 use alloc::vec;
@@ -368,6 +368,12 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
                 run_archived(board, "threads", "threads", (THREADS_BUDGET, INIT_ARCHIVE));
             }
             "test=refund" => run_archived(board, "refund", "refund", (REFUND_BUDGET, INIT_ARCHIVE)),
+            "test=reap-race" => run_archived(
+                board,
+                "reap-race",
+                "reaprace",
+                (REFUND_BUDGET, INIT_ARCHIVE),
+            ),
             "test=bench-threads" => run_archived(
                 board,
                 "bench-threads",

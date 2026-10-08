@@ -1,10 +1,18 @@
 //! Per-process handle tables. A handle value is `generation << 32 | index`; closing bumps the entry's generation,
 //! so a closed handle's value never reaches whatever reuses its entry. An entry is retired once its generation
 //! reaches 2^31, so handle values stay positive (never read as an error) and generations never wrap.
+//!
+//! A process's live table is a `Table`, read without a lock (a seqlock per entry) and written under the process's
+//! lock; `Handles` is a plain copy for building one (a spawned child's) or staging a change before it is committed.
+
+use core::hint::spin_loop;
+use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+use core::sync::atomic::{AtomicU64, fence};
 
 use mogfs::Inode;
 
 use crate::Clamp;
+use crate::Process;
 use crate::mutex::Mutex;
 use crate::network::Sock;
 use crate::pipe::End;
@@ -195,4 +203,221 @@ impl Default for Handles {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Words an entry's object is stored in: its tag, rights and handle generation, then two words of fields.
+type Words = [u64; 3];
+
+/// A handle table read without a lock: each entry is its words behind a 64-bit sequence (no wrap), a seqlock. Writers
+/// (every method taking `&mut Process`, the proof that the caller holds a process lock, this table's) store the
+/// sequence odd, then the words, then the sequence even; a lookup that sees the sequence change or odd retries, so it
+/// stores nothing and sibling threads' lookups share the line.
+pub struct Table([Entry; MAX_HANDLES]);
+
+struct Entry {
+    sequence: AtomicU64,
+    words: [AtomicU64; 3],
+}
+
+/// The last two entries lookups read and their sequences, to recheck once the object's own lock is held: unchanged, a
+/// sibling's `close` comes after the call, never during it. An index past the table is no entry.
+#[derive(Clone, Copy)]
+pub struct Seen([(usize, u64); 2]);
+
+impl Default for Seen {
+    fn default() -> Self {
+        Self([(MAX_HANDLES, 0); 2])
+    }
+}
+
+impl Table {
+    pub const fn new() -> Self {
+        Self(
+            [const {
+                Entry {
+                    sequence: AtomicU64::new(0),
+                    words: [const { AtomicU64::new(0) }; 3],
+                }
+            }; MAX_HANDLES],
+        )
+    }
+
+    /// The object `handle` reaches and its rights, read without a lock; recorded in `seen`.
+    #[inline(always)]
+    pub fn entry(&self, handle: Handle, seen: &mut Seen) -> Result<(Object, Rights), i64> {
+        let entry = &self.0[handle.index];
+        let (sequence, words) = loop {
+            let sequence = entry.sequence.load(Acquire);
+            let words = entry.words.each_ref().map(|w| w.load(Relaxed));
+            // `dmb ishld`: the words are read before the sequence is read again.
+            fence(Acquire);
+            if sequence & 1 == 0 && entry.sequence.load(Relaxed) == sequence {
+                break (sequence, words);
+            }
+            spin_loop();
+        };
+        seen.0 = [(handle.index, sequence), seen.0[0]];
+        match decode(words) {
+            (generation, Some(entry)) if handle.valid(generation) => Ok(entry),
+            _ => Err(EBADF),
+        }
+    }
+
+    /// The object `handle` reaches, if it holds every right in `need`; recorded in `seen`.
+    #[inline(always)]
+    pub fn get(&self, handle: Handle, need: Rights, seen: &mut Seen) -> Result<Object, i64> {
+        let (object, rights) = self.entry(handle, seen)?;
+        if rights & need != need {
+            return Err(EACCES);
+        }
+        Ok(object)
+    }
+
+    /// Whether no entry `seen` recorded changed since.
+    #[inline]
+    pub fn unchanged(&self, seen: &Seen) -> bool {
+        (seen.0.iter()).all(|&(i, sequence)| {
+            (self.0.get(i)).is_none_or(|e| e.sequence.load(Acquire) == sequence)
+        })
+    }
+
+    /// A copy of the table. Writers are serialized by the process lock, so this reads without retrying.
+    pub fn snapshot(&self, _: &mut Process) -> Handles {
+        Handles(core::array::from_fn(|i| decode(self.words(i))))
+    }
+
+    /// Writes every entry of `handles` (a `snapshot`, changed) that differs from the table.
+    pub fn commit(&self, _: &mut Process, handles: &Handles) {
+        for (i, new) in handles.0.iter().enumerate() {
+            let new = encode(*new);
+            if self.words(i) != new {
+                self.store(i, new);
+            }
+        }
+    }
+
+    /// How many handles `insert` can still add.
+    pub fn vacant(&self, _: &mut Process) -> usize {
+        (0..MAX_HANDLES).filter(|&i| free(self.words(i)[0])).count()
+    }
+
+    /// A new handle to `object` with `rights`.
+    pub fn insert(&self, _: &mut Process, object: Object, rights: Rights) -> Result<u64, i64> {
+        let i = (0..MAX_HANDLES)
+            .find(|&i| free(self.words(i)[0]))
+            .ok_or(EMFILE)?;
+        let generation = self.words(i)[0] as u32;
+        self.store(i, encode((generation, Some((object, rights)))));
+        Ok(u64::from(generation) << 32 | i as u64)
+    }
+
+    /// Closes `handle`; returns the object it reached.
+    pub fn close(&self, _: &mut Process, handle: Handle) -> Result<Object, i64> {
+        match decode(self.words(handle.index)) {
+            (generation, Some((object, _))) if handle.valid(generation) => {
+                self.store(handle.index, encode((generation + 1, None)));
+                Ok(object)
+            }
+            _ => Err(EBADF),
+        }
+    }
+
+    /// Entry `i`'s words, for a writer (the process lock holds every other writer off).
+    fn words(&self, i: usize) -> Words {
+        self.0[i].words.each_ref().map(|w| w.load(Relaxed))
+    }
+
+    /// Empties the table for the next process at its index; returns what it held.
+    pub fn take(&self, process: &mut Process) -> Handles {
+        let handles = self.snapshot(process);
+        self.commit(process, &Handles::new());
+        handles
+    }
+
+    fn store(&self, i: usize, words: Words) {
+        let entry = &self.0[i];
+        let sequence = entry.sequence.load(Relaxed);
+        entry.sequence.store(sequence + 1, Relaxed);
+        // `dmb ishst`: the odd sequence is seen before any of the new words.
+        fence(Release);
+        for (word, value) in entry.words.iter().zip(words) {
+            word.store(value, Relaxed);
+        }
+        entry.sequence.store(sequence + 2, Release);
+    }
+}
+
+impl Default for Table {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Whether the entry whose first word is `head` is empty and not retired.
+fn free(head: u64) -> bool {
+    head >> 32 == 0 && (head as u32) < RETIRED
+}
+
+/// An entry as words: its handle generation (bits 0-31), object tag (32-39, 0 for none) and rights (40-63), then the
+/// object's fields.
+fn encode((generation, entry): (u32, Option<(Object, Rights)>)) -> Words {
+    let Some((object, rights)) = entry else {
+        return [u64::from(generation), 0, 0];
+    };
+    let (tag, a, b) = match object {
+        Object::Console => (1, 0, 0),
+        Object::Process { index, generation } => (2, index as u64, generation),
+        Object::Thread { slot, generation } => (3, slot as u64, generation),
+        Object::Archive => (4, 0, 0),
+        Object::File { start, end } => (5, start as u64, end as u64),
+        Object::Dir(inode) => (6, inode.raw(), 0),
+        Object::Node(inode) => (7, inode.raw(), 0),
+        Object::Pipe(end) => (
+            8,
+            u64::from(end.index) | u64::from(end.write) << 32,
+            end.generation,
+        ),
+        Object::Mutex(mutex) => (9, mutex.index.into(), mutex.generation),
+        Object::NetStack => (10, 0, 0),
+        Object::Socket(sock) => (11, sock.index.into(), sock.generation),
+    };
+    [u64::from(generation) | tag << 32 | rights << 40, a, b]
+}
+
+#[inline(always)]
+fn decode([head, a, b]: Words) -> (u32, Option<(Object, Rights)>) {
+    let object = match (head >> 32) as u8 {
+        1 => Object::Console,
+        2 => Object::Process {
+            index: a as usize,
+            generation: b,
+        },
+        3 => Object::Thread {
+            slot: a as usize,
+            generation: b,
+        },
+        4 => Object::Archive,
+        5 => Object::File {
+            start: a as usize,
+            end: b as usize,
+        },
+        6 => Object::Dir(Inode::from_raw(a)),
+        7 => Object::Node(Inode::from_raw(a)),
+        8 => Object::Pipe(End {
+            index: a as u32,
+            write: a >> 32 != 0,
+            generation: b,
+        }),
+        9 => Object::Mutex(Mutex {
+            index: a as u32,
+            generation: b,
+        }),
+        10 => Object::NetStack,
+        11 => Object::Socket(Sock {
+            index: a as u32,
+            generation: b,
+        }),
+        _ => return (head as u32, None),
+    };
+    (head as u32, Some((object, head >> 40)))
 }

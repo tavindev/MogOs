@@ -339,6 +339,49 @@ pub unsafe fn set_ttbr0(table: PhysAddr, asid: usize) {
     };
 }
 
+/// The level-1 table TTBR0 points at: the running process's, during its syscall.
+pub fn user_table() -> PhysAddr {
+    let ttbr0: u64;
+    // SAFETY: reading TTBR0_EL1 has no side effects.
+    unsafe { asm!("mrs {}, ttbr0_el1", out(reg) ttbr0, options(nomem, nostack, preserves_flags)) };
+    PhysAddr(ttbr0 & ADDR)
+}
+
+/// How many level-2 and level-3 tables `map_page` adds under `l1` to map every page of `start..end`, so a caller can
+/// take them with the pages.
+///
+/// # Safety
+///
+/// As `map_page` for `l1`, and `start..end` must be page-aligned, from 4 GiB up, below 512 GiB.
+pub unsafe fn missing_tables(l1: PhysAddr, start: u64, end: u64) -> usize {
+    const GIB: u64 = 1 << 30;
+    const REGION: u64 = 1 << 21;
+    let (mut count, mut va) = (0, start);
+    while va < end {
+        // SAFETY: the caller guarantees `l1` is an identity-mapped table of this address space.
+        let l1e = unsafe {
+            (l1.0 as *const u64)
+                .wrapping_add((va >> 30) as usize & 511)
+                .read()
+        };
+        if l1e & VALID_TABLE_OR_PAGE != VALID_TABLE_OR_PAGE {
+            let last = end.min((va | (GIB - 1)) + 1);
+            count += 1 + (((last - 1) >> 21) - (va >> 21) + 1) as usize;
+            va = last;
+            continue;
+        }
+        // SAFETY: as above; a table descriptor of this space points at its level-2 table.
+        let l2e = unsafe {
+            ((l1e & ADDR) as *const u64)
+                .wrapping_add((va >> 21) as usize & 511)
+                .read()
+        };
+        count += (l2e & VALID_TABLE_OR_PAGE != VALID_TABLE_OR_PAGE) as usize;
+        va = (va | (REGION - 1)) + 1;
+    }
+    count
+}
+
 /// Drops every non-global TLB entry tagged with `asid`, on every core.
 pub fn flush_asid(asid: usize) {
     // SAFETY: invalidating TLB entries only forces later walks.

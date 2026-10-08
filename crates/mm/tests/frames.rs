@@ -174,3 +174,19 @@ fn matches_a_bit_by_bit_model() {
         }
     }
 }
+
+#[test]
+fn alloc_many_takes_all_or_none() {
+    let mut frames = FrameAllocator::<2>::new(frame(0)..frame(70));
+    frames.reserve(frame(1)..frame(2));
+    let mut out = [PhysAddr(0); 3];
+    assert!(frames.alloc_many(&mut out));
+    assert_eq!(out, [frame(0), frame(2), frame(3)]);
+    let mut big = [PhysAddr(0); 67];
+    assert!(!frames.alloc_many(&mut big));
+    assert_eq!(frames.free_count(), 66);
+    let mut rest = [PhysAddr(0); 66];
+    assert!(frames.alloc_many(&mut rest));
+    assert_eq!((rest[0], rest[65]), (frame(4), frame(69)));
+    assert_eq!(frames.free_count(), 0);
+}

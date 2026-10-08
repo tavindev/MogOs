@@ -3,6 +3,8 @@
 //! reaches above its directory through a path. The walk is bounded by the path's length: a crafted image can point an
 //! entry at `ROOT` or an ancestor (a cycle), so nothing here recurses over the tree.
 
+use alloc::vec::Vec;
+
 use mogfs::{Disk, Error, Fs, Inode, Kind};
 
 use crate::cpio;
@@ -144,4 +146,44 @@ pub fn list_archive(archive: &[u8], start: u64, out: &mut [u8]) -> Result<usize,
         out[len - 1] = b'\n';
     }
     Ok(len)
+}
+
+/// Open handles per inode, counted as handles to a `Dir` or `Node` open and close, so `unlink` asks it instead of
+/// scanning every process's table (each behind its own lock). At most one entry per open handle.
+#[derive(Default)]
+pub struct Opens(Vec<(Inode, u32)>);
+
+impl Opens {
+    pub const fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    /// A handle to `object` opened; one to anything but a `Dir` or `Node` is not counted.
+    pub fn open(&mut self, object: Object) {
+        let (Object::Dir(inode) | Object::Node(inode)) = object else {
+            return;
+        };
+        match self.0.iter_mut().find(|(i, _)| *i == inode) {
+            Some((_, count)) => *count += 1,
+            None => self.0.push((inode, 1)),
+        }
+    }
+
+    /// A handle to `object` closed.
+    pub fn close(&mut self, object: Object) {
+        let (Object::Dir(inode) | Object::Node(inode)) = object else {
+            return;
+        };
+        let at = self.0.iter().position(|(i, _)| *i == inode);
+        let at = at.expect("a close without its open");
+        self.0[at].1 -= 1;
+        if self.0[at].1 == 0 {
+            self.0.swap_remove(at);
+        }
+    }
+
+    /// Whether a handle reaches `inode`.
+    pub fn held(&self, inode: Inode) -> bool {
+        self.0.iter().any(|(i, _)| *i == inode)
+    }
 }
