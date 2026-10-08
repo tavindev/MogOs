@@ -449,9 +449,9 @@ pub struct Fs<'a, D> {
     unwritten: bool,
     /// The last two inode items read, newest first; any change to an inode item clears them.
     items: [Option<(Inode, Item)>; 2],
-    /// The last lookups that found their entry: directory, name length (0: none) and bytes, and the inode; any change
-    /// to an entry clears them.
-    names: [(Inode, u8, [u8; NAME_MAX], Inode); NAMES],
+    /// The last lookups that found their entry: directory, name hash, length (0: none) and bytes, and the inode; any
+    /// change to an entry clears them.
+    names: [(Inode, Offset, u8, [u8; NAME_MAX], Inode); NAMES],
     next_name: usize,
     /// The leaf the last descent reached, with its key bounds; cleared before a slot is reused or the tree's shape
     /// changes. `readdir` keeps there the last key it searched for and its item index.
@@ -506,7 +506,7 @@ impl<'a, D: Disk> Fs<'a, D> {
             cached: None,
             unwritten: false,
             items: [None; 2],
-            names: [(ROOT, 0, [0; NAME_MAX], ROOT); NAMES],
+            names: [(ROOT, Offset(0), 0, [0; NAME_MAX], ROOT); NAMES],
             next_name: 0,
             finger: None,
             start: (NONE, 0),
@@ -675,16 +675,17 @@ impl<'a, D: Disk> Fs<'a, D> {
             return Err(Error::InvalidName);
         }
         self.dir(dir)?;
+        let h = name_hash(self.seed, name);
         for j in 0..NAMES {
-            let (d, len, n, i) = &self.names[j];
-            if *d == dir && *len as usize == name.len() && n[..name.len()] == *name {
+            let (d, hash, len, n, i) = &self.names[j];
+            if (*d, *hash, *len as usize) == (dir, h, name.len()) && n[..name.len()] == *name {
                 return Ok(*i);
             }
         }
-        let e = self.find_entry(dir, name)?.0.ok_or(Error::NotFound)?;
+        let e = self.find_entry(dir, name, h)?.0.ok_or(Error::NotFound)?;
         self.child(dir, e)?;
-        let (d, len, n, i) = &mut self.names[self.next_name];
-        (*d, *len, *i) = (dir, name.len() as u8, e.1);
+        let (d, hash, len, n, i) = &mut self.names[self.next_name];
+        (*d, *hash, *len, *i) = (dir, h, name.len() as u8, e.1);
         n[..name.len()].copy_from_slice(name);
         self.next_name = (self.next_name + 1) % NAMES;
         Ok(e.1)
@@ -856,7 +857,10 @@ impl<'a, D: Disk> Fs<'a, D> {
             return Err(Error::InvalidName);
         }
         let mut d = *self.dir(dir)?;
-        let e = self.find_entry(dir, name)?.0.ok_or(Error::NotFound)?;
+        let e = self
+            .find_entry(dir, name, name_hash(self.seed, name))?
+            .0
+            .ok_or(Error::NotFound)?;
         let (off, inode, _) = e;
         let it = *self.child(dir, e)?;
         if it.kind == DIR
@@ -911,7 +915,7 @@ impl<'a, D: Disk> Fs<'a, D> {
         }
         let mut from = *self.dir(from_dir)?;
         let e = self
-            .find_entry(from_dir, from_name)?
+            .find_entry(from_dir, from_name, name_hash(self.seed, from_name))?
             .0
             .ok_or(Error::NotFound)?;
         let (off, inode, kind) = e;
@@ -920,7 +924,7 @@ impl<'a, D: Disk> Fs<'a, D> {
             return Ok(());
         }
         let mut to = *self.dir(to_dir)?;
-        let (taken, slot) = self.find_entry(to_dir, to_name)?;
+        let (taken, slot) = self.find_entry(to_dir, to_name, name_hash(self.seed, to_name))?;
         if taken.is_some() {
             return Err(Error::Exists);
         }
@@ -1518,7 +1522,7 @@ impl<'a, D: Disk> Fs<'a, D> {
 
     fn forget_names(&mut self) {
         for j in 0..NAMES {
-            self.names[j].1 = 0;
+            self.names[j].2 = 0;
         }
     }
 
@@ -1529,13 +1533,14 @@ impl<'a, D: Disk> Fs<'a, D> {
         Ok(())
     }
 
-    /// `name`'s entry in `dir` (its offset, inode and kind), and the first free offset in its hash chain.
+    /// `name`'s entry in `dir` (its offset, inode and kind), and the first free offset in its hash chain from `base`,
+    /// the name's hash.
     fn find_entry(
         &mut self,
         dir: Inode,
         name: &[u8],
+        base: Offset,
     ) -> Result<(Option<Entry>, Option<Offset>), Error> {
-        let base = name_hash(self.seed, name);
         let (mut k, last) = (
             Key::new(dir, ItemKind::Entry, base),
             Key::new(dir, ItemKind::Entry, base + (CHAIN - 1)),
@@ -1569,7 +1574,7 @@ impl<'a, D: Disk> Fs<'a, D> {
             return Err(Error::InvalidName);
         }
         let mut d = *self.dir(dir)?;
-        let (found, slot) = self.find_entry(dir, name)?;
+        let (found, slot) = self.find_entry(dir, name, name_hash(self.seed, name))?;
         match found {
             Some(e) if kind == FILE => return self.child(dir, e).map(|_| e.1),
             Some(_) => return Err(Error::Exists),
