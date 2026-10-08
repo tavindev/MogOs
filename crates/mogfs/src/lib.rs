@@ -723,34 +723,39 @@ impl<'a, D: Disk> Fs<'a, D> {
             }
             // A larger older slot may mark blocks past this disk's size; they reserve nothing and must not count.
             let end = self.blocks.div_ceil(64) as usize;
-            let tail = if self.blocks.is_multiple_of(64) {
-                !0
-            } else {
-                (1 << (self.blocks % 64)) - 1
-            };
-            // One pass: both slots' reach, the committed copies, whether the older slot reaches more, the used count.
-            let (mut lag, mut used) = (false, 0);
-            for i in 0..w {
-                let mask = match (i + 1).cmp(&end) {
-                    core::cmp::Ordering::Less => !0,
-                    core::cmp::Ordering::Equal => tail,
-                    core::cmp::Ordering::Greater => 0,
-                };
-                let (l, o) = (self.bits[i], self.bits[NEWEST * w + i]);
-                let (p, o) = if self.pins {
-                    let p = self.bits[w + i];
-                    let o = o | self.bits[(NEWEST + 1) * w + i];
-                    self.bits[(NEWEST + 1) * w + i] = p;
-                    (p, o)
-                } else {
-                    (0, o)
-                };
-                let o = o & mask;
-                let c = o | l | p;
-                (self.bits[COMMITTED * w + i], self.bits[NEWEST * w + i]) = (c, l);
-                lag |= o & !(l | p) != 0;
-                used += c.count_ones() as u64;
+            let maps = if self.pins { 2 } else { 1 };
+            for m in NEWEST..NEWEST + maps {
+                let older = &mut self.bits[m * w..(m + 1) * w];
+                if !self.blocks.is_multiple_of(64) {
+                    older[end - 1] &= (1 << (self.blocks % 64)) - 1;
+                }
+                older[end..].fill(0);
             }
+            // One pass: both slots' reach, the committed copies, whether the older slot reaches more, the used count.
+            let (lists, rest) = self.bits.split_at_mut(NEWEST * w);
+            let (copies, rest) = rest.split_at_mut(2 * w);
+            let (live, pinned) = lists.split_at(w);
+            let (newest, npinned) = copies.split_at_mut(w);
+            let committed = &mut rest[..w];
+            let (mut lag, mut used) = (0, 0);
+            if self.pins {
+                for i in 0..w {
+                    let (l, p, o) = (live[i], pinned[i], newest[i] | npinned[i]);
+                    let c = o | l | p;
+                    (committed[i], newest[i], npinned[i]) = (c, l, p);
+                    lag |= o & !(l | p);
+                    used += c.count_ones() as u64;
+                }
+            } else {
+                for i in 0..w {
+                    let (l, o) = (live[i], newest[i]);
+                    let c = o | l;
+                    (committed[i], newest[i]) = (c, l);
+                    lag |= o & !l;
+                    used += c.count_ones() as u64;
+                }
+            }
+            let lag = lag != 0;
             let d = MAPS * w..MAPS * w + self.lpages().div_ceil(64);
             self.bits[d.clone()].fill(0);
             let d = d.start;
