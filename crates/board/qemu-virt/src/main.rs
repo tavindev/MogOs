@@ -179,7 +179,7 @@ static KERNEL: Lock<Kernel, level::Kernel> = Lock::new(Kernel {
     fs: Fs::new(FsDisk(None)),
     mounted: false,
     opens: Opens::new(),
-    deferred: false,
+    ended: false,
     release: None,
 });
 
@@ -192,8 +192,9 @@ struct Kernel {
     /// `fs` is mounted: boot-spawned processes get its root as handle 3.
     mounted: bool,
     opens: Opens<{ MAX_PROCESSES * MAX_HANDLES }>,
-    /// This hold parked a kernel stack for the trap exit (`trap::DEFERRED`); taken by the hook's `Resume`.
-    deferred: bool,
+    /// This hold ended a thread that left work for the end of the hook: a release (`release`) or a kernel stack
+    /// parked for the trap exit (`trap::DEFERRED`). One flag, so a hook that ended none tests one byte.
+    ended: bool,
     /// A process whose last thread this hold ended, and its code, for the hook's `trap::finish_release`.
     release: Option<(usize, u64)>,
 }

@@ -78,6 +78,8 @@ unsafe extern "C" fn board_unlock_work() {
 /// frame this core resumes, switches again if what the release woke should run instead: this core idles, or a ready
 /// task outranks its own, which is not marked to end.
 ///
+/// Returns the frame to resume and whether a kernel stack is parked for the trap exit.
+///
 /// # Safety
 /// Trap context, holding `KERNEL` through `kernel`, every switch of this hook made, and `next` the frame it resumes.
 #[inline(always)]
@@ -86,35 +88,40 @@ unsafe fn finish_release(
     w: &mut W<'_, level::Kernel>,
     cpu: usize,
     next: usize,
-) -> usize {
-    match kernel.release {
-        None => next,
-        // SAFETY: the caller's contract.
-        Some(_) => unsafe { release_and_reschedule(kernel, w, cpu, next) },
+) -> (usize, bool) {
+    if !kernel.ended {
+        return (next, false);
     }
+    // SAFETY: the caller's contract.
+    unsafe { after_end(kernel, w, cpu, next) }
 }
 
-/// `finish_release` once there is a release, out of line.
+/// `finish_release` once this hold ended a thread, out of line.
 ///
 /// # Safety
 /// As `finish_release`.
 #[cold]
 #[inline(never)]
-unsafe fn release_and_reschedule(
+unsafe fn after_end(
     kernel: &mut Kernel,
     w: &mut W<'_, level::Kernel>,
     cpu: usize,
-    next: usize,
-) -> usize {
-    let release = kernel.release.take().expect("a release");
-    release_process(kernel, w, release);
-    let sched = &kernel.sched;
-    // A marked thread stays: the signal its killer sent ends it here.
-    if sched.idle(cpu) || (sched.outranked(cpu) && sched.marked(cpu).is_none()) {
-        // SAFETY: the caller's contract.
-        return unsafe { switch(&mut kernel.sched, cpu, next) };
+    mut next: usize,
+) -> (usize, bool) {
+    kernel.ended = false;
+    if let Some(release) = kernel.release.take() {
+        release_process(kernel, w, release);
+        let sched = &kernel.sched;
+        // A marked thread stays: the signal its killer sent ends it here.
+        if sched.idle(cpu) || (sched.outranked(cpu) && sched.marked(cpu).is_none()) {
+            // SAFETY: the caller's contract.
+            next = unsafe { switch(&mut kernel.sched, cpu, next) };
+        }
     }
-    next
+    // SAFETY: trap context.
+    (next, unsafe {
+        DEFERRED.with_masked(|parked| parked.is_some())
+    })
 }
 
 /// `finish_release`'s release.
@@ -203,7 +210,7 @@ fn end_thread(
     let Kernel {
         sched,
         mutexes,
-        deferred,
+        ended,
         release,
         ..
     } = kernel;
@@ -229,8 +236,8 @@ fn end_thread(
     if !on_it {
         free_stack(&mut FRAMES.lock_masked(w), stack);
     }
+    *ended |= on_it || last;
     if on_it {
-        *deferred = true;
         // SAFETY: trap context, as for every caller.
         let parked = unsafe { DEFERRED.with_masked(|parked| parked.replace(stack)) };
         debug_assert!(parked.is_none(), "two stacks in one trap");
@@ -472,7 +479,7 @@ unsafe extern "C" fn board_irq(frame: usize) -> Resume {
         None => frame,
     };
     // SAFETY: trap context, and `next` the frame this hook resumes.
-    let next = unsafe { finish_release(kernel, &mut w, cpu, next) };
+    let (next, parked) = unsafe { finish_release(kernel, &mut w, cpu, next) };
     // The tick only preempts a running task: an idle core takes none, and starts again once it runs one.
     if (tick || idle) && TICKS.load(Relaxed) && !kernel.sched.idle(cpu) {
         arch::timer::arm(TICK_US);
@@ -480,7 +487,7 @@ unsafe extern "C" fn board_irq(frame: usize) -> Resume {
         arch::timer::stop();
     }
     kick(&mut kernel.sched, cpu);
-    Resume::locked(next, core::mem::take(&mut kernel.deferred))
+    Resume::locked(next, parked)
 }
 
 /// Copies the user buffer at `ptr` into `buf` and runs `f` on the copy; `EFAULT` if EL0 may not read it.
@@ -612,11 +619,13 @@ fn pipe_call(
                 unsafe { block(kernel, &mut w, cpu, frame, Event::Pipe(end.index as usize)) };
             // A marked thread ends instead of blocking, maybe its process's last.
             // SAFETY: trap context, and `next` the frame this hook resumes.
-            unsafe { finish_release(kernel, &mut w, cpu, next) }
+            let (next, parked) = unsafe { finish_release(kernel, &mut w, cpu, next) };
+            kick(&mut kernel.sched, cpu);
+            return Resume::locked(next, parked);
         }
     };
     kick(&mut kernel.sched, cpu);
-    Resume::locked(next, core::mem::take(&mut kernel.deferred))
+    Resume::locked(next, false)
 }
 
 /// A call on shared state alone, or a table call of a process's only thread: takes `KERNEL` before its lookups, so a
@@ -636,9 +645,9 @@ unsafe fn kernel_first(root: &mut W<'_, level::Unlocked>, frame: &mut arch::Trap
     // SAFETY: the caller's contract.
     let next = unsafe { syscall(kernel, &mut w, (cpu, entry), frame, call) };
     // SAFETY: trap context, and `next` the frame this hook resumes.
-    let next = unsafe { finish_release(kernel, &mut w, cpu, next) };
+    let (next, parked) = unsafe { finish_release(kernel, &mut w, cpu, next) };
     kick(&mut kernel.sched, cpu);
-    Resume::locked(next, core::mem::take(&mut kernel.deferred))
+    Resume::locked(next, parked)
 }
 
 /// A call under `KERNEL` alone, which returns holding it.
@@ -659,9 +668,9 @@ fn kernel_call(
     // SAFETY: trap context, and `frame` the current process's (`board_syscall`'s contract).
     let next = unsafe { syscall(kernel, &mut w, (cpu, entry), frame, Ok(call)) };
     // SAFETY: trap context, and `next` the frame this hook resumes.
-    let next = unsafe { finish_release(kernel, &mut w, cpu, next) };
+    let (next, parked) = unsafe { finish_release(kernel, &mut w, cpu, next) };
     kick(&mut kernel.sched, cpu);
-    Resume::locked(next, core::mem::take(&mut kernel.deferred))
+    Resume::locked(next, parked)
 }
 
 /// A console write: copied in through this core's buffer, written under `CONSOLE` alone.
@@ -792,9 +801,9 @@ unsafe fn block_switch(root: &mut W<'_, level::Unlocked>, frame: &mut arch::Trap
         None => unsafe { switch(&mut kernel.sched, cpu, at) },
     };
     // SAFETY: trap context, and `next` the frame this hook resumes.
-    let next = unsafe { finish_release(kernel, &mut w, cpu, next) };
+    let (next, parked) = unsafe { finish_release(kernel, &mut w, cpu, next) };
     kick(&mut kernel.sched, cpu);
-    Resume::locked(next, core::mem::take(&mut kernel.deferred))
+    Resume::locked(next, parked)
 }
 
 /// A table call's work under the process lock and `KERNEL`: its result, or `None` once it marked itself blocked.
@@ -860,11 +869,16 @@ fn locked_table_call(
                     })
                 })
             };
-            opened.and_then(|object| {
-                let handle = table.insert(process, object, rights)?;
-                opens.open(object);
-                Ok(handle)
-            })
+            match opened {
+                Ok(object) => {
+                    let handle = table.insert(process, object, rights);
+                    if handle.is_ok() {
+                        opens.open(object);
+                    }
+                    handle
+                }
+                Err(error) => Err(error),
+            }
         }
         Call::Spawn {
             ref file,
@@ -1196,7 +1210,7 @@ unsafe extern "C" fn board_user_fault(frame: usize, ec: u64, far: u64) -> Resume
     // SAFETY: the caller masked IRQs; `frame` is the current process's.
     let next = unsafe { exit_process(kernel, &mut w, cpu, frame, KILLED) };
     // SAFETY: trap context, and `next` the frame this hook resumes.
-    let next = unsafe { finish_release(kernel, &mut w, cpu, next) };
+    let (next, parked) = unsafe { finish_release(kernel, &mut w, cpu, next) };
     kick(&mut kernel.sched, cpu);
-    Resume::locked(next, core::mem::take(&mut kernel.deferred))
+    Resume::locked(next, parked)
 }

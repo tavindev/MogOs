@@ -223,14 +223,15 @@ struct Entry {
     words: [AtomicU64; 3],
 }
 
-/// The last two entries lookups read and their sequences, to recheck once the object's own lock is held: unchanged, a
-/// sibling's `close` comes after the call, never during it. An index past the table is no entry.
+/// The entry a lookup read and its sequence, to recheck once the object's own lock is held: unchanged, a sibling's
+/// `close` comes after the call, never during it. A call whose lookups are not rechecked may make several (the last
+/// is kept); one that is makes one. An index past the table is no entry.
 #[derive(Clone, Copy)]
-pub struct Seen([(usize, u64); 2]);
+pub struct Seen(usize, u64);
 
 impl Default for Seen {
     fn default() -> Self {
-        Self([(MAX_HANDLES, 0); 2])
+        Self(MAX_HANDLES, 0)
     }
 }
 
@@ -280,7 +281,7 @@ impl Table {
             }
             spin_loop();
         };
-        seen.0 = [(handle.index, sequence), seen.0[0]];
+        *seen = Seen(handle.index, sequence);
         if words[0] >> 32 & 0xff == 0 || !handle.valid(words[0] as u32) {
             return Err(EBADF);
         }
@@ -297,12 +298,10 @@ impl Table {
         Ok(object)
     }
 
-    /// Whether no entry `seen` recorded changed since.
+    /// Whether the entry `seen` recorded is unchanged since.
     #[inline]
     pub fn unchanged(&self, seen: &Seen) -> bool {
-        (seen.0.iter()).all(|&(i, sequence)| {
-            (self.0.get(i)).is_none_or(|e| e.sequence.load(Acquire) == sequence)
-        })
+        (self.0.get(seen.0)).is_none_or(|e| e.sequence.load(Acquire) == seen.1)
     }
 
     /// A copy of the table. Writers are serialized by the process lock, so this reads without retrying.

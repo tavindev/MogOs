@@ -106,12 +106,16 @@ fn map_filled(
 ) {
     let base = page.0 as *mut u8;
     let end = at + bytes.len();
-    // SAFETY: a fresh frame from the allocator: identity-mapped RAM that nothing else uses, and `end <= PAGE`.
-    unsafe { ptr::write_bytes(base, 0, at) };
-    // SAFETY: as above; `bytes` is kernel memory, never this frame.
-    unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), base.wrapping_add(at), bytes.len()) };
-    // SAFETY: as above.
-    unsafe { ptr::write_bytes(base.wrapping_add(end), 0, PAGE - end) };
+    if bytes.is_empty() {
+        zeroed(page);
+    } else {
+        // SAFETY: a fresh frame from the allocator: identity-mapped RAM that nothing else uses, and `end <= PAGE`.
+        unsafe { ptr::write_bytes(base, 0, at) };
+        // SAFETY: as above; `bytes` is kernel memory, never this frame.
+        unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), base.wrapping_add(at), bytes.len()) };
+        // SAFETY: as above.
+        unsafe { ptr::write_bytes(base.wrapping_add(end), 0, PAGE - end) };
+    }
     // SAFETY: `l1` is a process's table built from zeroed frames like these, and `va` is a user address it leaves
     // unmapped, from 4 GiB up to `USER_END`, below every GiB a kernel block maps.
     let mapped =
@@ -166,7 +170,7 @@ where
         entry.budget.refund(count);
         return None;
     }
-    let mut taken = taken.into_iter();
+    let mut taken = taken[..count].iter().copied();
     let mut take = || taken.next().expect("counted");
     for va in (start..end).step_by(PAGE) {
         let page = take();
