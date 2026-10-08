@@ -203,7 +203,7 @@ unsafe fn enter(sched: &mut Sched, frame: usize, (next, from, to): (usize, usize
 /// Ends the thread in `slot`, which no core but `cpu` runs, with `code`: frees the mutexes it owns, drops the boost it
 /// lent, and refunds its kernel stack to its process, freeing its frames at once or, if `cpu` runs on it, once the trap
 /// exit left it. Its process's last thread leaves the process's release to the hook's `finish_release`. The boot
-/// context may wait for the task count to drop, so core 0 is signalled.
+/// context may wait for the task count to drop, so core 0 is signalled, once: by the release for a last thread.
 fn end_thread(
     kernel: &mut Kernel,
     w: &mut W<'_, level::Kernel>,
@@ -248,8 +248,7 @@ fn end_thread(
     if last {
         debug_assert!(release.is_none(), "two releases in one hold");
         *release = Some((process, code));
-    }
-    if cpu != 0 && sched.boot_waits() {
+    } else if cpu != 0 && sched.boot_waits() {
         send_sgi(0);
     }
 }
