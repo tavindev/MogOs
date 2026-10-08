@@ -25,8 +25,9 @@ lines and the exit status. `tests/user.rs` runs `crates/user`'s host tests (outs
   in the same change (`docs/DEVELOPMENT.md`, rules for agents).
 - A boot is killed, failing its test, once QEMU prints nothing for `SILENCE` (30 s) or at `CAP` (300 s), so a slow scenario passes under load while it prints and a hang fails fast; every scenario prints well within it (the captured output reports the longest silence). Every boot prints QEMU's exit status,
   stderr and stdout (captured: shown when the test fails).
-- The kernel is built once per test run (`Once` in `boot_with_input`): even a fresh `cargo build` replaces `mog_os`
-  (a new inode), so a build beside a booting test made QEMU fail with `Couldn't load elf` and no output.
+- The kernel is built once per test run (`OnceLock` in `boot_with`) and booted through a private hard link,
+  `mog_os-e2e-<pid>` beside `mog_os`: even a no-op `cargo build` replaces `mog_os` (a new inode), so a build beside a
+  booting test made QEMU fail with `Couldn't load elf` and no output. The links stay until `cargo clean`.
 - Disk scenarios make a zeroed raw image in the temp dir per test (`disk_image`), or a formatted MogFS one
   (`mogfs_image`, name-hash seed 1, so a native `ls` lists in the same order every run), and remove it; the flush checks (`test=disk`, and msh's `sync` in `sync_reports_a_failed_flush`) boot through a `blkdebug` blockdev that fails every host flush with EIO (`flush_fails`).
 - Console input (`boot_with_input`) writes chunk `i` once the output holds the ready marker `i + 1` times, so `shell`

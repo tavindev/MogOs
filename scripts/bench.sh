@@ -12,6 +12,13 @@ set -eu
 [ $# -ge 3 ] || { sed -n '2,10s/^# //p' "$0"; exit 2; }
 root=$(cd "$(dirname "$0")/.." && pwd)
 
+# One benchmark at a time on this machine, across worktrees (bench.lock in the common git dir); waits its turn.
+if [ -z "${BENCH_LOCKED:-}" ]; then
+    lock=$(git -C "$root" rev-parse --path-format=absolute --git-common-dir)/bench.lock
+    lockf -kst 0 "$lock" true || echo "bench.sh: waiting for another benchmark to finish ($lock)" >&2
+    BENCH_LOCKED=1 exec lockf -k "$lock" "$root/scripts/bench.sh" "$@"
+fi
+
 if [ "$1" = host ]; then
     [ $# -ge 4 ] || { sed -n '2,10s/^# //p' "$0"; exit 2; }
     rounds=$2 base=$3 package=$4

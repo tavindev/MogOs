@@ -8,6 +8,13 @@ set -euo pipefail
 
 RUNS=${1:-21}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
+
+# One benchmark at a time on this machine, as in scripts/bench.sh (the same lock).
+if [ -z "${BENCH_LOCKED:-}" ]; then
+    lock=$(git -C "$ROOT" rev-parse --path-format=absolute --git-common-dir)/bench.lock
+    lockf -kst 0 "$lock" true || echo "oscompare.sh: waiting for another benchmark to finish ($lock)" >&2
+    BENCH_LOCKED=1 exec lockf -k "$lock" "$ROOT/scripts/oscompare.sh" "$@"
+fi
 TP=$ROOT/third_party/oscompare
 OUT=$TP/out
 LLVM=/opt/homebrew/opt/llvm/bin
