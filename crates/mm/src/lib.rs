@@ -236,7 +236,11 @@ impl Budget {
 
     /// Refunds `count` frames `charge` took.
     pub fn refund(&self, count: usize) {
-        self.0.fetch_sub(count as u64, Relaxed);
+        let was = self.0.fetch_sub(count as u64, Relaxed);
+        debug_assert!(
+            was & u64::from(u32::MAX) >= count as u64,
+            "refund over the charge"
+        );
     }
 
     /// Lowers the limit by `frames`, which move to a child's budget; false, changing nothing, if fewer remain.

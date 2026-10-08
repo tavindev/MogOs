@@ -127,14 +127,14 @@ fn map_filled(
 /// Maps `pages` zeroed read-write pages at the current process's next map address, charged to its budget, taking the
 /// frames and any new tables in one pass of the bitmap; returns their address, or `None` with nothing mapped if the
 /// budget or the frames run out or the pages would reach `USER_END`. Under the process's lock only, unless the caller
-/// is its only thread.
+/// is its only thread (`alone`, read before the call's lookups).
 #[inline(never)]
 pub(crate) fn map(
-    entry: &ProcessEntry,
+    (entry, alone): (&ProcessEntry, bool),
     root: &mut W<'_, level::Unlocked>,
     pages: usize,
 ) -> Option<u64> {
-    if entry.alone() {
+    if alone {
         // SAFETY: the caller is its process's only thread, so nothing else reaches the process's data (`alone`).
         return map_pages(entry, unsafe { entry.lock.unshared() }, root, pages);
     }

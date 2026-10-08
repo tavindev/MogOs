@@ -540,7 +540,7 @@ unsafe extern "C" fn board_syscall(frame: &mut arch::TrapFrame) -> Resume {
     }
     // SAFETY: the caller masked IRQs.
     let entry = &PROCESSES[unsafe { CURRENT.with_masked(|current| *current) }];
-    // Read before `dispatch`, so a lookup it vouches for needs no recheck; only the caller's own `thread` changes it.
+    // Read before `dispatch`, so a lookup it vouches for needs no recheck; only the caller's own `thread` raises it.
     // `io` rechecks instead: no read on the console path.
     let alone = nr != IO && entry.alone();
     if alone && nr < 64 && TABLE_CALLS >> nr & 1 != 0 {
@@ -554,7 +554,7 @@ unsafe extern "C" fn board_syscall(frame: &mut arch::TrapFrame) -> Resume {
     // `Write` first and alone: the hot path tests one discriminant.
     frame.x[0] = match call {
         Ok(Call::Write { ptr, len }) => write(&mut root, ptr, len),
-        Ok(Call::Map { pages }) => map(entry, &mut root, pages).unwrap_or(ENOMEM as u64),
+        Ok(Call::Map { pages }) => map((entry, alone), &mut root, pages).unwrap_or(ENOMEM as u64),
         // The caller alone: no lock, unless a closed handle's object needs `KERNEL`.
         Ok(Call::Dup {
             object:
