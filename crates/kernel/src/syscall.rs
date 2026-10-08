@@ -67,10 +67,11 @@ const KILL: u64 = 12;
 /// `mkdir(dir, path_ptr, path_len)`: makes a directory at `path` under `dir` (write right), resolved as by `open`;
 /// returns 0. `EROFS` on the boot archive.
 const MKDIR: u64 = 13;
-/// `readdir(dir, ptr, len, start)`: fills `ptr` with whole `name\n` entries (`name/\n` for a directory) of `dir` (read
-/// right) from entry `start` on; returns the bytes written, 0 past the last entry. The caller advances `start` by the
-/// newlines it got; an unlink between calls moves an entry, so a resumed listing can skip or repeat one. `EINVAL` if
-/// the first entry does not fit in `len`.
+/// `readdir(dir, ptr, len, cursor)`: fills `ptr` with whole `name\n` entries (`name/\n` for a directory) of `dir` (read
+/// right) from `cursor` on (0: the first); returns the bytes written, 0 past the last entry, and in x1 the cursor the
+/// next call resumes from (`u64::MAX` past the end). A directory's cursor is an entry's key, not a position, so an
+/// unlink between calls never makes a resumed listing skip or repeat an entry. `EINVAL` if the first entry does not fit
+/// in `len`.
 const READDIR: u64 = 14;
 /// `sync(handle)`: makes every change to the file system the directory or file `handle` (no right needed: it changes
 /// nothing a handle reaches) is on durable, atomically; it holds the core for its writes and two flushes. `EIO` means unknown: the changes may or may not be durable.
@@ -296,12 +297,12 @@ pub enum Call {
         ptr: u64,
         len: usize,
     },
-    /// List `dir` (the boot archive or a directory) from entry `start` into `ptr..ptr + len`, as for `Read`.
+    /// List `dir` (the boot archive or a directory) from `cursor` into `ptr..ptr + len`, as for `Read`.
     Readdir {
         dir: Object,
         ptr: u64,
         len: usize,
-        start: u64,
+        cursor: u64,
     },
     /// Commit the file system.
     Sync,
@@ -380,7 +381,7 @@ const _: () = assert!(size_of::<Call>() == 56, "every syscall returns a Call");
 /// Spectre v1: the number indexes the jump table masked to its 32 entries; each call then clamps the arguments it
 /// indexes kernel memory with to the capacity of what they index, together behind one barrier (`C`), before their
 /// first use, and passes on only the clamped values: a handle (x0, and x3 for `rename`), a user buffer and its length,
-/// a file offset (x4), a `readdir` start (x3).
+/// a file offset (x4). A `readdir` cursor (x3) indexes nothing: it is a key the tree search compares.
 pub fn dispatch<C: Clamp>(nr: u64, args: &[u64; 7], handles: &mut Handles) -> Result<Call, i64> {
     if nr > SHUTDOWN {
         return Err(ENOSYS);
@@ -548,9 +549,9 @@ pub fn dispatch<C: Clamp>(nr: u64, args: &[u64; 7], handles: &mut Handles) -> Re
             })
         }
         READDIR => {
-            let [h, p1, l2, start] = C::clamp(
-                [handle(args[0]), offset(args[1]), args[2], args[3]],
-                [HANDLE, room(args[2]), LEN, MAX_FILE_SIZE],
+            let [h, p1, l2] = C::clamp(
+                [handle(args[0]), offset(args[1]), args[2]],
+                [HANDLE, room(args[2]), LEN],
             );
             let dir = handles.get(Handle::clamped(args[0], h), READ)?;
             let (Object::Archive | Object::Dir(_)) = dir else {
@@ -561,7 +562,7 @@ pub fn dispatch<C: Clamp>(nr: u64, args: &[u64; 7], handles: &mut Handles) -> Re
                 dir,
                 ptr: USER.start + p1,
                 len: l2 as usize,
-                start,
+                cursor: args[3],
             })
         }
         SYNC => match handles.get(h0(), 0)? {

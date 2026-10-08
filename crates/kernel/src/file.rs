@@ -14,7 +14,8 @@ use crate::syscall::{
 
 /// Entries one `readdir` call lists at most.
 const LIST: usize = 64;
-/// Components a path has at most, which bounds a walk's lookups (each at most a directory's 14 blocks) with IRQs masked.
+/// Components a path has at most, which bounds a walk's lookups (each a descent of at most 8 tree levels) with IRQs
+/// masked.
 pub const MAX_DEPTH: usize = 16;
 
 pub fn errno(error: Error) -> i64 {
@@ -25,9 +26,9 @@ pub fn errno(error: Error) -> i64 {
         Error::IsDir => EISDIR,
         Error::InvalidName => EINVAL,
         Error::TooBig => EFBIG,
-        Error::NoSpace => ENOSPC,
+        Error::NoSpace | Error::Collision => ENOSPC,
         Error::NotEmpty => ENOTEMPTY,
-        Error::Io | Error::Corrupt => EIO,
+        Error::Io | Error::Corrupt | Error::Unsupported => EIO,
     }
 }
 
@@ -100,48 +101,52 @@ pub fn rename<D: Disk>(
     fs.rename(from_dir, from, to_dir, to).map_err(errno)
 }
 
-/// Writes `dir`'s entries from index `start` on into `out`, as many whole `name\n` (`name/\n` for a directory) as fit
-/// up to `LIST`; returns the bytes written, `EINVAL` if the first entry does not fit. Resuming by index can skip or
-/// repeat an entry if an unlink moved one between calls.
+/// Writes `dir`'s entries from `cursor` on (0: the first) into `out`, as many whole `name\n` (`name/\n` for a directory)
+/// as fit up to `LIST`; returns the bytes written and the cursor to resume from (`u64::MAX` past the end), `EINVAL` if
+/// the first entry does not fit.
 pub fn readdir<D: Disk>(
     fs: &mut Fs<D>,
     dir: Inode,
-    start: u64,
+    cursor: u64,
     out: &mut [u8],
-) -> Result<usize, i64> {
-    let (mut len, mut count, mut full) = (0, 0, false);
-    fs.readdir(dir, start as usize, |name, _, kind| {
-        let slash = kind == Kind::Dir;
-        let end = len + name.len() + slash as usize + 1;
-        if count == LIST || end > out.len() {
-            full = true;
-            return true;
-        }
-        out[len..][..name.len()].copy_from_slice(name);
-        if slash {
-            out[end - 2] = b'/';
-        }
-        out[end - 1] = b'\n';
-        (len, count) = (end, count + 1);
-        false
-    })
-    .map_err(errno)?;
-    match (full, len) {
-        (true, 0) => Err(EINVAL),
-        _ => Ok(len),
+) -> Result<(usize, u64), i64> {
+    let (mut len, mut count) = (0, 0);
+    let next = fs
+        .readdir(dir, cursor, |name, _, kind| {
+            let slash = kind == Kind::Dir;
+            let end = len + name.len() + slash as usize + 1;
+            if count == LIST || end > out.len() {
+                return true;
+            }
+            out[len..][..name.len()].copy_from_slice(name);
+            if slash {
+                out[end - 2] = b'/';
+            }
+            out[end - 1] = b'\n';
+            (len, count) = (end, count + 1);
+            false
+        })
+        .map_err(errno)?;
+    match (next, len) {
+        (u64::MAX, _) | (_, 1..) => Ok((len, next)),
+        _ => Err(EINVAL),
     }
 }
 
-/// As `readdir`, for the boot archive, whose entries are all files.
-pub fn list_archive(archive: &[u8], start: u64, out: &mut [u8]) -> Result<usize, i64> {
+/// As `readdir`, for the boot archive, whose entries are all files; its cursor is an entry index.
+pub fn list_archive(archive: &[u8], cursor: u64, out: &mut [u8]) -> Result<(usize, u64), i64> {
     let mut len = 0;
-    for (name, _) in cpio::entries(archive).skip(start as usize) {
+    for (i, (name, _)) in cpio::entries(archive).enumerate().skip(cursor as usize) {
         if len + name.len() + 1 > out.len() {
-            return if len == 0 { Err(EINVAL) } else { Ok(len) };
+            return if len == 0 {
+                Err(EINVAL)
+            } else {
+                Ok((len, i as u64))
+            };
         }
         out[len..][..name.len()].copy_from_slice(name);
         len += name.len() + 1;
         out[len - 1] = b'\n';
     }
-    Ok(len)
+    Ok((len, u64::MAX))
 }

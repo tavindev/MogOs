@@ -81,7 +81,7 @@ const BENCHES: [(&str, u64, Bench); 27] = [
     }),
     ("readdir", 4096, |c, step| {
         if let Step::Timed(_) = step {
-            ok(readdir(ROOT, &mut c.list, 0));
+            ok(readdir(ROOT, &mut c.list, 0).0);
         }
     }),
     ("unlink", 256, |_, step| match step {

@@ -296,10 +296,16 @@ pub fn mkdir(dir: u64, path: &[u8]) -> i64 {
     syscall(13, [dir, path.as_ptr() as u64, path.len() as u64, 0])
 }
 
-/// Fills `buf` with whole `name\n` entries (`name/\n` for a directory) from entry `start` on; returns the bytes
-/// written, 0 at the end.
-pub fn readdir(dir: u64, buf: &mut [u8], start: u64) -> i64 {
-    syscall(14, [dir, buf.as_mut_ptr() as u64, buf.len() as u64, start])
+/// Fills `buf` with whole `name\n` entries (`name/\n` for a directory) from `cursor` on (0: the first); returns the
+/// bytes written (0 at the end) and the cursor to resume from (`u64::MAX` past the end).
+pub fn readdir(dir: u64, buf: &mut [u8], cursor: u64) -> (i64, u64) {
+    let (n, next);
+    // SAFETY: as in `syscall`; `readdir` writes only `buf`, x0 and x1.
+    unsafe {
+        asm!("svc #0", inlateout("x0") dir => n, inlateout("x1") buf.as_mut_ptr() as u64 => next,
+            in("x2") buf.len(), in("x3") cursor, in("x8") 14, options(nostack))
+    };
+    (n, next)
 }
 
 /// Makes every change to the file system durable; `EIO` leaves it unknown whether it did.

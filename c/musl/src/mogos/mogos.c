@@ -107,19 +107,22 @@ static int isdir(long h)
 	return r >= 0 || r == -EINVAL;
 }
 
-/* No stat call: the size is the first offset a one-byte read returns nothing at (files are under 64 KiB). */
+/* No stat call: the size is the first offset a one-byte read returns nothing at, bisected in [0, 64 KiB], then in
+   each doubled range while the top of the last one still reads. */
 static long long size_of(long h)
 {
 	char c;
-	long long lo = 0, hi = 1 << 16;
-	while (lo < hi) {
-		long long mid = (lo + hi) / 2;
-		long r = svc(N_IO, h, 0, (long)&c, 1, mid, 0, 0);
+	long long lo = 0, top = 1 << 16, hi = top;
+	for (long r;; lo = top + 1, top *= 2, hi = top) {
+		while (lo < hi) {
+			long long mid = (lo + hi) / 2;
+			if ((r = svc(N_IO, h, 0, (long)&c, 1, mid, 0, 0)) < 0) return r;
+			if (r) lo = mid + 1;
+			else hi = mid;
+		}
+		if (lo < top || !(r = svc(N_IO, h, 0, (long)&c, 1, top, 0, 0))) return lo;
 		if (r < 0) return r;
-		if (r) lo = mid + 1;
-		else hi = mid;
 	}
-	return lo;
 }
 
 static struct file *fd_file(int fd)
@@ -332,41 +335,59 @@ static long do_lseek(int fd, long long off, int whence)
 	return f->off = base + off;
 }
 
-/* The native `name\n` (`name/\n` for a directory) entries as `struct dirent`s; the offset counts entries. */
+static unsigned long hash(const char *s)
+{
+	unsigned long h = 14695981039346656037ul;
+	while (*s) h = (h ^ (unsigned char)*s++) * 1099511628211ul;
+	return h | 1;
+}
+
+/* `readdir` into `names`; the cursor to resume from goes to `next`. */
+static long list(long h, char *names, size_t len, long long cursor, long long *next)
+{
+	register long x0 __asm__("x0") = h, x1 __asm__("x1") = (long)names, x2 __asm__("x2") = len;
+	register long x3 __asm__("x3") = cursor, x8 __asm__("x8") = N_READDIR;
+	__asm__ __volatile__("svc 0" : "+r"(x0), "+r"(x1) : "r"(x2), "r"(x3), "r"(x8) : "memory");
+	*next = x1;
+	return x0;
+}
+
+/* The native `name\n` (`name/\n` for a directory) entries as `struct dirent`s; the offset is the native cursor, which
+   every entry of a call shares as its `d_off`. */
 static long do_getdents(int fd, char *buf, size_t len)
 {
 	struct file *f = fd_file(fd);
 	char names[1024];
+	long long next;
 	if (!f) return -EBADF;
 	if (f->kind != DIRECTORY) return -ENOTDIR;
-	long n = svc(N_READDIR, f->handle, (long)names, sizeof names, f->off, 0, 0, 0);
+	long n = list(f->handle, names, sizeof names, f->off, &next);
 	if (n < 0) return n;
 	size_t pos = 0;
 	long count = 0;
-	for (char *s = names, *nl; s < names + n; s = nl + 1) {
+	char *s = names;
+	for (char *nl; s < names + n; s = nl + 1) {
 		nl = memchr(s, '\n', names + n - s);
 		size_t namelen = nl - s, dir = namelen && s[namelen - 1] == '/';
 		namelen -= dir;
 		size_t rec = (offsetof(struct dirent, d_name) + namelen + 8) & ~7ul;
 		if (pos + rec > len) break;
 		struct dirent *d = (void *)(buf + pos);
-		d->d_ino = d->d_off = f->off + ++count;
 		d->d_reclen = rec;
 		d->d_type = dir ? DT_DIR : DT_REG;
 		memcpy(d->d_name, s, namelen);
 		d->d_name[namelen] = 0;
+		d->d_ino = hash(d->d_name);
 		pos += rec;
+		count++;
 	}
 	if (n && !count) return -EINVAL;
-	f->off += count;
+	/* Not all fit: list just those that did again, for the cursor after them. */
+	if (s < names + n && (n = list(f->handle, names, s - names, f->off, &next)) < 0) return n;
+	for (size_t at = 0; at < pos; at += ((struct dirent *)(buf + at))->d_reclen)
+		((struct dirent *)(buf + at))->d_off = next;
+	f->off = next;
 	return pos;
-}
-
-static unsigned long hash(const char *s)
-{
-	unsigned long h = 14695981039346656037ul;
-	while (*s) h = (h ^ (unsigned char)*s++) * 1099511628211ul;
-	return h | 1;
 }
 
 /* Kind from the open file or a probe; size from probes; the path's hash as inode (MogFS has no hard links). */

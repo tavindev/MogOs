@@ -59,7 +59,9 @@ kernel's ABI is `crates/kernel/src/syscall.rs`, mirrored here by hand (numbers, 
 - Memory: `brk` fails so malloc uses `mmap`, which chains 64 KiB native `map`s (the kernel places them
   contiguously); `munmap`, `mprotect`, `madvise` do nothing, so freed mappings stay charged to the budget.
 - No stat call: a file's kind comes from a zero-length `readdir` (`ENOTDIR` for a file), its size from a binary
-  search of one-byte reads (at most 17), its inode from a hash of its path. `TIOCGWINSZ` answers 80x24 on the stdio
+  search of one-byte reads (at most 16 under 64 KiB, about two more per doubling above), its inode from a hash of its
+  path. `getdents` keeps the native `readdir` cursor as the directory offset; every entry of one call shares it as
+  `d_off`, so a `seekdir` to a `telldir` taken mid-call resumes after that call's entries. `TIOCGWINSZ` answers 80x24 on the stdio
   fds, any other ioctl is `ENOTTY`.
 - A spawned child gets up to 1024 frames of the parent's budget, halved on `ENOMEM` down to 128.
 

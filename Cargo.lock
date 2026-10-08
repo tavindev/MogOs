@@ -342,14 +342,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mogfs2"
-version = "0.1.0"
-dependencies = [
- "cpu-time",
- "criterion",
-]
-
-[[package]]
 name = "net"
 version = "0.1.0"
 dependencies = [
