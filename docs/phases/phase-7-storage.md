@@ -70,28 +70,40 @@ Filled in as each step lands.
   against v1 (63 hvf rounds); create, mkdir, unlink and rename are 85-97% faster (v1 wrote blocks per change), `ls d1`
   -64%, `mkdir m` -84%, `mv` -77%. e2e: a 200-byte name, an 84 KB file appended past 64 KiB through busybox and
   1000 files in one directory survive a reboot; `shell_files_survive_a_reboot_only_once_synced` and every other e2e
-  pass on the B+tree image. Then the slowdowns against v1 were removed: (1) `sync-change` wrote four blocks per small commit
-  (nodes, bitmap page, index, superblock) against v1's two: the index block is gone, the live bitmap's page list sits
-  in the superblock, and after it a log of the bitmap words changed since the pages were written (247 entries beside
-  one page, at least 120 at 128 pages), so a small commit writes the nodes and the superblock; the pages are written, and the log
-  empties, only when it would overflow. Up to 128 pages (16 GiB) the superblock lists them; past
-  that it holds the root of an index of blocks listing 255 entries each, at any height, so the format is bounded
-  only by the block number width (`MAX_BLOCKS`, 2^62) and the caller's memory decides what mounts (a 300 GiB sparse
-  host test runs through two index levels). The index is rewritten only with the pages, so small commits stay at two
-  block writes at any size. Mount reads 3 requests on a fresh image, v1's count.
-  (2) `compiler_builtins`' `memcpy`/`memmove` assembled each unaligned word from bytes; `crates/arch` now provides
-  both (`mem.s`, 16 bytes per unaligned `ldp`/`stp`, no FP/SIMD), which also cut `pipe` 20% and `spawn` 19%.
-  (3) `open`, `open(TRUNC)` and `readdir` at opt-level 1: a memo of the last four lookups, the last leaf reached with
-  its key bounds, and `readdir`'s start index in it (each cleared before what it copies can change; the 200-seed
-  random test lists and looks up every directory twice after each step and fails if an invalidation is dropped).
-  (4) `unlink` skips the extent scans for an empty file or a directory. Against `96b22ab` (63 interleaved hvf rounds,
-  load 28-154): `open` -18%, `open(TRUNC)` -19%, `readdir` -12%, `read` -12%, `pipe` -20%, `spawn` -20%, create,
-  mkdir, unlink and rename -88..-97%, `sync-change` within noise (median +5%, min -2%; equal block writes and 72% fewer
-  TCG instructions). What remains: `write w hello` (+2% median, +20% min) issues 2 block writes against v1's 3
-  (`touch` -75%), and an instrumented A/B of the virtio request latency (15 boots each) shows the host's per-request
-  time, not the kernel, varying from 38 to 1129 us per write on both kernels; `rm m` (+9%) is v2's slotted-leaf
-  removes plus the directory's inode rewrite, about 55k TCG instructions on both (v1 55.5k). Not done: a v1 image is not tested (its magic differs, so it mounts as `Corrupt`); the kernel never calls
-  `set_time`, so inode times read 0; `unlink` or truncate of a large file does its extent deletes with IRQs masked
-  until step 42. The reviewer pass found the `getdents` re-list could skip or repeat an entry when a directory
-  changed between its two calls (fixed: one call), `size_of` bisected every doubled range (fixed), and the
-  unbounded large-file unlink (documented in the kernel contract).
+  pass on the B+tree image. Then the slowdowns against v1 were removed:
+  (1) `sync-change` wrote four blocks per small commit against v1's two: the live bitmap's page list moved into the
+  superblock, followed by a log of the bitmap words changed since the pages were written, so a small commit writes the
+  nodes and the superblock; the pages (and the index above them) are written, and the log empties, only when it would
+  overflow. Past 128 pages (16 GiB) the superblock holds the root of an index of blocks listing 255 entries each, at
+  any height, so the format is bounded only by the block number width (`MAX_BLOCKS`, 2^62); a 300 GiB sparse host test
+  runs through two index levels. (2) `compiler_builtins`' `memcpy`/`memmove` assembled each unaligned word from bytes;
+  `crates/arch` now provides both (`mem.s`, 16 bytes per `ldp`/`stp`, no FP/SIMD), which also cut `pipe` and `spawn`
+  about 20%. (3) `open`, `open(TRUNC)`, `readdir`: a memo of the last four lookups (matched on the name hash first, so a
+  miss costs no byte compares), the last leaf reached with its key bounds, and `readdir`'s start index in it.
+  (4) `unlink` skips the extent scans for an empty file or a directory; a leaf's values sit in any order, new ones at
+  its bottom, so an insert or a remove moves no other value. (5) `write w hello`: a per-request trace showed v1 issuing
+  a read and three writes and v2 two writes, the host costing about 35 us for a command's first read request and 70 us
+  for its first write; a written data page now stays in its buffer until the buffer is needed, `map` asks for it, or a
+  commit writes it at the head of the nodes' request (moved there when the blocks after it are taken), so `write`
+  issues no request and a commit with data stays `[0, 2, 2]`. (6) Mount read 3 requests against v1's 2: it reads
+  blocks 0 to 3 (the superblocks, and on a fresh image the bitmap page and the root) in one request; 8 blocks measured
+  slower at boot. A fault-injection test (random request failures, full disks, a model of the files checked only now
+  and then so memos live across changes) found that a commit marked the staged data page written before its request
+  (a failed request lost the only copy) and that a failed mount left the old tree readable; both fixed: after an error
+  in the middle of a change or a failed mount, every call fails with `Io` until a mount succeeds. The reviewer pass
+  found that the data page's move could let an early node write-out take its block, that the move could add log words
+  after the commit had decided the log had room, and that a commit writing the pages missed a page its own releases
+  changed (leaking the old block, or writing a page over its stale entry); all three fixed, each with a test (the
+  random test now forces half its checked commits to write the pages). Final numbers, release profile, against
+  `96b22ab` (63 interleaved hvf rounds under the bench lock, `docs/BENCHMARKS.md`): `open`, `open(TRUNC)`, `file-read`
+  equal, create, mkdir, unlink, rename and `file-write` 92-98% faster, `pipe` and `spawn` -19..-21%, `ls d1` -53%,
+  `write w hello` -83%, `mkdir m` -87%, `mv` -77..-81%, boot 318 -> 291 us, open+write+sync -22%; host lookup -9%,
+  create+write+commit -1..-4%. Within this run's noise: `readdir` +1.0% (TCG +37 instructions per call),
+  `sync-change` +1.7% median, +0.2% min. Open: `rm m` +5.9% (min +8.6%) with fewer instructions than v1; a timer
+  around the `unlink` call inside it reads 57 ticks median against v1's 37, so the extra 0.8 us is the cold B+tree path
+  (node searches and three copy-on-write paths touched right after `rm`'s spawn) against v1's flat table. Not done: a
+  v1 image is not tested (its magic differs, so it mounts as `Corrupt`); the kernel never calls `set_time`, so inode
+  times read 0; `unlink` or truncate of a large file does its extent deletes with IRQs masked until step 42. The first
+  reviewer pass found the `getdents` re-list could skip or repeat an entry when a directory changed between its two
+  calls (fixed: one call), `size_of` bisected every doubled range (fixed), and the unbounded large-file unlink
+  (documented in the kernel contract).
