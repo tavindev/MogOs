@@ -14,6 +14,9 @@ pub struct Full;
 /// is also the proof that a handle-table write holds a process lock or is its process's only thread (`handle::Table`).
 pub struct Process {
     pub next: u64,
+    /// Whether its holder is the process's only thread, set by each holder before a table write: then no lookup can
+    /// race the write, which skips the seqlock's sequence and barriers. A holder under the lock sets it false.
+    pub alone: bool,
 }
 
 /// What a blocked task waits for; `wake` makes every task waiting for it ready.

@@ -129,7 +129,7 @@ fn release_process(kernel: &mut Kernel, w: &mut W<'_, level::Kernel>, (index, co
     let entry = &PROCESSES[index];
     // SAFETY: the process's last thread ended under the `KERNEL` this hold has, so no thread of it holds or takes its
     // lock, and no other process takes it.
-    let process = unsafe { entry.lock.unshared() };
+    let process = unsafe { entry.unshared() };
     entry
         .handles
         .take(process, |object| release(kernel, w, (object, index), None));
@@ -562,13 +562,13 @@ unsafe extern "C" fn board_syscall(frame: &mut arch::TrapFrame) -> Resume {
             rights,
         }) if alone => {
             // SAFETY: the caller is its process's only thread, so nothing else reaches the process's data (`alone`).
-            let process = unsafe { entry.lock.unshared() };
+            let process = unsafe { entry.unshared() };
             let handle = entry.handles.insert(process, object, rights);
             handle.unwrap_or_else(|error| error as u64)
         }
         Ok(Call::Close(handle)) if alone => {
             // SAFETY: as above.
-            let process = unsafe { entry.lock.unshared() };
+            let process = unsafe { entry.unshared() };
             close(&mut root, (&entry.handles, process), handle).unwrap_or_else(|error| error as u64)
         }
         Ok(
@@ -714,11 +714,12 @@ fn table_call(
     let table = &*entry.handles;
     let result = if alone {
         // SAFETY: the caller is its process's only thread, so nothing else reaches the process's data (`alone`).
-        let process = unsafe { entry.lock.unshared() };
+        let process = unsafe { entry.unshared() };
         table_work(root, (table, process), frame, call)
     } else {
         let mut guard = entry.lock.lock_masked(root);
         let (process, mut pw) = guard.parts();
+        process.alone = false;
         if !table.unchanged(seen) {
             frame.restart();
             return Resume::unlocked(at);
@@ -1156,7 +1157,7 @@ unsafe fn syscall(
         | Call::Thread { .. }
         | Call::Net(NetCall::Socket(_) | NetCall::IoWait)) => {
             // SAFETY: the caller's contract: its process's only thread, so nothing else reaches the process's data.
-            let process = unsafe { entry.lock.unshared() };
+            let process = unsafe { entry.unshared() };
             let table = (&*entry.handles, process);
             match locked_table_call(kernel, w, cpu, table, frame, &call) {
                 Some(result) => result.unwrap_or_else(|error| error as u64),

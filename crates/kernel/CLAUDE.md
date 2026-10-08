@@ -28,7 +28,8 @@ safe atomics (`Table`, a seqlock per entry) the board reads without one.
   the proof a handle-table write holds it or is its process's only thread.
 - `Table` and `Handles` (`src/handle.rs`): a process's live handle table, its lookups (`entry`, `get`) lock-free (each
   entry's words behind a 64-bit sequence; the entries read go in a `Seen`, which `unchanged` rechecks), its writes
-  (`insert`, `reserve` + `fill`, `close`, `commit`, `take`) under the process lock, or by the process's only thread;
+  (`insert`, `reserve` + `fill`, `close`, `commit`, `take`) under the process lock, or by the process's only thread
+  (`Process::alone`, set by each holder), whose writes no lookup can race and so skip the sequence and its barriers;
   typed lookups (`mutex`, `io`) decode only the objects their call takes; `Handles` is a plain copy (`snapshot`) for
   `split` in `spawn` and building a child's. Rights; lookups take a `Handle`, a user value with its index clamped (by
   `dispatch`, or `Handle::new` / `split` with their own barrier).

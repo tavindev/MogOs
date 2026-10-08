@@ -217,9 +217,9 @@ const MUTEX: u8 = 9;
 
 /// A handle table read without a lock: each entry is its words behind a 64-bit sequence (no wrap), a seqlock. Writers
 /// (every method taking `&mut Process`, the proof that the caller holds this table's process lock or is the process's
-/// only thread) store the
-/// sequence odd, then the words, then the sequence even; a lookup that sees the sequence change or odd retries, so it
-/// stores nothing and sibling threads' lookups share the line.
+/// only thread) store the sequence odd, then the words, then the sequence even, but for the only thread
+/// (`Process::alone`), which no lookup races; a lookup that sees the sequence change or odd retries, so it stores
+/// nothing and sibling threads' lookups share the line.
 pub struct Table([Entry; MAX_HANDLES]);
 
 struct Entry {
@@ -331,14 +331,14 @@ impl Table {
     }
 
     /// Writes every entry of `handles` (a `snapshot`, changed) that differs from the table.
-    pub fn commit(&self, _: &mut Process, handles: &Handles) {
+    pub fn commit(&self, process: &mut Process, handles: &Handles) {
         for (i, new) in handles.0.iter().enumerate() {
             let new = encode(*new);
             if (self.0[i].words.iter())
                 .zip(new)
                 .any(|(w, n)| w.load(Relaxed) != n)
             {
-                self.store(i, new);
+                self.store(process, i, new);
             }
         }
     }
@@ -361,9 +361,9 @@ impl Table {
     }
 
     /// A handle to `object` with `rights` in the free entry `i` (from `reserve`); returns its value.
-    pub fn fill(&self, _: &mut Process, i: usize, object: Object, rights: Rights) -> u64 {
+    pub fn fill(&self, process: &mut Process, i: usize, object: Object, rights: Rights) -> u64 {
         let generation = self.0[i].words[0].load(Relaxed) as u32;
-        self.store(i, encode((generation, Some((object, rights)))));
+        self.store(process, i, encode((generation, Some((object, rights)))));
         u64::from(generation) << 32 | i as u64
     }
 
@@ -379,10 +379,10 @@ impl Table {
     }
 
     /// Closes `handle`; returns the object it reached.
-    pub fn close(&self, _: &mut Process, handle: Handle) -> Result<Object, i64> {
+    pub fn close(&self, process: &mut Process, handle: Handle) -> Result<Object, i64> {
         match decode(self.words(handle.index)) {
             (generation, Some((object, _))) if handle.valid(generation) => {
-                self.store(handle.index, encode((generation + 1, None)));
+                self.store(process, handle.index, encode((generation + 1, None)));
                 Ok(object)
             }
             _ => Err(EBADF),
@@ -395,11 +395,11 @@ impl Table {
     }
 
     /// Empties the table for the next process at its index, handing `f` each object it held.
-    pub fn take(&self, _: &mut Process, mut f: impl FnMut(Object)) {
+    pub fn take(&self, process: &mut Process, mut f: impl FnMut(Object)) {
         for i in 0..MAX_HANDLES {
             let words = self.words(i);
             if words.iter().any(|&w| w != 0) {
-                self.store(i, [0; 3]);
+                self.store(process, i, [0; 3]);
             }
             if let (_, Some((object, _))) = decode(words) {
                 f(object);
@@ -407,8 +407,14 @@ impl Table {
         }
     }
 
-    fn store(&self, i: usize, words: Words) {
+    fn store(&self, process: &Process, i: usize, words: Words) {
         let entry = &self.0[i];
+        if process.alone {
+            for (word, value) in entry.words.iter().zip(words) {
+                word.store(value, Relaxed);
+            }
+            return;
+        }
         let sequence = entry.sequence.load(Relaxed);
         entry.sequence.store(sequence + 1, Relaxed);
         // `dmb ishst`: the odd sequence is seen before any of the new words.

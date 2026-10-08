@@ -46,6 +46,20 @@ impl ProcessEntry {
     pub(crate) fn alone(&self) -> bool {
         self.threads.load(Acquire) == 1
     }
+
+    /// The process's data without its lock, marked `alone`, so its table's writes skip the seqlock.
+    ///
+    /// # Safety
+    /// Nothing else reaches the process's data or looks its table up: the caller is its only thread, or none is left
+    /// or started yet.
+    #[inline(always)]
+    #[allow(clippy::mut_from_ref)]
+    pub(crate) unsafe fn unshared(&self) -> &mut Process {
+        // SAFETY: the caller's contract.
+        let process = unsafe { self.lock.unshared() };
+        process.alone = true;
+        process
+    }
 }
 
 #[repr(align(128))]
@@ -61,7 +75,10 @@ impl<T> Deref for Line<T> {
 
 pub(crate) static PROCESSES: [ProcessEntry; MAX_PROCESSES] = [const {
     ProcessEntry {
-        lock: Line(Lock::new(Process { next: 0 })),
+        lock: Line(Lock::new(Process {
+            next: 0,
+            alone: false,
+        })),
         budget: Line(Budget::new(0)),
         threads: Line(AtomicU32::new(0)),
         handles: Line(Table::new()),
@@ -77,7 +94,7 @@ pub(crate) static PROCESSES: [ProcessEntry; MAX_PROCESSES] = [const {
 unsafe fn start_entry(index: usize, next: u64, budget: usize, handles: &Handles) {
     let entry = &PROCESSES[index];
     // SAFETY: the caller's contract: nothing else reaches the unpublished process's data.
-    let process = unsafe { entry.lock.unshared() };
+    let process = unsafe { entry.unshared() };
     process.next = next;
     entry.threads.store(1, Relaxed);
     entry.budget.reset(budget);
@@ -136,7 +153,7 @@ pub(crate) fn map(
 ) -> Option<u64> {
     if alone {
         // SAFETY: the caller is its process's only thread, so nothing else reaches the process's data (`alone`).
-        return map_pages(entry, unsafe { entry.lock.unshared() }, root, pages);
+        return map_pages(entry, unsafe { entry.unshared() }, root, pages);
     }
     let mut guard = entry.lock.lock_masked(root);
     let (process, mut w) = guard.parts();
