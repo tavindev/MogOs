@@ -481,6 +481,9 @@ pub struct Fs<'a, D> {
     lag: bool,
     /// A `View` is reading a snapshot: its nodes and data may be pinned as well as live.
     view: bool,
+    /// Pinned and its committed copy are in use (a slot holds pinned words, or there is a snapshot); until then their
+    /// memory is not even zeroed and nothing reads it.
+    pins: bool,
     /// Staging slots `1..=staged` hold blocks the next commit writes ahead of the nodes (a new snapshot's bitmap).
     staged: usize,
     free: u64,
@@ -552,6 +555,7 @@ impl<'a, D: Disk> Fs<'a, D> {
             changed: false,
             lag: false,
             view: false,
+            pins: false,
             staged: 0,
             free: 0,
             hint: Block(0),
@@ -684,30 +688,38 @@ impl<'a, D: Disk> Fs<'a, D> {
                 continue;
             }
             self.setup(s.blocks)?;
-            let r = self.load_bitmap(s, LIVE).and_then(|()| {
+            let r = self.load_bitmap(s, LIVE).and_then(|pins| {
                 (self.root, self.height) = (s.root, s.level + 1);
                 (self.generation, self.next_inode) = (s.generation, s.next_inode);
                 (self.seed, self.newest) = (s.seed, s.newest);
                 self.check_counter()?;
-                self.load_snapshot(s.newest)
+                self.load_snapshot(s.newest).map(|()| pins)
             });
-            match r {
-                Ok(()) => {}
+            let pins = match r {
+                Ok(pins) => pins,
                 Err(Error::Corrupt) => continue,
                 Err(e) => return Err(e),
-            }
+            };
             // The other slot's blocks (its live and pinned bitmaps, read into the committed copies' place) stay
             // reserved while its bitmap holds, even if its tree failed above.
             let w = self.words;
             let older = match &slots[1 - i] {
                 Some(o) if o.valid => match self.load_bitmap(o, NEWEST) {
-                    Err(Error::Corrupt) => false,
-                    r => r.map(|()| true)?,
+                    Err(Error::Corrupt) => None,
+                    r => Some(r?),
                 },
-                _ => false,
+                _ => None,
             };
-            if !older {
-                self.bits[NEWEST * w..(NEWEST + 2) * w].fill(0);
+            if older.is_none() {
+                self.bits[NEWEST * w..(NEWEST + 1) * w].fill(0);
+            }
+            // Pinned maps either slot left unwritten are zero, if pinned is in use at all.
+            self.pins = pins || older == Some(true) || self.newest != 0;
+            if self.pins && !pins {
+                self.bits[PINNED * w..(PINNED + 1) * w].fill(0);
+            }
+            if self.pins && older != Some(true) {
+                self.bits[(NEWEST + 1) * w..(NEWEST + 2) * w].fill(0);
             }
             // A larger older slot may mark blocks past this disk's size; they reserve nothing and must not count.
             let end = self.blocks.div_ceil(64) as usize;
@@ -724,11 +736,18 @@ impl<'a, D: Disk> Fs<'a, D> {
                     core::cmp::Ordering::Equal => tail,
                     core::cmp::Ordering::Greater => 0,
                 };
-                let (l, p) = (self.bits[i], self.bits[w + i]);
-                let o = (self.bits[NEWEST * w + i] | self.bits[(NEWEST + 1) * w + i]) & mask;
+                let (l, o) = (self.bits[i], self.bits[NEWEST * w + i]);
+                let (p, o) = if self.pins {
+                    let p = self.bits[w + i];
+                    let o = o | self.bits[(NEWEST + 1) * w + i];
+                    self.bits[(NEWEST + 1) * w + i] = p;
+                    (p, o)
+                } else {
+                    (0, o)
+                };
+                let o = o & mask;
                 let c = o | l | p;
                 (self.bits[COMMITTED * w + i], self.bits[NEWEST * w + i]) = (c, l);
-                self.bits[(NEWEST + 1) * w + i] = p;
                 lag |= o & !(l | p) != 0;
                 used += c.count_ones() as u64;
             }
@@ -1075,6 +1094,12 @@ impl<'a, D: Disk> Fs<'a, D> {
         let g = self.generation;
         if g > OFFSET {
             return Err(Error::TooBig);
+        }
+        if !self.pins {
+            let w = self.words;
+            self.bits[PINNED * w..(PINNED + 1) * w].fill(0);
+            self.bits[(NEWEST + 1) * w..(NEWEST + 2) * w].fill(0);
+            self.pins = true;
         }
         let r = self.write_snapshot(g, ixb);
         self.tear(&r);
@@ -1706,9 +1731,16 @@ impl<'a, D: Disk> Fs<'a, D> {
         let mut lag = false;
         for j in min(self.span.0, self.prev_span.0)..self.span.1.max(self.prev_span.1) {
             let before = self.reach(j).count_ones();
-            let older = self.bits[NEWEST * w + j] | self.bits[(NEWEST + 1) * w + j];
-            let (l, p) = (self.bits[j], self.bits[w + j]);
-            (self.bits[NEWEST * w + j], self.bits[(NEWEST + 1) * w + j]) = (l, p);
+            let (l, older) = (self.bits[j], self.bits[NEWEST * w + j]);
+            let (p, older) = if self.pins {
+                let p = self.bits[w + j];
+                let older = older | self.bits[(NEWEST + 1) * w + j];
+                self.bits[(NEWEST + 1) * w + j] = p;
+                (p, older)
+            } else {
+                (0, older)
+            };
+            self.bits[NEWEST * w + j] = l;
             self.bits[COMMITTED * w + j] = older | l | p;
             lag |= older & !(l | p) != 0;
             self.free = self.free + before as u64 - self.reach(j).count_ones() as u64;
@@ -1739,7 +1771,7 @@ impl<'a, D: Disk> Fs<'a, D> {
         (self.blocks, self.pages, self.words) = (blocks, pages, pages * PAGE_WORDS);
         (self.base, self.top, self.ix_h) = (base, base + pool, ix_height(2 * pages));
         self.hint = Block(0);
-        (self.nlog, self.full, self.lag) = (0, false, false);
+        (self.nlog, self.full, self.lag, self.pins) = (0, false, false, false);
         self.blk.fill(EMPTY);
         self.dirt.fill(false);
         self.ndirty = 0;
@@ -1756,8 +1788,9 @@ impl<'a, D: Disk> Fs<'a, D> {
     /// size): its index, its pages, then its log. For `LIVE` it keeps the page list in `cache[top..]`, the log's words
     /// in `log` and the words they replace in the last staging slot; another slot takes a page it shares with the live
     /// list from those, and its index blocks through the staging slots one level each. The live bitmap must mark its
-    /// pages, its index blocks and the root.
-    fn load_bitmap(&mut self, s: &Super, map: usize) -> Result<(), Error> {
+    /// pages, its index blocks and the root. Returns whether the slot has pinned words; if not, the map after `map` is
+    /// left unwritten.
+    fn load_bitmap(&mut self, s: &Super, map: usize) -> Result<bool, Error> {
         let (live, sb) = (map == LIVE, (s.generation % 2) as usize);
         let (pages, w) = (pages(s.blocks), self.words);
         let (lp, ws) = (2 * pages, pages * PAGE_WORDS);
@@ -1792,8 +1825,10 @@ impl<'a, D: Disk> Fs<'a, D> {
                 }
             }
         }
-        // A slot of this disk's size fills each page's place in turn; another is cleared first.
+        // A slot of this disk's size fills each page's place in turn, its pinned map only once it has a pinned word;
+        // another is cleared first.
         let same = pages == self.pages;
+        let mut pins = !same;
         if !same {
             self.bits[map * w..(map + 2) * w].fill(0);
         }
@@ -1801,11 +1836,19 @@ impl<'a, D: Disk> Fs<'a, D> {
         for p in 0..lp {
             let (lo, n) = (p * PAGE_WORDS, page_words(s.blocks, p));
             let at = map * w + lo;
+            let (b, sum) = self.list_entry(s, live, &mut held, p, None)?;
+            let zero = b == Block(0) && sum == Sum(0);
+            if p >= pages && !pins {
+                if zero {
+                    continue;
+                }
+                self.bits[(map + 1) * w..(map + 2) * w].fill(0);
+                pins = true;
+            }
             if same {
                 self.bits[at + n..at + PAGE_WORDS].fill(0);
             }
-            let (b, sum) = self.list_entry(s, live, &mut held, p, None)?;
-            if b == Block(0) && sum == Sum(0) {
+            if zero {
                 if same {
                     self.bits[at..at + n].fill(0);
                 }
@@ -1856,6 +1899,10 @@ impl<'a, D: Disk> Fs<'a, D> {
             let Some(m) = to(i) else {
                 continue;
             };
+            if i >= ws && !pins {
+                self.bits[(map + 1) * w..(map + 2) * w].fill(0);
+                pins = true;
+            }
             if live {
                 let old = self.bits[m].to_le_bytes();
                 self.cache[saved][8 * j..8 * j + 8].copy_from_slice(&old);
@@ -1893,7 +1940,7 @@ impl<'a, D: Disk> Fs<'a, D> {
                 }
             }
         }
-        Ok(())
+        Ok(pins)
     }
 
     /// Whether `map` marks `b`; another slot's map holds only the words its own pages gave, the rest are the live
