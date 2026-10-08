@@ -1801,3 +1801,62 @@ fn an_older_slot_marking_blocks_past_the_newest_slots_size_counts_none_of_them()
     fs.mount().unwrap();
     assert_eq!(names(&mut fs, ROOT).len(), 101);
 }
+
+#[test]
+fn under_snapshots_unlinking_until_no_space_leaves_delete_and_commit_able_to_run() {
+    for blocks in [1024, 4096] {
+        let ctx = format!("{blocks} blocks");
+        let mut disk = MemDisk::new(blocks);
+        let mut mem = Mem::new(blocks, POOL);
+        let mut fs = format(&mut mem, &mut disk);
+        // Files with long names over more leaves than the reserve keeps between a create and an unlink: unlinking
+        // them copies leaves only the snapshots hold, and frees nothing.
+        let n = blocks / 2;
+        let name = |i: usize| format!("f{i:0>200}");
+        let fill = fs.mkdir(ROOT, b"fill").unwrap();
+        for i in 0..n {
+            fs.create(ROOT, name(i).as_bytes()).unwrap();
+        }
+        // Two snapshots sharing everything but their own bitmaps.
+        let a = fs.snapshot().unwrap();
+        let b = fs.snapshot().unwrap();
+        // Fill the rest of the disk, in a directory of its own so the snapshots' leaves stay theirs: pages while they
+        // fit, then empty files until a create is refused.
+        let mut big = 0;
+        while let Ok(f) = fs.create(fill, format!("g{big}").as_bytes()) {
+            big += 1;
+            let _ = fs.write(f, 0, &[7; BLOCK_SIZE]);
+            fs.commit().unwrap();
+        }
+        // Unlinking what the snapshots hold frees nothing: the reserve refuses before delete's room is gone.
+        let refused = (0..n).any(|i| match fs.unlink(ROOT, name(i).as_bytes(), |_| false) {
+            Ok(()) => fs.commit().map(|()| false).unwrap(),
+            Err(Error::NoSpace) => true,
+            Err(e) => panic!("{ctx}: {e:?}"),
+        });
+        assert!(refused, "{ctx}");
+        // Deleting both, each followed by two commits, gives the space back.
+        fs.delete_snapshot(a).unwrap();
+        fs.commit().unwrap();
+        fs.commit().unwrap();
+        fs.delete_snapshot(b).unwrap();
+        fs.commit().unwrap();
+        fs.commit().unwrap();
+        for (dir, name) in names(&mut fs, fill)
+            .into_iter()
+            .map(|n| (fill, n))
+            .chain(names(&mut fs, ROOT).into_iter().map(|n| (ROOT, n)))
+        {
+            fs.unlink(dir, name.as_bytes(), |_| false).unwrap();
+            fs.commit().unwrap();
+        }
+        fs.commit().unwrap();
+        fs.commit().unwrap();
+        // Everything but the root is gone: the disk holds its first files again.
+        for i in 0..n {
+            fs.create(ROOT, name(i).as_bytes()).unwrap();
+        }
+        fs.commit().unwrap();
+        assert_eq!(names(&mut fs, ROOT).len(), n, "{ctx}");
+    }
+}
