@@ -494,3 +494,24 @@ fn a_process_whose_last_thread_ended_is_neither_live_nor_reapable_until_exited()
         "no handle left: freed"
     );
 }
+
+#[test]
+fn a_waiter_marked_to_end_lends_no_priority() {
+    let mut sched = Scheduler::<5, 5>::new();
+    sched.start_cores(2, 0xd0);
+    let ((low, _), _) = spawn_with(&mut sched, 0x100, 1);
+    spawn_with(&mut sched, 0x200, 2);
+    let ((high, _), _) = spawn_with(&mut sched, 0x300, 3);
+    assert_eq!(sched.switch(1, 0xd1).0, 0x300);
+    sched.block(0, Event::Idle);
+    assert_eq!(sched.switch(0, 0x10).0, 0x200, "mid runs on core 0");
+
+    // High, killed from core 0, reaches the mutex low owns before its own core ends it: it ends instead of waiting.
+    sched.mark(high, KILLED);
+    sched.boost(1, low);
+    sched.end(high, KILLED);
+    assert!(
+        !sched.outranked(0),
+        "low is not lifted above mid by a waiter that never waited"
+    );
+}

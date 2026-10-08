@@ -595,8 +595,12 @@ impl<const N: usize, const P: usize> Scheduler<N, P> {
         self.priority[self.cores[cpu].current]
     }
 
-    /// `cpu`'s current task waits for a mutex `slot` owns: `slot` runs at least at that task's priority.
+    /// `cpu`'s current task waits for a mutex `slot` owns: `slot` runs at least at that task's priority. A task marked to
+    /// end ends instead of waiting (`block`), so it lends nothing.
     pub fn boost(&mut self, cpu: usize, slot: usize) {
+        if self.marked(cpu).is_some() {
+            return;
+        }
         let current = self.cores[cpu].current;
         self.effective[slot] = self.effective[slot].max(self.effective[current]);
     }
