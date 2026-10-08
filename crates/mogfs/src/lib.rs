@@ -1062,6 +1062,11 @@ impl<'a, D: Disk> Fs<'a, D> {
         if self.broken {
             return Err(Error::Io);
         }
+        let ixb: usize = (1..=fan_height(self.pages))
+            .map(|l| ix_count(self.pages, l))
+            .sum();
+        // Before the commit of pending changes: `NoSpace` changes nothing.
+        self.reserve((self.pages + ixb) as u64, 1, ITEM + SNAP_LEN, ADD)?;
         if self.changed {
             self.commit()?;
         }
@@ -1069,10 +1074,6 @@ impl<'a, D: Disk> Fs<'a, D> {
         if g > OFFSET {
             return Err(Error::TooBig);
         }
-        let ixb: usize = (1..=fan_height(self.pages))
-            .map(|l| ix_count(self.pages, l))
-            .sum();
-        self.reserve((self.pages + ixb) as u64, 1, ITEM + SNAP_LEN, ADD)?;
         let r = self.write_snapshot(g, ixb);
         self.tear(&r);
         r?;
@@ -1117,7 +1118,8 @@ impl<'a, D: Disk> Fs<'a, D> {
         for p in 0..self.pages {
             let (lo, len) = (p * PAGE_WORDS, page_words(self.blocks, p));
             let own = self.page_dirty(p)
-                || (lo..lo + len).any(|i| self.bits[PINNED * w + i] & self.bits[SNAP * w + i] != 0);
+                || (lo..lo + len)
+                    .any(|i| self.bits[SNAP * w + i] & !self.bits[NEWEST * w + i] != 0);
             let e = if own {
                 c = self.next_snap(c);
                 let d = self.stage_in(&mut first_s, &mut n, lim)?;
@@ -1193,9 +1195,10 @@ impl<'a, D: Disk> Fs<'a, D> {
         self.changed = true;
     }
 
-    /// The first block from `b` on that the newest snapshot's own bitmap takes (pinned and in its bitmap).
+    /// The first block from `b` on that the newest snapshot's own bitmap takes: in its bitmap, not in the committed
+    /// live one it copies (the insert's released nodes are in both).
     fn next_snap(&self, mut b: Block) -> Block {
-        while !(self.has(PINNED, b) && self.has(SNAP, b)) {
+        while !(self.has(SNAP, b) && !self.has(NEWEST, b)) {
             b = b + 1;
         }
         b

@@ -169,11 +169,52 @@ fn extents(n: &Buf) -> Vec<(u64, usize, usize)> {
     out
 }
 
-/// The blocks slot `slot` reaches, if it is valid: its bitmap, nodes and data pages that verify.
+/// The blocks slot `slot` reaches, if it is valid: its bitmap, nodes and data pages that verify, and those of each
+/// snapshot its tree lists (their trees, and their bitmaps' index blocks and pages).
 fn slot_blocks(disk: &[Buf], slot: u64) -> Option<HashSet<u64>> {
     let f = superblock_fields(disk, slot)?;
     let mut set: HashSet<u64> = bitmap_blocks(disk, slot, &f)?.into_iter().collect();
-    for (b, _) in tree_nodes(disk, f[9], f[10]) {
+    let mut snaps = vec![];
+    tree_blocks(disk, f[9], f[10], &mut set, Some(&mut snaps));
+    let (pages, h) = (pages(f[2]), fan_height(pages(f[2])));
+    for (root, sum, ix, ix_sum) in snaps {
+        tree_blocks(disk, root, sum, &mut set, None);
+        let mut level = vec![(ix, ix_sum)];
+        for l in (1..=h).rev() {
+            let mut next = vec![];
+            for (i, &(b, sum)) in level.iter().enumerate() {
+                let len = 16 * ix_children(pages, l, i);
+                let Some(n) = disk.get(b as usize) else {
+                    continue;
+                };
+                if b < 2 || checksum(Block(b), &n[..len]).0 != sum {
+                    continue;
+                }
+                set.insert(b);
+                next.extend((0..len / 16).map(|j| (le64(n, 16 * j), le64(n, 16 * j + 8))));
+            }
+            level = next;
+        }
+        set.extend(
+            level
+                .iter()
+                .map(|e| e.0)
+                .filter(|&b| b >= 2 && (b as usize) < disk.len()),
+        );
+    }
+    Some(set)
+}
+
+/// Adds the nodes and data pages that verify under `root` to `set`; with `snaps`, collects the snapshot items (tree
+/// root and sum, bitmap index root and sum) its leaves hold under `ROOT`.
+fn tree_blocks(
+    disk: &[Buf],
+    root: u64,
+    sum: u64,
+    set: &mut HashSet<u64>,
+    mut snaps: Option<&mut Vec<(u64, u64, u64, u64)>>,
+) {
+    for (b, _) in tree_nodes(disk, root, sum) {
         set.insert(b);
         let n = &disk[b as usize];
         for (start, pages, at) in extents(n) {
@@ -186,8 +227,19 @@ fn slot_blocks(disk: &[Buf], slot: u64) -> Option<HashSet<u64>> {
                 }
             }
         }
+        if let Some(snaps) = snaps.as_deref_mut()
+            && n[0] == 0
+            && count(n) * ITEM <= CAP
+            && packed(n)
+        {
+            for i in 0..count(n) {
+                let (k, v) = (ikey(n, i).0, value(n, i));
+                if k >> 64 == 0 && (k as u64) >> 62 == 3 && v.len() == SNAP_LEN {
+                    snaps.push((le64(v, 0), le64(v, 8), le64(v, 32), le64(v, 40)));
+                }
+            }
+        }
     }
-    Some(set)
 }
 
 /// An in-memory disk that refuses (and records) a write to a block a valid slot reaches.
@@ -433,9 +485,13 @@ fn random_changes_keep_the_tree_and_free_space_consistent() {
         let mut fs = mem.fs(&mut disk);
         fs.format(seed).unwrap();
         let (mut files, mut dirs) = (vec![], vec![ROOT]);
+        // Each snapshot with its files; deletes not yet committed come back at a mount.
+        let mut snaps: Vec<(Snapshot, Files)> = vec![];
+        let mut deleted: Vec<(Snapshot, Files)> = vec![];
         for step in 0..300 {
             let ctx = format!("seed {seed} step {step}");
-            let r = match next(rng, 16) {
+            let op = next(rng, 18);
+            let r = match op {
                 0 | 1 => {
                     let d = dirs[next(rng, dirs.len() as u64) as usize];
                     fs.create(d, &name(rng, step, 0)).map(|f| files.push(f))
@@ -477,6 +533,7 @@ fn random_changes_keep_the_tree_and_free_space_consistent() {
                     // Half write the pages, which small disks otherwise do only at format.
                     fs.full |= next(rng, 2) == 0;
                     fs.commit().unwrap();
+                    deleted.clear();
                     let mut d = Guarded::new(fs.disk.blocks.clone(), true);
                     let mut m = Mem::new(blocks);
                     let mut fresh = m.fs(&mut d);
@@ -489,7 +546,17 @@ fn random_changes_keep_the_tree_and_free_space_consistent() {
                 9 => fs.mount().map(|()| {
                     files.retain(|&f| fs.kind(f) == Ok(Kind::File));
                     dirs.retain(|&d| fs.kind(d) == Ok(Kind::Dir));
+                    snaps.append(&mut deleted);
                 }),
+                15 => fs.snapshot().map(|s| {
+                    deleted.clear();
+                    snaps.push((s, files_of(&mut fs).unwrap()));
+                }),
+                16 if !snaps.is_empty() => {
+                    let i = next(rng, snaps.len() as u64) as usize;
+                    fs.delete_snapshot(snaps[i].0)
+                        .map(|()| deleted.push(snaps.swap_remove(i)))
+                }
                 10 => {
                     let d = dirs[next(rng, dirs.len() as u64) as usize];
                     match pick(&mut fs, d, rng) {
@@ -548,6 +615,17 @@ fn random_changes_keep_the_tree_and_free_space_consistent() {
                 "{ctx}: {r:?}"
             );
             check(&mut fs, &ctx);
+            if matches!(op, 9 | 15 | 16) || step % 25 == 0 {
+                let ids: Vec<u64> = snaps.iter().map(|s| s.0.0).collect();
+                check_pinned(&mut fs, &ids, &ctx);
+                for (s, model) in &snaps {
+                    assert_eq!(
+                        view_files(&mut fs, *s).as_ref(),
+                        Ok(model),
+                        "{ctx}: snapshot {s:?}"
+                    );
+                }
+            }
         }
     }
 }
@@ -949,6 +1027,38 @@ fn files<D: Disk>(fs: &mut Fs<D>) -> Result<Files, Error> {
     Ok(out)
 }
 
+/// As `files`, through a view of snapshot `s`.
+fn view_files<D: Disk>(fs: &mut Fs<D>, s: Snapshot) -> Result<Files, Error> {
+    let mut v = fs.view(s)?;
+    let (mut out, mut stack) = (vec![], vec![(ROOT, String::new())]);
+    while let Some((dir, path)) = stack.pop() {
+        let mut entries = vec![];
+        v.readdir(dir, 0, |n, i, k| {
+            entries.push((n.to_vec(), i, k));
+            false
+        })?;
+        for (n, i, k) in entries {
+            let p = format!("{path}/{}", String::from_utf8_lossy(&n));
+            assert_eq!(v.lookup(dir, &n)?, i, "{p}");
+            if k == Kind::Dir {
+                out.push((p.clone(), None));
+                stack.push((i, p));
+            } else {
+                let mut b = vec![0; v.stat(i)?.size as usize];
+                v.read(i, 0, &mut b)?;
+                out.push((p, Some(b)));
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// The live files, as `files` reads them.
+fn files_of<D: Disk>(fs: &mut Fs<D>) -> Result<Files, Error> {
+    files(fs)
+}
+
 /// Random changes on a disk that fails requests at random, and on disks that fill, against a model of the files: every
 /// view (listing, lookup, stat, read) shows what the changes so far should leave, checked only now and then so that
 /// the memos and the unwritten data page live across changes; `NoSpace` changes nothing; after a failed commit reads
@@ -1192,12 +1302,51 @@ fn snapshot_reach(disk: &[Buf], fs: &mut Fs<&mut Guarded>, g: u64) -> HashSet<u6
     set
 }
 
-/// Pinned holds exactly the blocks some snapshot reaches and the live tree does not.
+/// The blocks snapshot `g`'s bitmap marks, read through its index from the disk.
+fn snapshot_bitmap(disk: &[Buf], fs: &mut Fs<&mut Guarded>, g: u64) -> HashSet<u64> {
+    let (_, _, ix) = fs.snap_item(g).unwrap();
+    let (pages, h) = (fs.pages, fan_height(fs.pages));
+    let mut level = vec![ix];
+    for l in (1..=h).rev() {
+        let mut next = vec![];
+        for (i, &(b, _)) in level.iter().enumerate() {
+            let n = &disk[b.0 as usize];
+            for j in 0..ix_children(pages, l, i) {
+                next.push((Block(le64(n, 16 * j)), Sum(le64(n, 16 * j + 8))));
+            }
+        }
+        level = next;
+    }
+    let mut set = HashSet::new();
+    for (p, &(b, _)) in level.iter().enumerate() {
+        if b != Block(0) {
+            let page = &disk[b.0 as usize];
+            for i in 0..page_words(fs.blocks, p) {
+                let w = le64(page, 8 * i);
+                set.extend(
+                    (0..64)
+                        .filter(|k| w >> k & 1 != 0)
+                        .map(|k| (p * PAGE_WORDS + i) as u64 * 64 + k),
+                );
+            }
+        }
+    }
+    set
+}
+
+/// Each snapshot's bitmap marks every block it reaches; pinned holds exactly the blocks some snapshot's bitmap marks
+/// and the live tree does not (a snapshot's bitmap may also mark a live page it keeps its own copy of).
 fn check_pinned(fs: &mut Fs<&mut Guarded>, snaps: &[u64], ctx: &str) {
     let disk = fs.disk().blocks.clone();
     let mut held = HashSet::new();
     for &g in snaps {
-        held.extend(snapshot_reach(&disk, fs, g));
+        let marks = snapshot_bitmap(&disk, fs, g);
+        let reach = snapshot_reach(&disk, fs, g);
+        assert!(
+            reach.is_subset(&marks),
+            "{ctx}: snapshot {g} reaches unmarked blocks"
+        );
+        held.extend(marks);
     }
     for b in 0..fs.blocks {
         assert_eq!(
