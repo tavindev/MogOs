@@ -95,7 +95,7 @@ cargo run -- -append test=mmu-fault  # reads an unmapped address after MMU on; p
 cargo run -- -append test=wx-text    # stores to kernel text (wx-exec: branches to a .data word; wx-guard: core 0's stack overflows into its guard page); prints the fault
 cargo run -- -smp 1 -append test=el0-before-spec  # runs a user program before core 0 chooses its vector table; the boot table panics
 cargo run -- -append test=yield      # tasks a and b print 0..2 in turn via `svc` yield
-cargo run --release -- -append test=bench      # prints the yield round trip in ns
+cargo run --release -- -smp 1 -append test=bench      # prints the yield round trip in ns (one core only: without pinning, the yielding task may run on another core)
 cargo run -- -append test=preempt    # timer preempts spinning task a; task b prints 0..2
 cargo run -- -append test=user       # EL0 process A writes A: 0..9 to its console handle; B reads A's address, then C (B's process index) kernel RAM: both killed (fault: 2 ec=0x24 far=...)
 cargo run --release -- -append test=bench-syscall  # EL0 loop of no-op syscalls, prints the round trip in ns

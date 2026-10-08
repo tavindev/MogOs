@@ -657,8 +657,12 @@ fn wait<B: Board>(board: &mut B) {
     }
 }
 
-/// Each boot-task yield is one round trip through a task that only yields back.
+/// Each boot-task yield is one round trip through a task that only yields back. One core only: with no pinning yet,
+/// that task may run on another core, which makes the boot task's yield a return to itself.
 fn yield_bench<B: Board>(board: &mut B) {
+    if board.cpus() > 1 {
+        return;
+    }
     board.spawn(yield_forever, 0).expect("spawn");
     let start = board.uptime_us();
     for _ in 0..BENCH_YIELDS {
