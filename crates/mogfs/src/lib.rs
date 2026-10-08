@@ -731,15 +731,17 @@ impl<'a, D: Disk> Fs<'a, D> {
                 }
                 older[end..].fill(0);
             }
-            // One pass: both slots' reach, the committed copies, whether the older slot reaches more, the used count.
+            // One pass up to the disk's last word (every map is zero past it): both slots' reach, the committed copies,
+            // whether the older slot reaches more, the used count.
             let (lists, rest) = self.bits.split_at_mut(NEWEST * w);
             let (copies, rest) = rest.split_at_mut(2 * w);
             let (live, pinned) = lists.split_at(w);
             let (newest, npinned) = copies.split_at_mut(w);
             let committed = &mut rest[..w];
+            committed[end..].fill(0);
             let (mut lag, mut used) = (0, 0);
             if self.pins {
-                for i in 0..w {
+                for i in 0..end {
                     let (l, p, o) = (live[i], pinned[i], newest[i] | npinned[i]);
                     let c = o | l | p;
                     (committed[i], newest[i], npinned[i]) = (c, l, p);
@@ -747,7 +749,7 @@ impl<'a, D: Disk> Fs<'a, D> {
                     used += c.count_ones() as u64;
                 }
             } else {
-                for i in 0..w {
+                for i in 0..end {
                     let (l, o) = (live[i], newest[i]);
                     let c = o | l;
                     (committed[i], newest[i]) = (c, l);
