@@ -27,6 +27,10 @@ panic = "abort"
 # opt-level 0 kernel code has bloated stack frames and slow MMIO loops; build cost is unchanged.
 opt-level = 1
 
+# MogFS's non-generic code (checksums, name hash) at full speed; `Fs<D>` itself is instantiated at its user's level.
+[profile.dev.package.mogfs]
+opt-level = 3
+
 [profile.release]
 panic = "abort"
 lto = true

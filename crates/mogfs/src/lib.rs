@@ -138,6 +138,7 @@ pub struct Sum(u64);
 
 impl Add<u64> for Block {
     type Output = Block;
+    #[inline(always)]
     fn add(self, n: u64) -> Block {
         Block(self.0 + n)
     }
@@ -145,6 +146,7 @@ impl Add<u64> for Block {
 
 impl Sub for Block {
     type Output = u64;
+    #[inline(always)]
     fn sub(self, b: Block) -> u64 {
         self.0 - b.0
     }
@@ -152,6 +154,7 @@ impl Sub for Block {
 
 impl Add<u64> for Page {
     type Output = Page;
+    #[inline(always)]
     fn add(self, n: u64) -> Page {
         Page(self.0 + n)
     }
@@ -159,6 +162,7 @@ impl Add<u64> for Page {
 
 impl Sub for Page {
     type Output = u64;
+    #[inline(always)]
     fn sub(self, p: Page) -> u64 {
         self.0 - p.0
     }
@@ -216,6 +220,7 @@ struct Offset(u64);
 
 impl Add<u64> for Offset {
     type Output = Offset;
+    #[inline(always)]
     fn add(self, n: u64) -> Offset {
         Offset(self.0 + n)
     }
@@ -223,6 +228,7 @@ impl Add<u64> for Offset {
 
 impl Sub for Offset {
     type Output = u64;
+    #[inline(always)]
     fn sub(self, o: Offset) -> u64 {
         self.0 - o.0
     }
@@ -240,15 +246,18 @@ enum ItemKind {
 struct Key(u128);
 
 impl Key {
+    #[inline(always)]
     fn new(inode: Inode, kind: ItemKind, offset: Offset) -> Key {
         debug_assert!(offset.0 <= OFFSET);
         Key(((inode.0 as u128) << 64) + ((kind as u128) << 62) + offset.0 as u128)
     }
 
+    #[inline(always)]
     fn inode(self) -> Inode {
         Inode((self.0 >> 64) as u64)
     }
 
+    #[inline(always)]
     fn kind(self) -> Option<ItemKind> {
         match (self.0 as u64) >> 62 {
             0 => Some(ItemKind::Inode),
@@ -258,12 +267,14 @@ impl Key {
         }
     }
 
+    #[inline(always)]
     fn offset(self) -> Offset {
         Offset(self.0 as u64 & OFFSET)
     }
 }
 
 /// The key of `inode`'s extent starting at `page`.
+#[inline(always)]
 fn extent_key(inode: Inode, page: Page) -> Key {
     Key::new(inode, ItemKind::Extent, Offset(page.0))
 }
@@ -277,6 +288,7 @@ struct Ptr {
 
 impl Ptr {
     /// The cache slot of the dirty node it names, if it names one.
+    #[inline(always)]
     fn slot(self) -> Option<usize> {
         (self.block.0 & TAG != 0).then_some((self.block.0 & !TAG) as usize)
     }
@@ -358,8 +370,10 @@ pub struct Fs<'a, D> {
     clock: u64,
     /// `DATA` (a data page) and `META` (superblocks, and scratch for an extent's value).
     bufs: [Buf; 2],
-    /// The block and sum `bufs[DATA]` holds unchanged.
-    cached: Option<(Block, Sum)>,
+    /// The block and sum `bufs[DATA]` holds unchanged, and the file page it is.
+    cached: Option<(Block, Sum, Inode, Page)>,
+    /// The last two inode items read, newest first; any change to an inode item clears them.
+    items: [Option<(Inode, Item)>; 2],
     broken: bool,
 }
 
@@ -399,6 +413,7 @@ impl<'a, D: Disk> Fs<'a, D> {
             clock: 0,
             bufs: [[0; BLOCK_SIZE]; 2],
             cached: None,
+            items: [None; 2],
             broken: true,
         }
     }
@@ -463,7 +478,7 @@ impl<'a, D: Disk> Fs<'a, D> {
     /// uncommitted changes. Blocks the other slot's bitmap marks stay reserved.
     pub fn mount(&mut self) -> Result<(), Error> {
         self.broken = true;
-        self.cached = None;
+        (self.cached, self.items) = (None, [None; 2]);
         self.disk.read(0, &mut self.bufs)?;
         let disk = min(self.disk.blocks(), MAX_BLOCKS);
         let mut slots = [
@@ -576,7 +591,7 @@ impl<'a, D: Disk> Fs<'a, D> {
     }
 
     pub fn stat(&mut self, inode: Inode) -> Result<Stat, Error> {
-        let it = self.inode(inode)?;
+        let it = *self.inode(inode)?;
         Ok(Stat {
             kind: kind_of(it.kind),
             size: it.size,
@@ -599,8 +614,10 @@ impl<'a, D: Disk> Fs<'a, D> {
 
     /// Reads from `offset` up to the end of the file; returns the byte count (0 at or past the end).
     pub fn read(&mut self, file: Inode, offset: u64, buf: &mut [u8]) -> Result<usize, Error> {
-        let it = self.file(file)?;
-        let end = min(it.size, offset.saturating_add(buf.len() as u64));
+        let end = min(
+            self.file(file)?.size,
+            offset.saturating_add(buf.len() as u64),
+        );
         let mut pos = offset;
         while pos < end {
             let (page, at) = (
@@ -609,15 +626,17 @@ impl<'a, D: Disk> Fs<'a, D> {
             );
             let n = min(BLOCK_SIZE - at, (end - pos) as usize);
             let out = &mut buf[(pos - offset) as usize..][..n];
-            match self.extent_at(file, page)? {
-                None => out.fill(0),
-                Some((off, start, _)) => {
-                    let j = (page - off) % EXTENT_MAX;
-                    self.load_page(start + j, Sum(le64(&self.bufs[META], 8 + 8 * j as usize)))?;
-                    out.copy_from_slice(&self.bufs[DATA][at..at + n]);
-                }
-            }
             pos += n as u64;
+            if !self.cached.is_some_and(|(.., i, p)| i == file && p == page) {
+                let Some((off, start, _)) = self.extent_at(file, page)? else {
+                    out.fill(0);
+                    continue;
+                };
+                let j = (page - off) % EXTENT_MAX;
+                let sum = Sum(le64(&self.bufs[META], 8 + 8 * j as usize));
+                self.load_page(start + j, sum, file, page)?;
+            }
+            out.copy_from_slice(&self.bufs[DATA][at..at + n]);
         }
         Ok(end.saturating_sub(offset) as usize)
     }
@@ -639,7 +658,7 @@ impl<'a, D: Disk> Fs<'a, D> {
         if self.broken {
             return Err(Error::Io);
         }
-        let mut it = self.file(file)?;
+        let mut it = *self.file(file)?;
         let end = offset
             .checked_add(data.len() as u64)
             .filter(|&e| e <= MAX_FILE_SIZE)
@@ -665,11 +684,13 @@ impl<'a, D: Disk> Fs<'a, D> {
         if self.broken {
             return Err(Error::Io);
         }
-        let mut it = self.file(file)?;
-        let bytes = self.extent_bytes(file)?;
-        if it.size == 0 && bytes == 0 {
+        let it = self.file(file)?;
+        // A file's extents end within its size (only a truncate shrinks it), so an empty one has none.
+        if it.size == 0 {
             return Ok(());
         }
+        let mut it = *it;
+        let bytes = self.extent_bytes(file)?;
         self.reserve(0, 2, bytes, true)?;
         let r = self.remove_extents(file).and_then(|()| {
             it.size = 0;
@@ -688,10 +709,10 @@ impl<'a, D: Disk> Fs<'a, D> {
         if !valid_name(name) {
             return Err(Error::InvalidName);
         }
-        let mut d = self.dir(dir)?;
+        let mut d = *self.dir(dir)?;
         let e = self.find_entry(dir, name)?.0.ok_or(Error::NotFound)?;
         let (off, inode, _) = e;
-        let it = self.child(dir, e)?;
+        let it = *self.child(dir, e)?;
         if it.kind == DIR
             && let Some((s, i, _)) = self.seek(Key::new(inode, ItemKind::Entry, Offset(0)))?
             && ikey(&self.cache[s], i) < Key::new(inode, ItemKind::Extent, Offset(0))
@@ -703,7 +724,10 @@ impl<'a, D: Disk> Fs<'a, D> {
         let r = self
             .delete(Key::new(dir, ItemKind::Entry, off))
             .and_then(|()| self.remove_extents(inode))
-            .and_then(|()| self.delete(Key::new(inode, ItemKind::Inode, Offset(0))))
+            .and_then(|()| {
+                self.items = [None; 2];
+                self.delete(Key::new(inode, ItemKind::Inode, Offset(0)))
+            })
             .and_then(|()| {
                 (d.mtime, d.ctime) = (self.now, self.now);
                 self.set_inode(dir, &d)
@@ -727,17 +751,17 @@ impl<'a, D: Disk> Fs<'a, D> {
         if !valid_name(to_name) || !valid_name(from_name) {
             return Err(Error::InvalidName);
         }
-        let mut from = self.dir(from_dir)?;
+        let mut from = *self.dir(from_dir)?;
         let e = self
             .find_entry(from_dir, from_name)?
             .0
             .ok_or(Error::NotFound)?;
         let (off, inode, kind) = e;
-        let mut it = self.child(from_dir, e)?;
+        let mut it = *self.child(from_dir, e)?;
         if from_dir == to_dir && from_name == to_name {
             return Ok(());
         }
-        let mut to = self.dir(to_dir)?;
+        let mut to = *self.dir(to_dir)?;
         let (taken, slot) = self.find_entry(to_dir, to_name)?;
         if taken.is_some() {
             return Err(Error::Exists);
@@ -907,7 +931,7 @@ impl<'a, D: Disk> Fs<'a, D> {
         self.ndirty = 0;
         self.dirty = [0; 4];
         (self.span, self.prev_span) = ((usize::MAX, 0), (0, pages * PAGE_WORDS));
-        self.cached = None;
+        (self.cached, self.items) = (None, [None; 2]);
         Ok(())
     }
 
@@ -1006,18 +1030,31 @@ impl<'a, D: Disk> Fs<'a, D> {
         }
     }
 
-    fn inode(&mut self, inode: Inode) -> Result<Item, Error> {
-        let k = Key::new(inode, ItemKind::Inode, Offset(0));
-        let (s, _) = self.leaf(k)?;
-        let n = &self.cache[s];
-        let i = search(n, k);
-        if i == count(n) || ikey(n, i) != k {
-            return Err(Error::NotFound);
+    /// `inode`'s item, from the memo of the last two read or else the tree. A reference, since the kernel's dev build
+    /// instantiates this at opt-level 1, where each move of an `Item` is a `memcpy` call.
+    fn inode(&mut self, inode: Inode) -> Result<&Item, Error> {
+        let at = match &self.items {
+            [Some((i, _)), _] if *i == inode => 0,
+            [_, Some((i, _))] if *i == inode => 1,
+            _ => {
+                let k = Key::new(inode, ItemKind::Inode, Offset(0));
+                let (s, _) = self.leaf(k)?;
+                let n = &self.cache[s];
+                let i = search(n, k);
+                if i == count(n) || ikey(n, i) != k {
+                    return Err(Error::NotFound);
+                }
+                self.items = [Some((inode, decode(value(n, i)))), self.items[0]];
+                0
+            }
+        };
+        match &self.items[at] {
+            Some((_, it)) => Ok(it),
+            None => Err(Error::NotFound),
         }
-        Ok(decode(value(n, i)))
     }
 
-    fn file(&mut self, inode: Inode) -> Result<Item, Error> {
+    fn file(&mut self, inode: Inode) -> Result<&Item, Error> {
         let it = self.inode(inode)?;
         if it.kind == DIR {
             return Err(Error::IsDir);
@@ -1025,7 +1062,7 @@ impl<'a, D: Disk> Fs<'a, D> {
         Ok(it)
     }
 
-    fn dir(&mut self, inode: Inode) -> Result<Item, Error> {
+    fn dir(&mut self, inode: Inode) -> Result<&Item, Error> {
         let it = self.inode(inode)?;
         if it.kind != DIR {
             return Err(Error::NotDir);
@@ -1034,7 +1071,7 @@ impl<'a, D: Disk> Fs<'a, D> {
     }
 
     /// The inode entry `e` of `dir` names, if it records that entry back; `Corrupt` if not.
-    fn child(&mut self, dir: Inode, e: Entry) -> Result<Item, Error> {
+    fn child(&mut self, dir: Inode, e: Entry) -> Result<&Item, Error> {
         let it = self.inode(e.1).map_err(|_| Error::Corrupt)?;
         if it.parent != dir || it.entry != e.0 || it.kind != e.2 {
             return Err(Error::Corrupt);
@@ -1043,6 +1080,7 @@ impl<'a, D: Disk> Fs<'a, D> {
     }
 
     fn set_inode(&mut self, inode: Inode, it: &Item) -> Result<(), Error> {
+        self.items = [None; 2];
         let (s, at) = self.value_mut(Key::new(inode, ItemKind::Inode, Offset(0)))?;
         encode(&mut self.cache[s][at..at + INODE_LEN], it);
         Ok(())
@@ -1087,7 +1125,7 @@ impl<'a, D: Disk> Fs<'a, D> {
         if !valid_name(name) {
             return Err(Error::InvalidName);
         }
-        let mut d = self.dir(dir)?;
+        let mut d = *self.dir(dir)?;
         let (found, slot) = self.find_entry(dir, name)?;
         match found {
             Some(e) if kind == FILE => return self.child(dir, e).map(|_| e.1),
@@ -1179,7 +1217,7 @@ impl<'a, D: Disk> Fs<'a, D> {
                         &self.bufs[META],
                         8 + 8 * ((page - off) % EXTENT_MAX) as usize,
                     ));
-                    self.load_page(start + (page - off), sum)?;
+                    self.load_page(start + (page - off), sum, inode, page)?;
                 }
                 _ => self.bufs[DATA].fill(0),
             }
@@ -1193,8 +1231,8 @@ impl<'a, D: Disk> Fs<'a, D> {
             let r = self.disk.write(b.0, from_ref(&self.bufs[DATA]));
             self.broken |= r.is_err();
             r?;
-            self.cached = Some((b, sum));
             self.set_page(inode, page, b, sum, old)?;
+            self.cached = Some((b, sum, inode, page));
             pos += n as u64;
         }
         Ok(())
@@ -1413,21 +1451,21 @@ impl<'a, D: Disk> Fs<'a, D> {
             self.free += 1;
             self.hint = min(self.hint, b);
         }
-        if self.cached.is_some_and(|(c, _)| c == b) {
+        if self.cached.is_some_and(|(c, ..)| c == b) {
             self.cached = None;
         }
         self.changed = true;
         Ok(())
     }
 
-    fn load_page(&mut self, b: Block, sum: Sum) -> Result<(), Error> {
-        if self.cached == Some((b, sum)) {
+    fn load_page(&mut self, b: Block, sum: Sum, inode: Inode, page: Page) -> Result<(), Error> {
+        if self.cached == Some((b, sum, inode, page)) {
             return Ok(());
         }
         self.cached = None;
         self.disk.read(b.0, from_mut(&mut self.bufs[DATA]))?;
         verify(b, &self.bufs[DATA], sum)?;
-        self.cached = Some((b, sum));
+        self.cached = Some((b, sum, inode, page));
         Ok(())
     }
 
@@ -1934,6 +1972,7 @@ fn tagged(s: usize) -> Ptr {
     }
 }
 
+#[inline(always)]
 fn kind_of(kind: u8) -> Kind {
     if kind == DIR { Kind::Dir } else { Kind::File }
 }
@@ -2014,6 +2053,7 @@ fn encode(v: &mut [u8], it: &Item) {
     }
 }
 
+#[inline(always)]
 fn decode(v: &[u8]) -> Item {
     Item {
         kind: v[0],
@@ -2028,6 +2068,7 @@ fn decode(v: &[u8]) -> Item {
     }
 }
 
+#[inline(always)]
 fn count(n: &[u8]) -> usize {
     le16(n, 2)
 }
@@ -2036,26 +2077,32 @@ fn set_count(n: &mut [u8], c: usize) {
     n[2..4].copy_from_slice(&(c as u16).to_le_bytes());
 }
 
+#[inline(always)]
 fn ikey(n: &[u8], i: usize) -> Key {
     Key(le128(n, HDR + ITEM * i))
 }
 
+#[inline(always)]
 fn voff(n: &[u8], i: usize) -> usize {
     le16(n, HDR + ITEM * i + 16)
 }
 
+#[inline(always)]
 fn vlen(n: &[u8], i: usize) -> usize {
     le16(n, HDR + ITEM * i + 18)
 }
 
+#[inline(always)]
 fn value(n: &[u8], i: usize) -> &[u8] {
     &n[voff(n, i)..voff(n, i) + vlen(n, i)]
 }
 
+#[inline(always)]
 fn ekey(n: &[u8], i: usize) -> Key {
     Key(le128(n, HDR + ENTRY * i))
 }
 
+#[inline(always)]
 fn eptr(n: &[u8], i: usize) -> Ptr {
     let at = HDR + ENTRY * i;
     Ptr {
@@ -2087,6 +2134,7 @@ fn used(n: &[u8]) -> usize {
 }
 
 /// The first item at or after `k`.
+#[inline(always)]
 fn search(n: &[u8], k: Key) -> usize {
     let (mut a, mut b) = (0, count(n));
     while a < b {
@@ -2101,6 +2149,7 @@ fn search(n: &[u8], k: Key) -> usize {
 }
 
 /// The child whose range holds `k`.
+#[inline(always)]
 fn route(n: &[u8], k: Key) -> usize {
     let (mut a, mut b) = (1, count(n));
     while a < b {
@@ -2184,8 +2233,7 @@ fn valid_name(name: &[u8]) -> bool {
         && name.len() <= NAME_MAX
         && name != b"."
         && name != b".."
-        && !name.contains(&b'/')
-        && !name.contains(&0)
+        && name.iter().all(|&b| b != b'/' && b != 0)
 }
 
 fn mix(h: u64, w: u64) -> u64 {
@@ -2199,9 +2247,7 @@ fn name_hash(seed: u64, name: &[u8]) -> Offset {
         mix(h, u64::from_le_bytes(*w))
     });
     if !rest.is_empty() {
-        let mut last = [0; 8];
-        last[..rest.len()].copy_from_slice(rest);
-        h = mix(h, u64::from_le_bytes(last));
+        h = mix(h, rest.iter().rev().fold(0, |w, &b| w << 8 | b as u64));
     }
     h ^= h >> 31;
     h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -2229,14 +2275,17 @@ fn seal(block: Block, n: &mut Buf, len: usize) -> Sum {
     sum
 }
 
+#[inline(always)]
 fn le16(b: &[u8], at: usize) -> usize {
     u16::from_le_bytes([b[at], b[at + 1]]) as usize
 }
 
+#[inline(always)]
 fn le64(b: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
 }
 
+#[inline(always)]
 fn le128(b: &[u8], at: usize) -> u128 {
     u128::from_le_bytes(b[at..at + 16].try_into().unwrap())
 }

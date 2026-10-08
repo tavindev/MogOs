@@ -75,8 +75,7 @@ pub fn mkdir<D: Disk>(fs: &mut Fs<D>, dir: Inode, path: &[u8]) -> Result<(), i64
     fs.mkdir(dir, name).map(|_| ()).map_err(errno)
 }
 
-/// Removes the file or empty directory at `path` under `dir`; `EBUSY` if `held` says a handle reaches it, since its
-/// inode would be reused.
+/// Removes the file or empty directory at `path` under `dir`; `EBUSY` if `held` says a handle reaches it.
 pub fn unlink<D: Disk>(
     fs: &mut Fs<D>,
     dir: Inode,
