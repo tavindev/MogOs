@@ -68,6 +68,11 @@ libcalls. Needs: Homebrew `llvm` (clang 19 or later for `-mabi=aapcs-soft`), `gs
 | `clippy::multiple_unsafe_ops_per_block = "warn"` | `qemu-virt`, `arch`, `user` `[lints.clippy]` | Keeps unsafe blocks small so each `SAFETY` comment covers one operation. |
 
 Evaluated and not applied (all within noise on this crate): `debug = "line-tables-only"`, dev `codegen-units`, toggling `incremental`. No `rustfmt.toml`: defaults already pass.
+Also evaluated and not applied: compiling is not the slow part of the loop (a cold kernel build is 8 s, an edit
+rebuilds in 1-3 s); contention from parallel QEMU runs is. Test `opt-level = 0` made host tests 10x slower, and
+dependencies alone at 0 slowed smoltcp's interop test 25x. sccache (an environment `RUSTC_WRAPPER`) misses across
+worktrees, whose target paths differ. nextest passes since e2e boots a private kernel link, but libtest stays the
+runner. One shared target dir would serialize concurrent agents on cargo's lock.
 
 Re-measure (`time cargo build`, median) before changing any of the above.
 
@@ -198,6 +203,7 @@ keeps its spaces (`sh -c 'mkdir d; ls'`). A failure prints `msh: <command>: <err
 - `cargo test-host` must pass, including the e2e boot test; extend `crates/e2e/tests/boot.rs` when boot output changes.
 - `cargo run` must still boot and print the hello line.
 - Do not raise the `jobs` or linker `--threads` caps.
+- Benchmarks run one at a time under the machine-wide bench lock, never beside another (`docs/BENCHMARKS.md`, Workflow); no load-wait or poll loops.
 - New crates use `[lints] workspace = true`. Never opt a crate out of `unsafe_code = "forbid"` unless it is an arch/board crate; put `unsafe` behind a safe API there.
 - Hot-path changes report before/after benchmark numbers; any regression fails unless no safe faster form exists (`docs/BENCHMARKS.md`).
 - Do not add dependencies without a stated reason.
