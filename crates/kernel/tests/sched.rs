@@ -515,3 +515,23 @@ fn a_waiter_marked_to_end_lends_no_priority() {
         "low is not lifted above mid by a waiter that never waited"
     );
 }
+
+#[test]
+fn a_core_back_from_a_release_goes_on_round_robin_after_the_thread_it_ended() {
+    let mut sched = Scheduler::<5, 5>::new();
+    sched.start_cores(1, 0xd0);
+    spawn(&mut sched, 0x100);
+    let (b, _) = spawn(&mut sched, 0x200);
+    spawn(&mut sched, 0x300);
+    sched.block(0, Event::Idle);
+    assert_eq!(sched.switch(0, 0x10).0, 0x100);
+    assert_eq!(sched.switch(0, 0x100).0, 0x200);
+    let (_, _, last) = sched.end(b.0, 0);
+    assert!(last);
+    sched.to_idle(0, 0x200);
+    assert_eq!(
+        sched.switch(0, 0xd0).0,
+        0x300,
+        "the next after the ended thread, not the first"
+    );
+}

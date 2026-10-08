@@ -162,7 +162,8 @@ fn bit(i: usize) -> u64 {
 const RESUME_BOOT: usize = 1 << (usize::BITS - 1);
 
 /// What one core runs, on a 128-byte line of its own (the M4 host's; other cores write `kicked`): a slot (`IDLE` for its idle context), that slot's process (0, the boot table, while idle), the
-/// idle context's saved frame, and whether it was signalled since it last went idle.
+/// idle context's saved frame, whether it was signalled since it last went idle, and the slot its next pick from idle
+/// goes on after (`to_idle`'s, so round robin continues past the thread it ended).
 #[derive(Clone, Copy)]
 #[repr(align(128))]
 struct Core {
@@ -170,6 +171,7 @@ struct Core {
     process: usize,
     idle: usize,
     kicked: bool,
+    after: Option<usize>,
 }
 
 /// Run queue of up to `N` threads of up to `P` processes, each thread known by its saved trap frame address, process,
@@ -244,6 +246,7 @@ impl<const N: usize, const P: usize> Scheduler<N, P> {
             process: 0,
             idle: 0,
             kicked: true,
+            after: None,
         };
         self.cores = alloc::vec![idle; cpus].leak();
         self.cores[0] = Core {
@@ -307,7 +310,7 @@ impl<const N: usize, const P: usize> Scheduler<N, P> {
             IDLE => {
                 core.idle = frame;
                 self.sleepers -= !core.kicked as usize;
-                self.end - 1
+                core.after.take().unwrap_or(self.end - 1)
             }
             current => {
                 self.frame[current] = frame;
@@ -359,6 +362,7 @@ impl<const N: usize, const P: usize> Scheduler<N, P> {
         let from = core.process;
         self.frame[core.current] = frame;
         self.on_core[core.current] = false;
+        core.after = Some(core.current);
         (core.current, core.process, core.kicked) = (IDLE, 0, true);
         (core.idle, from, 0)
     }
