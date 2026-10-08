@@ -9,6 +9,11 @@ Speed is a primary goal, so performance is tested like behavior: measured, recor
 | Host | Pure-logic crates (allocators, parsers, encodings) | `benches/*.rs` (`harness = false`) on criterion, timed in the benchmark thread's CPU time, run on macOS | Algorithmic cost of safe crates |
 | Kernel | Hot paths in the running kernel (exception entry, context switch, syscall, pipe, page fault, allocation) | Boot QEMU in bench mode, time with the ARM generic timer (`CNTVCT_EL0`), print results over the UART | Real kernel paths end to end |
 
+- Profile: every tracked kernel number (hvf, TCG `-icount`, boot time, the cross-OS table) is of the release build
+  (`lto = true`, `codegen-units = 1`), the image that ships; `scripts/bench.sh` builds it by default. Rows before the
+  cutover at `b45cac4` (2026-10-08) are of the dev build (`opt-level = 1`) and compare only with each other. The e2e
+  benchmark scenarios boot the dev build: they check the lines are well-formed, never the numbers, and the dev build
+  keeps the debug assertions and overflow checks the fuzzer and the other scenarios rely on to catch bugs.
 - Kernel numbers under QEMU's default emulator (TCG) are only meaningful as relative comparisons between commits, not as absolute speed.
 - For realistic absolute numbers, run with Apple's hypervisor, which executes natively on the M-series CPU. The boot path works under `-accel hvf -cpu cortex-a72` (PSCI power-off, exceptions, MMU, fault report). `-cpu host` (and `max`) abort at startup on QEMU 9.2.1 with an M4 host (`Property 'host-arm-cpu.sme' not found`).
 - Host: `cargo bench-host`. Kernel boot time: every boot prints `boot: <N> us` (kmain entry to end of init, from `CNTVCT_EL0`/`CNTFRQ_EL0`); take min and median of 11 boots.
@@ -48,14 +53,15 @@ Speed is a primary goal, so performance is tested like behavior: measured, recor
   change over 11 or more rounds lies above the A/A spread measured the same way (the host noise floor in Baselines). The base must
   already have criterion benches.
 - New hot paths (each roadmap step that adds one) get a benchmark when they land, alongside their end-to-end test.
-- Per call, A/B: `scripts/bench.sh <test> <rounds> <new mog_os> [<base mog_os>]` boots each kernel `<rounds>` times
-  under hvf, alternating which goes first, each boot on a fresh 1024-block MogFS image, and prints the median and min
-  of every `bench <name>: <ns> ns` line, base vs new with deltas. `SLOWER` marks a call whose median and min both rose:
+- Per call, A/B: `scripts/bench.sh <test> <rounds> [<new mog_os> [<base mog_os>]]` boots each kernel `<rounds>` times
+  (no kernel given: the release build, built first) under hvf, alternating which goes first, each boot on a fresh
+  1024-block MogFS image, and prints the median and min of every `bench <name>: <ns> ns`, `<name>: [<what>] <ns>
+  ns/round-trip` and `boot: <us> us` line (the boot row is the boot with that disk mounted), base vs new with deltas. `SLOWER` marks a call whose median and min both rose:
   rerun it with more rounds; if it holds, it is a failure under the rule above. A/A noise at 21 rounds (one kernel
   against itself, load about 25): medians within 1% for calls under 1 us and within 7% for disk-bound calls, and
   `SLOWER` showed on 3 of 27 calls, so one flag alone is not a verdict.
-- Build the base kernel from the base commit (a worktree, `cargo build`, copy
-  `target/aarch64-unknown-none-softfloat/debug/mog_os`), then the new one; the script takes the two files.
+- Build the base kernel from the base commit (a worktree, `cargo build --release`, copy
+  `target/aarch64-unknown-none-softfloat/release/mog_os`), then the new one; the script takes the two files.
 - `test=bench-syscalls` (`crates/user/src/bin/sysbench.rs`): one table entry per call, each its fast path. A batch
   makes the call many times in groups of up to 8 between two `CNTVCT_EL0` reads (raw ticks, converted once per batch,
   so the counter read costs under 1 ns per call), setup and undo outside the timed part; the line is the median of
