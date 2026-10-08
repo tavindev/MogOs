@@ -38,7 +38,7 @@ use linked_list_allocator::Heap;
 use lock_order as level;
 use mm::{FrameAllocator, PhysAddr};
 use mogfs::{Error, Fs};
-use process::{executable, spawn_init, user_program};
+use process::{PROCESSES, executable, spawn_init, user_program};
 use uart::Uart;
 use virtio_blk::VirtioBlk;
 use virtio_net::VirtioNet;
@@ -542,8 +542,16 @@ impl kernel::Board for QemuVirt {
         ONLINE.load(Acquire)
     }
 
-    fn contended(&self) -> u32 {
-        KERNEL.contended()
+    fn contended(&self) -> [u32; kernel::LOCK_LEVELS.len()] {
+        let processes = PROCESSES.iter().map(|p| p.lock.contended());
+        [
+            processes.fold(0, u32::wrapping_add),
+            KERNEL.contended(),
+            net::contended(),
+            FRAMES.contended(),
+            CONSOLE.contended(),
+            HEAP.0.contended(),
+        ]
     }
 
     fn counter_us(&self) -> u64 {

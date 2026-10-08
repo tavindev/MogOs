@@ -719,13 +719,17 @@ fn smp_bench_reports_throughput_and_contention_for_each_worker_count() {
                 .iter()
                 .find_map(|l| l.strip_prefix(&line))
                 .unwrap_or_else(|| panic!("missing line: {line}"));
-            let (rate, contended) = rest.split_once(" ops/s, ").unwrap();
+            let (rate, contended) = rest.split_once(" ops/s, contended ").unwrap();
             assert!(rate.parse::<u64>().unwrap() > 0);
-            contended
-                .strip_suffix(" contended")
-                .unwrap()
-                .parse::<u32>()
-                .unwrap();
+            let words: Vec<_> = contended.split(' ').collect();
+            let levels: Vec<_> = words.iter().step_by(2).copied().collect();
+            assert_eq!(
+                levels,
+                ["process", "kernel", "net", "frames", "console", "heap"]
+            );
+            for count in words.iter().skip(1).step_by(2) {
+                count.parse::<u32>().unwrap();
+            }
         }
     }
     assert_no_leak(&lines, "bench-smp");

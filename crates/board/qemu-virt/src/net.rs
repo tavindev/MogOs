@@ -66,6 +66,11 @@ fn nic() -> Option<VirtioNet> {
     Some(nic)
 }
 
+/// Acquisitions of `NET` and `SETUP` that had to wait (wrapping).
+pub fn contended() -> u32 {
+    NET.contended().wrapping_add(SETUP.contended())
+}
+
 /// `Board::has_nic`: one device-ID read per transport, down to the first empty one.
 pub fn present() -> bool {
     let id = |i| {

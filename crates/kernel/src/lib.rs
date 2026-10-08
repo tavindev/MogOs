@@ -16,6 +16,7 @@ pub mod syscall;
 pub use mogfs::{BLOCK_SIZE, Disk};
 pub use sched::{Event, Full, PRIORITIES, Process, Scheduler};
 
+use alloc::format;
 use alloc::string::ToString;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -117,8 +118,9 @@ pub trait Board {
     fn ticked_cpus(&self) -> usize;
     /// Cores whose interrupt controller is set up, this one included, once `start_cpus` ran.
     fn online_cpus(&self) -> usize;
-    /// Acquisitions of the board's kernel lock that had to wait, so far (wrapping).
-    fn contended(&self) -> u32;
+    /// Lock acquisitions that had to wait, so far (wrapping), per lock level, summed over the level's locks, in
+    /// `LOCK_LEVELS` order.
+    fn contended(&self) -> [u32; LOCK_LEVELS.len()];
     /// The counter in microseconds from its start (not from the board's entry), as EL0 reads it.
     fn counter_us(&self) -> u64;
     /// Takes the board's kernel lock, and unless the counter has reached `start_us` by then, holds it until `waiters`
@@ -699,6 +701,9 @@ fn lock_split<B: Board>(board: &mut B) {
 
 /// `test=bench-smp`: k `smpwork` processes at once for each mode, timed from their spawn until all exited; prints the
 /// aggregate operations per second and the kernel lock's contended acquisitions over the run.
+/// The lock levels `Board::contended` counts, in its order.
+pub const LOCK_LEVELS: [&str; 6] = ["process", "kernel", "net", "frames", "console", "heap"];
+
 fn smp_bench<B: Board>(board: &mut B) {
     run_checked(board, "bench-smp", |board| {
         let modes = [
@@ -719,11 +724,12 @@ fn smp_bench<B: Board>(board: &mut B) {
                 wait(board);
                 let us = (board.uptime_us() - start).max(1);
                 let rate = k as u64 * ops * 1_000_000 / us;
-                let contended = board.contended().wrapping_sub(contended);
-                let _ = writeln!(
-                    board.console(),
-                    "bench-smp {mode} {k}: {rate} ops/s, {contended} contended"
-                );
+                let after = board.contended();
+                let mut line = format!("bench-smp {mode} {k}: {rate} ops/s, contended");
+                for (level, (a, b)) in LOCK_LEVELS.iter().zip(after.iter().zip(contended)) {
+                    line += &format!(" {level} {}", a.wrapping_sub(b));
+                }
+                let _ = writeln!(board.console(), "{line}");
             }
         }
     });
