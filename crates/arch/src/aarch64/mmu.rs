@@ -442,6 +442,7 @@ pub unsafe fn sync_icache(start: usize, len: usize) {
     let ctr: usize;
     // SAFETY: reading CTR_EL0 has no side effects.
     unsafe { asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack, preserves_flags)) };
+    debug_assert_eq!((ctr >> 14) & 3, 3, "a PIPT I-cache (CTR_EL0.L1Ip)");
     let (dline, iline) = (4 << ((ctr >> 16) & 0xf), 4 << (ctr & 0xf));
     for addr in (start & !(dline - 1)..start + len).step_by(dline) {
         // SAFETY: cleaning a mapped line to the point of unification does not change memory contents.

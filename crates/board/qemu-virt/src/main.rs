@@ -190,7 +190,7 @@ struct Kernel {
     fs: Fs<FsDisk>,
     /// `fs` is mounted: boot-spawned processes get its root as handle 3.
     mounted: bool,
-    opens: Opens,
+    opens: Opens<{ MAX_PROCESSES * MAX_HANDLES }>,
     /// This hold left `trap::Deferred` work for the trap exit; taken by the hook's `Resume`.
     deferred: bool,
 }

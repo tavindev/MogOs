@@ -68,14 +68,10 @@ unsafe fn start_entry(index: usize, next: u64, budget: usize, handles: &Handles)
     entry.handles.commit(process, handles);
 }
 
-/// Returns a thread's kernel stack at `stack` to `frames`, refunding `budget`.
-pub(crate) fn free_stack(
-    frames: &mut FrameAllocator<FRAME_WORDS>,
-    budget: &Budget,
-    stack: PhysAddr,
-) {
+/// Returns a thread's kernel stack at `stack` to `frames` (its process's budget refunded apart, under `KERNEL`).
+pub(crate) fn free_stack(frames: &mut FrameAllocator<FRAME_WORDS>, stack: PhysAddr) {
     for i in 0..TASK_STACK_FRAMES {
-        budget.free(frames, PhysAddr(stack.0 + (i * PAGE) as u64));
+        frames.free(PhysAddr(stack.0 + (i * PAGE) as u64));
     }
 }
 

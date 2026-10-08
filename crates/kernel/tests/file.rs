@@ -157,7 +157,7 @@ fn opens_count_dir_and_node_handles_until_the_last_closes() {
     use kernel::handle::Object;
     use mogfs::ROOT;
 
-    let mut opens = Opens::new();
+    let mut opens = Opens::<4>::new();
     opens.open(Object::Console);
     assert!(!opens.held(ROOT));
     opens.open(Object::Dir(ROOT));

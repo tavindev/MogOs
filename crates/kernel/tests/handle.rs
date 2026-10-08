@@ -126,9 +126,10 @@ fn a_lookup_racing_close_and_dup_sees_the_old_or_the_new_entry_never_a_torn_one(
             }
             done.store(true, Relaxed);
         });
-        let (mut seen, mut read) = (0, 0);
+        let (mut changed, mut read) = (0, 0);
         while !done.load(Relaxed) {
-            match table.entry(h(0), &mut Seen::default()) {
+            let mut seen = Seen::default();
+            match table.entry(h(0), &mut seen) {
                 Ok((Object::Process { index, generation }, WRITE)) => {
                     assert_eq!(generation, 3 * index as u64)
                 }
@@ -137,9 +138,9 @@ fn a_lookup_racing_close_and_dup_sees_the_old_or_the_new_entry_never_a_torn_one(
                 other => panic!("torn: {other:?}"),
             }
             read += 1;
-            seen += table.unchanged(&Seen::default()) as u32;
+            changed += !table.unchanged(&seen) as u32;
         }
-        assert!(read > 0 && seen == read);
+        assert!(read > 0 && changed > 0, "the recheck saw the writes");
     });
 }
 
