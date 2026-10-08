@@ -53,11 +53,11 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
   both before it returns, rechecking the entries it read (a change reruns the call); `io` on a pipe, console read or
   file takes `KERNEL` and returns holding it after the same recheck. A process's only thread (`ProcessEntry::alone`,
   an `OnlyThread` read before `dispatch`: only the caller's own `thread` raises the count) skips the process lock and
-  the recheck:
-  its `TABLE_CALLS` take `KERNEL` first like the shared ones, its `dup` of a stateless object and its `close` take
-  no lock but what the object's release needs, and its table writes skip the seqlock (`ProcessEntry::unshared` takes
-  the `OnlyThread` and gives the `Alone` writer; the locked path's writer is the guard's `Process`). `board_unlock` and `board_unlock_work`, called by the
-  trap exit, release `KERNEL`, the second after the hook's deferred work.
+  the recheck: its `TABLE_CALLS` take `KERNEL` first like the shared ones, its `dup` of a stateless object and its
+  `close` take no lock but what the object's release needs, and its table writes skip the seqlock. The `unsafe`
+  `ProcessEntry::unshared` (taking that entry's `OnlyThread`, giving the `Alone` writer) is the proof no lookup races
+  them; the `Writer` types only stop accidents. The locked path's writer is the guard's `Process`. `board_unlock` and
+  `board_unlock_work`, called by the trap exit, release `KERNEL`, the second after the hook's deferred work.
 - `Board::console` writes (`Console`) hold `CONSOLE` for a whole `write_fmt`, so no other `Console` line splits it (the unlocked writers below can); it is the PL011
   at `UART0`, like every other UART access. `test=bench-lock`'s `round_trips` (ticket vs test-and-set lock, `cpu()`, `PerCpu::with`) and `add_locked`; `test=bench-ipi`'s `ipi_round_trips` (`PING_SGI`, answered in `board_irq`);
   `test=smp`'s `cpus`, `cpu`, `online_cpus` (`ONLINE`) and `ticked_cpus` (`TICKED`, a count each core adds 1 to on

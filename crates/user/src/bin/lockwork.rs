@@ -1,6 +1,6 @@
 //! A `test=lock-split` worker: spawned with no budget to spare, spins on a one-page `map` until the boot context, holding
-//! the kernel's big lock, raises its budget; then makes `WRITES` 0-byte console writes and prints `W: done`. None of it
-//! needs that lock. Exits 1 on any failure.
+//! the kernel's big lock, raises its budget; then makes `WRITES` 0-byte console writes, prints `W: done` and maps 16
+//! pages, which the boot context waits to see in its budget. None of it needs that lock. Exits 1 on any failure.
 #![no_std]
 #![no_main]
 
@@ -22,5 +22,8 @@ fn main(_: &[&[u8]]) -> u64 {
         return 1;
     }
     write(CONSOLE, b"W: done\n");
-    0
+    match map(16 * 4096) {
+        Some(_) => 0,
+        None => 1,
+    }
 }

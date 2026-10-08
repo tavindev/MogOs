@@ -606,9 +606,7 @@ unsafe extern "C" fn other_call(
     let call = dispatch::<Nospec>(nr, args, &entry.handles, &mut seen);
     let at = frame as *mut arch::TrapFrame as usize;
     frame.x[0] = match call {
-        Ok(Call::Map { pages }) => {
-            map((entry, alone.is_some()), &mut root, pages).unwrap_or(ENOMEM as u64)
-        }
+        Ok(Call::Map { pages }) => map((entry, alone), &mut root, pages).unwrap_or(ENOMEM as u64),
         // The caller alone: no lock, unless a closed handle's object needs `KERNEL`.
         Ok(Call::Dup {
             object:
@@ -737,7 +735,7 @@ unsafe fn kernel_first(
     Resume::locked(next, parked)
 }
 
-/// A call under `KERNEL` alone, which returns holding it.
+/// `io`'s console read or file call: under `KERNEL`, after rechecking its lookup (`seen`), which it returns holding.
 #[inline(always)]
 fn kernel_call(
     root: &mut W<'_, level::Unlocked>,

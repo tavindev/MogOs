@@ -29,9 +29,9 @@ safe atomics (`Table`, a seqlock per entry) the board reads without one.
 - `Table` and `Handles` (`src/handle.rs`): a process's live handle table, its lookups (`entry`, `get`) lock-free (each
   entry's words behind a 64-bit sequence; the entries read go in a `Seen`, which `unchanged` rechecks), its writes
   (`insert`, `reserve` + `fill`, `close`, `commit`, `take`) by a `Writer`, a sealed typestate: `Process` (the lock
-  held, each store sequenced) or `Alone` (made only from an `OnlyThread`, which only `OnlyThread::of` makes, from a
-  thread count read with Acquire at most 1: no lookup races its stores, which skip the sequence and its barriers; the
-  compile-fail doctests keep both unforgeable);
+  held, each store sequenced) or `Alone` (made from an `OnlyThread`, a thread count read with Acquire at most 1, so
+  its stores skip the sequence and its barriers). The types stop accidents (a stale flag, an `Alone` without a count
+  read); that no lookup races an `Alone` store is the board's `unsafe` `ProcessEntry::unshared` contract;
   typed lookups (`mutex`, `io`) decode only the objects their call takes; `Handles` is a plain copy (`snapshot`) for
   `split` in `spawn` and building a child's. Rights; lookups take a `Handle`, a user value with its index clamped (by
   `dispatch`, or `Handle::new` / `split` with their own barrier).

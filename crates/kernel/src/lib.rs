@@ -120,9 +120,9 @@ pub trait Board {
     /// Lock acquisitions that had to wait, so far (wrapping), per lock level, summed over the level's locks, in
     /// `LOCK_LEVELS` order.
     fn contended(&self) -> [u32; LOCK_LEVELS.len()];
-    /// Takes the board's kernel lock, then raises every live process's budget by a page's worth (and its tables), and
-    /// holds the lock until `waiters` more acquisitions have waited for it.
-    fn hold_kernel(&mut self, waiters: u32);
+    /// Takes the board's kernel lock once every live process runs on a core (no tick), then raises their budgets
+    /// enough for a one-page `map` and a 16-page one, and holds the lock until each made both (its budget shows them).
+    fn hold_kernel(&mut self);
     /// Chooses this core's vector table (until then an exception from EL0 panics), then prints the `spec:` line
     /// (speculative-execution vulnerabilities and the vector table) for the worst core, once every core `start_cpus`
     /// started has chosen its own. Call before any EL0 code runs on this core.
@@ -681,9 +681,9 @@ fn pipe_bench<B: Board>(board: &mut B) {
 /// `test=lock-split`'s workers, one per secondary core of four.
 const LOCK_SPLIT_WORKERS: u32 = 3;
 /// `test=lock-split`: `lockwork` processes, spawned with the least budget their spawn takes, so none can `map`, spin
-/// on a one-page `map`, then make calls that need no big lock; the boot context takes the kernel's big lock, only
-/// then raises their budgets (atomic, outside it), and holds it until all three wait on it (their exits), so every
-/// `W: done` line precedes `released`, however the host schedules the cores.
+/// on a one-page `map`, then make calls that need no big lock, the last a 16-page `map`; the boot context takes the
+/// kernel's big lock, only then raises their budgets (atomic, outside it), and holds it until their budgets show the
+/// last map, so every `W: done` line precedes `released`, however the host schedules the cores.
 fn lock_split<B: Board>(board: &mut B) {
     run_checked(board, "lock-split", |board| {
         let args = b"lockwork\0";
@@ -699,7 +699,7 @@ fn lock_split<B: Board>(board: &mut B) {
                 .spawn_archived("lockwork", budget, INIT_ARCHIVE, args)
                 .expect("spawn");
         }
-        board.hold_kernel(LOCK_SPLIT_WORKERS);
+        board.hold_kernel();
         let _ = writeln!(board.console(), "lock-split: released");
     });
 }

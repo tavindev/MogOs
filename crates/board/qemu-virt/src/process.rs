@@ -52,7 +52,8 @@ impl ProcessEntry {
     /// The process's data without its lock, as a table writer that skips the seqlock.
     ///
     /// # Safety
-    /// Nothing else reaches the process's data: the caller is its only thread (`only`), or none is left or started.
+    /// Nothing else reaches the process's data and no other core looks its table up: `only` is this entry's count and
+    /// the caller its only thread, or no thread of it is left or started.
     #[inline(always)]
     pub(crate) unsafe fn unshared(&self, only: OnlyThread) -> Alone<'_> {
         // SAFETY: the caller's contract.
@@ -89,14 +90,11 @@ pub(crate) static PROCESSES: [ProcessEntry; MAX_PROCESSES] = [const {
 unsafe fn start_entry(index: usize, next: u64, budget: usize, handles: &Handles) {
     let entry = &PROCESSES[index];
     // SAFETY: the caller's contract: nothing else reaches the unpublished process's data.
-    unsafe { entry.lock.unshared() }.next = next;
+    let process = unsafe { entry.lock.unshared() };
+    process.next = next;
     entry.threads.store(1, Relaxed);
     entry.budget.reset(budget);
-    let only = entry.alone().expect("one thread, not yet started");
-    // SAFETY: as above.
-    entry
-        .handles
-        .commit(&mut unsafe { entry.unshared(only) }, handles);
+    entry.handles.commit(process, handles);
 }
 
 /// Returns a thread's kernel stack at `stack` to `frames` (its process's budget refunded apart, under `KERNEL`).
@@ -142,15 +140,15 @@ fn map_filled(
 /// Maps `pages` zeroed read-write pages at the current process's next map address, charged to its budget, taking the
 /// frames and any new tables in one pass of the bitmap; returns their address, or `None` with nothing mapped if the
 /// budget or the frames run out or the pages would reach `USER_END`. Under the process's lock only, unless the caller
-/// is its only thread (`alone`, read before the call's lookups).
+/// is its only thread (`alone`).
 #[inline(never)]
 pub(crate) fn map(
-    (entry, alone): (&ProcessEntry, bool),
+    (entry, alone): (&ProcessEntry, Option<OnlyThread>),
     root: &mut W<'_, level::Unlocked>,
     pages: usize,
 ) -> Option<u64> {
-    if alone {
-        // SAFETY: the caller is its process's only thread, so nothing else reaches the process's data (`alone`).
+    if alone.is_some() {
+        // SAFETY: the caller is its process's only thread, so nothing else reaches the process's data.
         return map_pages(entry, unsafe { entry.lock.unshared() }, root, pages);
     }
     let mut guard = entry.lock.lock_masked(root);

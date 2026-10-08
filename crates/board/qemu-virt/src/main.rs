@@ -54,8 +54,12 @@ const UNMAPPED: PhysAddr = PhysAddr(0x8000_0000);
 /// The boot table's entries every address space copies: device memory (GiB 0) and RAM (GiB 1), EL1-only, global.
 const KERNEL_ENTRIES: usize = 2;
 const PAGE: usize = 4096;
-/// What `hold_kernel` raises each live process's budget by: a page and the tables a first `map` may need.
-const GATE_FRAMES: usize = 4;
+/// What `hold_kernel` raises each live process's budget by: a one-page `map` (its page and up to 3 tables), then a
+/// 16-page one (its pages and up to 3 tables).
+const GATE_FRAMES: usize = 4 + 16 + 3;
+/// The most a process has left of `GATE_FRAMES` once it made both maps (at least 1 + 16 frames), and fewer than after
+/// the first alone (at most 4).
+const GATE_DONE: usize = GATE_FRAMES - 17;
 /// Where user programs' code is mapped; one 2 MiB region, so a process needs a single level-3 table.
 const USER_BASE: u64 = 1 << 32;
 /// Each process's one stack page ends here.
@@ -560,18 +564,27 @@ impl kernel::Board for QemuVirt {
         ]
     }
 
-    fn hold_kernel(&mut self, waiters: u32) {
+    fn hold_kernel(&mut self) {
         // SAFETY: a `Board` method, which the kernel crate calls holding no lock.
         let mut root = unsafe { arch::root() };
-        let _kernel = KERNEL.lock(&mut root);
-        let from = KERNEL.contended();
-        for entry in PROCESSES
-            .iter()
-            .filter(|entry| entry.threads.load(Relaxed) > 0)
-        {
-            entry.budget.grow(GATE_FRAMES);
-        }
-        while KERNEL.contended().wrapping_sub(from) < waiters {
+        let live = || {
+            (PROCESSES.iter().enumerate().skip(1))
+                .filter(|(_, entry)| entry.threads.load(Relaxed) > 0)
+        };
+        // Once each is on a core (with no tick, none leaves it but by a syscall): one still to start would wait for
+        // this lock.
+        let cpus = self.cpus();
+        let _kernel = loop {
+            let kernel = KERNEL.lock(&mut root);
+            let running = |index| (0..cpus).any(|cpu| kernel.sched.process(cpu) == index);
+            if live().all(|(index, _)| running(index)) {
+                break kernel;
+            }
+            drop(kernel);
+            spin_loop();
+        };
+        live().for_each(|(_, entry)| entry.budget.grow(GATE_FRAMES));
+        while live().any(|(_, entry)| entry.budget.remaining() > GATE_DONE) {
             spin_loop();
         }
     }

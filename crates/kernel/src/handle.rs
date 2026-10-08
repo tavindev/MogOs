@@ -217,8 +217,11 @@ const PIPE: u8 = 8;
 const MUTEX: u8 = 9;
 
 /// What a table write holds, which decides how it stores: the process's lock (`Process`), while lookups may run on
-/// other cores, so each store is sequenced; or `Alone`, proof that none can, so stores skip the sequence and its
-/// barriers. Sealed: no other writer exists.
+/// other cores, so each store is sequenced; or `Alone`, for a writer no lookup races, so stores skip the sequence and
+/// its barriers. Sealed: no other writer exists. The types keep a store from skipping the seqlock by accident (a stale
+/// flag, an `Alone` made without a count read); they do not prove no lookup races it, as safe code can pass
+/// `OnlyThread::of` another count, or a locked `Process` to `Alone::new`: that proof is the board's `unsafe`
+/// `ProcessEntry::unshared` contract.
 pub trait Writer: sealed::Sealed {
     const SEQUENCED: bool;
 }
@@ -233,13 +236,9 @@ impl Writer for Process {
     const SEQUENCED: bool = true;
 }
 
-/// Proof that a process had at most one thread when `of` read its count (Acquire, so after any sibling's end, which
-/// lowers it with Release): no other core looks its table up until that thread starts another, as only it can. Only
-/// `of` makes one.
-///
-/// ```compile_fail,E0423
-/// let _forged = kernel::handle::OnlyThread(());
-/// ```
+/// That the thread count `of` read (Acquire, so after any sibling's end, which lowers it with Release) was at most 1:
+/// for the count of the caller's own process, no other core looks its table up until that thread starts another, as
+/// only it can.
 pub struct OnlyThread(());
 
 impl OnlyThread {
@@ -249,12 +248,8 @@ impl OnlyThread {
     }
 }
 
-/// A process's data in the hands of its only thread, or of no thread (`OnlyThread`): a `Writer` whose table writes no
-/// lookup races, so they skip the seqlock.
-///
-/// ```compile_fail,E0423
-/// let _forged = kernel::handle::Alone(core::marker::PhantomData);
-/// ```
+/// A process's data in the hands of its only thread, or of no thread (`OnlyThread`): a `Writer` whose table writes skip
+/// the seqlock.
 pub struct Alone<'a>(PhantomData<&'a mut Process>);
 
 impl<'a> Alone<'a> {
@@ -424,13 +419,7 @@ impl Table {
         object: Object,
         rights: Rights,
     ) -> Result<u64, i64> {
-        let mut i = 0;
-        while !free(self.0[i].words[0].load(Relaxed)) {
-            i += 1;
-            if i == MAX_HANDLES {
-                return Err(EMFILE);
-            }
-        }
+        let [i] = self.reserve(process)?;
         Ok(self.fill(process, i, object, rights))
     }
 
