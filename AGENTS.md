@@ -52,7 +52,8 @@ Every new `.md` file must be linked from its parent so it stays reachable from t
 ## Layout
 
 - `crates/kernel` ([CLAUDE.md](crates/kernel/CLAUDE.md)) — OS logic, `#![no_std]`, **no `unsafe`** (`forbid`). Defines ports (traits) like `Board` (and re-exports `mogfs`'s `Disk`), the scheduler and process table, handles, pipes, mutexes, the console line discipline, syscall decoding, the network (sockets over `crates/net`'s stacks) and the boot archive's cpio and ELF parsers.
-- `crates/mm` ([CLAUDE.md](crates/mm/CLAUDE.md)) — arch-independent memory management (`PhysAddr`, frame allocator). Safe, host-tested.
+- `crates/mm` ([CLAUDE.md](crates/mm/CLAUDE.md)) — arch-independent memory management (`PhysAddr`, frame allocator, budgets). Safe, host-tested.
+- `crates/lock-order` ([CLAUDE.md](crates/lock-order/CLAUDE.md)) — the lock levels, `LockAfter` and the witnesses `arch::Lock` takes, so an out-of-order lock does not compile. Safe, host-tested (compile tests).
 - `crates/dtb` ([CLAUDE.md](crates/dtb/CLAUDE.md)) — minimal FDT parser. Safe, host-tested.
 - `crates/mogfs` ([CLAUDE.md](crates/mogfs/CLAUDE.md)) — MogFS: a checksummed copy-on-write B+tree file system over a `Disk` trait (format at the top of `src/lib.rs`) in fixed memory its caller gives. Safe, `no_std`, no `alloc`, host-tested; `examples/mkfs.rs` writes an empty image.
 - `crates/net` ([CLAUDE.md](crates/net/CLAUDE.md)) — network stack over a `Nic` trait: Ethernet, ARP, IPv4, ICMP echo, UDP, TCP with NewReno, in caller-supplied memory with time as an input. Safe, `no_std`, host-tested over a seeded simulated link (`tests/sim/mod.rs`).

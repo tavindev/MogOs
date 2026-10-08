@@ -10,6 +10,7 @@ const PHDR: usize = 56;
 
 /// A `PT_LOAD` segment: `size` bytes at page-aligned `vaddr`, the first ones from `data` (byte offsets in the file),
 /// the rest zero.
+#[derive(Clone)]
 pub struct Segment {
     pub vaddr: u64,
     pub data: Range<usize>,
@@ -68,7 +69,7 @@ impl<'a> Elf<'a> {
     }
 
     /// The `PT_LOAD` segments, as `parse` checked them.
-    pub fn segments(self) -> impl Iterator<Item = Segment> + 'a {
+    pub fn segments(self) -> impl Iterator<Item = Segment> + Clone + 'a {
         self.phdrs
             .iter()
             .filter(|ph| u32_at(*ph, 0) == Some(PT_LOAD))

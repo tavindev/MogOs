@@ -14,14 +14,15 @@ mod sched;
 pub mod syscall;
 
 pub use mogfs::{BLOCK_SIZE, Disk};
-pub use sched::{Event, Full, Memory, PRIORITIES, Scheduler};
+pub use sched::{Event, Full, PRIORITIES, Process, Scheduler};
 
+use alloc::format;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::Write;
 use core::ops::Range;
-use core::sync::atomic::AtomicUsize;
-use core::sync::atomic::Ordering::Relaxed;
+use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+use core::sync::atomic::{AtomicU64, AtomicUsize};
 
 use dtb::Dtb;
 use handle::{INIT_ARCHIVE, Rights, SHELL_ARCHIVE};
@@ -116,8 +117,12 @@ pub trait Board {
     fn ticked_cpus(&self) -> usize;
     /// Cores whose interrupt controller is set up, this one included, once `start_cpus` ran.
     fn online_cpus(&self) -> usize;
-    /// Acquisitions of the board's kernel lock that had to wait, so far (wrapping).
-    fn contended(&self) -> u32;
+    /// Lock acquisitions that had to wait, so far (wrapping), per lock level, summed over the level's locks, in
+    /// `LOCK_LEVELS` order.
+    fn contended(&self) -> [u32; LOCK_LEVELS.len()];
+    /// Takes the board's kernel lock once every live process runs on a core (no tick), then raises their budgets
+    /// enough for a one-page `map` and a 16-page one, and holds the lock until each made both (its budget shows them).
+    fn hold_kernel(&mut self);
     /// Chooses this core's vector table (until then an exception from EL0 panics), then prints the `spec:` line
     /// (speculative-execution vulnerabilities and the vector table) for the worst core, once every core `start_cpus`
     /// started has chosen its own. Call before any EL0 code runs on this core.
@@ -197,6 +202,10 @@ const IPI_ROUND_TRIPS: u64 = 1000;
 const CONTENDED_LOCKS: u64 = 100_000;
 /// `test=bench-lock`'s adders that are done.
 static ADDERS_DONE: AtomicUsize = AtomicUsize::new(0);
+/// `test=bench-lock`'s adders past their first half in the overlap check.
+static ADDERS_HALFWAY: AtomicUsize = AtomicUsize::new(0);
+/// The count once every adder finished the timed run; the overlap check's counts are from it.
+static TIMED_COUNT: AtomicU64 = AtomicU64::new(0);
 /// `test=smp`'s kernel tasks that each take a core at once (the full N-task form is step 31's `test=limits`).
 const MAX_SPINNERS: usize = 32;
 /// `test=smp`'s spinners that have started, and those that have printed their core.
@@ -370,6 +379,12 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
                 run_archived(board, "threads", "threads", (THREADS_BUDGET, INIT_ARCHIVE));
             }
             "test=refund" => run_archived(board, "refund", "refund", (REFUND_BUDGET, INIT_ARCHIVE)),
+            "test=reap-race" => run_archived(
+                board,
+                "reap-race",
+                "reaprace",
+                (REFUND_BUDGET, INIT_ARCHIVE),
+            ),
             "test=bench-threads" => run_archived(
                 board,
                 "bench-threads",
@@ -379,6 +394,7 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
             "test=bench-pipe" => pipe_bench(board),
             "test=bench-lock" => lock_bench(board),
             "test=bench-smp" => smp_bench(board),
+            "test=lock-split" => lock_split(board),
             "test=bench-ipi" if board.cpus() > 1 => {
                 let start = board.uptime_us();
                 board.ipi_round_trips(IPI_ROUND_TRIPS);
@@ -641,8 +657,12 @@ fn wait<B: Board>(board: &mut B) {
     }
 }
 
-/// Each boot-task yield is one round trip through a task that only yields back.
+/// Each boot-task yield is one round trip through a task that only yields back. One core only: with no pinning yet,
+/// that task may run on another core, which makes the boot task's yield a return to itself.
 fn yield_bench<B: Board>(board: &mut B) {
+    if board.cpus() > 1 {
+        return;
+    }
     board.spawn(yield_forever, 0).expect("spawn");
     let start = board.uptime_us();
     for _ in 0..BENCH_YIELDS {
@@ -664,8 +684,37 @@ fn pipe_bench<B: Board>(board: &mut B) {
     let _ = writeln!(board.console(), "pipe: {ns} ns/round-trip");
 }
 
+/// `test=lock-split`'s workers, one per secondary core of four.
+const LOCK_SPLIT_WORKERS: u32 = 3;
+/// `test=lock-split`: `lockwork` processes, spawned with the least budget their spawn takes, so none can `map`, spin
+/// on a one-page `map`, then make calls that need no big lock, the last a 16-page `map`; the boot context takes the
+/// kernel's big lock, only then raises their budgets (atomic, outside it), and holds it until their budgets show the
+/// last map, so every `W: done` line precedes `released`, however the host schedules the cores.
+fn lock_split<B: Board>(board: &mut B) {
+    run_checked(board, "lock-split", |board| {
+        let args = b"lockwork\0";
+        let budget = (1..=SMP_WORK_BUDGET)
+            .find(|&budget| {
+                board
+                    .spawn_archived("lockwork", budget, INIT_ARCHIVE, args)
+                    .is_ok()
+            })
+            .expect("spawn");
+        for _ in 1..LOCK_SPLIT_WORKERS {
+            board
+                .spawn_archived("lockwork", budget, INIT_ARCHIVE, args)
+                .expect("spawn");
+        }
+        board.hold_kernel();
+        let _ = writeln!(board.console(), "lock-split: released");
+    });
+}
+
 /// `test=bench-smp`: k `smpwork` processes at once for each mode, timed from their spawn until all exited; prints the
 /// aggregate operations per second and the kernel lock's contended acquisitions over the run.
+/// The lock levels `Board::contended` counts, in its order.
+pub const LOCK_LEVELS: [&str; 6] = ["process", "kernel", "net", "frames", "console", "heap"];
+
 fn smp_bench<B: Board>(board: &mut B) {
     run_checked(board, "bench-smp", |board| {
         let modes = [
@@ -686,11 +735,12 @@ fn smp_bench<B: Board>(board: &mut B) {
                 wait(board);
                 let us = (board.uptime_us() - start).max(1);
                 let rate = k as u64 * ops * 1_000_000 / us;
-                let contended = board.contended().wrapping_sub(contended);
-                let _ = writeln!(
-                    board.console(),
-                    "bench-smp {mode} {k}: {rate} ops/s, {contended} contended"
-                );
+                let after = board.contended();
+                let mut line = format!("bench-smp {mode} {k}: {rate} ops/s, contended");
+                for (level, (a, b)) in LOCK_LEVELS.iter().zip(after.iter().zip(contended)) {
+                    line += &format!(" {level} {}", a.wrapping_sub(b));
+                }
+                let _ = writeln!(board.console(), "{line}");
             }
         }
     });
@@ -699,7 +749,8 @@ fn smp_bench<B: Board>(board: &mut B) {
 /// Times uncontended acquire + release of the ticket and the test-and-set lock, reading the core index and a per-CPU
 /// access; then the boot context and a task per other core (at least one,
 /// so the timer interleaves them on one) each adds `CONTENDED_LOCKS` to a counter under the board's lock, timed from
-/// their spawn until all are done, and the total must be exact.
+/// their spawn until all are done. Then, untimed, each adds `CONTENDED_LOCKS` again in halves, the second once every
+/// adder finished its first (`add_in_halves`), so they are likely to overlap; that run's total must be exact.
 fn lock_bench<B: Board>(board: &mut B) {
     for (name, kind) in [
         ("ticket", RoundTrip::Ticket),
@@ -716,23 +767,45 @@ fn lock_bench<B: Board>(board: &mut B) {
     let adders = board.cpus().max(2);
     let start = board.uptime_us();
     for _ in 1..adders {
-        board.spawn(add_and_yield, 0).expect("spawn");
+        board.spawn(add_and_yield, adders).expect("spawn");
     }
     board.start_timer();
     board.add_locked(CONTENDED_LOCKS);
-    while ADDERS_DONE.load(Relaxed) < adders - 1 {
+    while ADDERS_DONE.load(Acquire) < adders - 1 {
         board.idle();
     }
     let ns = (board.uptime_us() - start) * 1000 / CONTENDED_LOCKS;
     let _ = writeln!(board.console(), "lock: contended {ns} ns/round-trip");
-    let count = board.add_locked(0);
+    TIMED_COUNT.store(board.add_locked(0), Relaxed);
+    // The adders start the overlap check once this count is out.
+    ADDERS_DONE.fetch_add(1, Release);
+    add_in_halves(board, adders);
+    while ADDERS_DONE.load(Acquire) < 2 * adders - 1 {
+        board.idle();
+    }
+    let count = board.add_locked(0) - TIMED_COUNT.load(Relaxed);
     let _ = writeln!(board.console(), "lock: count {count}");
 }
 
-fn add_and_yield<B: Board>(board: &mut B, _: usize) -> ! {
+/// Adds `CONTENDED_LOCKS` in two halves, the second once all `adders` finished their first.
+fn add_in_halves<B: Board>(board: &mut B, adders: usize) {
+    board.add_locked(CONTENDED_LOCKS / 2);
+    ADDERS_HALFWAY.fetch_add(1, Relaxed);
+    while ADDERS_HALFWAY.load(Relaxed) < adders {
+        board.yield_now();
+    }
+    board.add_locked(CONTENDED_LOCKS - CONTENDED_LOCKS / 2);
+}
+
+fn add_and_yield<B: Board>(board: &mut B, adders: usize) -> ! {
     let count = board.add_locked(CONTENDED_LOCKS);
     let _ = writeln!(board.console(), "lock: adder done at {count}");
-    ADDERS_DONE.fetch_add(1, Relaxed);
+    ADDERS_DONE.fetch_add(1, Release);
+    while ADDERS_DONE.load(Acquire) < adders {
+        board.yield_now();
+    }
+    add_in_halves(board, adders);
+    ADDERS_DONE.fetch_add(1, Release);
     loop {
         board.yield_now();
     }

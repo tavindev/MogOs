@@ -1,10 +1,19 @@
 //! Per-process handle tables. A handle value is `generation << 32 | index`; closing bumps the entry's generation,
 //! so a closed handle's value never reaches whatever reuses its entry. An entry is retired once its generation
 //! reaches 2^31, so handle values stay positive (never read as an error) and generations never wrap.
+//!
+//! A process's live table is a `Table`, read without a lock (a seqlock per entry) and written under the process's
+//! lock; `Handles` is a plain copy for building one (a spawned child's) or staging a change before it is committed.
+
+use core::hint::spin_loop;
+use core::marker::PhantomData;
+use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+use core::sync::atomic::{AtomicU32, AtomicU64, fence};
 
 use mogfs::Inode;
 
 use crate::Clamp;
+use crate::Process;
 use crate::mutex::Mutex;
 use crate::network::Sock;
 use crate::pipe::End;
@@ -195,4 +204,366 @@ impl Default for Handles {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Words an entry's object is stored in: its tag, rights and handle generation, then two words of fields.
+type Words = [u64; 3];
+
+/// The tags the typed lookups (`Table::mutex`, `Table::io`) test alone.
+const CONSOLE: u8 = 1;
+const DIR: u8 = 6;
+const NODE: u8 = 7;
+const PIPE: u8 = 8;
+const MUTEX: u8 = 9;
+
+/// What a table write holds, which decides how it stores: the process's lock (`Process`), while lookups may run on
+/// other cores, so each store is sequenced; or `Alone`, for a writer no lookup races, so stores skip the sequence and
+/// its barriers. Sealed: no other writer exists. The types keep a store from skipping the seqlock by accident (a stale
+/// flag, an `Alone` made without a count read); they do not prove no lookup races it, as safe code can pass
+/// `OnlyThread::of` another count, or a locked `Process` to `Alone::new`: that proof is the board's `unsafe`
+/// `ProcessEntry::unshared` contract.
+pub trait Writer: sealed::Sealed {
+    const SEQUENCED: bool;
+}
+
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for crate::Process {}
+    impl Sealed for super::Alone<'_> {}
+}
+
+impl Writer for Process {
+    const SEQUENCED: bool = true;
+}
+
+/// That the thread count `of` read (Acquire, so after any sibling's end, which lowers it with Release) was at most 1:
+/// for the count of the caller's own process, no other core looks its table up until that thread starts another, as
+/// only it can.
+pub struct OnlyThread(());
+
+impl OnlyThread {
+    #[inline(always)]
+    pub fn of(threads: &AtomicU32) -> Option<Self> {
+        (threads.load(Acquire) <= 1).then_some(Self(()))
+    }
+}
+
+/// A process's data in the hands of its only thread, or of no thread (`OnlyThread`): a `Writer` whose table writes skip
+/// the seqlock.
+pub struct Alone<'a>(PhantomData<&'a mut Process>);
+
+impl<'a> Alone<'a> {
+    #[inline(always)]
+    pub fn new(_: &'a mut Process, _: OnlyThread) -> Self {
+        Self(PhantomData)
+    }
+}
+
+impl Writer for Alone<'_> {
+    const SEQUENCED: bool = false;
+}
+
+/// A handle table read without a lock: each entry is its words behind a 64-bit sequence (no wrap), a seqlock. A
+/// `Writer` stores the sequence odd, then the words, then the sequence even, but for `Alone`, which no lookup races; a
+/// lookup that sees the sequence change or odd retries, so it stores nothing and sibling threads' lookups share the
+/// line.
+pub struct Table([Entry; MAX_HANDLES]);
+
+struct Entry {
+    sequence: AtomicU64,
+    words: [AtomicU64; 3],
+}
+
+/// The entry a lookup read and its sequence, to recheck once the object's own lock is held: unchanged, a sibling's
+/// `close` comes after the call, never during it. A call whose lookups are not rechecked may make several (the last
+/// is kept); one that is makes one. An index past the table is no entry.
+#[derive(Clone, Copy)]
+pub struct Seen(usize, u64);
+
+impl Default for Seen {
+    fn default() -> Self {
+        Self(MAX_HANDLES, 0)
+    }
+}
+
+impl Table {
+    pub const fn new() -> Self {
+        Self(
+            [const {
+                Entry {
+                    sequence: AtomicU64::new(0),
+                    words: [const { AtomicU64::new(0) }; 3],
+                }
+            }; MAX_HANDLES],
+        )
+    }
+
+    /// The object `handle` reaches and its rights, read without a lock; recorded in `seen`.
+    #[inline(always)]
+    pub fn entry(&self, handle: Handle, seen: &mut Seen) -> Result<(Object, Rights), i64> {
+        let words = self.read(handle, seen)?;
+        Ok(decode(words).1.expect("read checks the tag"))
+    }
+
+    /// The mutex `handle` reaches (`EACCES` for another object), decoding only a mutex's fields; recorded in `seen`.
+    #[inline(always)]
+    pub fn mutex(&self, handle: Handle, seen: &mut Seen) -> Result<Mutex, i64> {
+        match self.read(handle, seen)? {
+            [head, index, generation] if (head >> 32) as u8 == MUTEX => Ok(Mutex {
+                index: index as u32,
+                generation,
+            }),
+            _ => Err(EACCES),
+        }
+    }
+
+    /// The object an `io` on `handle` reaches if it holds every right in `need`, decoding only the console, a pipe end,
+    /// a file and a directory (`None` for another object); recorded in `seen`.
+    #[inline(always)]
+    pub fn io(&self, handle: Handle, need: Rights, seen: &mut Seen) -> Result<Option<Object>, i64> {
+        let [head, a, b] = self.read(handle, seen)?;
+        if (head >> 40) & need != need {
+            return Err(EACCES);
+        }
+        Ok(match (head >> 32) as u8 {
+            CONSOLE => Some(Object::Console),
+            PIPE => Some(Object::Pipe(pipe_end(a, b))),
+            NODE => Some(Object::Node(Inode::from_raw(a))),
+            DIR => Some(Object::Dir(Inode::from_raw(a))),
+            _ => None,
+        })
+    }
+
+    /// The words of the entry `handle` names, read without a lock (`EBADF` if it is empty or another generation's);
+    /// recorded in `seen`.
+    #[inline(always)]
+    fn read(&self, handle: Handle, seen: &mut Seen) -> Result<Words, i64> {
+        let entry = &self.0[handle.index];
+        let (sequence, words) = loop {
+            let sequence = entry.sequence.load(Acquire);
+            let words = load(&entry.words);
+            // `dmb ishld`: the words are read before the sequence is read again.
+            fence(Acquire);
+            if sequence & 1 == 0 && entry.sequence.load(Relaxed) == sequence {
+                break (sequence, words);
+            }
+            spin_loop();
+        };
+        *seen = Seen(handle.index, sequence);
+        if words[0] >> 32 & 0xff == 0 || !handle.valid(words[0] as u32) {
+            return Err(EBADF);
+        }
+        Ok(words)
+    }
+
+    /// The object `handle` reaches, if it holds every right in `need`; recorded in `seen`.
+    #[inline(always)]
+    pub fn get(&self, handle: Handle, need: Rights, seen: &mut Seen) -> Result<Object, i64> {
+        let (object, rights) = self.entry(handle, seen)?;
+        if rights & need != need {
+            return Err(EACCES);
+        }
+        Ok(object)
+    }
+
+    /// Whether the entry `seen` recorded is unchanged since.
+    #[inline]
+    pub fn unchanged(&self, seen: &Seen) -> bool {
+        (self.0.get(seen.0)).is_none_or(|e| e.sequence.load(Acquire) == seen.1)
+    }
+
+    /// A copy of the table. Writers are serialized by the process lock, so this reads without retrying.
+    pub fn snapshot(&self, _: &mut impl Writer) -> Handles {
+        Handles(core::array::from_fn(|i| decode(self.words(i))))
+    }
+
+    /// Writes every entry of `handles` (a `snapshot`, changed) that differs from the table.
+    pub fn commit<P: Writer>(&self, _: &mut P, handles: &Handles) {
+        for (i, new) in handles.0.iter().enumerate() {
+            let new = encode(*new);
+            if (self.0[i].words.iter())
+                .zip(new)
+                .any(|(w, n)| w.load(Relaxed) != n)
+            {
+                self.store::<P>(i, new);
+            }
+        }
+    }
+
+    /// The first `N` free entries, to `fill` once every step that can fail is done; `EMFILE` with fewer.
+    pub fn reserve<const N: usize>(&self, _: &mut impl Writer) -> Result<[usize; N], i64> {
+        // Index loops here and below: the dev build (`opt-level` 1) leaves iterator adapters as calls.
+        let (mut found, mut n) = ([0; N], 0);
+        for i in 0..MAX_HANDLES {
+            if free(self.0[i].words[0].load(Relaxed)) {
+                (found[n], n) = (i, n + 1);
+                if n == N {
+                    return Ok(found);
+                }
+            }
+        }
+        Err(EMFILE)
+    }
+
+    /// A handle to `object` with `rights` in the free entry `i` (from `reserve`); returns its value.
+    pub fn fill<P: Writer>(&self, _: &mut P, i: usize, object: Object, rights: Rights) -> u64 {
+        let generation = self.0[i].words[0].load(Relaxed) as u32;
+        self.store::<P>(i, encode((generation, Some((object, rights)))));
+        u64::from(generation) << 32 | i as u64
+    }
+
+    /// A new handle to `object` with `rights`.
+    pub fn insert(
+        &self,
+        process: &mut impl Writer,
+        object: Object,
+        rights: Rights,
+    ) -> Result<u64, i64> {
+        let [i] = self.reserve(process)?;
+        Ok(self.fill(process, i, object, rights))
+    }
+
+    /// Closes `handle`; returns the object it reached.
+    pub fn close<P: Writer>(&self, _: &mut P, handle: Handle) -> Result<Object, i64> {
+        match decode(self.words(handle.index)) {
+            (generation, Some((object, _))) if handle.valid(generation) => {
+                self.store::<P>(handle.index, [u64::from(generation + 1), 0, 0]);
+                Ok(object)
+            }
+            _ => Err(EBADF),
+        }
+    }
+
+    /// Entry `i`'s words, for a writer (the process lock holds every other writer off).
+    fn words(&self, i: usize) -> Words {
+        load(&self.0[i].words)
+    }
+
+    /// Empties the table for the next process at its index, handing `f` each object it held.
+    pub fn take<P: Writer>(&self, _: &mut P, mut f: impl FnMut(Object)) {
+        for i in 0..MAX_HANDLES {
+            let words = self.words(i);
+            if words.iter().any(|&w| w != 0) {
+                self.store::<P>(i, [0; 3]);
+            }
+            if let (_, Some((object, _))) = decode(words) {
+                f(object);
+            }
+        }
+    }
+
+    fn store<P: Writer>(&self, i: usize, words: Words) {
+        let entry = &self.0[i];
+        if !P::SEQUENCED {
+            store(&entry.words, words);
+            return;
+        }
+        let sequence = entry.sequence.load(Relaxed);
+        entry.sequence.store(sequence + 1, Relaxed);
+        // `dmb ishst`: the odd sequence is seen before any of the new words.
+        fence(Release);
+        store(&entry.words, words);
+        entry.sequence.store(sequence + 2, Release);
+    }
+}
+
+impl Default for Table {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The words, each with a relaxed load.
+#[inline(always)]
+fn load(words: &[AtomicU64; 3]) -> Words {
+    [
+        words[0].load(Relaxed),
+        words[1].load(Relaxed),
+        words[2].load(Relaxed),
+    ]
+}
+
+/// Stores `value` into the words, each with a relaxed store.
+#[inline(always)]
+fn store(words: &[AtomicU64; 3], value: Words) {
+    words[0].store(value[0], Relaxed);
+    words[1].store(value[1], Relaxed);
+    words[2].store(value[2], Relaxed);
+}
+
+/// Whether the entry whose first word is `head` is empty and not retired.
+#[inline(always)]
+fn free(head: u64) -> bool {
+    // No tag or rights above the generation: one compare.
+    head < u64::from(RETIRED)
+}
+
+/// An entry as words: its handle generation (bits 0-31), object tag (32-39, 0 for none) and rights (40-63), then the
+/// object's fields.
+fn encode((generation, entry): (u32, Option<(Object, Rights)>)) -> Words {
+    let Some((object, rights)) = entry else {
+        return [u64::from(generation), 0, 0];
+    };
+    let (tag, a, b) = match object {
+        Object::Console => (CONSOLE, 0, 0),
+        Object::Process { index, generation } => (2, index as u64, generation),
+        Object::Thread { slot, generation } => (3, slot as u64, generation),
+        Object::Archive => (4, 0, 0),
+        Object::File { start, end } => (5, start as u64, end as u64),
+        Object::Dir(inode) => (DIR, inode.raw(), 0),
+        Object::Node(inode) => (NODE, inode.raw(), 0),
+        Object::Pipe(end) => (
+            PIPE,
+            u64::from(end.index) | u64::from(end.write) << 32,
+            end.generation,
+        ),
+        Object::Mutex(mutex) => (MUTEX, mutex.index.into(), mutex.generation),
+        Object::NetStack => (10, 0, 0),
+        Object::Socket(sock) => (11, sock.index.into(), sock.generation),
+    };
+    let tag = u64::from(tag);
+    [u64::from(generation) | tag << 32 | rights << 40, a, b]
+}
+
+#[inline(always)]
+fn pipe_end(a: u64, generation: u64) -> End {
+    End {
+        index: a as u32,
+        write: a >> 32 != 0,
+        generation,
+    }
+}
+
+#[inline(always)]
+fn decode([head, a, b]: Words) -> (u32, Option<(Object, Rights)>) {
+    let object = match (head >> 32) as u8 {
+        CONSOLE => Object::Console,
+        2 => Object::Process {
+            index: a as usize,
+            generation: b,
+        },
+        3 => Object::Thread {
+            slot: a as usize,
+            generation: b,
+        },
+        4 => Object::Archive,
+        5 => Object::File {
+            start: a as usize,
+            end: b as usize,
+        },
+        DIR => Object::Dir(Inode::from_raw(a)),
+        NODE => Object::Node(Inode::from_raw(a)),
+        PIPE => Object::Pipe(pipe_end(a, b)),
+        MUTEX => Object::Mutex(Mutex {
+            index: a as u32,
+            generation: b,
+        }),
+        10 => Object::NetStack,
+        11 => Object::Socket(Sock {
+            index: a as u32,
+            generation: b,
+        }),
+        _ => return (head as u32, None),
+    };
+    (head as u32, Some((object, head >> 40)))
 }

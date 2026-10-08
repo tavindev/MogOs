@@ -60,6 +60,10 @@ Speed is a primary goal, so performance is tested like behavior: measured, recor
   rerun it with more rounds; if it holds, it is a failure under the rule above. A/A noise at 21 rounds (one kernel
   against itself, load about 25): medians within 1% for calls under 1 us and within 7% for disk-bound calls, and
   `SLOWER` showed on 3 of 27 calls, so one flag alone is not a verdict.
+- A/A before a new benchmark, core count or QEMU argument is trusted: `scripts/bench.sh <test> <rounds> <k> <copy of
+  k>` must show no row beyond the noise above. A row whose boots fall into two modes is not comparable at that setting:
+  `test=bench` at `-smp 4` reads about 62 or 124 ns per boot (the spawned yielder lands on core 0 or on another
+  core), so its median flips between runs; it runs at `-smp 1`, where A/A is within 1 ns.
 - Build the base kernel from the base commit (a worktree, `cargo build --release`, copy
   `target/aarch64-unknown-none-softfloat/release/mog_os`), then the new one; the script takes the two files.
 - `test=bench-syscalls` (`crates/user/src/bin/sysbench.rs`): one table entry per call, each its fast path. A batch
@@ -78,56 +82,58 @@ Speed is a primary goal, so performance is tested like behavior: measured, recor
 
 ## Per-call baselines
 
-`scripts/bench.sh bench-syscalls 21`, QEMU hvf (`-cpu cortex-a72`), dev build, M4 Pro, load about 30, commit
-"e2e: build the kernel once per run" (ns per call; the `bench` line names in brackets).
+`scripts/bench.sh bench-syscalls 21 <release> <dev>`, QEMU hvf (`-cpu cortex-a72`), release build, M4 Pro, load about
+5, main `b45cac4`, MogFS v1 (before step 39b) (ns per call; the `bench` line names in brackets). Dev median: the dev build of the same commit,
+interleaved in the same run. The last dev-only table (commit "e2e: build the kernel once per run", load about 30) read
+36.6 for `console-write` and 32.9 for `enosys`.
 
-| Call | Median | Min |
-| --- | --- | --- |
-| `io_submit_wait` console write, 0 bytes (`console-write`) | 36.6 | 32.5 |
-| `io_submit_wait` console read, 0 bytes (`console-read`) | 37.1 | 34.3 |
-| `io_submit_wait` pipe write, 64 bytes (`pipe-write`) | 59.8 | 55.2 |
-| `io_submit_wait` pipe read, 64 bytes (`pipe-read`) | 62.6 | 58.3 |
-| `io_submit_wait` file write, 64 bytes at offset 0 (`file-write`; a block write) | 15366 | 13691 |
-| `io_submit_wait` file read, 64 bytes at offset 0 (`file-read`) | 73.6 | 69.4 |
-| `dup` | 38.1 | 35.5 |
-| `close` | 38.4 | 34.7 |
-| `open`, existing file in the root (`open`) | 81.4 | 76.9 |
-| `open(CREATE)`, new file (`open-create`) | 16018 | 11159 |
-| `open(TRUNC)`, existing empty file (`open-trunc`) | 86.8 | 83.1 |
-| `mkdir` | 16038 | 14007 |
-| `readdir`, root of 3 entries into 512 bytes | 89.4 | 84.7 |
-| `unlink` of an empty file | 8278 | 7495 |
-| `rename` within the root | 16025 | 14398 |
-| `sync`, nothing changed (`sync`) | 36.8 | 32.4 |
-| `sync` after a 64-byte file write (`sync-change`) | 98268 | 88908 |
-| `map`, one page | 552 | 522 |
-| `pipe` | 99.0 | 86.2 |
-| `spawn` of `nop`, no arguments (`spawn`) | 2441 | 2347 |
-| `spawn` of `nop`, two arguments (`spawn-args`) | 2661 | 2531 |
-| `wait` on a killed child (`wait`) | 54.0 | 48.8 |
-| `kill` of a ready child that never ran (`kill`) | 1074 | 909 |
-| `mutex` | 38.2 | 36.4 |
-| `lock`, uncontended | 36.9 | 33.1 |
-| `unlock`, no waiter | 37.9 | 35.9 |
-| unknown syscall 64 (18 before phase 8 step 50), `ENOSYS` (`enosys`) | 32.9 | 30.0 |
+| Call | Median | Min | Dev median |
+| --- | --- | --- | --- |
+| `io_submit_wait` console write, 0 bytes (`console-write`) | 55.6 | 52.3 | 59.0 |
+| `io_submit_wait` console read, 0 bytes (`console-read`) | 55.7 | 52.8 | 60.6 |
+| `io_submit_wait` pipe write, 64 bytes (`pipe-write`) | 83.8 | 78.9 | 87.4 |
+| `io_submit_wait` pipe read, 64 bytes (`pipe-read`) | 84.8 | 78.0 | 83.9 |
+| `io_submit_wait` file write, 64 bytes at offset 0 (`file-write`; a block write) | 15079 | 12728 | 16037 |
+| `io_submit_wait` file read, 64 bytes at offset 0 (`file-read`) | 80.2 | 77.0 | 95.3 |
+| `dup` | 58.1 | 55.9 | 60.2 |
+| `close` | 56.4 | 54.7 | 57.7 |
+| `open`, existing file in the root (`open`) | 85.0 | 81.3 | 111.3 |
+| `open(CREATE)`, new file (`open-create`) | 15631 | 11390 | 16295 |
+| `open(TRUNC)`, existing empty file (`open-trunc`) | 88.6 | 84.7 | 111.6 |
+| `mkdir` | 15459 | 10546 | 16314 |
+| `readdir`, root of 3 entries into 512 bytes | 86.5 | 84.2 | 112.4 |
+| `unlink` of an empty file | 8515 | 7370 | 9064 |
+| `rename` within the root | 15202 | 10439 | 16266 |
+| `sync`, nothing changed (`sync`) | 55.7 | 52.2 | 56.0 |
+| `sync` after a 64-byte file write (`sync-change`) | 84533 | 76352 | 88165 |
+| `map`, one page | 572.9 | 540.3 | 576.1 |
+| `pipe` | 97.2 | 88.4 | 106.6 |
+| `spawn` of `nop`, no arguments (`spawn`) | 1516 | 1355 | 1789 |
+| `spawn` of `nop`, two arguments (`spawn-args`) | 1735 | 1613 | 1990 |
+| `wait` on a killed child (`wait`) | 68.3 | 61.8 | 77.4 |
+| `kill` of a ready child that never ran (`kill`) | 891.2 | 667.3 | 947.2 |
+| `mutex` | 52.0 | 48.2 | 52.4 |
+| `lock`, uncontended | 56.8 | 54.3 | 61.5 |
+| `unlock`, no waiter | 59.7 | 58.0 | 63.6 |
+| unknown syscall 64 (18 before phase 8 step 50), `ENOSYS` (`enosys`) | 42.8 | 41.5 | 44.1 |
 
 ## Shell command baselines
 
-`scripts/bench.sh bench-shell 21`, as above: 105 samples per command (21 boots of 5 rounds), each from msh's
+`scripts/bench.sh bench-shell 21 <release> <dev>`, as above: 105 samples per command (21 boots of 5 rounds), each from msh's
 `spawn` of the program to reaping it, output to the PL011 included (us).
 
-| Command | Median | Min |
-| --- | --- | --- |
-| `ls d1` (1 entry) | 37.6 | 26.1 |
-| `ls d100` (100 entries) | 914 | 843 |
-| `ls d390` (390 entries) | 3552 | 3298 |
-| `cat small` (4 KiB) | 6161 | 5818 |
-| `cat big` (57232 bytes) | 86283 | 82076 |
-| `write w hello` | 115 | 75.7 |
-| `mkdir m` | 41.4 | 29.3 |
-| `rm m` | 5.6 | 5.1 |
-| `mv a b` / `mv b a` | 24.2 / 22.7 | 18.8 / 16.5 |
-| `echo hi` | 11.9 | 10.5 |
+| Command | Median | Min | Dev median |
+| --- | --- | --- | --- |
+| `ls d1` (1 entry) | 29.3 | 25.5 | 30.9 |
+| `ls d100` (100 entries) | 854.5 | 802.0 | 861.3 |
+| `ls d390` (390 entries) | 3303 | 3152 | 3325 |
+| `cat small` (4 KiB) | 5741 | 5504 | 5738 |
+| `cat big` (57232 bytes) | 80157 | 78149 | 80630 |
+| `write w hello` | 72.8 | 55.0 | 73.6 |
+| `mkdir m` | 36.9 | 26.4 | 37.3 |
+| `rm m` | 5.3 | 4.1 | 5.9 |
+| `mv a b` / `mv b a` | 21.3 / 20.6 | 16.8 / 15.8 | 21.9 / 21.5 |
+| `echo hi` | 11.3 | 10.0 | 11.5 |
 
 `ls` and `cat` are bound by the console: each byte is a PL011 write, a VM exit under hvf (about 1.5 us per byte), so
 `cat big` is about 57232 of them.
@@ -184,9 +190,12 @@ Speed is a primary goal, so performance is tested like behavior: measured, recor
 | SGI round trip between core 0 and core 1, `test=bench-ipi`, 1000 trips (ns; the target woken from `wfi` each time; GICv2 base 28877 median in the same run) | QEMU hvf (`-cpu cortex-a72`), dev build, `-smp 4`, 11 interleaved boots, load 15-27 | 11837 | 16464 | phase 5 step 25c |
 | `arch::cpu()` / `PerCpu::with` round trip, `test=bench-lock` (ns) | QEMU hvf (`-cpu cortex-a72`), dev build, 11 boots | 1.0 / 4.6 | 1.0 / 4.6 | phase 5 step 25c |
 | `bench-smp` aggregate throughput at k = 1, 2, 4, 8, 12 workers (ops/s): 0-byte `write`; pipe round trips with own `pong`; `spawn` + `wait` of `nop` | QEMU hvf (`-cpu cortex-a72`), dev build, `-smp 12`, 5 boots, load 16-49 (medians) | | syscall 14.4 M, 10.9 M, 7.1 M, 2.1 M, 0.02 M; pipe 13.4 k, 8.6 k, 4.3 k, 5.4 k, 2.5 k; spawn 53.9 k, 41.7 k, 13.6 k, 9.2 k, 1.5 k | phase 5 step 25c |
+| `bench-smp` after the split, k = 1, 2, 4, 8, 12 (ops/s; contended acquisitions per level printed beside, all on `KERNEL` but syscall's 2-16; main `26e6363` in the same run: syscall 14.8 M, 8.9 M, 7.2 M, 1.8 M, 0.013 M; pipe 14.9 k, 8.4 k, 4.3 k, 4.1 k, 0.54 k; spawn 59.2 k, 27.6 k, 8.7 k, 4.3 k, 1.5 k) | QEMU hvf (`-cpu cortex-a72`), dev build, `-smp 12`, 5 interleaved boots under the benchmark lock, load 9-153 (medians; the syscall target, 0.8k times k = 1 at load under 4, is reported, not gated: 2.05x at 2, 3.3x at 4, 4.4x at 8) | | syscall 15.4 M, 31.6 M, 51.0 M, 68.4 M, 92.3 M; pipe 15.9 k, 8.9 k, 3.1 k, 3.5 k, 1.1 k; spawn 52.3 k, 29.5 k, 10.0 k, 4.4 k, 0.47 k | phase 5 step 26a |
+| `bench-smp` after the 26a cost pass, k = 1, 2, 4, 8, 12 (ops/s; main `26e6363` in the same run: syscall 16.3 M, 12.2 M, 10.0 M, 6.4 M, 1.3 M; pipe 33.1 k, 27.6 k, 15.6 k, 34.9 k, 120.8 k; spawn 66.1 k, 54.9 k, 42.6 k, 41.7 k, 45.8 k) | QEMU hvf (`-cpu cortex-a72`), dev build, `-smp 12` on the 12-core host, 15 interleaved boots under the benchmark lock, load 6-15 (medians; the syscall target, 0.8k times k = 1, is met at 2, 4 and 8: 1.96x, 3.81x, 6.82x; 6.1x at 12, where the guest's 12 vCPUs share the host's 12 cores with the load) | | syscall 17.8 M, 34.9 M, 67.9 M, 121.3 M, 108.7 M (`KERNEL` contention 0-16); pipe 33.0 k, 25.8 k, 17.3 k, 33.9 k, 132.5 k; spawn 71.7 k, 50.0 k, 35.6 k, 34.8 k, 56.4 k (both still under `KERNEL`, steps 28 and 32) | phase 5 step 26a |
+| `bench-smp` at step 26a's end, release builds, k = 1, 2, 4, 8, 12 (ops/s; main `b45cac4` in the same run: syscall 16.6 M, 11.7 M, 11.9 M, 6.0 M, 1.5 M; pipe 37.9 k, 27.6 k, 16.8 k, 34.6 k, 160 k; spawn 68.0 k, 58.2 k, 48.3 k, 46.3 k, 76.5 k. A main-against-main A/A in one session: spawn 68.1 / 68.5 k, 58.5 / 59.2 k, 44.0 / 47.5 k, 43.3 / 43.8 k, 62.1 / 75.6 k, pipe at k = 4 15.5 / 17.3 k and at k = 12 113 / 140 k, so spawn and pipe beyond k = 2 vary about 8 to 25% between identical kernels) | QEMU hvf (`-cpu cortex-a72`), `-smp 12`, 31 interleaved boots under the benchmark lock, load 6-46 | | syscall 18.5 M, 36.9 M, 71.0 M, 132.0 M, 134.4 M (`KERNEL` contention 0-12); pipe 35.5 k, 28.8 k, 15.1 k, 38.1 k, 175 k; spawn 78.1 k, 62.3 k, 43.7 k, 46.5 k, 78.3 k (a second run: 78.1 k, 61.8 k, 42.0 k, 42.8 k, 79.8 k, against main's 67.8 k, 58.8 k, 45.6 k, 50.8 k, 63.2 k) | phase 5 step 26a |
 | Cores online, `start_cpus` to the last core's GIC up (us; tree bring-up) | QEMU hvf (`-cpu cortex-a72`), one boot each, load 100+ | | 327 at 4, 824 at 12, 5063 at 64 | phase 5 step 25c |
 | Yield round trip via `svc`, `test=bench`, 100000 trips (ns) | QEMU TCG, dev build, 11 boots | 1178 | 1218 | uncommitted |
-| Yield round trip via `svc`, `test=bench`, 100000 trips (ns) | QEMU hvf (`-cpu cortex-a72`), dev build, 21 boots | 68 | 70 | phase 3 step 16 |
+| Yield round trip via `svc`, `test=bench`, 100000 trips (ns; `-smp 1` only since step 26a: with more cores the yielding task, unpinned, sometimes ran on another core, and the round trip read about 62 or 124 ns by boot, a main-against-main A/A showing the same 74 -> 116 ns split at `-smp 4`) | QEMU hvf (`-cpu cortex-a72`), dev build, 21 boots | 68 | 70 | phase 3 step 16 |
 | Syscall round trip from EL0, `test=bench-syscall`, 100000 `print(sp, 0)` timed in user space (ns; before `print` became `write`) | QEMU TCG, dev build, 11 boots | 621 | 637 | phase 3 step 11 |
 | Syscall round trip from EL0, `test=bench-syscall`, 100000 `io_submit_wait(console, write, sp, 0)` timed in user space (ns; one `KERNEL` lock round trip per trap since step 24, base 28 / 30 in the same run) | QEMU hvf (`-cpu cortex-a72`), dev build, 63 interleaved boots, load about 10 | 29 | 32 | phase 5 step 24 |
 | Pipe round trip, `test=bench-pipe`: one byte to `pong` and back over two pipes, 100000 trips, timed by the kernel from spawn to exit (ns) | QEMU TCG, dev build, 11 boots | 14180 | 14556 | phase 3 step 15 |
@@ -214,6 +223,24 @@ Speed is a primary goal, so performance is tested like behavior: measured, recor
 | Phase 8 (steps 49-51) against main `a597dcf`, exact TCG instruction counts (`-icount shift=0`): yield / syscall / pipe round trip, boot without bootargs (instructions; boot in us of 1000) | QEMU TCG, `-icount shift=0`, dev build | 345 / 218 / 2480 / 156 | same; main 345 / 218 / 2480 / 163 | phase 8 step 51 |
 | Kernel boot with a NIC and `net=`, against main `22c07bc` (us; the `rng-seed` read joined the bootargs walk, about 45k instructions removed; the NIC probe and setup, ring memory and stacks, about 60 us under hvf, moved to the net task, which a scenario waits for after `boot:`, so that part is moved, not removed): exact TCG instruction counts (`-icount shift=0`, thousands) with / without a NIC, then hvf median of 31 interleaved boots with a NIC | QEMU TCG `-icount` / hvf, dev build, load 25 to 60 | 164 / 157 (main 264 / 156) | hvf 278 (main 378) | phase 8 follow-ups |
 | Boot to network ready with a NIC and `net=` (`net: ready <N> us`, printed once the net task's setup is done, before any scenario), against main `22c07bc`, which set up inside `boot:` (thousands of TCG instructions, `-icount shift=0`): `boot:` / `net: ready` | QEMU TCG `-icount`, dev build | 164 / 226 | main 264 / (264) | phase 8 follow-ups |
+| Release cutover: from here on every kernel row is the release build. Each row is `scripts/bench.sh <test> 21 <release> <dev>` (or the loop named), both builds of main `b45cac4` (MogFS v1, before step 39b) interleaved, load 4-30; the dev median of the same run is in brackets | | | | |
+| Kernel boot, kmain to end of init, no disk, `-smp 1` / `-smp 4` (us; dev 232 / 244) | QEMU hvf (`-cpu cortex-a72`), release build, 21 interleaved boots each | 212 / 219 | 224 / 243 | release cutover `b45cac4` |
+| Kernel boot with a MogFS disk mounted (us; dev 322; the `boot (us)` row of `bench-syscalls`) | QEMU hvf (`-cpu cortex-a72`), release build, 21 boots | 278 | 302 | release cutover `b45cac4` |
+| Yield round trip, `test=bench`, `-smp 1` (ns; dev 66) | QEMU hvf (`-cpu cortex-a72`), release build, 21 boots | 55 | 59 | release cutover `b45cac4` |
+| Syscall round trip from EL0, `test=bench-syscall` (ns; dev 53) | QEMU hvf (`-cpu cortex-a72`), release build, 21 boots | 48 | 52 | release cutover `b45cac4` |
+| Pipe round trip, `test=bench-pipe` (ns; dev 528) | QEMU hvf (`-cpu cortex-a72`), release build, 21 boots | 474 | 504 | release cutover `b45cac4` |
+| Thread round trip / same-process switch, `test=bench-threads` (ns; dev 446 / 468) | QEMU hvf (`-cpu cortex-a72`), release build, 21 boots | 350 / 431 | 374 / 439 | release cutover `b45cac4` |
+| Uncontended lock round trip, `test=bench-lock`: ticket / test-and-set / `arch::cpu()` / `PerCpu::with`, then contended (ns; dev 2.7 / 5.6 / 0.4 / 4.1, 144; `cpu` is a 7-instruction loop around one `mrs`, not folded) | QEMU hvf (`-cpu cortex-a72`), release build, 21 boots | 2.7 / 5.5 / 0.2 / 4.0, 116 | 2.7 / 5.6 / 0.2 / 4.1, 150 | release cutover `b45cac4` |
+| File round trips, `test=bench-fs`: `open(CREATE \| TRUNC)` + write + `sync` + `close` / `open` + `close` (ns; dev 116919 / 164) | QEMU hvf (`-cpu cortex-a72`), release build, 21 boots | 106819 / 135 | 112032 / 139 | release cutover `b45cac4` |
+| Spawn round trip, `test=bench-spawn`, without / with two arguments (ns; dev 3057 / 3389) | QEMU hvf (`-cpu cortex-a72`), release build, 21 boots | 2397 / 2794 | 2703 / 3044 | release cutover `b45cac4` |
+| Loopback TCP, `test=bench-sockets`: round trip / connect + close / 4 KiB stream send (ns; dev 4233 / 2944 / 4209) | QEMU hvf (`-cpu cortex-a72`), release build, 21 boots | 3426 / 2001 / 3341 | 3499 / 2152 / 3376 | release cutover `b45cac4` |
+| Network, `test=bench-net` to a host UDP echo: round trip / burst send / 16 in flight (ns; dev 49400 / 12691 / 15352) | QEMU hvf (`-cpu cortex-a72`), release build, 21 boots | 40537 / 12115 / 14415 | 47632 / 12440 / 14878 | release cutover `b45cac4` |
+| Disk throughput, `test=bench-disk`, 8 MiB raw image: 4 KiB write+flush / read / 256 KiB write+flush / read (MiB/s, higher is better; dev medians 159 / 247 / 3693 / 8412; a loop of 21 boots each, not `bench.sh`, which reads ns lines) | QEMU hvf (`-cpu cortex-a72`), release build, 21 interleaved boots | max 181 / 270 / 3805 / 11251 | 162 / 240 / 3659 / 9080 | release cutover `b45cac4` |
+| Syscall through musl / busybox spawn, `sh -c cbench` through the e2e shell harness under hvf, `-smp 4` (ns; dev 64 / 36435) | QEMU hvf (`-cpu cortex-a72`), release build, 11 interleaved boots | 57 / 34137 | 62 / 36733 | release cutover `b45cac4` |
+| SGI round trip, `test=bench-ipi`, `-smp 4` (ns; dev 12314 in the same 21 rounds; no profile difference: with the target spinning instead of in `wfi` both builds read 8.2 us (11 interleaved boots each), the kernel's share; the rest is hvf waking an idle vCPU, host-scheduling noise that put release anywhere from level with dev to 55% above it across runs of identical kernels) | QEMU hvf (`-cpu cortex-a72`), release build, 21 rounds | 13152 | 16721 | release cutover `b45cac4` |
+| `bench-smp` throughput at k = 1, 2, 4, 8, 12 workers (ops/s, medians of 5 interleaved boots; only k = 1 is stable: at k = 12 single boots range 50k-2.5M for syscall and 0.7k-200k for pipe on this shared host): syscall; pipe; spawn | QEMU hvf (`-cpu cortex-a72`), release build, `-smp 12`, load 5-84 | | syscall 16.2 M, 11.5 M, 10.0 M, 5.6 M, 1.3 M; pipe 29.5 k, 13.1 k, 7.9 k, 9.4 k, 86.0 k; spawn 67.7 k, 54.5 k, 34.8 k, 35.2 k, 36.1 k (dev: syscall 16.3 M, 12.1 M, 9.3 M, 6.6 M, 0.5 M; pipe 24.4 k, 17.8 k, 10.3 k, 31.6 k, 28.6 k; spawn 66.2 k, 58.7 k, 31.5 k, 56.5 k, 42.3 k) | release cutover `b45cac4` |
+| Exact TCG instruction counts (`-icount shift=0,sleep=off`, `-smp 1`): yield / syscall / pipe round trip, boot without bootargs (instructions; boot in us of 1000; dev of the same commit 429 / 250 / 2826 / 184) | QEMU TCG `-icount`, release build | 409 / 211 / 2208 / 137 | same | release cutover `b45cac4` |
+| HTTP through `hostfwd` (`test=httpd`): not re-baselined in release; its client-side timings and 64 MiB rates came from host scripts outside the repository, and `fetch=<page>,<times>` alone cannot end the boot (`httpd=0` serves forever) | | | | queued |
 
 ## Cross-OS comparison
 
@@ -293,30 +320,34 @@ Known differences, not corrected for:
 
 ### Results
 
-2026-10-07, Apple M4 Pro (12 cores), macOS 26.6.2, QEMU 9.2.1 hvf, MogOs `09053b6` plus `oscb` in the boot archive,
-release build, Alpine 3.24.2 (Linux 6.18.52-0-virt), musl 1.2.5 on both guests, 21 interleaved runs; the table is
-the script's output (columns renamed). Busy machine:
-load average 15 before, 11 after (other agents building), so the disk and `fsync` rows are noisy. Cells: median
-(best). Ratio: Linux (mitigations default) median over MogOs `oscb` median for ns, the inverse for MiB/s, so above 1
-means MogOs is faster; "native" marks a row only MogOs's Rust benchmark covers. Every MogOs `yield`, `readdir1000`
-and `file-*` run failed (`oscb: error`, reasons below).
+2026-10-08, Apple M4 Pro (12 cores), macOS 26.6.2, QEMU 9.2.1 hvf, MogOs `d5a25f3` (the kernel of main `b45cac4`),
+release build, Alpine 3.24.2 (Linux 6.18.52-0-virt), musl 1.2.5 on both guests, 21 interleaved runs under the bench
+lock; the table is the script's output (columns renamed). Load average 8 before, 32 after (other agents building), so
+the disk and `fsync` rows are noisy. Cells: median (best). Ratio: Linux (mitigations default) median over MogOs
+`oscb` median for ns, the inverse for MiB/s, so above 1 means MogOs is faster; "native" marks a row only MogOs's Rust
+benchmark covers. Every MogOs `yield`, `readdir1000` and `file-*` run failed (`oscb: error`, reasons below). The
+analysis below quotes the 2026-10-07 run (`09053b6`: `write0` 39.8, native 30.0, `pipe` 441.7, `open+close` 156.0 ns);
+MogOs's syscall paths read 15-80 ns slower here: bisected to `7565e10` (phase 10 steps 60a-60c, the BHB loop and the
+v1 `csdb`), about 24-25 ns per trap (release kernels of 11 merges from `09053b6` to `b45cac4`, 5 interleaved rounds:
+native syscall 26 -> 50 ns, flat before and after). `write0` is one trap and `pipe` six; `oscb`'s `open+close` is
+three (`open`, then the `readdir` musl's `do_openat` makes for `isdir`, then `close`): 147 -> 226 ns.
 
 | Benchmark | Unit | MogOs `oscb` | MogOs native | Linux | Linux `mitigations=off` | macOS host (reference) | MogOs vs Linux |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `getppid` | ns | 2.0 (1.9) | n/a | 105.3 (100.7) | 82.9 (80.5) | 74.7 (71.8) | n/a |
-| `write0` | ns | 39.8 (34.9) | 30.0 (28.0) | 1245.4 (1219.1) | 1216.0 (1196.2) | 450.6 (394.8) | 2.65x vs Linux `getppid` |
-| `yield` | ns | n/a | n/a | 554.9 (537.5) | 501.4 (496.8) | 155.8 (94.4) | n/a |
-| `pipe` | ns | 441.7 (409.0) | 367.0 (355.0) | 1055.9 (1036.4) | 963.0 (947.1) | 5091.4 (4635.7) | 2.39x |
-| `spawn` | ns | 18027.1 (16495.0) | 3289.0 (3034.0) | 18456.9 (16628.8) | 18139.4 (16946.8) | 1354800.4 (1222897.6) | 1.02x |
-| `open+close` | ns | 156.0 (152.5) | 93.0 (89.0) | 453.9 (445.7) | 404.3 (399.1) | 7562.7 (7356.1) | 2.91x |
-| `create+write+fsync` | ns | 163829.0 (119608.4) | 146639.0 (119856.0) | 227311.2 (198542.0) | 231912.0 (201045.7) | 52674.0 (45583.5) | 1.39x |
-| `readdir1000` | ns | n/a | n/a | 79399.2 (75798.3) | 79562.1 (72553.8) | 291324.6 (262707.9) | n/a |
-| `file-write+fsync-256k` | MiB/s | n/a | n/a | 2632.5 (2867.4) | 2632.4 (3097.9) | 3765.9 (4451.5) | n/a |
-| `file-read-256k` | MiB/s | n/a | n/a | 35430.9 (36781.6) | 34169.8 (36831.0) | 18790.4 (22349.0) | n/a |
-| `raw-write+flush-4k` | MiB/s | n/a | 176.0 (198.0) | 97.7 (114.4) | 106.6 (129.2) | n/a | 1.80x (native) |
-| `raw-read-4k` | MiB/s | n/a | 226.0 (254.0) | 122.4 (146.7) | 127.3 (137.7) | n/a | 1.85x (native) |
-| `raw-write+flush-256k` | MiB/s | n/a | 3449.0 (4134.0) | 2394.3 (2749.2) | 2579.7 (3164.2) | n/a | 1.44x (native) |
-| `raw-read-256k` | MiB/s | n/a | 8032.0 (11347.0) | 4686.4 (6660.9) | 5241.3 (6570.4) | n/a | 1.71x (native) |
+| `getppid` | ns | 2.5 (2.4) | n/a | 105.1 (100.8) | 82.5 (80.4) | 72.8 (71.4) | n/a |
+| `write0` | ns | 64.0 (57.8) | 55.0 (54.0) | 1231.9 (1197.6) | 1211.5 (1192.1) | 402.8 (381.1) | 1.64x vs getppid |
+| `yield` | ns | n/a | n/a | 546.6 (537.1) | 498.3 (486.5) | 93.7 (85.9) | n/a |
+| `pipe` | ns | 571.3 (554.4) | 505.0 (497.0) | 1047.0 (1028.4) | 957.0 (939.1) | 4713.2 (4473.0) | 1.83x |
+| `spawn` | ns | 15345.5 (14476.5) | 2919.0 (2669.0) | 17596.7 (16172.7) | 17588.9 (16409.0) | 1164473.1 (1121749.2) | 1.15x |
+| `open+close` | ns | 239.0 (233.2) | 150.0 (146.0) | 446.3 (440.8) | 398.9 (394.7) | 7375.9 (7220.0) | 1.87x |
+| `create+write+fsync` | ns | 122668.6 (107322.1) | 120662.0 (105775.0) | 194152.6 (180254.3) | 190440.3 (180937.9) | 43992.0 (40625.5) | 1.58x |
+| `readdir1000` | ns | n/a | n/a | 75701.3 (72363.8) | 76097.5 (71655.0) | 239878.8 (225941.3) | n/a |
+| `file-write+fsync-256k` | MiB/s | n/a | n/a | 2801.8 (3201.0) | 2767.7 (2926.0) | 4222.0 (4932.9) | n/a |
+| `file-read-256k` | MiB/s | n/a | n/a | 36036.0 (37412.3) | 36240.1 (37573.4) | 22974.8 (24480.4) | n/a |
+| `raw-write+flush-4k` | MiB/s | n/a | 188.0 (221.0) | 118.0 (134.9) | 116.7 (133.0) | n/a | 1.59x (native) |
+| `raw-read-4k` | MiB/s | n/a | 231.0 (316.0) | 143.3 (157.3) | 143.7 (171.9) | n/a | 1.61x (native) |
+| `raw-write+flush-256k` | MiB/s | n/a | 3708.0 (4142.0) | 2808.0 (3122.4) | 2781.0 (3164.1) | n/a | 1.32x (native) |
+| `raw-read-256k` | MiB/s | n/a | 8629.0 (12121.0) | 5756.1 (7147.9) | 5627.4 (6991.0) | n/a | 1.50x (native) |
 
 ### Analysis
 
@@ -389,7 +420,11 @@ BHB"), which is what lets the `getppid` delta be charged to BHB alone.
 | Zeroing on allocation (`INIT_ON_ALLOC_DEFAULT_ON`) | `spawn`, `map`, `pipe` | unmeasured, in both columns | Declined: safe Rust cannot read uninitialized heap memory, and frames given to user space are already zeroed (`map`), a cost the baselines already pay | phase 10 (decision) | declined, by design |
 | List pointer checks (`LIST_HARDENED`) | `yield`, `pipe`, `spawn` | unmeasured, in both columns | Declined: the kernel has no pointer-linked lists; phase 5's run queues link by bounds-checked indexes | phase 10 (decision) | declined, by design |
 | Multi-core wake and IPI paths | `pipe`, `yield`, `spawn` | in every number (Alpine is an SMP kernel even at `-smp 1`: real atomics, wait queues, RCU) | One big ticket lock first (one uncontended round trip per trap), the reschedule SGI only to wake idle cores (and only for a task still waiting at the end of the trap), deterministic placement with no wake-affine heuristics (step 28a's direct-switch `call` for ping-pong, two traps per round trip: about 220 ns at `-smp 1` and `-smp 4`, estimate), TLB shootdown by broadcast `tlbi ... is` with no IPI | phase 5 steps 24, 25b, 25c, 28, 28a | lock share paid in step 24: 2.9 ns per round trip, syscall 30 -> 32 ns, pipe 375 -> 389 ns; per-core scheduler paid in 25b/25c at `-smp 1` (against main `7565e10`, 63 boots: syscall 68 -> 69, yield 91 -> 93, pipe 629 -> 646 ns; TCG +152 instructions per yield and +274 per pipe round trip, not yet shown unavoidable); cross-core hand-off at `-smp 4` unpaid by design (pipe 412 -> 2289 ns, spawn 3.7 -> 18.6 us: an SGI and a vCPU wake per hand-off; `bench-ipi` 9-17 us under GICv3) |
-| Big kernel lock under several cores | `bench-smp`, every syscall on several cores | per-object locks, RCU, per-CPU run queues | Split `KERNEL`: per-process locks first (map cursor, handle-table writes, futex waiters born there in 27; handle lookups by seqlock, with no lock; budgets atomic) under a compile-time lock order (step 26a), then per-core run queues with a wake inbox and per-pipe locks (step 28), a queued lock for what stays shared (step 32) | phase 5 steps 26a, 28, 32 | unpaid: `bench-smp` at `-smp 12` (25c) falls with workers: syscall 14.4 M ops/s at k = 1, 10.9 M at 2, 7.1 M at 4, 2.1 M at 8, 0.02 M at 12; pipe 13.4 k, 8.6 k, 4.3 k, 5.4 k, 2.5 k round trips/s; spawn 53.9 k, 41.7 k, 13.6 k, 9.2 k, 1.5 k/s |
+| Per-process locks' cost on one core (26a) | `dup`, `close`, `open`, `mutex`, `map`, `pipe`, `thread` | (Linux's per-file-table lock and RCU fd lookups, per-mm locks: the same split) | Measured, not owed: the split is the design (seqlock lookups, a process lock before `KERNEL` for table writes, atomic budgets, a frame-allocator lock, a kernel stack freed at the trap exit) | phase 5 step 26a | paid, release builds (`--release`, LTO), hvf, 63 interleaved rounds under the benchmark lock against main `b45cac4`, load 8-28 (median ns, `-smp 1`): syscall round trip 52 -> 46, pipe 472 -> 449, thread create + join 391 -> 372, thread pipe 445 -> 423, spawn per call 1613 -> 1379; per call `dup` 59.8 -> 54.5, `close` 57.7 -> 52.3, `pipe` 98.3 -> 61.6, `mutex` 53.3 -> 53.4, console write and read, pipe I/O and file read 2-6 ns faster (`-smp 4`: thread create + join 5424 -> 4921, spawn round trip 13551 -> 12515). What is left is the next row, owed to step 28 |
+| Shared calls' class test, seqlock read and tag decode (26a) | `open`, `readdir`, `sync`, `wait`, `lock`, `unlock` | (Linux takes per-object locks and RCU fd lookups on these paths) | A call on shared state takes `KERNEL` before its lookup, behind a class test of its number (about 7 instructions), and the lookup is still the seqlock read (+6 against a plain load) with a tag decode; `open` also counts the inode's opens (`Opens::open`, unlink's hold check, as no core may scan other processes' tables) and `sync` calls `Fs::commit` out of line. Step 28 takes `KERNEL` off these paths (per-object locks), which removes the class test and lets each call look its handle up under the lock it takes | phase 5 step 28 | owed (release, hvf `-smp 1`, 63 rounds against `b45cac4`: `open` 88.3 -> 92.3 ns, `readdir` 90.0 -> 93.5, `sync` 54.5 -> 55.4, `wait` 69.0 -> 70.9, `lock` 58.0 -> 58.5, `unlock` 61.2 -> 61.9; TCG instructions per call, main -> branch: `open` 642 -> 725, `readdir` 743 -> 775, `sync` 195 -> 230, `wait` 306 -> 331, `lock` 219 -> 228, `unlock` 285 -> 293) |
+| Spawn throughput at 4 workers (26a) | `bench-smp` spawn, k = 4 | (Linux's per-CPU run queues and wake-affine placement) | After 26a a core that ended a process's last thread releases it from its idle context and then picks a task under the one shared table; with the reschedule signals and `KERNEL` holds per spawn back at main's (1.01-1.16 SGIs, 6.1 acquisitions), k = 4 still reads below main. Step 28's per-core run queues and wake inbox replace this pick and wake path wholesale | phase 5 step 28 | owed (release, hvf `-smp 12`, 31 interleaved boots each, against `b45cac4`: 45.4 -> 41.1, 48.3 -> 43.7, 45.6 -> 42.0 k spawns/s; a main-against-main A/A in the same session read 44.0 / 47.5 k, an 8% spread; k = 1, 2, 8, 12 at or above main) |
+| Per-core switch on one shared table, `-smp 1` | `yield`, `pipe`, `spawn`, every hook | (Linux's per-CPU run queues: no shared-table core lookup) | Step 28's per-core run queues, touched only by their own core, remove the core lookup and its bounds check per hook, the `on_core` set/clear and test, and the kick test | phase 5 step 28 | owed (25c follow-up, TCG instructions per round trip against main `e997c36`): yield 373 -> 453 (+80, two switches), pipe 2642 -> 2826 (+184), thread pipe 2626 -> 2808 (+182), syscall 245 -> 250 (+5), spawn 39534 -> 39829 (+295); hvf `-smp 1` yield 77 -> 78, pipe 528 -> 539 ns. Step 28's done-when brings yield and pipe at `-smp 1` back to `e997c36`'s counts |
+| Big kernel lock under several cores | `bench-smp`, every syscall on several cores | per-object locks, RCU, per-CPU run queues | Split `KERNEL`: per-process locks first (map cursor, handle-table writes, futex waiters born there in 27; handle lookups by seqlock, with no lock; budgets atomic) under a compile-time lock order (step 26a), then per-core run queues with a wake inbox and per-pipe locks (step 28), a queued lock for what stays shared (step 32) | phase 5 steps 26a, 28, 32 | per-process share paid in 26a: `bench-smp` syscall at `-smp 12` now scales (15.4 M ops/s at k = 1, 31.6 M at 2, 51.0 M at 4, 68.4 M at 8, 92.3 M at 12, against main's 14.8 M, 8.9 M, 7.2 M, 1.8 M, 0.013 M in the same run, load 9-153), its `KERNEL` contention 2-16 acquisitions; pipe and spawn still take `KERNEL` (28, 32): pipe 15.9 k, 8.9 k, 3.1 k, 3.5 k, 1.1 k; spawn 52.3 k, 29.5 k, 10.0 k, 4.4 k, 0.47 k/s (25c: syscall 14.4 M, 10.9 M, 7.1 M, 2.1 M, 0.02 M) |
 | Fair-scheduler pick | `yield`, `pipe` (wake) | in `yield` (555 ns) and `pipe` (EEVDF pick, rbtree, `update_curr`) | EEVDF over a linear scan of the core's fair tasks with vruntimes relative to the queue minimum, no tunables, one cached timer deadline; RT tasks (the syscall and pipe benchmarks) never reach it | phase 5 step 29 | unpaid |
 | Group accounting | `yield`, `pipe` | in the same rows (hierarchical `sched_entity` charging; the benchmarks run in the root group) | Groups do not nest: one entity per group in each core's fair queue, a token bucket only on groups with a quota, so an ungrouped task pays one charge | phase 5 step 30 | unpaid |
 | Inode timestamps | `create+write+fsync`, `file-write+fsync-256k`, `readdir1000` | in those rows (`relatime`: mtime and ctime on every write, atime at most daily) | MogFS inode items carry mtime, ctime and btime as 64-bit ns, written inside the inode item the commit already copies, the clock from `CNTVCT_EL0`; no atime, so a read never dirties an inode | phase 7 steps 39, 39b | unpaid: the format carries the times since 39b, but the kernel never calls `Fs::set_time`, so every time reads 0 |
@@ -400,6 +435,8 @@ BHB"), which is what lets the `getppid` delta be charged to BHB alone.
 | Tracing hooks | every syscall and switch | near zero when off (static keys patch tracepoints to `nop`), plus the entry work-flag test | Per-CPU rings of fixed records; without code patching the hook is one load and branch on a flag the compiler can see, measured against a build without it | phase 10 step 60 (the survey's step-24 trace skeleton was not built in phase 5) | unpaid |
 | Signals | syscall exit, `pipe` | in every row (a pending-work flag test on each return to EL0; signal checks in every wait) | No signal state in the kernel: libc builds signals from the exception channel and a notify bit that completes a wait; a remote stop reuses the switch path's kill mark and the reschedule SGI, so the syscall exit gains nothing | phase 9 step 53 | unpaid |
 | Timer tick during benchmarks | every row | in every row (1000 Hz, each tick a VM exit) | MogOs's `test=shell` runs without its timer; once the shell runs in the fair class its slice timer is on, and the rerun keeps it on | phase 5 step 29 | unpaid |
+| musl `open`'s directory probe (owed to MogOs) | `open+close`, every C `open` | none: Linux's `open` returns the inode's type with the fd | `open` returns the file kind, so musl's `do_openat` drops its `isdir` `readdir` trap: about 25 ns per `open` | after phase 5 step 27; owner libc and kernel | queued |
+| `bench-ipi` comparability (owed to the benchmark) | `bench-ipi` | n/a | Track the round trip with the target spinning (8.2 us in both profiles, stable) as the comparable row, and the idle-wake round trip (the target in `wfi`, hvf wake noise) as information only; its own hvf A/B | owner smp | queued |
 
 At the 2026-10-07 run only the step-24 lock share was paid; 60a has since paid the BHB row. Linux's hardening defaults above come from Alpine's
 `config-6.18.52-0-virt`. KPTI is in neither Linux column: A72 is on Linux's KPTI safe list, and `RANDOMIZE_BASE` is

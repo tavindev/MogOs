@@ -225,6 +225,18 @@ impl Sub for Page {
     }
 }
 
+impl Inode {
+    /// Its number, for a table that stores it in a word (the kernel's lock-free handle table).
+    pub fn raw(self) -> u64 {
+        self.0
+    }
+
+    /// The inode `raw` returned this number for.
+    pub fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     File,

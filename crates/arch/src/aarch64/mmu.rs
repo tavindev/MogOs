@@ -339,6 +339,49 @@ pub unsafe fn set_ttbr0(table: PhysAddr, asid: usize) {
     };
 }
 
+/// The level-1 table TTBR0 points at: the running process's, during its syscall.
+pub fn user_table() -> PhysAddr {
+    let ttbr0: u64;
+    // SAFETY: reading TTBR0_EL1 has no side effects.
+    unsafe { asm!("mrs {}, ttbr0_el1", out(reg) ttbr0, options(nomem, nostack, preserves_flags)) };
+    PhysAddr(ttbr0 & ADDR)
+}
+
+/// How many level-2 and level-3 tables `map_page` adds under `l1` to map every page of `start..end`, so a caller can
+/// take them with the pages.
+///
+/// # Safety
+///
+/// As `map_page` for `l1`, and `start..end` must be page-aligned, from 4 GiB up, below 512 GiB.
+pub unsafe fn missing_tables(l1: PhysAddr, start: u64, end: u64) -> usize {
+    const GIB: u64 = 1 << 30;
+    const REGION: u64 = 1 << 21;
+    let (mut count, mut va) = (0, start);
+    while va < end {
+        // SAFETY: the caller guarantees `l1` is an identity-mapped table of this address space.
+        let l1e = unsafe {
+            (l1.0 as *const u64)
+                .wrapping_add((va >> 30) as usize & 511)
+                .read()
+        };
+        if l1e & VALID_TABLE_OR_PAGE != VALID_TABLE_OR_PAGE {
+            let last = end.min((va | (GIB - 1)) + 1);
+            count += 1 + (((last - 1) >> 21) - (va >> 21) + 1) as usize;
+            va = last;
+            continue;
+        }
+        // SAFETY: as above; a table descriptor of this space points at its level-2 table.
+        let l2e = unsafe {
+            ((l1e & ADDR) as *const u64)
+                .wrapping_add((va >> 21) as usize & 511)
+                .read()
+        };
+        count += (l2e & VALID_TABLE_OR_PAGE != VALID_TABLE_OR_PAGE) as usize;
+        va = (va | (REGION - 1)) + 1;
+    }
+    count
+}
+
 /// Drops every non-global TLB entry tagged with `asid`, on every core.
 pub fn flush_asid(asid: usize) {
     // SAFETY: invalidating TLB entries only forces later walks.
@@ -387,33 +430,34 @@ pub fn user_writable(va: u64) -> bool {
     par & 1 == 0
 }
 
-/// Cleans `start..start + len` to the point of unification, the first half of making instructions written there
-/// visible to instruction fetch; `invalidate_icache` completes it for every range cleaned before it.
+/// Makes instructions written to `start..start + len` visible to instruction fetch on every core: cleans its D-cache
+/// lines to the point of unification, then invalidates its I-cache lines by address, which reaches every alias of a
+/// line in the PIPT I-caches of QEMU `virt`'s Cortex-A72 (CTR_EL0.L1Ip) and under hvf; `icache_synced` completes it
+/// for every range before it. Line by line beats `ic ialluis` on spawn (`bench-smp`, k = 2 to 8).
 ///
 /// # Safety
 ///
 /// The range must be mapped.
-pub unsafe fn clean_dcache(start: usize, len: usize) {
+pub unsafe fn sync_icache(start: usize, len: usize) {
     let ctr: usize;
     // SAFETY: reading CTR_EL0 has no side effects.
     unsafe { asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack, preserves_flags)) };
-    let line = 4 << ((ctr >> 16) & 0xf);
-    for addr in (start & !(line - 1)..start + len).step_by(line) {
+    debug_assert_eq!((ctr >> 14) & 3, 3, "a PIPT I-cache (CTR_EL0.L1Ip)");
+    let (dline, iline) = (4 << ((ctr >> 16) & 0xf), 4 << (ctr & 0xf));
+    for addr in (start & !(dline - 1)..start + len).step_by(dline) {
         // SAFETY: cleaning a mapped line to the point of unification does not change memory contents.
         unsafe { asm!("dc cvau, {}", in(reg) addr, options(nostack, preserves_flags)) };
     }
+    // SAFETY: a barrier only orders the cleans before the invalidates.
+    unsafe { asm!("dsb ish", options(nostack, preserves_flags)) };
+    for addr in (start & !(iline - 1)..start + len).step_by(iline) {
+        // SAFETY: invalidating a mapped line only discards stale instructions.
+        unsafe { asm!("ic ivau, {}", in(reg) addr, options(nostack, preserves_flags)) };
+    }
 }
 
-/// Waits for the cleans before it, then discards every stale instruction in every core's I-cache.
-pub fn invalidate_icache() {
-    // SAFETY: barriers and an I-cache invalidate only discard stale instructions.
-    unsafe {
-        asm!(
-            "dsb ish",
-            "ic ialluis",
-            "dsb ish",
-            "isb",
-            options(nostack, preserves_flags)
-        )
-    };
+/// Waits for the `sync_icache` invalidates before it to complete everywhere.
+pub fn icache_synced() {
+    // SAFETY: barriers only.
+    unsafe { asm!("dsb ish", "isb", options(nostack, preserves_flags)) };
 }

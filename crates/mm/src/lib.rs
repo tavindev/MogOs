@@ -2,6 +2,8 @@
 
 use core::fmt;
 use core::ops::Range;
+use core::sync::atomic::AtomicU64;
+use core::sync::atomic::Ordering::Relaxed;
 
 const FRAME_SIZE: u64 = 4096;
 
@@ -118,6 +120,37 @@ impl<const WORDS: usize> FrameAllocator<WORDS> {
         Some(PhysAddr(self.base + (word * 64 + bit) as u64 * FRAME_SIZE))
     }
 
+    /// Takes `count` free frames in one pass over the bitmap, handing each to `put` with its position, after a count of
+    /// the free bits from the hint on; false, taking none, if too few are free.
+    pub fn alloc_many(&mut self, count: usize, mut put: impl FnMut(usize, PhysAddr)) -> bool {
+        let mut free = 0;
+        let enough = (self.used[self.hint..].iter()).any(|w| {
+            free += w.count_zeros() as usize;
+            free >= count
+        });
+        if count == 0 || !enough {
+            return count == 0;
+        }
+        let mut taken = 0;
+        for w in self.hint..WORDS {
+            let word = &mut self.used[w];
+            while *word != u64::MAX {
+                let bit = word.trailing_ones() as usize;
+                *word |= 1 << bit;
+                put(
+                    taken,
+                    PhysAddr(self.base + (w * 64 + bit) as u64 * FRAME_SIZE),
+                );
+                taken += 1;
+                if taken == count {
+                    self.hint = w;
+                    return true;
+                }
+            }
+        }
+        unreachable!("counted")
+    }
+
     /// Panics if `frame` was not allocated from this allocator.
     pub fn free(&mut self, frame: PhysAddr) {
         let offset = frame.0 - self.base;
@@ -141,77 +174,104 @@ impl<const WORDS: usize> FrameAllocator<WORDS> {
     }
 }
 
-/// Frames a process may hold; every frame taken through it is charged at allocation time.
-pub struct Budget {
-    limit: usize,
-    used: usize,
-}
+/// Most frames a `Budget` counts: its limit and use are each a `u32` (16 TiB of 4 KiB frames).
+pub const MAX_FRAMES: usize = u32::MAX as usize;
+
+/// Frames a process may hold; every frame taken through it is charged at allocation time. The limit (high half) and
+/// the frames used (low half) share one word and each checked change is one CAS on both (an unchecked one an add), so a check and its update never see
+/// two different limits, and any core may charge or refund it without a lock.
+pub struct Budget(AtomicU64);
 
 impl Budget {
+    /// Panics above `MAX_FRAMES`.
     pub const fn new(limit: usize) -> Self {
-        Self { limit, used: 0 }
+        assert!(limit <= MAX_FRAMES, "budget over MAX_FRAMES");
+        Self(AtomicU64::new((limit as u64) << 32))
+    }
+
+    /// Applies `f` to (limit, used) in one CAS; false, changing nothing, if `f` refuses.
+    fn update(&self, f: impl Fn(u64, u64) -> Option<(u64, u64)>) -> bool {
+        (self.0)
+            .try_update(Relaxed, Relaxed, |w| {
+                f(w >> 32, w & u64::from(u32::MAX)).map(|(limit, used)| limit << 32 | used)
+            })
+            .is_ok()
     }
 
     /// Takes a frame from `frames` and charges it; `None` (nothing charged) over budget or out of frames.
-    pub fn alloc<const W: usize>(&mut self, frames: &mut FrameAllocator<W>) -> Option<PhysAddr> {
-        if self.used == self.limit {
-            return None;
-        }
-        let frame = frames.alloc()?;
-        self.used += 1;
-        Some(frame)
+    pub fn alloc<const W: usize>(&self, frames: &mut FrameAllocator<W>) -> Option<PhysAddr> {
+        self.charge(1).then(|| frames.alloc())?.or_else(|| {
+            self.refund(1);
+            None
+        })
     }
 
     /// Takes `count` contiguous frames and charges them; `None` (nothing charged) over budget or out of frames.
     pub fn alloc_contiguous<const W: usize>(
-        &mut self,
+        &self,
         frames: &mut FrameAllocator<W>,
         count: usize,
     ) -> Option<Range<PhysAddr>> {
-        if self.remaining() < count {
-            return None;
-        }
-        let range = frames.alloc_contiguous(count)?;
-        self.used += count;
-        Some(range)
+        self.charge(count)
+            .then(|| frames.alloc_contiguous(count))?
+            .or_else(|| {
+                self.refund(count);
+                None
+            })
     }
 
     /// Returns `frame` to `frames` and refunds it.
-    pub fn free<const W: usize>(&mut self, frames: &mut FrameAllocator<W>, frame: PhysAddr) {
+    pub fn free<const W: usize>(&self, frames: &mut FrameAllocator<W>, frame: PhysAddr) {
         frames.free(frame);
-        self.used -= 1;
+        self.refund(1);
     }
 
-    /// Charges `count` frames the kernel holds outside the allocator for the owner; false, charging nothing, over budget.
-    pub fn charge(&mut self, count: usize) -> bool {
-        let fits = count <= self.remaining();
-        if fits {
-            self.used += count;
-        }
-        fits
+    /// Charges `count` frames; false, charging nothing, over budget. A charge the allocator then cannot fill is
+    /// refunded, so meanwhile another charge may fail that would fit once it is (only with the frames run out).
+    pub fn charge(&self, count: usize) -> bool {
+        self.update(|limit, used| {
+            (count as u64 <= limit - used).then(|| (limit, used + count as u64))
+        })
     }
 
     /// Refunds `count` frames `charge` took.
-    pub fn refund(&mut self, count: usize) {
-        self.used -= count;
+    pub fn refund(&self, count: usize) {
+        let was = self.0.fetch_sub(count as u64, Relaxed);
+        debug_assert!(
+            was & u64::from(u32::MAX) >= count as u64,
+            "refund over the charge"
+        );
     }
 
-    /// Lowers the limit by `frames`, which moved to a child's budget; panics if fewer remain.
-    pub fn shrink(&mut self, frames: usize) {
-        assert!(frames <= self.remaining(), "budget overdrawn");
-        self.limit -= frames;
+    /// Lowers the limit by `frames`, which move to a child's budget; false, changing nothing, if fewer remain.
+    pub fn shrink(&self, frames: usize) -> bool {
+        self.update(|limit, used| {
+            (frames as u64 <= limit - used).then(|| (limit - frames as u64, used))
+        })
     }
 
     /// Raises the limit by `frames`, which came back from an exited child's budget.
-    pub fn grow(&mut self, frames: usize) {
-        self.limit += frames;
+    pub fn grow(&self, frames: usize) {
+        self.0.fetch_add((frames as u64) << 32, Relaxed);
+    }
+
+    /// Starts the budget over at `limit` with nothing charged, for the next process at an index.
+    pub fn reset(&self, limit: usize) {
+        assert!(limit <= MAX_FRAMES, "budget over MAX_FRAMES");
+        self.0.store((limit as u64) << 32, Relaxed);
+    }
+
+    /// Empties the budget: returns its limit and leaves 0 (frames still charged stay with their holders).
+    pub fn take(&self) -> usize {
+        (self.0.swap(0, Relaxed) >> 32) as usize
     }
 
     pub fn limit(&self) -> usize {
-        self.limit
+        (self.0.load(Relaxed) >> 32) as usize
     }
 
     pub fn remaining(&self) -> usize {
-        self.limit - self.used
+        let w = self.0.load(Relaxed);
+        ((w >> 32) - (w & u64::from(u32::MAX))) as usize
     }
 }

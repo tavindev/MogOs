@@ -3,7 +3,7 @@
 //! reaches above its directory through a path. The walk is bounded by the path's length: a crafted image can point an
 //! entry at `ROOT` or an ancestor (a cycle), so nothing here recurses over the tree.
 
-use mogfs::{Disk, Error, Fs, Inode, Kind};
+use mogfs::{Disk, Error, Fs, Inode, Kind, ROOT};
 
 use crate::cpio;
 use crate::handle::Object;
@@ -146,4 +146,65 @@ pub fn list_archive(archive: &[u8], cursor: u64, out: &mut [u8]) -> Result<(usiz
         out[len - 1] = b'\n';
     }
     Ok((len, u64::MAX))
+}
+
+/// Open handles per inode, counted as handles to a `Dir` or `Node` open and close, so `unlink` asks it instead of
+/// scanning every process's table (each behind its own lock). `N` bounds the handles open at once (every process's
+/// table), so it never runs out of entries and allocates nothing.
+pub struct Opens<const N: usize> {
+    counts: [(Inode, u32); N],
+    len: usize,
+}
+
+impl<const N: usize> Opens<N> {
+    pub const fn new() -> Self {
+        Self {
+            counts: [(ROOT, 0); N],
+            len: 0,
+        }
+    }
+
+    /// A handle to `object` opened; one to anything but a `Dir` or `Node` is not counted.
+    pub fn open(&mut self, object: Object) {
+        let (Object::Dir(inode) | Object::Node(inode)) = object else {
+            return;
+        };
+        match self.counts[..self.len]
+            .iter_mut()
+            .find(|(i, _)| *i == inode)
+        {
+            Some((_, count)) => *count += 1,
+            None => {
+                self.counts[self.len] = (inode, 1);
+                self.len += 1;
+            }
+        }
+    }
+
+    /// A handle to `object` closed.
+    pub fn close(&mut self, object: Object) {
+        let (Object::Dir(inode) | Object::Node(inode)) = object else {
+            return;
+        };
+        let at = self.counts[..self.len]
+            .iter()
+            .position(|(i, _)| *i == inode);
+        let at = at.expect("a close without its open");
+        self.counts[at].1 -= 1;
+        if self.counts[at].1 == 0 {
+            self.len -= 1;
+            self.counts[at] = self.counts[self.len];
+        }
+    }
+
+    /// Whether a handle reaches `inode`.
+    pub fn held(&self, inode: Inode) -> bool {
+        self.counts[..self.len].iter().any(|(i, _)| *i == inode)
+    }
+}
+
+impl<const N: usize> Default for Opens<N> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
