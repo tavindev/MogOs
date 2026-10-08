@@ -61,7 +61,7 @@ libcalls. Needs: Homebrew `llvm` (clang 19 or later for `-mabi=aapcs-soft`), `gs
 | `criterion` (no default features), `cpu-time` | `[dev-dependencies]` of `mm`, `mogfs`, `net`, `mogfs2` | Host benchmarks: criterion gives each row a confidence interval and the change against a saved baseline, which `scripts/bench.sh host` turns into an interleaved A/B; `cpu-time` reads the thread's CPU time for `benches/thread_time.rs`, since wall time on this loaded host counts other processes' time. Without default features: no plotters, no rayon. Dev-only, so never in the kernel build; `cargo test-host` compiles them for these crates' tests. |
 | `panic = "abort"` | both profiles | No unwinding in a kernel. |
 | dev `opt-level = 1` | root `Cargo.toml` | Opt-level 0 kernel code has bloated stack frames and slow MMIO loops; measured build cost is zero. Trade-off: some locals show as optimized out in the debugger. |
-| release `lto = true`, `codegen-units = 1` | root `Cargo.toml` | Smallest/fastest release image; release only, so the inner loop does not pay for it. |
+| release `lto = true`, `codegen-units = 1` | root `Cargo.toml` | Smallest/fastest release image, the one every tracked kernel benchmark measures (`docs/BENCHMARKS.md`); release only, so the inner loop does not pay for it. |
 | `unsafe_code = "forbid"` | `[workspace.lints.rust]` | Every crate is safe Rust by default; the compiler rejects `unsafe` outside `arch` and board crates. |
 | `unsafe_op_in_unsafe_fn = "deny"` | `qemu-virt`, `arch`, `user` `[lints.rust]` | Each unsafe op inside an `unsafe fn` needs its own `unsafe {}` block and justification. |
 | `clippy::undocumented_unsafe_blocks = "deny"` | `qemu-virt`, `arch`, `user` `[lints.clippy]` | Enforces the `// SAFETY:` comment rule mechanically. |
@@ -95,10 +95,10 @@ cargo run -- -append test=mmu-fault  # reads an unmapped address after MMU on; p
 cargo run -- -append test=wx-text    # stores to kernel text (wx-exec: branches to a .data word; wx-guard: core 0's stack overflows into its guard page); prints the fault
 cargo run -- -smp 1 -append test=el0-before-spec  # runs a user program before core 0 chooses its vector table; the boot table panics
 cargo run -- -append test=yield      # tasks a and b print 0..2 in turn via `svc` yield
-cargo run -- -append test=bench      # prints the yield round trip in ns
+cargo run --release -- -append test=bench      # prints the yield round trip in ns
 cargo run -- -append test=preempt    # timer preempts spinning task a; task b prints 0..2
 cargo run -- -append test=user       # EL0 process A writes A: 0..9 to its console handle; B reads A's address, then C (B's process index) kernel RAM: both killed (fault: 2 ec=0x24 far=...)
-cargo run -- -append test=bench-syscall  # EL0 loop of no-op syscalls, prints the round trip in ns
+cargo run --release -- -append test=bench-syscall  # EL0 loop of no-op syscalls, prints the round trip in ns
 cargo run -- -append test=handles    # EL0 process writes via its console handle, then a no-write duplicate, a closed and a stale handle fail (H: lines)
 cargo run -- -append test=map-end    # asm fixture whose map cursor starts two pages below USER_END: one page maps, three are ENOMEM, the last page maps (N: lines)
 cargo run -- -append test=budget     # EL0 process maps pages until ENOMEM (M: lines), exits; free frames before/after its lifetime match
@@ -107,32 +107,32 @@ cargo run -- -append test=pipe       # reader blocks on an empty pipe until its 
 cargo run -- -append test=wait       # waiter's child A exits before child B is spawned; wait still returns both codes and budgets; closing a third, exited child's handle returns its budget too (P: and C: lines); free frames before/after match
 cargo run -- -append test=pi         # timer on: L (priority 1) holds a mutex H (3) blocks on while Mid (2) is ready to spin forever; H acquires only through priority inheritance, then init kills Mid (L:, H:, P: lines; no M: line); free frames before/after match
 cargo run -- -append test=echo       # readlines prints E: ready, reads two lines typed on the console (echoed, backspace erases), prints got: <line> for each
-cargo run -- -append test=bench-spawn # spawnbench spawns nop, waits and closes it 1000 times without and then with two arguments; prints each round trip in ns
-cargo run -- -append test=bench-pipe # ping and pong echo one byte over two pipes 100000 times; prints the round trip in ns
+cargo run --release -- -append test=bench-spawn # spawnbench spawns nop, waits and closes it 1000 times without and then with two arguments; prints each round trip in ns
+cargo run --release -- -append test=bench-pipe # ping and pong echo one byte over two pipes 100000 times; prints the round trip in ns
 cargo run -- -smp 1 -append test=refund  # refund kills its child nop (a zombie it holds), hands its blocked last thread's handle to refundc, which kills it: R: the killer gained 0 pages (the zombie's frames go to the holder)
 cargo run -- -append test=threads    # timer on: four threads add to a shared counter (T: count 400000) and are joined with their TLS as exit codes; a process with a spinning and a blocked thread is killed; free frames before/after match
-cargo run -- -append test=bench-threads # threadbench: thread create + join + close 1000 times, then one byte to a thread of the same process and back over two pipes 100000 times; prints each round trip in ns
-cargo run -- -smp 12 -append test=bench-smp  # 1, 2, 4, 8, 12 smpwork processes at once (up to the cores) for 0-byte writes, pipe round trips with their own pong, spawn + wait of nop; prints ops/s and KERNEL's contended acquisitions per run
-cargo run -- -append test=bench-ipi  # core 0 sends core 1 an SGI that it answers with one, 1000 times; prints the round trip in ns
-cargo run -- -append test=bench-lock # uncontended acquire + release of the ticket and a test-and-set lock in ns; two timer-preempted tasks add 10^7 each under the lock (lock: count 20000000)
+cargo run --release -- -append test=bench-threads # threadbench: thread create + join + close 1000 times, then one byte to a thread of the same process and back over two pipes 100000 times; prints each round trip in ns
+cargo run --release -- -smp 12 -append test=bench-smp  # 1, 2, 4, 8, 12 smpwork processes at once (up to the cores) for 0-byte writes, pipe round trips with their own pong, spawn + wait of nop; prints ops/s and KERNEL's contended acquisitions per run
+cargo run --release -- -append test=bench-ipi  # core 0 sends core 1 an SGI that it answers with one, 1000 times; prints the round trip in ns
+cargo run --release -- -append test=bench-lock # uncontended acquire + release of the ticket and a test-and-set lock in ns; two timer-preempted tasks add 10^7 each under the lock (lock: count 20000000)
 cargo run -- -append test=smp  # cores 1-3 start (PSCI CPU_ON, as a tree), smp: 4 cpus online in <us> us; threads' victim is killed while one thread spins on another core; with the timer off four kernel tasks each print a distinct core (smp: spinner on cpu <n>); once every core took a timer tick, smp: 4 cpus ticked
-cargo run -p mogfs --example mkfs --target aarch64-apple-darwin -- b.img 1024; cargo run -- -drive file=b.img,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0 -append test=bench-syscalls  # fresh image; prints `bench <call>: <ns> ns` for every syscall's fast path
-cargo run -p mogfs --example mkfs --target aarch64-apple-darwin -- b.img 1024; cargo run -- -drive file=b.img,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0 -append test=bench-shell  # fresh image; shellsetup makes fixtures, msh times 11 commands 5 times (`bench <command>: <ns> ns`)
-scripts/bench.sh bench-syscalls 21 new_mog_os base_mog_os  # hvf A/B, interleaved; see docs/BENCHMARKS.md
+cargo run -p mogfs --example mkfs --target aarch64-apple-darwin -- b.img 1024; cargo run --release -- -drive file=b.img,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0 -append test=bench-syscalls  # fresh image; prints `bench <call>: <ns> ns` for every syscall's fast path
+cargo run -p mogfs --example mkfs --target aarch64-apple-darwin -- b.img 1024; cargo run --release -- -drive file=b.img,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0 -append test=bench-shell  # fresh image; shellsetup makes fixtures, msh times 11 commands 5 times (`bench <command>: <ns> ns`)
+scripts/bench.sh bench-syscalls 21  # hvf, the release build 21 times; with `<new mog_os> <base mog_os>` after 21 an interleaved A/B; see docs/BENCHMARKS.md
 cargo run -p mogfs --example mkfs --target aarch64-apple-darwin -- fuzz.img 1024; cargo run -- -drive file=fuzz.img,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0 -append "test=fuzz fuzz=7,1000000"  # syscall fuzzer on a fresh image: seed 7, a million calls ("Testing strategy")
 cargo run -- -drive file=disk.img,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0 -append test=disk  # attach a raw image (`truncate -s 1M disk.img`); every boot prints `disk: <n> blocks` (`disk: none` without a disk); the first writes blocks 1-2 and flushes (disk: wrote), the next reads them back (disk: read ok); a failed flush prints disk: flush failed
-cargo run -- -drive file=disk.img,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0 -append test=bench-disk  # image of at least 8 MiB; sequential write+flush and read throughput in MiB/s, 4 KiB and 256 KiB per request
+cargo run --release -- -drive file=disk.img,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0 -append test=bench-disk  # image of at least 8 MiB; sequential write+flush and read throughput in MiB/s, 4 KiB and 256 KiB per request
 cargo run -p mogfs --example mkfs --target aarch64-apple-darwin -- disk.img 16384  # empty 64 MiB MogFS image
 [ -f disk.img ] || cargo mkfs; cargo shell  # formats disk.img if missing, boots into msh with it; files survive a reboot once synced (see "Using the shell")
-cargo run -- -drive file=disk.img,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0 -append test=bench-fs  # MogFS image; open(CREATE|TRUNC)+write+sync and open+close round trips in ns
+cargo run --release -- -drive file=disk.img,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0 -append test=bench-fs  # MogFS image; open(CREATE|TRUNC)+write+sync and open+close round trips in ns
 [ -f disk.img ] || cargo mkfs; cargo shell, then: sh -c cbench  # musl syscall round trip and busybox spawn in ns
 cargo httpd, then from the Mac: curl -v http://localhost:8080/anything -d hello  # the echo server answers 200 OK, text/plain, the request as received (see "The HTTP echo server")
 cargo run -- -netdev user,id=n0 -device virtio-net-device,netdev=n0 -append "test=httpd fetch=10.0.2.2:8000/,100"  # fetch GETs a host page 100 times (bench http-get), then the server runs
 scripts/oscompare.sh [runs]  # same C benchmarks (c/oscb.c) on MogOs, Linux and macOS, interleaved; docs/BENCHMARKS.md "Cross-OS comparison"
 cargo run -- -netdev user,id=n0 -device virtio-net-device,netdev=n0 -append "test=net net=10.0.2.15/24,gw=10.0.2.2 udp=7777"  # needs a UDP echo on the host's 127.0.0.1:7777; pings 10.0.2.2 (ping: reply from ...), echoes mog over UDP (udp: echo ...), prints the frame counters; a net= bootarg without a NIC prints net: no nic
-QEMU_ARGS="-netdev user,id=n0 -device virtio-net-device,netdev=n0" scripts/bench.sh "bench-net net=10.0.2.15/24,gw=10.0.2.2 udp=7777" 21 <mog_os>  # UDP round trip, burst send and 16-in-flight stream to the host echo (docs/BENCHMARKS.md)
+QEMU_ARGS="-netdev user,id=n0 -device virtio-net-device,netdev=n0" scripts/bench.sh "bench-net net=10.0.2.15/24,gw=10.0.2.2 udp=7777" 21  # UDP round trip, burst send and 16-in-flight stream to the host echo (docs/BENCHMARKS.md)
 cargo run -- -append test=sockets   # loopback only: C tcpecho server and client on musl's BSD sockets, nettest serving 8 connections at once through io_wait, a child without the NetStack handle (EBADF), a listen-only one (EACCES), one whose budget holds 3 sockets (ENOBUFS); free frames before/after match
-cargo run -- -append test=bench-sockets  # loopback TCP: 64-byte round trip, connect + close, 4 KiB stream sends (bench lines)
+cargo run --release -- -append test=bench-sockets  # loopback TCP: 64-byte round trip, connect + close, 4 KiB stream sends (bench lines)
 cargo run -- -s -S     # boot halted, gdbstub on localhost:1234; attach lldb/gdb
 cargo build --release  # LTO release image
 ```

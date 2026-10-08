@@ -1,15 +1,16 @@
 #!/bin/sh
-# Usage: scripts/bench.sh <test> <rounds> <kernel> [<base kernel>]
-# Boots the kernel <rounds> times under hvf with -append test=<test>, each boot on a fresh 1024-block MogFS image, and
-# prints the median and min of every `bench <name>: <ns> ns` line. With a base kernel, each round boots both, the order
-# alternating, and prints the base, the new and the delta of each; `SLOWER` marks a call whose median and min both rose.
+# Usage: scripts/bench.sh <test> <rounds> [<kernel> [<base kernel>]]
+# Boots the kernel (default: the release build, built first) <rounds> times under hvf with -append test=<test>, each
+# boot on a fresh 1024-block MogFS image, and prints the median and min of every `bench <name>: <ns> ns`,
+# `<name>: [<what>] <ns> ns/round-trip` and `boot: <us> us` line. With a base kernel, each round boots both, the order
+# alternating, and prints the base, the new and the delta of each; `SLOWER` marks a row whose median and min both rose.
 # <test> may carry more bootargs; QEMU_ARGS adds QEMU arguments (a NIC: `-netdev user,id=n0 -device virtio-net-device,netdev=n0`).
 # Usage: scripts/bench.sh host <rounds> <base commit> <package> [<criterion args>]
 # Host criterion benches of <package>, the working tree against <base commit> (a temporary worktree): each round
 # runs both, the order alternating, then prints criterion's change estimate and confidence interval for every row; the
 # end prints each row's median, min and max change over the rounds.
 set -eu
-[ $# -ge 3 ] || { sed -n '2,10s/^# //p' "$0"; exit 2; }
+[ $# -ge 2 ] || { sed -n '2,11s/^# //p' "$0"; exit 2; }
 root=$(cd "$(dirname "$0")/.." && pwd)
 
 # One benchmark at a time on this machine, across worktrees (bench.lock in the common git dir); waits its turn.
@@ -20,7 +21,7 @@ if [ -z "${BENCH_LOCKED:-}" ]; then
 fi
 
 if [ "$1" = host ]; then
-    [ $# -ge 4 ] || { sed -n '2,10s/^# //p' "$0"; exit 2; }
+    [ $# -ge 4 ] || { sed -n '2,11s/^# //p' "$0"; exit 2; }
     rounds=$2 base=$3 package=$4
     shift 4
     # The base outside $root, so it does not also load $root's .cargo/config.toml.
@@ -78,25 +79,33 @@ if [ "$1" = host ]; then
     exit
 fi
 
-test=$1 rounds=$2 new=$3 base=${4:-}
+test=$1 rounds=$2 new=${3:-} base=${4:-}
+if [ -z "$new" ]; then
+    cargo build -q --release --manifest-path "$root/Cargo.toml" -p qemu-virt
+    new=$root/target/aarch64-unknown-none-softfloat/release/mog_os
+fi
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 cargo run -q --manifest-path "$root/Cargo.toml" -p mogfs --example mkfs --target aarch64-apple-darwin -- \
     "$tmp/clean.img" 1024 >/dev/null
 
-# boot <label> <kernel>: appends `<label> <tab> <name> <tab> <ns>` per bench line to $tmp/results.
+# boot <label> <kernel>: appends `<label> <tab> <name> <tab> <value>` per measured line to $tmp/results.
 boot() {
     cp "$tmp/clean.img" "$tmp/disk.img"
     qemu-system-aarch64 -M virt,gic-version=3 -accel hvf -cpu cortex-a72 -m 128M -global virtio-mmio.force-legacy=false \
         -global virtio-mmio.ioeventfd=off -nographic -kernel "$2" \
         -drive file="$tmp/disk.img",if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0 ${QEMU_ARGS:-} \
         -append "test=$test" </dev/null | tr -d '\r' >"$tmp/out"
-    if grep -qE '^(panic|fault):' "$tmp/out" || ! grep -q '^bench ' "$tmp/out"; then
+    sed -n -e "s/^bench \(.*\): \([0-9.]*\) ns$/$1	\1	\2/p" \
+        -e "s/^\([^:]*\): \([^ ]* \)\{0,1\}\([0-9.]*\) ns\/round-trip$/$1	\1 \2	\3/p" \
+        -e "s/^boot: \([0-9]*\) us$/$1	boot (us)	\1/p" "$tmp/out" | sed 's/ 	/	/' >"$tmp/rows"
+    # Every boot prints `boot:`, so a run with nothing else measured nothing.
+    if grep -qE '^(panic|fault):' "$tmp/out" || ! grep -qv '	boot (us)	' "$tmp/rows"; then
         cat "$tmp/out" >&2
         echo "bench.sh: $2 failed" >&2
         exit 1
     fi
-    sed -n "s/^bench \(.*\): \([0-9.]*\) ns$/$1	\1	\2/p" "$tmp/out" >>"$tmp/results"
+    cat "$tmp/rows" >>"$tmp/results"
 }
 
 i=0
