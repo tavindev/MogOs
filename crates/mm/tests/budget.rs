@@ -8,7 +8,7 @@ fn frame(i: u64) -> PhysAddr {
 
 #[test]
 fn a_charge_counts_against_the_budget_until_refunded() {
-    let mut budget = Budget::new(10);
+    let budget = Budget::new(10);
     assert!(budget.charge(8));
     assert!(!budget.charge(3));
     assert_eq!(budget.remaining(), 2);
@@ -19,10 +19,24 @@ fn a_charge_counts_against_the_budget_until_refunded() {
 #[test]
 fn out_of_frames_charges_nothing() {
     let mut frames = FrameAllocator::<1>::new(frame(0)..frame(2));
-    let mut budget = Budget::new(10);
+    let budget = Budget::new(10);
     assert_eq!(budget.alloc_contiguous(&mut frames, 3), None);
     budget.alloc(&mut frames).unwrap();
     budget.alloc(&mut frames).unwrap();
     assert_eq!(budget.alloc(&mut frames), None);
     assert_eq!(budget.remaining(), 8);
+}
+
+#[test]
+fn shrink_and_charge_over_the_limit_change_nothing() {
+    let budget = Budget::new(10);
+    assert!(budget.charge(4));
+    assert!(!budget.shrink(7));
+    assert!(!budget.charge(7));
+    assert_eq!((budget.limit(), budget.remaining()), (10, 6));
+    assert!(budget.shrink(6));
+    assert_eq!((budget.limit(), budget.remaining()), (4, 0));
+    budget.grow(6);
+    assert_eq!(budget.take(), 10);
+    assert_eq!(budget.limit(), 0);
 }

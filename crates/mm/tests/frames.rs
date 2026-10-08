@@ -144,12 +144,25 @@ fn matches_a_bit_by_bit_model() {
                         });
                     assert_eq!(frames.alloc_contiguous(count), expect, "seed {seed}");
                 }
-                1 => {
+                1 if next(2) == 0 => {
                     let expect = used.iter().position(|u| !u).map(|s| {
                         used[s] = true;
                         frame(s as u64)
                     });
                     assert_eq!(frames.alloc(), expect, "seed {seed}");
+                }
+                1 => {
+                    let mut out = vec![PhysAddr(0); 1 + next(8) as usize];
+                    let free: Vec<_> = (0..total as usize).filter(|&i| !used[i]).collect();
+                    let fits = free.len() >= out.len();
+                    let many = frames.alloc_many(out.len(), |i, f| out[i] = f);
+                    assert_eq!(many, fits, "seed {seed}");
+                    if fits {
+                        let expect: Vec<_> =
+                            free[..out.len()].iter().map(|&i| frame(i as u64)).collect();
+                        assert_eq!(out.to_vec(), expect, "seed {seed}");
+                        free[..out.len()].iter().for_each(|&i| used[i] = true);
+                    }
                 }
                 2 => {
                     let start = if next(4) == 0 { 0 } else { next(total) };
@@ -179,4 +192,20 @@ fn matches_a_bit_by_bit_model() {
             );
         }
     }
+}
+
+#[test]
+fn alloc_many_takes_all_or_none() {
+    let mut frames = FrameAllocator::<2>::new(frame(0)..frame(70));
+    frames.reserve(frame(1)..frame(2));
+    let mut out = [PhysAddr(0); 3];
+    assert!(frames.alloc_many(3, |i, f| out[i] = f));
+    assert_eq!(out, [frame(0), frame(2), frame(3)]);
+    assert!(!frames.alloc_many(67, |_, _| panic!("none taken")));
+    assert_eq!(frames.free_count(), 66);
+    let mut rest = [PhysAddr(0); 66];
+    assert!(frames.alloc_many(66, |i, f| rest[i] = f));
+    assert_eq!((rest[0], rest[65]), (frame(4), frame(69)));
+    assert_eq!(frames.free_count(), 0);
+    assert!(frames.alloc_many(0, |_, _| panic!("none asked")));
 }

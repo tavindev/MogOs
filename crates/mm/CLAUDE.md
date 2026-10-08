@@ -10,13 +10,17 @@ or the policy of who gets how many frames (`crates/kernel`, board `spawn`).
 
 ## Responsibilities
 
-- `FrameAllocator`: `new` over a RAM range, `reserve`, `alloc`, `alloc_contiguous`, `free`, `free_count`.
-  `alloc` and `alloc_contiguous` start their first-fit scan at `hint`, below which every word is full: `free` lowers
-  it, `alloc` moves it to the word it took from (`WORDS` when none is free), `alloc_contiguous` past the full words
-  at it. Results are first fit's for every `count >= 1` (`matches_a_bit_by_bit_model`); only the scan over the full
-  prefix (the reserved image, then the frames in use) is skipped.
-- `Budget`: `alloc` / `alloc_contiguous` / `free` against a `FrameAllocator`; `shrink` / `grow` when frames move
-  between parent and child.
+- `FrameAllocator`: `new` over a RAM range, `reserve`, `alloc`, `alloc_contiguous`, `alloc_many` (`count` frames,
+  any, handed to a closure; counts the free bits first, so all or none, then one pass over the bitmap), `free`, `free_count`. `alloc`, `alloc_contiguous` and `alloc_many` start their
+  first-fit scan at `hint`, below which every word is full: `free` lowers it, `alloc` and `alloc_many` move it to the
+  word they took from last (`WORDS` when none is free), `alloc_contiguous` past the full words at it. Results are first
+  fit's for every `count >= 1` (`matches_a_bit_by_bit_model`); only the scan over the full prefix (the reserved image,
+  then the frames in use) is skipped.
+- `Budget`: limit and frames used, each a `u32` (`MAX_FRAMES`, 16 TiB), packed in one `AtomicU64`; every checked change
+  is one CAS on both (`refund` and `grow`, which cannot fail, one atomic add), so any core charges or refunds a budget
+  without a lock. `alloc` / `alloc_contiguous` / `free` against a
+  `FrameAllocator`; `charge` / `refund`; `shrink` / `grow` when frames move between parent and child; `reset` (an
+  index's next process) and `take` (a reaped child's limit).
 
 ## Boundaries (hard)
 
@@ -29,10 +33,13 @@ or the policy of who gets how many frames (`crates/kernel`, board `spawn`).
 - Capacity is `WORDS * 64` frames; `new` trims RAM to whole frames and ignores frames past capacity. A set bit is in
   use, so `empty()` (all bits set) hands out nothing.
 - `free` panics on a frame outside the allocator, misaligned, or not allocated (double free).
-- `Budget::alloc` and `alloc_contiguous` charge only on success: over budget or out of frames charges nothing.
+- `Budget::alloc` and `alloc_contiguous` charge, then allocate, and refund if the allocator fails: over budget or out
+  of frames leaves nothing charged, though meanwhile another charge may fail that would fit (only with the frames run
+  out).
 - `Budget::charge` counts frames the kernel holds outside the allocator (the network's socket pool) and refuses,
   charging nothing, over budget; `refund` undoes it.
-- `Budget::shrink` panics if fewer than `frames` remain (`"budget overdrawn"`); `grow` returns a child's frames.
+- `Budget::shrink` returns false, changing nothing, if fewer than `frames` remain (a sibling's charge may land
+  between a check and the shrink); `grow` returns a child's frames.
 - `alloc` is a hot path (first non-full word, `trailing_ones`).
 - Performance is the moat: a slowdown is never accepted because it has an explanation; it is removed, or shown to
   be unavoidable with before/after numbers (`docs/BENCHMARKS.md`).

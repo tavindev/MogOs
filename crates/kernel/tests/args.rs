@@ -1,4 +1,5 @@
-use kernel::handle::{EXEC, Handles, Object};
+use kernel::Process;
+use kernel::handle::{EXEC, Handles, Object, Seen, Table};
 use kernel::syscall::{E2BIG, EFAULT, EINVAL, MAX_ARGS, argc, dispatch};
 
 /// The host's clamp: no speculation to bound.
@@ -38,9 +39,12 @@ fn spawn_checks_the_argument_buffer() {
     let exe = handles
         .insert(Object::File { start: 0, end: 0 }, EXEC)
         .unwrap();
+    let table = Table::new();
+    table.commit(&mut Process { next: 0 }, &handles);
     let user = 1 << 32;
-    let spawn = |handles: &mut Handles, ptr: u64, len: u64| {
-        dispatch::<Min>(SPAWN, &[exe, 0, 0, 0, 0, ptr, len], handles).err()
+    let spawn = |_: &mut Handles, ptr: u64, len: u64| {
+        let args = [exe, 0, 0, 0, 0, ptr, len];
+        dispatch::<Min>(SPAWN, &args, &table, &mut Seen::default()).err()
     };
     assert_eq!(spawn(&mut handles, user, 4096), None);
     assert_eq!(spawn(&mut handles, user, 4097), Some(E2BIG));

@@ -22,11 +22,12 @@ use core::slice;
 use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize};
 
-use arch::{Conduit, Guard, KernelMap, Lock, PerCpu};
+use arch::{Conduit, KernelMap, Lock, PerCpu};
 use dtb::Dtb;
 use fs::FsDisk;
 use kernel::console::Line;
 use kernel::elf::Segment;
+use kernel::file::Opens;
 use kernel::handle::{INIT_ARCHIVE, MAX_HANDLES, Rights};
 use kernel::mutex::Mutexes;
 use kernel::network::Network;
@@ -34,9 +35,10 @@ use kernel::pipe::Pipes;
 use kernel::syscall::{ENOENT, MAX_BUFFER};
 use kernel::{Event, FRAME_WORDS, Full, PRIORITIES, Program, RoundTrip, Scheduler, Violation};
 use linked_list_allocator::Heap;
+use lock_order as level;
 use mm::{FrameAllocator, PhysAddr};
 use mogfs::{BLOCK_SIZE, Buf, Error, Fs, MAX_BLOCKS, bitmap_words, cache_blocks};
-use process::{executable, spawn_init, user_program};
+use process::{PROCESSES, executable, spawn_init, user_program};
 use uart::Uart;
 use virtio_blk::VirtioBlk;
 use virtio_net::VirtioNet;
@@ -52,6 +54,12 @@ const UNMAPPED: PhysAddr = PhysAddr(0x8000_0000);
 /// The boot table's entries every address space copies: device memory (GiB 0) and RAM (GiB 1), EL1-only, global.
 const KERNEL_ENTRIES: usize = 2;
 const PAGE: usize = 4096;
+/// What `hold_kernel` raises each live process's budget by: a one-page `map` (its page and up to 3 tables), then a
+/// 16-page one (its pages and up to 3 tables).
+const GATE_FRAMES: usize = 4 + 16 + 3;
+/// The most a process has left of `GATE_FRAMES` once it made both maps (at least 1 + 16 frames), and fewer than after
+/// the first alone (at most 4).
+const GATE_DONE: usize = GATE_FRAMES - 17;
 /// Where user programs' code is mapped; one 2 MiB region, so a process needs a single level-3 table.
 const USER_BASE: u64 = 1 << 32;
 /// Each process's one stack page ends here.
@@ -148,14 +156,13 @@ const FS_POOL: usize = 64;
 #[global_allocator]
 static HEAP: KernelHeap = KernelHeap(Lock::new(Heap::empty()));
 
-/// A leaf lock: nothing else is taken while it is held.
-struct KernelHeap(Lock<Heap>);
+struct KernelHeap(Lock<Heap, level::Leaf>);
 
 // SAFETY: `Heap` hands out non-overlapping blocks of at least `layout` from the region `init_heap` gave it.
 unsafe impl GlobalAlloc for KernelHeap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         self.0
-            .lock()
+            .lock_leaf()
             .allocate_first_fit(layout)
             .map_or(ptr::null_mut(), NonNull::as_ptr)
     }
@@ -164,41 +171,64 @@ unsafe impl GlobalAlloc for KernelHeap {
         // SAFETY: `GlobalAlloc` only passes pointers that `alloc` returned, which are non-null.
         let ptr = unsafe { NonNull::new_unchecked(ptr) };
         // SAFETY: `ptr` was allocated from this heap with `layout`.
-        unsafe { self.0.lock().deallocate(ptr, layout) }
+        unsafe { self.0.lock_leaf().deallocate(ptr, layout) }
     }
 }
 
-/// The big lock over threads and processes, free frames, pipes, mutexes, console input, the file system and the
-/// buffer user inputs are copied into. Every trap hook
-/// takes it and returns holding it, and the trap exit releases it (`board_unlock`). Lock order: `KERNEL`, then `HEAP`
-/// or `CONSOLE`. File system calls do their disk I/O under it, so a `sync` holds it for its flushes.
-static KERNEL: Lock<Kernel> = Lock::new(Kernel {
+/// The big lock over threads and processes, pipes, mutexes, console input, the file system and its open counts. A
+/// trap hook that switches takes it and returns holding it, and the trap exit releases it (`board_unlock`); a call that
+/// touches only its own process takes it not at all. File system calls do their disk I/O under it, so a `sync` holds
+/// it for its flushes.
+static KERNEL: Lock<Kernel, level::Kernel> = Lock::new(Kernel {
     sched: Scheduler::new(),
-    frames: FrameAllocator::empty(),
     pipes: Pipes::new(),
     mutexes: Mutexes::new(),
     line: Line::new(),
     fs: Fs::new(FsDisk(None), &mut [], &mut []),
     mounted: false,
-    buf: [0; 2 * MAX_BUFFER as usize],
+    opens: Opens::new(),
+    ended: false,
+    release: None,
+    signal_boot: false,
 });
 
 struct Kernel {
     sched: Sched,
-    frames: FrameAllocator<FRAME_WORDS>,
     pipes: Pipes<MAX_PIPES>,
     mutexes: Mutexes<MAX_MUTEXES>,
     line: Line,
     fs: Fs<'static, FsDisk>,
     /// `fs` is mounted: boot-spawned processes get its root as handle 3.
     mounted: bool,
-    /// Where a syscall copies user inputs and stages outputs: room for `rename`'s two paths.
-    buf: [u8; 2 * MAX_BUFFER as usize],
+    opens: Opens<{ MAX_PROCESSES * MAX_HANDLES }>,
+    /// This hold ended a thread that left work for the end of the hook: a release (`release`), a kernel stack parked
+    /// for the trap exit (`trap::DEFERRED`) or core 0 to signal (`signal_boot`). One flag, so a hook that ended none
+    /// tests one byte.
+    ended: bool,
+    /// A process whose last thread this hold ended, and its code, for the hook's `trap::finish_release`.
+    release: Option<(usize, u64)>,
+    /// The boot context may wait for the task count this hold lowered: core 0 gets one signal at the hook's end.
+    signal_boot: bool,
 }
 
-/// Every console write and read on `UART0`, a leaf lock, except panic output, which goes straight to `UART0` so a panic
-/// under this lock still prints.
-static CONSOLE: Lock<Uart> = Lock::new(Uart::new(UART0));
+/// The free frames: one pass of the bitmap per `spawn` or `map`, which take every frame they need at once.
+static FRAMES: Lock<FrameAllocator<FRAME_WORDS>, level::Frames> =
+    Lock::new(FrameAllocator::empty());
+
+#[unsafe(link_section = ".percpu")]
+// SAFETY: in `.percpu`.
+/// This core's current process index, written by its own switches only, so a syscall finds its table without `KERNEL`.
+static CURRENT: PerCpu<usize> = unsafe { PerCpu::new(0) };
+#[unsafe(link_section = ".percpu")]
+// SAFETY: in `.percpu`.
+/// Where a syscall copies user inputs and stages outputs: room for `rename`'s two paths. A hook never switches while it
+/// uses it.
+static BUF: PerCpu<[u8; 2 * MAX_BUFFER as usize]> =
+    unsafe { PerCpu::new([0; 2 * MAX_BUFFER as usize]) };
+
+/// Every console write and read on `UART0`, the last lock in the order, except panic output, which goes straight to
+/// `UART0` so a panic under this lock still prints.
+static CONSOLE: Lock<Uart, level::Console> = Lock::new(Uart::new(UART0));
 
 /// `Board::console`: each formatted write holds `CONSOLE` for its whole line.
 #[derive(Clone)]
@@ -206,11 +236,13 @@ struct Console;
 
 impl Write for Console {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        CONSOLE.lock().write_str(s)
+        // SAFETY: `Board::console`'s writer, which the kernel crate uses holding no lock.
+        CONSOLE.lock(&mut unsafe { arch::root() }).write_str(s)
     }
 
     fn write_fmt(&mut self, args: fmt::Arguments<'_>) -> fmt::Result {
-        CONSOLE.lock().write_fmt(args)
+        // SAFETY: as above.
+        CONSOLE.lock(&mut unsafe { arch::root() }).write_fmt(args)
     }
 }
 
@@ -250,9 +282,7 @@ impl kernel::Board for QemuVirt {
     }
 
     fn breakpoint_self_test(&mut self) {
-        let _ = Guard::leak(KERNEL.lock());
-        // SAFETY: `KERNEL` is held through the guard leaked above, which the trap exit releases.
-        unsafe { arch::breakpoint_self_test() }
+        arch::breakpoint_self_test()
     }
 
     fn read_unmapped(&mut self) {
@@ -283,7 +313,7 @@ impl kernel::Board for QemuVirt {
 
     fn init_heap(&mut self, region: Range<PhysAddr>) {
         let size = (region.end.0 - region.start.0) as usize;
-        let mut heap = HEAP.0.lock();
+        let mut heap = HEAP.0.lock_leaf();
         assert!(heap.bottom().is_null(), "heap already initialized");
         // SAFETY: the heap is empty (checked above); `region` being unused, mapped RAM is the `Board::init_heap` contract the kernel upholds.
         unsafe { heap.init(region.start.0 as *mut u8, size) }
@@ -308,10 +338,14 @@ impl kernel::Board for QemuVirt {
 
     fn spawn(&mut self, entry: fn(&mut Self, usize) -> !, arg: usize) -> Result<(), Full> {
         let board = self.clone();
-        let mut kernel = KERNEL.lock();
-        let Kernel { sched, frames, .. } = &mut *kernel;
+        // SAFETY: a `Board` method, which the kernel crate calls holding no lock.
+        let mut root = unsafe { arch::root() };
+        let mut kernel = KERNEL.lock(&mut root);
+        let (kernel, mut w) = kernel.parts();
+        let sched = &mut kernel.sched;
         sched.free_slot().ok_or(Full).and_then(|slot| {
-            let stack = frames.alloc_contiguous(TASK_STACK_FRAMES).ok_or(Full)?;
+            let stack = FRAMES.lock(&mut w).alloc_contiguous(TASK_STACK_FRAMES);
+            let stack = stack.ok_or(Full)?;
             let start = (stack.end.0 as usize - size_of::<Start>()) & !15;
             // SAFETY: `start` is 16-byte aligned and inside the fresh stack, which nothing else references.
             unsafe { (start as *mut Start).write(Start { board, entry, arg }) };
@@ -328,7 +362,9 @@ impl kernel::Board for QemuVirt {
     }
 
     fn run_others(&mut self) {
-        KERNEL.lock().sched.block(arch::cpu(), Event::Idle);
+        // SAFETY: a `Board` method, which the kernel crate calls holding no lock.
+        let mut root = unsafe { arch::root() };
+        KERNEL.lock(&mut root).sched.block(arch::cpu(), Event::Idle);
         arch::yield_now()
     }
 
@@ -349,13 +385,19 @@ impl kernel::Board for QemuVirt {
     fn init_frames(&mut self, frames: FrameAllocator<FRAME_WORDS>) {
         // SAFETY: block 0's stack, which core 0 (on its boot stack) leaves to its idle context.
         let idle = unsafe { arch::new_task(area(0) as usize, idle, 0) };
-        let mut kernel = KERNEL.lock();
-        kernel.frames = frames;
-        kernel.sched.start_cores(CPUS.load(Relaxed), idle);
+        // SAFETY: a `Board` method, which the kernel crate calls holding no lock.
+        let mut root = unsafe { arch::root() };
+        *FRAMES.lock(&mut root) = frames;
+        KERNEL
+            .lock(&mut root)
+            .sched
+            .start_cores(CPUS.load(Relaxed), idle);
     }
 
     fn free_frames(&self) -> usize {
-        KERNEL.lock().frames.free_count()
+        // SAFETY: a `Board` method, which the kernel crate calls holding no lock.
+        let mut root = unsafe { arch::root() };
+        FRAMES.lock(&mut root).free_count()
     }
 
     fn spawn_user(&mut self, program: Program, budget: usize) -> Result<(), i64> {
@@ -372,7 +414,7 @@ impl kernel::Board for QemuVirt {
             writable: false,
         };
         spawn_init(
-            (code, [segment].into_iter(), entry),
+            (code, core::iter::once(segment), entry),
             (budget, next),
             0,
             INIT_ARCHIVE,
@@ -398,11 +440,14 @@ impl kernel::Board for QemuVirt {
     }
 
     fn tasks(&self) -> usize {
-        KERNEL.lock().sched.count() - net::STARTED.load(Relaxed) as usize
+        // SAFETY: a `Board` method, which the kernel crate calls holding no lock.
+        let mut root = unsafe { arch::root() };
+        KERNEL.lock(&mut root).sched.count() - net::STARTED.load(Relaxed) as usize
     }
 
     fn disk(&mut self) -> Option<VirtioBlk> {
-        let alloc = || KERNEL.lock().frames.alloc();
+        // SAFETY: a `Board` method, which the kernel crate calls holding no lock.
+        let alloc = || FRAMES.lock(&mut unsafe { arch::root() }).alloc();
         if DISK_TAKEN.swap(true, Relaxed) {
             return None;
         }
@@ -421,14 +466,15 @@ impl kernel::Board for QemuVirt {
     }
 
     fn mount(&mut self, disk: VirtioBlk) -> Result<(), Error> {
-        let mut kernel = KERNEL.lock();
+        // SAFETY: a `Board` method, which the kernel crate calls holding no lock.
+        let mut root = unsafe { arch::root() };
+        let mut kernel = KERNEL.lock(&mut root);
+        let (kernel, mut w) = kernel.parts();
         let blocks = kernel::Disk::blocks(&disk).min(MAX_BLOCKS);
         let (cache, words) = (cache_blocks(blocks, FS_POOL), bitmap_words(blocks));
         let frames = cache + (words * 8).div_ceil(BLOCK_SIZE);
-        let memory = kernel
-            .frames
-            .alloc_contiguous(frames)
-            .ok_or(Error::TooBig)?;
+        let memory = FRAMES.lock(&mut w).alloc_contiguous(frames);
+        let memory = memory.ok_or(Error::TooBig)?;
         let at = memory.start.0 as usize;
         // SAFETY: the first `cache` of the fresh identity-mapped frames, owned from now on by `KERNEL.fs` alone.
         let cache = unsafe { slice::from_raw_parts_mut(at as *mut Buf, cache) };
@@ -455,14 +501,16 @@ impl kernel::Board for QemuVirt {
     }
 
     fn round_trips(&mut self, n: u64, kind: RoundTrip) {
-        static TICKET: Lock<()> = Lock::new(());
+        static TICKET: Lock<(), level::Kernel> = Lock::new(());
         static TAS: AtomicBool = AtomicBool::new(false);
         #[unsafe(link_section = ".percpu")]
         // SAFETY: in `.percpu`.
         static COUNT: PerCpu<u64> = unsafe { PerCpu::new(0) };
+        // SAFETY: a `Board` method, which the kernel crate calls holding no lock.
+        let mut root = unsafe { arch::root() };
         for _ in 0..n {
             match kind {
-                RoundTrip::Ticket => drop(TICKET.lock_masked()),
+                RoundTrip::Ticket => drop(TICKET.lock_masked(&mut root)),
                 RoundTrip::TestAndSet => {
                     while TAS.swap(true, Acquire) {
                         spin_loop();
@@ -489,11 +537,13 @@ impl kernel::Board for QemuVirt {
     }
 
     fn add_locked(&mut self, n: u64) -> u64 {
-        static COUNT: Lock<u64> = Lock::new(0);
+        static COUNT: Lock<u64, level::Kernel> = Lock::new(0);
+        // SAFETY: a `Board` method, which the kernel crate calls holding no lock.
+        let mut root = unsafe { arch::root() };
         for _ in 0..n {
-            *COUNT.lock() += 1;
+            *COUNT.lock(&mut root) += 1;
         }
-        *COUNT.lock()
+        *COUNT.lock(&mut root)
     }
 
     fn start_cpus(&mut self, smp_test: bool) {
@@ -521,8 +571,41 @@ impl kernel::Board for QemuVirt {
         ONLINE.load(Acquire)
     }
 
-    fn contended(&self) -> u32 {
-        KERNEL.contended()
+    fn contended(&self) -> [u32; kernel::LOCK_LEVELS.len()] {
+        let processes = PROCESSES.iter().map(|p| p.lock.contended());
+        [
+            processes.fold(0, u32::wrapping_add),
+            KERNEL.contended(),
+            net::contended(),
+            FRAMES.contended(),
+            CONSOLE.contended(),
+            HEAP.0.contended(),
+        ]
+    }
+
+    fn hold_kernel(&mut self) {
+        // SAFETY: a `Board` method, which the kernel crate calls holding no lock.
+        let mut root = unsafe { arch::root() };
+        let live = || {
+            (PROCESSES.iter().enumerate().skip(1))
+                .filter(|(_, entry)| entry.threads.load(Relaxed) > 0)
+        };
+        // Once each is on a core (with no tick, none leaves it but by a syscall): one still to start would wait for
+        // this lock.
+        let cpus = self.cpus();
+        let _kernel = loop {
+            let kernel = KERNEL.lock(&mut root);
+            let running = |index| (0..cpus).any(|cpu| kernel.sched.process(cpu) == index);
+            if live().all(|(index, _)| running(index)) {
+                break kernel;
+            }
+            drop(kernel);
+            spin_loop();
+        };
+        live().for_each(|(_, entry)| entry.budget.grow(GATE_FRAMES));
+        while live().any(|(_, entry)| entry.budget.remaining() > GATE_DONE) {
+            spin_loop();
+        }
     }
 
     fn report_speculation(&mut self) {

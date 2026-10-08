@@ -6,8 +6,8 @@ use mogfs::{Inode, MAX_FILE_SIZE};
 
 use crate::Clamp;
 use crate::handle::{
-    CONNECT, EXEC, Handle, Handles, KILL as KILL_RIGHT, LISTEN, MAX_HANDLES, Object, READ, Rights,
-    WRITE,
+    CONNECT, DUPLICATE, EXEC, Handle, KILL as KILL_RIGHT, LISTEN, MAX_HANDLES, Object, READ,
+    Rights, Seen, Table, WRITE,
 };
 use crate::mutex::Mutex;
 use crate::network::{BACKLOG, OP_CONNECT, OP_RECEIVE, OP_SEND, Sock};
@@ -20,7 +20,7 @@ const EXIT: u64 = 0;
 /// `pwrite`; a file is read or written at `offset` (a read at or past its end returns 0), which the console and pipes
 /// ignore. A `len` over `MAX_BUFFER` moves at most `MAX_BUFFER` bytes (a short read or write). Reading the console
 /// waits for a line (`console::Line`); with two readers, whichever runs first gets it.
-const IO: u64 = 1;
+pub const IO: u64 = 1;
 /// `dup(handle, rights)`: returns a new handle to the same object with `rights`, a subset of `handle`'s (duplicate right).
 const DUP: u64 = 2;
 /// `close(handle)`: returns 0.
@@ -120,6 +120,29 @@ const IO_WAIT: u64 = 24;
 /// `shutdown(socket)`: ends the send side (write right): a FIN follows the queued data; returns 0. `ENOTCONN` unless
 /// connected.
 const SHUTDOWN: u64 = 25;
+
+/// The syscalls that write no handle table and are not process-local, a bit per number: a board may take its lock over
+/// the shared state before `dispatch` for them, so their lookups need no recheck.
+pub const SHARED_CALLS: u64 = 1 << EXIT
+    | 1 << WAIT
+    | 1 << LOCK
+    | 1 << UNLOCK
+    | 1 << KILL
+    | 1 << MKDIR
+    | 1 << READDIR
+    | 1 << SYNC
+    | 1 << UNLINK
+    | 1 << RENAME
+    | 1 << THREAD_EXIT
+    | 1 << BIND
+    | 1 << LISTEN_CALL
+    | 1 << IO_SUBMIT
+    | 1 << SHUTDOWN;
+
+/// The syscalls that write the caller's handle table and need the shared state too, a bit per number: a board may
+/// take its lock over that state before `dispatch` for them when nothing else can write the table.
+pub const TABLE_CALLS: u64 =
+    1 << OPEN | 1 << PIPE | 1 << MUTEX | 1 << SPAWN | 1 << THREAD | 1 << SOCKET | 1 << IO_WAIT;
 
 /// Most arguments a `spawn` passes.
 pub const MAX_ARGS: usize = 32;
@@ -221,7 +244,7 @@ const _: () = assert!(
     "a longer pipe write would never fit"
 );
 /// Longest `map` (16 pages), so its IRQs-masked zeroing stays bounded.
-const MAX_MAP: u64 = 16 * 4096;
+pub const MAX_MAP: u64 = 16 * 4096;
 
 pub enum Call {
     /// End the caller's process with this code.
@@ -263,13 +286,13 @@ pub enum Call {
         slot: usize,
         generation: u64,
     },
-    /// `handle` is a new handle to `object`.
+    /// A new handle to `object` with `rights`, a subset of the duplicated handle's.
     Dup {
-        handle: u64,
         object: Object,
+        rights: Rights,
     },
-    /// A handle to this object was closed.
-    Close(Object),
+    /// Close this handle.
+    Close(Handle),
     /// Map this many pages into the caller's address space.
     Map {
         pages: usize,
@@ -346,6 +369,7 @@ pub enum Call {
     Net(NetCall),
 }
 
+#[derive(Clone, Copy)]
 pub enum NetCall {
     /// Create a socket with these NetStack rights.
     Socket(Rights),
@@ -375,14 +399,60 @@ pub enum NetCall {
 
 const _: () = assert!(size_of::<Call>() == 56, "every syscall returns a Call");
 
-/// Runs syscall `nr` with arguments `args` (`x0`-`x6`) against the caller's `handles`, leaving the board the parts
-/// that touch hardware or tasks; `Err` holds the result to return.
+/// `dispatch`'s `io`, for a board that knows the number: the same checks, without the jump table.
+#[inline(always)]
+pub fn dispatch_io<C: Clamp>(
+    args: &[u64; 7],
+    handles: &Table,
+    seen: &mut Seen,
+) -> Result<Call, i64> {
+    let op = args[1];
+    let need = match op {
+        IO_READ => READ,
+        IO_WRITE => WRITE,
+        _ => return Err(EINVAL),
+    };
+    let io_len = args[3].min(MAX_BUFFER);
+    let [h, ptr, len, file_offset] = C::clamp(
+        [handle(args[0]), offset(args[2]), io_len, args[4]],
+        [HANDLE, room(io_len), LEN, MAX_FILE_SIZE + 1],
+    );
+    let object = handles.io(Handle::clamped(args[0], h), need, seen)?;
+    user_buffer(args[2], io_len)?;
+    let (ptr, len) = (USER.start + ptr, len as usize);
+    match object {
+        Some(Object::Console) if op == IO_WRITE => Ok(Call::Write { ptr, len }),
+        Some(Object::Console) => Ok(Call::Read { ptr, len }),
+        Some(Object::Pipe(end)) if end.write == (op == IO_WRITE) => {
+            Ok(Call::Pipe { end, ptr, len })
+        }
+        Some(Object::Node(inode)) => Ok(Call::File {
+            inode,
+            write: op == IO_WRITE,
+            offset: file_offset,
+            ptr,
+            len,
+        }),
+        Some(Object::Dir(_)) => Err(EISDIR),
+        _ => Err(EACCES),
+    }
+}
+
+/// Runs syscall `nr` with arguments `args` (`x0`-`x6`) against the caller's `handles`, read without a lock (the entries
+/// read go in `seen`), leaving the board the parts that touch hardware, tasks or the table; `Err` holds the result to
+/// return.
 ///
 /// Spectre v1: the number indexes the jump table masked to its 32 entries; each call then clamps the arguments it
 /// indexes kernel memory with to the capacity of what they index, together behind one barrier (`C`), before their
 /// first use, and passes on only the clamped values: a handle (x0, and x3 for `rename`), a user buffer and its length,
 /// a file offset (x4). A `readdir` cursor (x3) indexes nothing: it is a key the tree search compares.
-pub fn dispatch<C: Clamp>(nr: u64, args: &[u64; 7], handles: &mut Handles) -> Result<Call, i64> {
+#[inline(always)]
+pub fn dispatch<C: Clamp>(
+    nr: u64,
+    args: &[u64; 7],
+    handles: &Table,
+    seen: &mut Seen,
+) -> Result<Call, i64> {
     if nr > SHUTDOWN {
         return Err(ENOSYS);
     }
@@ -397,43 +467,18 @@ pub fn dispatch<C: Clamp>(nr: u64, args: &[u64; 7], handles: &mut Handles) -> Re
             tls: args[2],
             arg: args[3],
         }),
-        IO => {
-            let op = args[1];
-            let need = match op {
-                IO_READ => READ,
-                IO_WRITE => WRITE,
-                _ => return Err(EINVAL),
-            };
-            let io_len = args[3].min(MAX_BUFFER);
-            let [h, ptr, len, file_offset] = C::clamp(
-                [handle(args[0]), offset(args[2]), io_len, args[4]],
-                [HANDLE, room(io_len), LEN, MAX_FILE_SIZE + 1],
-            );
-            let object = handles.get(Handle::clamped(args[0], h), need)?;
-            user_buffer(args[2], io_len)?;
-            let (ptr, len) = (USER.start + ptr, len as usize);
-            match object {
-                Object::Console if op == IO_WRITE => Ok(Call::Write { ptr, len }),
-                Object::Console => Ok(Call::Read { ptr, len }),
-                Object::Pipe(end) if end.write == (op == IO_WRITE) => {
-                    Ok(Call::Pipe { end, ptr, len })
-                }
-                Object::Node(inode) => Ok(Call::File {
-                    inode,
-                    write: op == IO_WRITE,
-                    offset: file_offset,
-                    ptr,
-                    len,
-                }),
-                Object::Dir(_) => Err(EISDIR),
-                _ => Err(EACCES),
-            }
-        }
+        IO => dispatch_io::<C>(args, handles, seen),
         DUP => {
-            let (handle, object) = handles.dup(h0(), args[1])?;
-            Ok(Call::Dup { handle, object })
+            let (object, held) = handles.entry(h0(), seen)?;
+            if held & DUPLICATE == 0 || args[1] & !held != 0 {
+                return Err(EACCES);
+            }
+            Ok(Call::Dup {
+                object,
+                rights: args[1],
+            })
         }
-        CLOSE => handles.close(h0()).map(Call::Close),
+        CLOSE => Ok(Call::Close(h0())),
         MAP => match args[0] {
             0 => Err(EINVAL),
             len if len > MAX_MAP => Err(EINVAL),
@@ -447,7 +492,7 @@ pub fn dispatch<C: Clamp>(nr: u64, args: &[u64; 7], handles: &mut Handles) -> Re
                 return Err(EINVAL);
             }
             let (h0, ptr, len) = handle_buffer::<C>(args[0], args[1], args[2]);
-            let (dir, rights) = handles.entry(h0)?;
+            let (dir, rights) = handles.entry(h0, seen)?;
             match dir {
                 Object::Archive if flags != 0 => return Err(EROFS),
                 Object::Archive | Object::Dir(_) => {}
@@ -482,7 +527,8 @@ pub fn dispatch<C: Clamp>(nr: u64, args: &[u64; 7], handles: &mut Handles) -> Re
                     LEN,
                 ],
             );
-            let Object::File { start, end } = handles.get(Handle::clamped(args[0], h), EXEC)?
+            let Object::File { start, end } =
+                handles.get(Handle::clamped(args[0], h), EXEC, seen)?
             else {
                 return Err(EACCES);
             };
@@ -505,25 +551,22 @@ pub fn dispatch<C: Clamp>(nr: u64, args: &[u64; 7], handles: &mut Handles) -> Re
             })
         }
         PIPE => Ok(Call::NewPipe),
-        WAIT => match handles.get(h0(), crate::handle::WAIT)? {
+        WAIT => match handles.get(h0(), crate::handle::WAIT, seen)? {
             Object::Process { index, generation } => Ok(Call::Wait { index, generation }),
             Object::Thread { slot, generation } => Ok(Call::Join { slot, generation }),
             _ => Err(EACCES),
         },
         MUTEX => Ok(Call::NewMutex),
-        LOCK | UNLOCK => match handles.get(h0(), 0)? {
-            Object::Mutex(mutex) if nr == LOCK => Ok(Call::Lock(mutex)),
-            Object::Mutex(mutex) => Ok(Call::Unlock(mutex)),
-            _ => Err(EACCES),
-        },
-        KILL => match handles.get(h0(), KILL_RIGHT)? {
+        LOCK => Ok(Call::Lock(handles.mutex(h0(), seen)?)),
+        UNLOCK => Ok(Call::Unlock(handles.mutex(h0(), seen)?)),
+        KILL => match handles.get(h0(), KILL_RIGHT, seen)? {
             Object::Process { index, generation } => Ok(Call::Kill { index, generation }),
             Object::Thread { slot, generation } => Ok(Call::KillThread { slot, generation }),
             _ => Err(EACCES),
         },
         MKDIR | UNLINK => {
             let clamped = handle_buffer::<C>(args[0], args[1], args[2]);
-            let (dir, ptr, len) = path(handles, (args[1], args[2]), clamped)?;
+            let (dir, ptr, len) = path(handles, seen, (args[1], args[2]), clamped)?;
             Ok(match nr {
                 MKDIR => Call::Mkdir { dir, ptr, len },
                 _ => Call::Unlink { dir, ptr, len },
@@ -544,8 +587,8 @@ pub fn dispatch<C: Clamp>(nr: u64, args: &[u64; 7], handles: &mut Handles) -> Re
             let from = (Handle::clamped(args[0], h0), USER.start + p1, l2);
             let to = (Handle::clamped(args[3], h3), USER.start + p4, l5);
             Ok(Call::Rename {
-                from: path(handles, (args[1], args[2]), from)?,
-                to: path(handles, (args[4], args[5]), to)?,
+                from: path(handles, seen, (args[1], args[2]), from)?,
+                to: path(handles, seen, (args[4], args[5]), to)?,
             })
         }
         READDIR => {
@@ -553,7 +596,7 @@ pub fn dispatch<C: Clamp>(nr: u64, args: &[u64; 7], handles: &mut Handles) -> Re
                 [handle(args[0]), offset(args[1]), args[2]],
                 [HANDLE, room(args[2]), LEN],
             );
-            let dir = handles.get(Handle::clamped(args[0], h), READ)?;
+            let dir = handles.get(Handle::clamped(args[0], h), READ, seen)?;
             let (Object::Archive | Object::Dir(_)) = dir else {
                 return Err(ENOTDIR);
             };
@@ -565,18 +608,18 @@ pub fn dispatch<C: Clamp>(nr: u64, args: &[u64; 7], handles: &mut Handles) -> Re
                 cursor: args[3],
             })
         }
-        SYNC => match handles.get(h0(), 0)? {
+        SYNC => match handles.get(h0(), 0, seen)? {
             Object::Dir(_) | Object::Node(_) => Ok(Call::Sync),
             _ => Err(ENOTDIR),
         },
-        SOCKET => match handles.entry(h0())? {
+        SOCKET => match handles.entry(h0(), seen)? {
             (Object::NetStack, rights) if rights & (CONNECT | LISTEN) != 0 => {
                 Ok(Call::Net(NetCall::Socket(rights)))
             }
             _ => Err(EACCES),
         },
         BIND => {
-            let sock = socket(handles, h0(), WRITE)?;
+            let sock = socket(handles, seen, h0(), WRITE)?;
             let port = u16::try_from(args[1]).map_err(|_| EINVAL)?;
             let loopback = match args[2] {
                 0 => false,
@@ -590,7 +633,7 @@ pub fn dispatch<C: Clamp>(nr: u64, args: &[u64; 7], handles: &mut Handles) -> Re
             }))
         }
         LISTEN_CALL => Ok(Call::Net(NetCall::Listen {
-            sock: socket(handles, h0(), WRITE)?,
+            sock: socket(handles, seen, h0(), WRITE)?,
             backlog: args[1].clamp(1, BACKLOG as u64) as u8,
         })),
         IO_SUBMIT => {
@@ -602,8 +645,12 @@ pub fn dispatch<C: Clamp>(nr: u64, args: &[u64; 7], handles: &mut Handles) -> Re
             let need = if op & 1 == 0 { READ } else { WRITE };
             let io_len = args[3].min(MAX_BUFFER);
             let (h0, ptr, len) = handle_buffer::<C>(args[0], args[2], io_len);
-            let sock = socket(handles, h0, need)?;
-            let (_, rights) = handles.entry(h0)?;
+            let (Object::Socket(sock), rights) = handles.entry(h0, seen)? else {
+                return Err(EACCES);
+            };
+            if rights & need != need {
+                return Err(EACCES);
+            }
             // A connect's address and port are values, never a buffer, so they travel apart from it.
             let peer = match op {
                 OP_RECEIVE | OP_SEND => {
@@ -627,7 +674,12 @@ pub fn dispatch<C: Clamp>(nr: u64, args: &[u64; 7], handles: &mut Handles) -> Re
             }))
         }
         IO_WAIT => Ok(Call::Net(NetCall::IoWait)),
-        SHUTDOWN => Ok(Call::Net(NetCall::Shutdown(socket(handles, h0(), WRITE)?))),
+        SHUTDOWN => Ok(Call::Net(NetCall::Shutdown(socket(
+            handles,
+            seen,
+            h0(),
+            WRITE,
+        )?))),
         // Single values: a range pattern would lower to a compare outside the table.
         #[allow(clippy::manual_range_patterns)]
         26 | 27 | 28 | 29 | 30 | 31 => Err(ENOSYS),
@@ -637,8 +689,8 @@ pub fn dispatch<C: Clamp>(nr: u64, args: &[u64; 7], handles: &mut Handles) -> Re
 
 /// The socket `handle` reaches, if it holds the rights in `need`.
 #[inline(always)]
-fn socket(handles: &Handles, handle: Handle, need: Rights) -> Result<Sock, i64> {
-    match handles.get(handle, need)? {
+fn socket(handles: &Table, seen: &mut Seen, handle: Handle, need: Rights) -> Result<Sock, i64> {
+    match handles.get(handle, need, seen)? {
         Object::Socket(sock) => Ok(sock),
         _ => Err(EACCES),
     }
@@ -679,11 +731,12 @@ fn handle_buffer<C: Clamp>(value: u64, ptr: u64, len: u64) -> (Handle, u64, u64)
 /// names, its clamped form in `clamped`.
 #[inline(always)]
 fn path(
-    handles: &Handles,
+    handles: &Table,
+    seen: &mut Seen,
     (ptr, len): (u64, u64),
     (handle, cptr, clen): (Handle, u64, u64),
 ) -> Result<(Inode, u64, usize), i64> {
-    let dir = match handles.entry(handle)? {
+    let dir = match handles.entry(handle, seen)? {
         (Object::Archive, _) => return Err(EROFS),
         (Object::Dir(_), rights) if rights & WRITE == 0 => return Err(EACCES),
         (Object::Dir(dir), _) => dir,
