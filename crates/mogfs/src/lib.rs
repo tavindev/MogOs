@@ -699,15 +699,15 @@ impl<'a, D: Disk> Fs<'a, D> {
             // The other slot's blocks (its live and pinned bitmaps, read into the committed copies' place) stay
             // reserved while its bitmap holds, even if its tree failed above.
             let w = self.words;
-            self.bits[NEWEST * w..(NEWEST + 2) * w].fill(0);
-            if let Some(o) = &slots[1 - i]
-                && o.valid
-                && let Err(e) = self.load_bitmap(o, NEWEST)
-            {
+            let older = match &slots[1 - i] {
+                Some(o) if o.valid => match self.load_bitmap(o, NEWEST) {
+                    Err(Error::Corrupt) => false,
+                    r => r.map(|()| true)?,
+                },
+                _ => false,
+            };
+            if !older {
                 self.bits[NEWEST * w..(NEWEST + 2) * w].fill(0);
-                if e != Error::Corrupt {
-                    return Err(e);
-                }
             }
             // A larger older slot may mark blocks past this disk's size; they reserve nothing and must not count.
             let end = self.blocks.div_ceil(64) as usize;
@@ -719,15 +719,13 @@ impl<'a, D: Disk> Fs<'a, D> {
             // One pass: both slots' reach, the committed copies, whether the older slot reaches more, the used count.
             let (mut lag, mut used) = (false, 0);
             for i in 0..w {
-                let (l, p) = (self.bits[i], self.bits[w + i]);
-                let o = self.bits[NEWEST * w + i] | self.bits[(NEWEST + 1) * w + i];
-                let o = if i + 1 < end {
-                    o
-                } else if i + 1 == end {
-                    o & tail
-                } else {
-                    0
+                let mask = match (i + 1).cmp(&end) {
+                    core::cmp::Ordering::Less => !0,
+                    core::cmp::Ordering::Equal => tail,
+                    core::cmp::Ordering::Greater => 0,
                 };
+                let (l, p) = (self.bits[i], self.bits[w + i]);
+                let o = (self.bits[NEWEST * w + i] | self.bits[(NEWEST + 1) * w + i]) & mask;
                 let c = o | l | p;
                 (self.bits[COMMITTED * w + i], self.bits[NEWEST * w + i]) = (c, l);
                 self.bits[(NEWEST + 1) * w + i] = p;
@@ -1794,22 +1792,30 @@ impl<'a, D: Disk> Fs<'a, D> {
                 }
             }
         }
-        self.bits[map * w..(map + 2) * w].fill(0);
+        // A slot of this disk's size fills each page's place in turn; another is cleared first.
+        let same = pages == self.pages;
+        if !same {
+            self.bits[map * w..(map + 2) * w].fill(0);
+        }
         let mut held = [usize::MAX; MAX_IX + 1];
         for p in 0..lp {
+            let (lo, n) = (p * PAGE_WORDS, page_words(s.blocks, p));
+            let at = map * w + lo;
+            if same {
+                self.bits[at + n..at + PAGE_WORDS].fill(0);
+            }
             let (b, sum) = self.list_entry(s, live, &mut held, p, None)?;
             if b == Block(0) && sum == Sum(0) {
+                if same {
+                    self.bits[at..at + n].fill(0);
+                }
                 continue;
             }
             if !(2..s.blocks).contains(&b.0) {
                 return Err(Error::Corrupt);
             }
-            let (lo, n) = (p * PAGE_WORDS, page_words(s.blocks, p));
-            if !live
-                && pages == self.pages
-                && self.list_entry(s, true, &mut held, p, None)? == (b, sum)
-            {
-                self.bits.copy_within(lo..lo + n, map * w + lo);
+            if !live && same && self.list_entry(s, true, &mut held, p, None)? == (b, sum) {
+                self.bits.copy_within(lo..lo + n, at);
                 for j in 0..self.nlog {
                     let i = self.log[j] as usize;
                     if (lo..lo + n).contains(&i) {
@@ -1827,9 +1833,16 @@ impl<'a, D: Disk> Fs<'a, D> {
             {
                 return Err(Error::Corrupt);
             }
-            for i in 0..n {
-                if let Some(at) = to(lo + i) {
-                    self.bits[at] = le64(&self.cache[0], 8 * i);
+            if same {
+                let words = self.cache[0][..8 * n].as_chunks::<8>().0;
+                for (d, c) in self.bits[at..at + n].iter_mut().zip(words) {
+                    *d = u64::from_le_bytes(*c);
+                }
+            } else {
+                for i in 0..n {
+                    if let Some(at) = to(lo + i) {
+                        self.bits[at] = le64(&self.cache[0], 8 * i);
+                    }
                 }
             }
         }
