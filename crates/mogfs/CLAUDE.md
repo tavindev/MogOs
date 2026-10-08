@@ -22,8 +22,9 @@ or a device driver.
   `commit`.
 - One copy-on-write B+tree of inode, directory entry and extent items; every pointer holds its child's sum and birth
   generation; data pages are whole 4096-byte blocks whose sums live in their extent (at most 128 pages).
-- Free space stored per root as a bitmap (pages of 128 MiB under one index, so at most about 32 GiB; a larger format
-  takes an incompatible feature flag), with the other slot's bitmap kept reserved.
+- Free space stored per root as a bitmap: pages of 128 MiB listed in the superblock (at most 128, so 16 GiB; a larger
+  format takes an incompatible feature flag), and after them a log of the words changed since the pages were
+  written, so a small commit writes no bitmap block. The other slot's bitmap is kept reserved.
 - Directory entries keyed by a seeded name hash with a collision chain of 8; a full chain is `Collision`. The bound,
   not the hash's strength, is the guarantee (the hash is a seeded multiply-rotate; tests build collisions from the
   seed).
@@ -33,7 +34,7 @@ or a device driver.
 
 - `#![cfg_attr(not(test), no_std)]`, no dependencies, no `alloc`, workspace `forbid(unsafe_code)`.
 - Leaf crate: `kernel`, `qemu-virt` and `e2e` (dev) depend on it; it depends on none of them.
-- `Fs` is about 22 KiB plus the caller's memory: `cache` (one index slot, the bitmap pages, 32 commit staging slots and
+- `Fs` is about 22 KiB plus the caller's memory: `cache` (the live page list, the bitmap pages, 32 commit staging slots and
   a node pool of 32 to 512 slots) and `bits` (three bitmaps), neither needing to be zeroed. A disk past that memory is
   `TooBig` at mount.
 
@@ -42,14 +43,17 @@ or a device driver.
 - Spectre v1: `read`, `map` and `write` index an extent's sums by `(page - off) % EXTENT_MAX`, in bounds by
   construction, since a page from a user's offset, on a mispredicted bound check, reaches past the extent; the kernel
   clamps the offset itself at `dispatch`. A `readdir` cursor indexes nothing: it becomes a key the tree search compares.
-- No block reachable from either slot is written. Dirty nodes stay in their cache slots; `commit` gives them, the
-  changed bitmap pages and a new index one free run, copies the nodes after the pages in the staging slots and writes
-  them in one request, flushes, writes the other slot, flushes (`[0, 2, 2]` while a run fits and the staging slots
-  hold them). When the pool runs short, dirty nodes are written out early (not a commit) at the start of a tree
+- No block reachable from either slot is written. Dirty nodes stay in their cache slots; `commit` gives them one free
+  run, copies them into the staging slots and writes them in one request, flushes, writes the other slot with the
+  log, flushes (`[0, 2, 2]` while a run fits and the staging slots hold them). When the log would overflow, the
+  pages changed since they were last written join that request (after their old copies are released) and the log
+  empties. Mount reads both superblocks, each live page, and the rightmost path; the older slot's pages only where
+  it does not share them, rebuilding a shared page's older words from the live log's replaced values. When the pool runs short, dirty nodes are written out early (not a commit) at the start of a tree
   operation, never in the middle of one.
 - Every on-disk value is checked once when decoded: a node's sum, level, layout, sorted keys within its bounds, every
   pointer in range and set in the live bitmap, birth generations, value shapes (extents within the disk, not
-  overlapping, at most 128 pages); a superblock's fields; a bitmap's sums, zero tails and marks for its own blocks. A
+  overlapping, at most 128 pages); a superblock's fields and log (words increasing, within the disk, zero tail); a bitmap's sums, zero tails
+  and marks for its own blocks. A
   crafted image gives a named error (or a fallback mount), never a panic.
 - An entry never names the root or its own directory (checked when decoded), and is followed only if the inode it
   names records it back (parent, entry offset, kind): no directory handle reaches outside its subtree, and no inode is

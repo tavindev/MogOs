@@ -14,11 +14,13 @@ pub(crate) fn reachable(disk: &[Buf]) -> Vec<bool> {
 }
 
 /// Slot `slot`'s superblock fields, if they keep the format's rules.
-fn superblock_fields(disk: &[Buf], slot: u64) -> Option<[u64; 15]> {
+fn superblock_fields(disk: &[Buf], slot: u64) -> Option<[u64; 14]> {
     let sb = &disk[slot as usize];
-    let f: [u64; 15] = std::array::from_fn(|i| le64(sb, 8 * i));
+    let f: [u64; 14] = std::array::from_fn(|i| le64(sb, 8 * i));
     let blocks = f[2];
-    let ok = le64(sb, END) == checksum(Block(slot), &sb[..SB_LEN]).0
+    let pages = pages(blocks.min(MAX_BLOCKS));
+    let end = SB_HDR as u128 + 16 * (pages as u128 + f[13] as u128);
+    let ok = le64(sb, END) == checksum(Block(slot), &sb[..END]).0
         && f[0] == MAGIC
         && f[1] % 2 == slot
         && (MIN_BLOCKS..=disk.len() as u64).contains(&blocks)
@@ -27,27 +29,20 @@ fn superblock_fields(disk: &[Buf], slot: u64) -> Option<[u64; 15]> {
         && f[12] < MAX_HEIGHT as u64
         && f[11] <= f[1]
         && (2..blocks).contains(&f[9])
-        && (2..blocks).contains(&f[13])
-        && sb[SB_LEN..END].iter().all(|&b| b == 0);
+        && end <= END as u128
+        && sb[end as usize..END].iter().all(|&b| b == 0);
     ok.then_some(f)
 }
 
-/// The bitmap index and page blocks of a slot, if its bitmap verifies, is well formed and marks them and the root.
-fn bitmap_blocks(disk: &[Buf], f: &[u64; 15]) -> Option<Vec<u64>> {
-    let (blocks, ix) = (f[2], f[13]);
+/// The bitmap page blocks of a slot, if its pages verify, its log is well formed and the bitmap marks the pages and
+/// the root.
+fn bitmap_blocks(disk: &[Buf], slot: u64, f: &[u64; 14]) -> Option<Vec<u64>> {
+    let (sb, blocks) = (&disk[slot as usize], f[2]);
     let (pages, words) = (pages(blocks), blocks.div_ceil(64) as usize);
-    let index = &disk[ix as usize];
-    let len = 16 * pages;
-    if le64(index, END) != f[14]
-        || checksum(Block(ix), &index[..len]).0 != f[14]
-        || index[len..END].iter().any(|&b| b != 0)
-    {
-        return None;
-    }
     let mut bits = vec![0u64; pages * PAGE_WORDS];
-    let mut held = vec![ix];
+    let mut held = vec![];
     for p in 0..pages {
-        let (b, sum) = (le64(index, 16 * p), le64(index, 16 * p + 8));
+        let (b, sum) = (le64(sb, SB_HDR + 16 * p), le64(sb, SB_HDR + 16 * p + 8));
         if (b, sum) == (0, 0) {
             continue;
         }
@@ -62,6 +57,16 @@ fn bitmap_blocks(disk: &[Buf], f: &[u64; 15]) -> Option<Vec<u64>> {
             bits[p * PAGE_WORDS + i] = le64(&disk[b as usize], 8 * i);
         }
         held.push(b);
+    }
+    let at = SB_HDR + 16 * pages;
+    let mut last = None;
+    for j in 0..f[13] as usize {
+        let (i, v) = (le64(sb, at + 16 * j), le64(sb, at + 16 * j + 8));
+        if i as usize >= words || last.is_some_and(|l| l >= i) {
+            return None;
+        }
+        bits[i as usize] = v;
+        last = Some(i);
     }
     let has = |b: u64| bits[(b / 64) as usize] >> (b % 64) & 1 != 0;
     let tail = (blocks..(words as u64 * 64)).any(has);
@@ -115,7 +120,7 @@ fn extents(n: &Buf) -> Vec<(u64, usize, usize)> {
 /// The blocks slot `slot` reaches, if it is valid: its bitmap, nodes and data pages that verify.
 fn slot_blocks(disk: &[Buf], slot: u64) -> Option<HashSet<u64>> {
     let f = superblock_fields(disk, slot)?;
-    let mut set: HashSet<u64> = bitmap_blocks(disk, &f)?.into_iter().collect();
+    let mut set: HashSet<u64> = bitmap_blocks(disk, slot, &f)?.into_iter().collect();
     for (b, _) in tree_nodes(disk, f[9], f[10]) {
         set.insert(b);
         let n = &disk[b as usize];
@@ -275,7 +280,7 @@ fn check<D: Disk>(fs: &mut Fs<D>, ctx: &str) {
         assert!(child < fs.next_inode, "{ctx}: inode past the counter");
     }
     assert_eq!(seen.len(), inodes.len(), "{ctx}: unnamed inode");
-    blocks.extend([0, 1, fs.index.0.0]);
+    blocks.extend([0, 1]);
     blocks.extend(
         (0..fs.pages)
             .map(|p| le64(&fs.cache[0], 16 * p))
@@ -478,7 +483,7 @@ fn mutation_base() -> Vec<Buf> {
 }
 
 fn reseal_superblock(disk: &mut [Buf], slot: usize) {
-    let sum = checksum(Block(slot as u64), &disk[slot][..SB_LEN]);
+    let sum = checksum(Block(slot as u64), &disk[slot][..END]);
     disk[slot][END..].copy_from_slice(&sum.0.to_le_bytes());
 }
 
@@ -502,13 +507,6 @@ fn reseal_up(
             }
         }
     }
-}
-
-/// Reseals the bitmap index `ix` of slot `slot` and its superblock.
-fn reseal_index(disk: &mut [Buf], slot: usize, ix: u64, blocks: u64) {
-    let sum = seal(Block(ix), &mut disk[ix as usize], 16 * pages(blocks));
-    disk[slot][112..120].copy_from_slice(&sum.0.to_le_bytes());
-    reseal_superblock(disk, slot);
 }
 
 /// `old`, a field of `width` bytes, changed one of several ways, some aimed at block and inode numbers.
@@ -541,45 +539,48 @@ fn write(disk: &mut [Buf], b: u64, at: usize, width: usize, rng: &mut u64) {
     disk[b as usize][at..at + width].copy_from_slice(&v.to_le_bytes()[..width]);
 }
 
-/// Changes one decoded field of a slot's superblock, bitmap index, bitmap page or tree node, resealing every sum
+/// Changes one decoded field of a slot's superblock (its header, page list or log), bitmap page or tree node, resealing every sum
 /// above it. Returns false, leaving the change out, for an extent moved onto blocks a slot reaches: catching that
 /// takes a walk of every root (step 41's scrub), not a check when decoded.
 fn mutate(disk: &mut [Buf], rng: &mut u64) -> bool {
     let slot = next(rng, 2) as usize;
     // A slot an earlier change already made invalid takes no more.
-    let Some(f) = superblock_fields(disk, slot as u64).filter(|f| bitmap_blocks(disk, f).is_some())
+    let Some(f) = superblock_fields(disk, slot as u64)
+        .filter(|f| bitmap_blocks(disk, slot as u64, f).is_some())
     else {
         return true;
     };
-    let ix = f[13];
     match next(rng, 8) {
         0 => {
-            write(disk, slot as u64, 8 * next(rng, 15) as usize, 8, rng);
+            write(disk, slot as u64, 8 * next(rng, 14) as usize, 8, rng);
             reseal_superblock(disk, slot);
             true
         }
         1 => {
-            write(
-                disk,
-                ix,
-                8 * next(rng, 2 * pages(f[2]) as u64) as usize,
-                8,
-                rng,
-            );
-            reseal_index(disk, slot, ix, f[2]);
-            true
+            // A page list or log field; a log value may then free a reachable block, which only scrub can catch.
+            let fields = 2 * (pages(f[2]) as u64 + f[13]);
+            let at = SB_HDR + 8 * next(rng, fields) as usize;
+            write(disk, slot as u64, at, 8, rng);
+            reseal_superblock(disk, slot);
+            // A log entry still well formed may free a reachable block: a scrub finding, left out.
+            at < SB_HDR + 16 * pages(f[2])
+                || superblock_fields(disk, slot as u64)
+                    .is_none_or(|f| bitmap_blocks(disk, slot as u64, &f).is_none())
         }
         2 => {
             // Only marking a block used: a bitmap that frees a reachable block is also a scrub finding.
-            let page = le64(&disk[ix as usize], 0) as usize;
+            let page = le64(&disk[slot], SB_HDR) as usize;
+            if page == 0 {
+                return true;
+            }
             let bit = next(rng, f[2]);
             disk[page][(bit / 8) as usize] |= 1 << (bit % 8);
             let sum = checksum(
                 Block(page as u64),
-                &disk[page][..8 * f[2].div_ceil(64) as usize],
+                &disk[page][..8 * f[2].div_ceil(64).min(PAGE_WORDS as u64) as usize],
             );
-            disk[ix as usize][8..16].copy_from_slice(&sum.0.to_le_bytes());
-            reseal_index(disk, slot, ix, f[2]);
+            disk[slot][SB_HDR + 8..SB_HDR + 16].copy_from_slice(&sum.0.to_le_bytes());
+            reseal_superblock(disk, slot);
             true
         }
         _ => {

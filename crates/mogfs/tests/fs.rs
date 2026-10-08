@@ -159,6 +159,8 @@ fn entry(path: &str, data: &[u8]) -> (String, Vec<u8>) {
 }
 
 const SEED: u64 = 0x5eed;
+/// Superblock bytes before the live page list.
+const SB_HDR: usize = 112;
 
 #[test]
 fn round_trip_survives_remount_and_drops_uncommitted_changes() {
@@ -402,7 +404,7 @@ fn crafted(mut disk: MemDisk, slots: &[usize], i: usize, value: u64) -> MemDisk 
     for &s in slots {
         let sb = &mut disk.durable[s];
         sb[8 * i..8 * i + 8].copy_from_slice(&value.to_le_bytes());
-        let sum = sum(s as u64, &sb[..120]);
+        let sum = sum(s as u64, &sb[..BLOCK_SIZE - 8]);
         sb[BLOCK_SIZE - 8..].copy_from_slice(&sum.to_le_bytes());
     }
     disk
@@ -445,9 +447,10 @@ fn flipped_byte_in_any_block_reads_as_corrupt_or_falls_back() {
             }
         }
     }
-    // The data reads as corrupt. The newest superblock, bitmap index, bitmap page and tree (one leaf, on the
-    // rightmost path mount checks) fall back to the empty older slot; flips in the older slot change nothing.
-    assert_eq!((corrupt, fallback), (2, 8));
+    // The data, and the bitmap page both slots share (the newest only logs its changes), read as corrupt. The newest
+    // superblock and tree (one leaf, on the rightmost path mount checks) fall back to the empty older slot; flips in
+    // the older slot change nothing.
+    assert_eq!((corrupt, fallback), (4, 4));
 }
 
 #[test]
@@ -496,9 +499,19 @@ fn uncommitted_changes_leave_the_older_slot_intact() {
 
 #[test]
 fn crafted_superblocks_are_rejected() {
-    // A block count too small or past the disk; a root table of two roots; a tree too tall; a root or index at a
-    // superblock.
-    for (i, value) in [(2, 0), (2, 15), (2, 65), (8, 2), (12, 8), (9, 1), (13, 0)] {
+    // A block count too small or past the disk; a root table of two roots; a tree too tall; a root at a superblock; a
+    // log past the superblock's room, or one whose words are out of order or past the disk.
+    for (i, value) in [
+        (2, 0),
+        (2, 15),
+        (2, 65),
+        (8, 2),
+        (12, 8),
+        (9, 1),
+        (13, 248),
+        (13, 2),
+        (16, 1),
+    ] {
         let mut disk = crafted(hello(), &[0], i, value);
         assert_eq!(snapshot(&mut disk), Ok(vec![]), "field {i} = {value}");
     }
@@ -599,9 +612,9 @@ fn failed_mount_leaves_the_fs_read_only() {
     let mut fs = mount(&mut mem, &mut disk).unwrap();
     let docs = fs.lookup(ROOT, b"docs").unwrap();
     let a = fs.lookup(docs, b"a.txt").unwrap();
-    // The older slot's bitmap index fails to read after the newest slot loaded.
-    let older = le64(&disk.durable[1], 13 * 8);
-    let mut fs = mem.fs(FailReads(&mut disk, older, usize::MAX));
+    // The live root (one leaf) fails to read after the superblocks and bitmap did.
+    let root = le64(&disk.durable[0], 9 * 8);
+    let mut fs = mem.fs(FailReads(&mut disk, root, usize::MAX));
     assert_eq!(fs.mount(), Err(Error::Io));
     assert_eq!(fs.write(a, 0, b"HE"), Err(Error::Io));
     assert_eq!(fs.truncate(a), Err(Error::Io));
@@ -1086,6 +1099,36 @@ impl Disk for Counted<'_> {
 }
 
 #[test]
+fn small_commits_log_the_bitmap_until_the_log_fills() {
+    let mut disk = MemDisk::new(16384);
+    let mut mem = Mem::new(16384, POOL);
+    let mut fs = format(&mut mem, &mut disk);
+    // The newest superblock's log length and first page block.
+    let log = |disk: &MemDisk| {
+        let sb = (0..2).max_by_key(|&s| le64(&disk.durable[s], 8)).unwrap();
+        (
+            le64(&disk.durable[sb], 13 * 8),
+            le64(&disk.durable[sb], SB_HDR),
+        )
+    };
+    let (_, page) = log(fs.disk());
+    let f = fs.create(ROOT, b"f").unwrap();
+    fs.write(f, 0, &[1; 100]).unwrap();
+    fs.commit().unwrap();
+    let (n, p) = log(fs.disk());
+    assert!(n > 0 && p == page, "{n} {p} {page}");
+    // Pages in 250 words of the bitmap: more than the log holds, so the pages are written and the log empties.
+    for i in 0..250 * 64 {
+        fs.write(f, i * BLOCK_SIZE as u64, &[2; 8]).unwrap();
+    }
+    fs.commit().unwrap();
+    let (n, p) = log(fs.disk());
+    assert!(n == 0 && p != page, "{n} {p} {page}");
+    let tree = snapshot(&mut disk).unwrap();
+    assert_eq!(tree.len(), 1);
+}
+
+#[test]
 fn block_io_per_operation() {
     let mut disk = MemDisk::new(1024);
     let mut mem = Mem::new(1024, POOL);
@@ -1100,10 +1143,10 @@ fn block_io_per_operation() {
     fs.commit().unwrap();
     let io = Cell::new([0; 3]);
     let mut fs = mem.fs(Counted(&mut disk, &io));
-    // [reads, writes, flushes]: both superblocks in one request, the live bitmap index and page, the rightmost path
-    // (root and last leaf), then the older slot's index and page.
+    // [reads, writes, flushes]: both superblocks in one request, the live bitmap page (the older slot shares it), and
+    // the rightmost path (root and last leaf).
     fs.mount().unwrap();
-    assert_eq!(io.take(), [7, 0, 0]);
+    assert_eq!(io.take(), [4, 0, 0]);
     assert_eq!(fs.height(), 2);
     // The leaf with the root's entries and the first inodes; the root node is cached.
     let docs = fs.lookup(ROOT, b"docs").unwrap();
@@ -1116,7 +1159,8 @@ fn block_io_per_operation() {
     // The page written since the last commit is rewritten in place from the buffer.
     fs.write(b, 100, &[2; 100]).unwrap();
     assert_eq!(io.take(), [0, 1, 0]);
-    // The dirty nodes, the bitmap page and a new index in one request, then the superblock between two flushes.
+    // The dirty nodes in one request, then the superblock, its log holding the bitmap's changes, between two
+    // flushes.
     fs.commit().unwrap();
     assert_eq!(io.take(), [0, 2, 2]);
     fs.commit().unwrap();
@@ -1285,14 +1329,18 @@ fn an_older_slot_larger_than_the_memory_is_reserved_without_reading_past_it() {
     let mut fs = format(&mut mem, &mut disk);
     fs.create(ROOT, b"a").unwrap();
     fs.commit().unwrap();
-    // Slot 0 (generation 2) shrinks to 16384 blocks: one bitmap page whose sum covers 256 words.
-    let ix = le64(&disk.durable[0], 13 * 8) as usize;
-    let page = le64(&disk.durable[ix], 0) as usize;
+    // Slot 0 (generation 2) shrinks to 16384 blocks: one bitmap page whose sum covers 256 words, its log folded in.
+    let sb = disk.durable[0];
+    let page = le64(&sb, SB_HDR) as usize;
+    for j in 0..le64(&sb, 13 * 8) as usize {
+        let at = SB_HDR + 16 * 3 + 16 * j;
+        let w = le64(&sb, at) as usize;
+        disk.durable[page][8 * w..8 * w + 8].copy_from_slice(&sb[at + 8..at + 16]);
+    }
+    disk.durable[0][SB_HDR + 16..BLOCK_SIZE - 8].fill(0);
     let s = sum(page as u64, &disk.durable[page][..2048]);
-    disk.durable[ix][8..16].copy_from_slice(&s.to_le_bytes());
-    let s = sum(ix as u64, &disk.durable[ix][..16]);
-    disk.durable[ix][BLOCK_SIZE - 8..].copy_from_slice(&s.to_le_bytes());
-    let disk = crafted(disk, &[0], 14, s);
+    let disk = crafted(disk, &[0], 13, 0);
+    let disk = crafted(disk, &[0], 15, s);
     let disk = crafted(disk, &[0], 2, 16384);
     // Slot 1 keeps 70000 blocks but puts its root past what memory for 16384 blocks holds.
     let mut disk = crafted(disk, &[1], 9, 69000);
@@ -1350,7 +1398,7 @@ fn image_name(i: usize) -> String {
 }
 
 /// A fixed workload: a height-2 tree with leaf splits, nodes written out early, an extent split, a sum updated in
-/// place, a truncate, merges and a rename. `image.bin` is what it wrote at 5b7d427, before the newtypes.
+/// place, a truncate, merges and a rename. `image.bin` is what it wrote with step 39b's format (superblock page list and log).
 fn image_workload(disk: &mut MemDisk) {
     let mut mem = Mem::new(IMAGE_BLOCKS, POOL);
     let mut fs = mem.fs(disk);
@@ -1378,7 +1426,7 @@ fn image_workload(disk: &mut MemDisk) {
 }
 
 #[test]
-fn image_from_before_the_newtypes_mounts_and_is_rewritten_bit_for_bit() {
+fn image_mounts_and_is_rewritten_bit_for_bit() {
     let image = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/image.bin")).unwrap();
     let mut disk = MemDisk::new(IMAGE_BLOCKS);
     image_workload(&mut disk);
