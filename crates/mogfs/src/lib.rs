@@ -2113,12 +2113,12 @@ impl<'a, D: Disk> Fs<'a, D> {
         }
     }
 
-    /// Makes the path to `k`'s leaf dirty, writing dirty nodes out first if the cache is short of slots.
-    fn cow(&mut self, k: Key) -> Result<Path, Error> {
+    /// Makes the path to `k`'s leaf dirty, recorded in `path`, writing dirty nodes out first if the cache is short of
+    /// slots.
+    fn cow(&mut self, k: Key, path: &mut Path) -> Result<(), Error> {
         if self.top - self.base - self.ndirty < 3 * (self.height + 2) {
             self.spill()?;
         }
-        let mut path = Path::default();
         let (mut p, mut level, mut lo, mut hi) = (self.root, self.height - 1, Key(0), NONE);
         let mut parent: Option<(usize, usize)> = None;
         loop {
@@ -2130,7 +2130,7 @@ impl<'a, D: Disk> Fs<'a, D> {
             }
             (path.slot[level], path.lo[level], path.hi[level]) = (s, lo, hi);
             if level == 0 {
-                return Ok(path);
+                return Ok(());
             }
             let n = &self.cache[s];
             let i = route(n, k);
@@ -2184,7 +2184,9 @@ impl<'a, D: Disk> Fs<'a, D> {
 
     /// The slot and value offset of item `k`, on a dirty path.
     fn value_mut(&mut self, k: Key) -> Result<(usize, usize), Error> {
-        let s = self.cow(k)?.slot[0];
+        let mut path = Path::default();
+        self.cow(k, &mut path)?;
+        let s = path.slot[0];
         let n = &self.cache[s];
         let i = search(n, k);
         if i == count(n) || ikey(n, i) != k {
@@ -2196,7 +2198,8 @@ impl<'a, D: Disk> Fs<'a, D> {
     /// Adds item `k` with a `len`-byte value to fill; returns its slot and value offset.
     fn insert(&mut self, k: Key, len: usize) -> Result<(usize, usize), Error> {
         (self.finger, self.start) = (None, (NONE, 0));
-        let path = self.cow(k)?;
+        let mut path = Path::default();
+        self.cow(k, &mut path)?;
         let s = path.slot[0];
         let i = search(&self.cache[s], k);
         if i < count(&self.cache[s]) && ikey(&self.cache[s], i) == k {
@@ -2276,7 +2279,8 @@ impl<'a, D: Disk> Fs<'a, D> {
     /// Removes item `k`, merging nodes that fall below a quarter full into a sibling where they fit.
     fn delete(&mut self, k: Key) -> Result<(), Error> {
         (self.finger, self.start) = (None, (NONE, 0));
-        let path = self.cow(k)?;
+        let mut path = Path::default();
+        self.cow(k, &mut path)?;
         let s = path.slot[0];
         let i = search(&self.cache[s], k);
         if i == count(&self.cache[s]) || ikey(&self.cache[s], i) != k {
@@ -2727,10 +2731,12 @@ fn leaf_remove(n: &mut [u8], i: usize) {
     let (off, len) = (voff(n, i), vlen(n, i));
     n.copy_within(b..off, b + len);
     n.copy_within(HDR + ITEM * (i + 1)..HDR + ITEM * c, HDR + ITEM * i);
-    for j in 0..c - 1 {
-        let o = voff(n, j);
-        if o < off {
-            set_voff(n, j, o + len);
+    if off > b {
+        for j in 0..c - 1 {
+            let o = voff(n, j);
+            if o < off {
+                set_voff(n, j, o + len);
+            }
         }
     }
     set_count(n, c - 1);
