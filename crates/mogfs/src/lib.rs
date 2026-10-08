@@ -124,6 +124,11 @@ const NEWEST: usize = 2;
 const COMMITTED: usize = 4;
 const SNAP: usize = 5;
 const MAPS: usize = 6;
+
+// `reserve` levels.
+const DELETE: usize = 0;
+const REMOVE: usize = 1;
+const ADD: usize = 2;
 const DATA: usize = 0;
 const META: usize = 1;
 
@@ -873,7 +878,7 @@ impl<'a, D: Disk> Fs<'a, D> {
         let pages = (end - 1) / BLOCK_SIZE as u64 - offset / BLOCK_SIZE as u64 + 1;
         // Each page may add an extent or a sum; the extents at both ends may split.
         let bytes = (pages as usize + 2) * (ITEM + 16) * 2 + 2 * EXTENT_ITEM;
-        self.reserve(pages, 3, bytes, false)?;
+        self.reserve(pages, 3, bytes, ADD)?;
         let r = self.write_pages(file, offset, data).and_then(|()| {
             it.size = it.size.max(end);
             (it.mtime, it.ctime) = (self.now, self.now);
@@ -895,7 +900,7 @@ impl<'a, D: Disk> Fs<'a, D> {
         }
         let mut it = *it;
         let bytes = self.extent_bytes(file)?;
-        self.reserve(0, 2, bytes, true)?;
+        self.reserve(0, 2, bytes, REMOVE)?;
         let r = self.remove_extents(file).and_then(|()| {
             it.size = 0;
             (it.mtime, it.ctime) = (self.now, self.now);
@@ -942,7 +947,7 @@ impl<'a, D: Disk> Fs<'a, D> {
         } else {
             0
         };
-        self.reserve(0, 4, bytes, true)?;
+        self.reserve(0, 4, bytes, REMOVE)?;
         self.forget_names();
         let r = self
             .delete(Key::new(dir, ItemKind::Entry, off))
@@ -999,7 +1004,7 @@ impl<'a, D: Disk> Fs<'a, D> {
         if from_dir != to_dir && kind == DIR && self.below(inode, to_dir)? {
             return Err(Error::InvalidName);
         }
-        self.reserve(0, 5, 0, false)?;
+        self.reserve(0, 5, 0, ADD)?;
         self.forget_names();
         let r = self
             .delete(Key::new(from_dir, ItemKind::Entry, off))
@@ -1053,7 +1058,7 @@ impl<'a, D: Disk> Fs<'a, D> {
         let ixb: usize = (1..=fan_height(self.pages))
             .map(|l| ix_count(self.pages, l))
             .sum();
-        self.reserve((self.pages + ixb) as u64, 1, ITEM + SNAP_LEN, false)?;
+        self.reserve((self.pages + ixb) as u64, 1, ITEM + SNAP_LEN, ADD)?;
         let r = self.write_snapshot(g, ixb);
         self.tear(&r);
         r?;
@@ -1192,6 +1197,142 @@ impl<'a, D: Disk> Fs<'a, D> {
         Ok(*n - 1)
     }
 
+    /// Deletes `snapshot`: its item, and the blocks only it holds come free (after the commit after next, as the live
+    /// tree's do). Open even when a removal would be refused for space.
+    pub fn delete_snapshot(&mut self, snapshot: Snapshot) -> Result<(), Error> {
+        if self.broken {
+            return Err(Error::Io);
+        }
+        let g = snapshot.0;
+        let (_, _, ix) = self.snap_item(g)?;
+        let (prev, next) = self.neighbours(g)?;
+        self.reserve(0, 1, 0, DELETE)?;
+        let r = self.unpin(ix, prev, next).and_then(|()| {
+            if next.is_none() {
+                self.newest = prev.map_or(0, |p| p.0);
+                self.load_snapshot()?;
+            }
+            self.forget_names();
+            self.delete(Key::new(ROOT, ItemKind::Snapshot, Offset(g)))?;
+            // A clean node only the snapshot reached must not answer for its block once that is reused.
+            for s in self.base..self.top {
+                if !self.dirt[s]
+                    && self.blk[s] != EMPTY
+                    && !(self.has(LIVE, self.blk[s]) || self.has(PINNED, self.blk[s]))
+                {
+                    self.blk[s] = EMPTY;
+                }
+            }
+            (self.finger, self.start) = (None, (NONE, 0));
+            self.changed = true;
+            Ok(())
+        });
+        self.tear(&r);
+        r
+    }
+
+    /// The snapshots just older and just newer than generation `g`, with their bitmap index roots.
+    #[allow(clippy::type_complexity)]
+    fn neighbours(
+        &mut self,
+        g: u64,
+    ) -> Result<(Option<(u64, (Block, Sum))>, Option<(u64, (Block, Sum))>), Error> {
+        let (mut k, end) = (
+            Key::new(ROOT, ItemKind::Snapshot, Offset(0)),
+            Key::new(ROOT, ItemKind::Snapshot, Offset(OFFSET)),
+        );
+        let (mut prev, mut next) = (None, None);
+        while let Some((s, i, hi)) = self.seek(k)? {
+            let n = &self.cache[s];
+            let key = ikey(n, i);
+            if key > end {
+                break;
+            }
+            let v = value(n, i);
+            let e = (key.offset().0, (Block(le64(v, 32)), Sum(le64(v, 40))));
+            if e.0 > g {
+                next = Some(e);
+                break;
+            }
+            if e.0 < g {
+                prev = Some(e);
+            }
+            k = if i + 1 < count(n) { ikey(n, i + 1) } else { hi };
+            if k == NONE {
+                break;
+            }
+        }
+        Ok((prev, next))
+    }
+
+    /// Unpins the blocks the snapshot whose bitmap index root is `ix` holds and its neighbours do not: the snapshots
+    /// holding a block are a run of consecutive generations, so no other snapshot holds them. For the newest, the live
+    /// tree holds none of them (pinned and live are disjoint). A page the snapshot shares with a neighbour unpins
+    /// nothing.
+    fn unpin(
+        &mut self,
+        ix: (Block, Sum),
+        prev: Option<(u64, (Block, Sum))>,
+        next: Option<(u64, (Block, Sum))>,
+    ) -> Result<(), Error> {
+        let (pages, h, w) = (self.pages, fan_height(self.pages), self.words);
+        // Each bitmap's index levels and its page in staging slots of their own (`3 * h + 3` is at most 21 slots).
+        let roots = [Some(ix), prev.map(|p| p.1), next.map(|n| n.1)];
+        let mut held = [[usize::MAX; MAX_IX + 1]; 3];
+        for p in 0..pages {
+            let mut e = [None; 3];
+            for j in 0..3 {
+                if let Some(root) = roots[j] {
+                    let b = self.blocks;
+                    e[j] =
+                        Some(self.index_entry(root, h, pages, b, &mut held[j], p, None, j * h)?);
+                }
+            }
+            let own = e[0].unwrap_or((Block(0), Sum(0)));
+            if own == (Block(0), Sum(0)) || e[1] == Some(own) || e[2] == Some(own) {
+                continue;
+            }
+            let (lo, n) = (p * PAGE_WORDS, page_words(self.blocks, p));
+            for j in 0..3 {
+                if let Some(e) = e[j] {
+                    self.read_page(e, n, 3 * h + 1 + j)?;
+                }
+            }
+            for i in 0..n {
+                let mut u = le64(&self.cache[3 * h + 1], 8 * i);
+                for j in 1..3 {
+                    if e[j].is_some() {
+                        u &= !le64(&self.cache[3 * h + 1 + j], 8 * i);
+                    }
+                }
+                let at = w + lo + i;
+                if self.bits[at] & u != 0 {
+                    let before = self.reach(lo + i).count_ones();
+                    self.bits[at] &= !u;
+                    self.touch(at);
+                    self.free += (before - self.reach(lo + i).count_ones()) as u64;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Reads the bitmap page `e` (`n` words; a zero pointer is all zero) into staging slot `s` and checks its sum.
+    fn read_page(&mut self, e: (Block, Sum), n: usize, s: usize) -> Result<(), Error> {
+        if e == (Block(0), Sum(0)) {
+            self.cache[s].fill(0);
+            return Ok(());
+        }
+        if !(2..self.blocks).contains(&e.0.0) {
+            return Err(Error::Corrupt);
+        }
+        self.fetch(e.0, s)?;
+        if checksum(e.0, &self.cache[s][..8 * n]) != e.1 {
+            return Err(Error::Corrupt);
+        }
+        Ok(())
+    }
+
     /// Snapshot `g`'s tree root and height and its bitmap index root, from its item in the live tree.
     fn snap_item(&mut self, g: u64) -> Result<(Ptr, usize, (Block, Sum)), Error> {
         let k = Key::new(ROOT, ItemKind::Snapshot, Offset(g.min(OFFSET)));
@@ -1232,7 +1373,7 @@ impl<'a, D: Disk> Fs<'a, D> {
         }
         let mut held = [usize::MAX; MAX_IX + 1];
         for p in 0..pages {
-            let (b, sum) = self.index_entry(ix, h, pages, self.blocks, &mut held, p, None)?;
+            let (b, sum) = self.index_entry(ix, h, pages, self.blocks, &mut held, p, None, 0)?;
             if (b, sum) == (Block(0), Sum(0)) {
                 continue;
             }
@@ -1270,7 +1411,8 @@ impl<'a, D: Disk> Fs<'a, D> {
         }
         let mut held = [usize::MAX; MAX_IX + 1];
         for p in 0..pages {
-            let (b, _) = self.index_entry(ix, h, pages, self.blocks, &mut held, p, Some(SNAP))?;
+            let (b, _) =
+                self.index_entry(ix, h, pages, self.blocks, &mut held, p, Some(SNAP), 0)?;
             if b != Block(0) && !self.has(SNAP, b) {
                 return Err(Error::Corrupt);
             }
@@ -1767,7 +1909,16 @@ impl<'a, D: Disk> Fs<'a, D> {
         } else if s.ix_h == 0 {
             (usize::MAX, SB_HDR + 16 * p)
         } else {
-            return self.index_entry(s.ix, s.ix_h, 2 * pages(s.blocks), s.blocks, held, p, check);
+            return self.index_entry(
+                s.ix,
+                s.ix_h,
+                2 * pages(s.blocks),
+                s.blocks,
+                held,
+                p,
+                check,
+                0,
+            );
         };
         let b = if slot == usize::MAX {
             &self.bufs[sb]
@@ -1790,12 +1941,13 @@ impl<'a, D: Disk> Fs<'a, D> {
         held: &mut [usize; MAX_IX + 1],
         p: usize,
         check: Option<usize>,
+        off: usize,
     ) -> Result<(Block, Sum), Error> {
         let mut ptr = root;
         for l in (1..=h).rev() {
             let i = (0..l).fold(p, |i, _| i / FAN);
             if held[l] != i {
-                self.read_ix(l, ptr, 16 * ix_children(pages, l, i), blocks)?;
+                self.read_ix(off + l, ptr, 16 * ix_children(pages, l, i), blocks)?;
                 if let Some(map) = check
                     && ptr.0 != Block(0)
                     && !self.marked(map, ptr.0)
@@ -1807,8 +1959,8 @@ impl<'a, D: Disk> Fs<'a, D> {
             }
             let at = 16 * ((0..l - 1).fold(p, |i, _| i / FAN) % FAN);
             ptr = (
-                Block(le64(&self.cache[l], at)),
-                Sum(le64(&self.cache[l], at + 8)),
+                Block(le64(&self.cache[off + l], at)),
+                Sum(le64(&self.cache[off + l], at + 8)),
             );
         }
         Ok(ptr)
@@ -1953,7 +2105,7 @@ impl<'a, D: Disk> Fs<'a, D> {
         self.forget_names();
         let inode = Inode(self.next_inode);
         let next = self.next_inode.checked_add(1).ok_or(Error::NoSpace)?;
-        self.reserve(0, 3, ITEM + 9 + name.len() + ITEM + INODE_LEN, false)?;
+        self.reserve(0, 3, ITEM + 9 + name.len() + ITEM + INODE_LEN, ADD)?;
         let it = Item {
             kind,
             mode: if kind == DIR { 0o755 } else { 0o644 },
@@ -2175,20 +2327,23 @@ impl<'a, D: Disk> Fs<'a, D> {
     }
 
     /// Fails with `NoSpace` unless `data` blocks, the nodes `paths` tree changes touching `bytes` of items may dirty
-    /// or add, and what commit needs (every dirty node, the bitmap pages and index blocks) are free. A change that is not
-    /// a `removal` also leaves room for one, so a full disk can still be emptied.
-    fn reserve(&self, data: u64, paths: usize, bytes: usize, removal: bool) -> Result<(), Error> {
+    /// or add, and what commit needs (every dirty node, the page list's pages and index blocks) are free, beyond a floor
+    /// for `level`: a change that adds (`ADD`) keeps room for a removal, and a removal (`REMOVE`) room for a snapshot
+    /// delete and its commit (`DELETE`), so a full disk can still be emptied under a snapshot.
+    fn reserve(&self, data: u64, paths: usize, bytes: usize, level: usize) -> Result<(), Error> {
         // Adjacent leaves together hold at least a quarter leaf, and internal nodes are at least a quarter full.
         let nodes = |paths: usize, bytes: usize| {
             2 * (paths * (self.height + 1) + 2 * bytes.div_ceil(QUARTER))
         };
-        let floor = if removal { 0 } else { nodes(4, 0) };
         let ix = if self.ix_h == 0 {
             0
         } else {
             ix_blocks(self.lpages())
         };
-        let need = data + (nodes(paths, bytes) + floor + self.ndirty + self.lpages() + ix) as u64;
+        let commit = self.lpages() + ix;
+        let delete = nodes(1, 0) + commit;
+        let floor = [0, delete, nodes(4, 0) + delete][level];
+        let need = data + (nodes(paths, bytes) + floor + self.ndirty + commit) as u64;
         if need > self.free {
             return Err(Error::NoSpace);
         }
@@ -2363,7 +2518,7 @@ impl<'a, D: Disk> Fs<'a, D> {
             return Ok(());
         };
         // Its extent's path may need new dirty nodes; a commit must never run short of space.
-        if self.reserve(1, 1, 0, true).is_err() {
+        if self.reserve(1, 1, 0, REMOVE).is_err() {
             return Ok(());
         }
         let Some((off, _, 1)) = self.extent_at(inode, page)? else {

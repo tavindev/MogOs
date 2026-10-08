@@ -1163,3 +1163,103 @@ fn pages_commits_on_an_aged_disk_release_every_old_block() {
         }
     }
 }
+
+/// The blocks snapshot `g` reaches: its tree's nodes and data, and its bitmap's index blocks and pages, through the
+/// disk (a restatement of the format).
+fn snapshot_reach(disk: &[Buf], fs: &mut Fs<&mut Guarded>, g: u64) -> HashSet<u64> {
+    let (root, _, ix) = fs.snap_item(g).unwrap();
+    let mut set = HashSet::new();
+    for (b, _) in tree_nodes(disk, root.block.0, root.sum.0) {
+        set.insert(b);
+        for (start, pages, _) in extents(&disk[b as usize]) {
+            set.extend((0..pages as u64).map(|j| start + j));
+        }
+    }
+    let (pages, h) = (fs.pages, fan_height(fs.pages));
+    let mut level = vec![ix];
+    for l in (1..=h).rev() {
+        let mut next = vec![];
+        for (i, &(b, _)) in level.iter().enumerate() {
+            set.insert(b.0);
+            let n = &disk[b.0 as usize];
+            for j in 0..ix_children(pages, l, i) {
+                next.push((Block(le64(n, 16 * j)), Sum(le64(n, 16 * j + 8))));
+            }
+        }
+        level = next;
+    }
+    set.extend(level.iter().map(|e| e.0.0).filter(|&b| b != 0));
+    set
+}
+
+/// Pinned holds exactly the blocks some snapshot reaches and the live tree does not.
+fn check_pinned(fs: &mut Fs<&mut Guarded>, snaps: &[u64], ctx: &str) {
+    let disk = fs.disk().blocks.clone();
+    let mut held = HashSet::new();
+    for &g in snaps {
+        held.extend(snapshot_reach(&disk, fs, g));
+    }
+    for b in 0..fs.blocks {
+        assert_eq!(
+            fs.has(PINNED, Block(b)),
+            held.contains(&b) && !fs.has(LIVE, Block(b)),
+            "{ctx}: pinned bit {b}"
+        );
+    }
+}
+
+/// Snapshots taken between changes keep exactly their blocks pinned; deleting one in the middle, the newest and the
+/// last unpins exactly what no other root holds, and after two commits the free space is a fresh mount's.
+#[test]
+fn deleting_a_snapshot_frees_exactly_the_blocks_no_other_root_reaches() {
+    let blocks = 3000;
+    let mut disk = Guarded::new(vec![[0; BLOCK_SIZE]; blocks], true);
+    let mut mem = Mem::new(blocks);
+    let mut fs = mem.fs(&mut disk);
+    fs.format(3).unwrap();
+    let mut files = vec![];
+    let mut snaps = vec![];
+    for round in 0..4u64 {
+        for i in 0..30 {
+            let f = fs
+                .create(ROOT, format!("r{round}-{i:0>30}").as_bytes())
+                .unwrap();
+            fs.write(f, 0, &vec![round as u8; 1 + i * 700]).unwrap();
+            files.push(f);
+        }
+        for &f in files.iter().step_by(3) {
+            // Some were unlinked in an earlier round.
+            let r = fs.write(f, 100, &[0xee; 5000]);
+            assert!(matches!(r, Ok(()) | Err(Error::NotFound)), "{r:?}");
+        }
+        for i in (0..30).step_by(4) {
+            let _ = fs.unlink(
+                ROOT,
+                format!("r{}-{i:0>30}", round.saturating_sub(1)).as_bytes(),
+                |_| false,
+            );
+        }
+        snaps.push(fs.snapshot().unwrap().0);
+        check(&mut fs, &format!("round {round}"));
+        check_pinned(&mut fs, &snaps, &format!("round {round}"));
+    }
+    fs.mount().unwrap();
+    check_pinned(&mut fs, &snaps, "remount");
+    for g in [snaps[1], snaps[3], snaps[0], snaps[2]] {
+        fs.delete_snapshot(Snapshot(g)).unwrap();
+        snaps.retain(|&s| s != g);
+        check_pinned(&mut fs, &snaps, &format!("delete {g}"));
+        fs.commit().unwrap();
+        fs.commit().unwrap();
+        check(&mut fs, &format!("delete {g}"));
+        let free = fs.free;
+        let mut d = Guarded::new(fs.disk().blocks.clone(), true);
+        let mut m = Mem::new(blocks);
+        let mut fresh = m.fs(&mut d);
+        fresh.mount().unwrap();
+        assert_eq!(fresh.free, free, "delete {g}: free");
+        check_pinned(&mut fresh, &snaps, &format!("delete {g}, fresh"));
+        assert_eq!(fs.view(Snapshot(g)).map(|_| ()), Err(Error::NotFound));
+    }
+    assert!((0..fs.words).all(|i| fs.bits[PINNED * fs.words + i] == 0));
+}
