@@ -1516,3 +1516,34 @@ fn deleting_the_newest_snapshot_loads_the_next_newests_bitmap_from_the_disk() {
         vec![("/a".to_string(), Some(vec![1; 1200 * BLOCK_SIZE]))]
     );
 }
+
+/// Enough snapshots that their items span leaves: deletes in an order that makes a neighbour sit in another leaf still
+/// unpin exactly what no other snapshot marks.
+#[test]
+fn snapshot_neighbours_are_found_across_leaves() {
+    let blocks = 6000;
+    let mut disk = Guarded::new(vec![[0; BLOCK_SIZE]; blocks], true);
+    let mut mem = Mem::new(blocks);
+    let mut fs = mem.fs(&mut disk);
+    fs.format(9).unwrap();
+    let f = fs.create(ROOT, b"f").unwrap();
+    let mut snaps = vec![];
+    for i in 0..120u64 {
+        fs.write(f, i * BLOCK_SIZE as u64, &[i as u8; 100]).unwrap();
+        snaps.push(fs.snapshot().unwrap().0);
+    }
+    check_pinned(&mut fs, &snaps, "created");
+    let rng = &mut 7u64;
+    while !snaps.is_empty() {
+        let g = snaps.remove(next(rng, snaps.len() as u64) as usize);
+        fs.delete_snapshot(Snapshot(g)).unwrap();
+        if snaps.len() % 10 == 0 {
+            check_pinned(&mut fs, &snaps, &format!("deleted {g}"));
+            fs.commit().unwrap();
+        }
+    }
+    fs.commit().unwrap();
+    fs.commit().unwrap();
+    check(&mut fs, "all deleted");
+    assert!((0..fs.words).all(|i| fs.bits[PINNED * fs.words + i] == 0));
+}

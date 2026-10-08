@@ -1275,37 +1275,44 @@ impl<'a, D: Disk> Fs<'a, D> {
         r
     }
 
-    /// The snapshots just older and just newer than generation `g`, with their bitmap index roots.
+    /// The snapshots just older and just newer than generation `g` (whose item exists), with their bitmap index
+    /// roots: the items next to its item.
     #[allow(clippy::type_complexity)]
     fn neighbours(
         &mut self,
         g: u64,
     ) -> Result<(Option<(u64, (Block, Sum))>, Option<(u64, (Block, Sum))>), Error> {
-        let (mut k, end) = (
+        let k = Key::new(ROOT, ItemKind::Snapshot, Offset(g));
+        let (first, last) = (
             Key::new(ROOT, ItemKind::Snapshot, Offset(0)),
             Key::new(ROOT, ItemKind::Snapshot, Offset(OFFSET)),
         );
-        let (mut prev, mut next) = (None, None);
-        while let Some((s, i, hi)) = self.seek(k)? {
-            let n = &self.cache[s];
-            let key = ikey(n, i);
-            if key > end {
-                break;
-            }
+        let snap = |n: &[u8], i: usize| {
             let v = value(n, i);
-            let e = (key.offset().0, (Block(le64(v, 32)), Sum(le64(v, 40))));
-            if e.0 > g {
-                next = Some(e);
-                break;
+            (
+                ikey(n, i).offset().0,
+                (Block(le64(v, 32)), Sum(le64(v, 40))),
+            )
+        };
+        let next = match self.seek(Key(k.0 + 1))? {
+            Some((s, i, _)) if ikey(&self.cache[s], i) <= last => Some(snap(&self.cache[s], i)),
+            _ => None,
+        };
+        // The last item below `k`: in the leaf holding `x - 1`, or below that leaf's lower bound.
+        let mut x = k;
+        let prev = loop {
+            if x <= first {
+                break None;
             }
-            if e.0 < g {
-                prev = Some(e);
+            let (s, _) = self.leaf(Key(x.0 - 1))?;
+            let lo = self.finger.map_or(Key(0), |f| f.1);
+            let i = search(&self.cache[s], x);
+            if i > 0 {
+                let n = &self.cache[s];
+                break (ikey(n, i - 1) >= first).then(|| snap(n, i - 1));
             }
-            k = if i + 1 < count(n) { ikey(n, i + 1) } else { hi };
-            if k == NONE {
-                break;
-            }
-        }
+            x = lo;
+        };
         Ok((prev, next))
     }
 
@@ -1453,12 +1460,25 @@ impl<'a, D: Disk> Fs<'a, D> {
                 self.bits[SNAP * w + lo + i] = le64(&self.cache[0], 8 * i);
             }
         }
-        let mut held = [usize::MAX; MAX_IX + 1];
-        for p in 0..pages {
-            let (b, _) =
-                self.index_entry(ix, h, pages, self.blocks, &mut held, p, Some(SNAP), 0)?;
-            if b != Block(0) && !self.has(SNAP, b) {
+        // Its pages are marked; so is each index block, read again only past one level (disks over 32 TiB).
+        if h == 1 {
+            if !self.has(SNAP, ix.0) {
                 return Err(Error::Corrupt);
+            }
+            for p in 0..pages {
+                let b = Block(le64(&self.cache[1], 16 * p));
+                if b != Block(0) && !self.has(SNAP, b) {
+                    return Err(Error::Corrupt);
+                }
+            }
+        } else {
+            let mut held = [usize::MAX; MAX_IX + 1];
+            for p in 0..pages {
+                let (b, _) =
+                    self.index_entry(ix, h, pages, self.blocks, &mut held, p, Some(SNAP), 0)?;
+                if b != Block(0) && !self.has(SNAP, b) {
+                    return Err(Error::Corrupt);
+                }
             }
         }
         if !self.has(SNAP, root.block) {
