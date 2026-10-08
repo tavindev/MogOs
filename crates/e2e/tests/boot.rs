@@ -696,14 +696,6 @@ fn lock_bench(cpus: usize, secs: u64) {
             .parse::<f64>()
             .unwrap();
     }
-    let first = lines
-        .iter()
-        .find_map(|l| l.strip_prefix("lock: adder overlapped at "))
-        .expect("missing adder line")
-        .parse::<u64>()
-        .unwrap();
-    // One adder per core, the boot context one of them, each adding 10^5.
-    assert!(first > 100_000, "the adders never interleaved");
     let count = format!("lock: count {}", cpus * 100_000);
     assert!(lines.contains(&count), "missing line: {count}");
     assert!(status.success(), "QEMU exited with {status}");

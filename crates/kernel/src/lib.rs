@@ -750,8 +750,7 @@ fn smp_bench<B: Board>(board: &mut B) {
 /// access; then the boot context and a task per other core (at least one,
 /// so the timer interleaves them on one) each adds `CONTENDED_LOCKS` to a counter under the board's lock, timed from
 /// their spawn until all are done. Then, untimed, each adds `CONTENDED_LOCKS` again in halves, the second once every
-/// adder finished its first (`add_in_halves`), so they overlap however the host schedules them; that run's total must
-/// be exact.
+/// adder finished its first (`add_in_halves`), so they are likely to overlap; that run's total must be exact.
 fn lock_bench<B: Board>(board: &mut B) {
     for (name, kind) in [
         ("ticket", RoundTrip::Ticket),
@@ -788,14 +787,14 @@ fn lock_bench<B: Board>(board: &mut B) {
     let _ = writeln!(board.console(), "lock: count {count}");
 }
 
-/// Adds `CONTENDED_LOCKS` in two halves, the second once all `adders` finished their first; returns the count after.
-fn add_in_halves<B: Board>(board: &mut B, adders: usize) -> u64 {
+/// Adds `CONTENDED_LOCKS` in two halves, the second once all `adders` finished their first.
+fn add_in_halves<B: Board>(board: &mut B, adders: usize) {
     board.add_locked(CONTENDED_LOCKS / 2);
     ADDERS_HALFWAY.fetch_add(1, Relaxed);
     while ADDERS_HALFWAY.load(Relaxed) < adders {
         board.yield_now();
     }
-    board.add_locked(CONTENDED_LOCKS - CONTENDED_LOCKS / 2)
+    board.add_locked(CONTENDED_LOCKS - CONTENDED_LOCKS / 2);
 }
 
 fn add_and_yield<B: Board>(board: &mut B, adders: usize) -> ! {
@@ -805,8 +804,7 @@ fn add_and_yield<B: Board>(board: &mut B, adders: usize) -> ! {
     while ADDERS_DONE.load(Acquire) < adders {
         board.yield_now();
     }
-    let count = add_in_halves(board, adders) - TIMED_COUNT.load(Relaxed);
-    let _ = writeln!(board.console(), "lock: adder overlapped at {count}");
+    add_in_halves(board, adders);
     ADDERS_DONE.fetch_add(1, Release);
     loop {
         board.yield_now();

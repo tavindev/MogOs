@@ -120,6 +120,9 @@ unsafe fn after_end(
             next = unsafe { switch(&mut kernel.sched, cpu, next) };
         }
     }
+    if core::mem::take(&mut kernel.signal_boot) {
+        send_sgi(0);
+    }
     // SAFETY: trap context.
     (next, unsafe {
         DEFERRED.with_masked(|parked| parked.is_some())
@@ -144,9 +147,7 @@ fn release_process(kernel: &mut Kernel, w: &mut W<'_, level::Kernel>, (index, co
     drop(frames);
     kernel.sched.exited(index, code);
     // The boot context may wait for the task count, which counted this release.
-    if arch::cpu() != 0 && kernel.sched.boot_waits() {
-        send_sgi(0);
-    }
+    kernel.signal_boot |= arch::cpu() != 0 && kernel.sched.boot_waits();
 }
 
 /// Saves `cpu`'s current `frame` and enters the next ready task, or its idle context (process 0); returns its frame.
@@ -203,7 +204,8 @@ unsafe fn enter(sched: &mut Sched, frame: usize, (next, from, to): (usize, usize
 /// Ends the thread in `slot`, which no core but `cpu` runs, with `code`: frees the mutexes it owns, drops the boost it
 /// lent, and refunds its kernel stack to its process, freeing its frames at once or, if `cpu` runs on it, once the trap
 /// exit left it. Its process's last thread leaves the process's release to the hook's `finish_release`. The boot
-/// context may wait for the task count to drop, so core 0 is signalled, once: by the release for a last thread.
+/// context may wait for the task count to drop, so core 0 is signalled once, at the end of the hook (`after_end`),
+/// however many threads the hold ended.
 fn end_thread(
     kernel: &mut Kernel,
     w: &mut W<'_, level::Kernel>,
@@ -215,6 +217,7 @@ fn end_thread(
         mutexes,
         ended,
         release,
+        signal_boot,
         ..
     } = kernel;
     let process = sched.process_of(slot);
@@ -239,7 +242,8 @@ fn end_thread(
     if !on_it {
         free_stack(&mut FRAMES.lock_masked(w), stack);
     }
-    *ended |= on_it || last;
+    *signal_boot |= cpu != 0 && sched.boot_waits();
+    *ended |= on_it || last || *signal_boot;
     if on_it {
         // SAFETY: trap context, as for every caller.
         let parked = unsafe { DEFERRED.with_masked(|parked| parked.replace(stack)) };
@@ -248,8 +252,6 @@ fn end_thread(
     if last {
         debug_assert!(release.is_none(), "two releases in one hold");
         *release = Some((process, code));
-    } else if cpu != 0 && sched.boot_waits() {
-        send_sgi(0);
     }
 }
 
