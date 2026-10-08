@@ -290,7 +290,10 @@ impl Table {
     pub fn commit(&self, _: &mut Process, handles: &Handles) {
         for (i, new) in handles.0.iter().enumerate() {
             let new = encode(*new);
-            if self.words(i) != new {
+            if (self.0[i].words.iter())
+                .zip(new)
+                .any(|(w, n)| w.load(Relaxed) != n)
+            {
                 self.store(i, new);
             }
         }
@@ -328,10 +331,14 @@ impl Table {
     }
 
     /// Empties the table for the next process at its index; returns what it held.
-    pub fn take(&self, process: &mut Process) -> Handles {
-        let handles = self.snapshot(process);
-        self.commit(process, &Handles::new());
-        handles
+    pub fn take(&self, _: &mut Process) -> Handles {
+        Handles(core::array::from_fn(|i| {
+            let words = self.words(i);
+            if words.iter().any(|&w| w != 0) {
+                self.store(i, [0; 3]);
+            }
+            decode(words)
+        }))
     }
 
     fn store(&self, i: usize, words: Words) {

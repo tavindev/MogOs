@@ -388,7 +388,7 @@ impl<const N: usize, const P: usize> Scheduler<N, P> {
 
     /// The cores to signal: the tasks made ready since the last call that are still ready and run nowhere (the caller
     /// may have switched to one), if any core is left to signal, and core 0 if the boot context may resume.
-    #[inline]
+    #[inline(always)]
     pub fn take_woken(&mut self) -> usize {
         if self.woken == 0 {
             return 0;

@@ -1,6 +1,5 @@
 //! Process construction: address spaces, ELF and asm programs, spawn and its arguments.
 
-use alloc::vec;
 use core::arch::global_asm;
 use core::ops::{Deref, Range};
 use core::ptr;
@@ -169,25 +168,24 @@ fn spawn_process(
         .map(|s| s.size.div_ceil(PAGE as u64) as usize);
     // The level-1 table, one level-2 and one level-3 table (every user page is in one region), and the stack pages.
     let count = 3 + pages.sum::<usize>() + 1 + !args.is_empty() as usize;
+    debug_assert!(count <= SPAWN_FRAMES);
     if count + TASK_STACK_FRAMES + sockets > budget {
         return Err(ENOMEM);
     }
-    let mut taken = vec![PhysAddr(0); count];
-    let stack = {
-        let mut frames = FRAMES.lock_masked(w);
-        let stack = frames.alloc_contiguous(TASK_STACK_FRAMES);
-        match stack {
-            Some(stack) if !frames.alloc_many(&mut taken) => {
-                (stack.start.0..stack.end.0)
-                    .step_by(PAGE)
-                    .for_each(|f| frames.free(PhysAddr(f)));
-                None
-            }
-            stack => stack,
-        }
-    };
-    let stack = stack.ok_or(ENOMEM)?;
-    let mut taken = taken.into_iter();
+    let mut frames = FRAMES.lock_masked(w);
+    let stack = frames.alloc_contiguous(TASK_STACK_FRAMES).ok_or(ENOMEM)?;
+    // The list of the other frames lies at the bottom of the new kernel stack, which nothing uses until the thread's
+    // first frame is written at its top, below which the list ends.
+    // SAFETY: fresh identity-mapped frames nothing else references; `SPAWN_FRAMES` fit below the first frame.
+    let taken = unsafe { slice::from_raw_parts_mut(stack.start.0 as *mut PhysAddr, count) };
+    if !frames.alloc_many(taken) {
+        (stack.start.0..stack.end.0)
+            .step_by(PAGE)
+            .for_each(|f| frames.free(PhysAddr(f)));
+        return Err(ENOMEM);
+    }
+    drop(frames);
+    let mut taken = taken.iter().copied();
     let mut take = || taken.next().expect("counted");
     let l1 = zeroed(take());
     // SAFETY: `l1` is a fresh frame; the boot table's kernel entries stay fixed after `kmain`.
@@ -256,6 +254,13 @@ fn spawn_process(
 const _: () = assert!(
     USER_BASE >> 21 == (USER_STACK_TOP - 1) >> 21,
     "one level-3 table"
+);
+
+/// Frames a spawn takes besides its kernel stack, at most: three tables and every page from `USER_BASE` to the stack top.
+const SPAWN_FRAMES: usize = 3 + ((USER_STACK_TOP - USER_BASE) / PAGE as u64) as usize;
+const _: () = assert!(
+    SPAWN_FRAMES * size_of::<PhysAddr>() + size_of::<arch::TrapFrame>() <= TASK_STACK_FRAMES * PAGE,
+    "the spawn's frame list fits below its first trap frame"
 );
 
 /// The boot archive's executable at `file` (byte offsets), checked, as `spawn_process` takes it.

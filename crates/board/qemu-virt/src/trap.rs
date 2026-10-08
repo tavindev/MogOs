@@ -79,50 +79,55 @@ unsafe extern "C" fn board_unlock_work(frame: usize) -> Resume {
     let deferred = unsafe { DEFERRED.with_masked(core::mem::take) };
     // SAFETY: the trap exit, with `KERNEL` released above and no other lock held.
     let mut root = unsafe { arch::root() };
-    if let Some((stack, index)) = deferred.stack {
-        free_stack(
-            &mut FRAMES.lock_masked(&mut root),
-            &PROCESSES[index].budget,
-            stack,
-        );
-    }
     let Some((index, code)) = deferred.release else {
+        if let Some((stack, index)) = deferred.stack {
+            let budget = &PROCESSES[index].budget;
+            free_stack(&mut FRAMES.lock_masked(&mut root), budget, stack);
+        }
         return Resume::unlocked(frame);
     };
-    if !release_process(&mut root, index, code) {
-        return Resume::unlocked(frame);
-    }
-    let kernel = Guard::leak(KERNEL.lock_masked(&mut root)).0;
+    // The handles first, under the process's lock, which comes before `KERNEL`.
+    let entry = &PROCESSES[index];
+    let handles = entry.handles.take(&mut entry.lock.lock_masked(&mut root));
+    let (kernel, mut w) = Guard::leak(KERNEL.lock_masked(&mut root));
     let cpu = arch::cpu();
-    // SAFETY: trap context, and `frame` this core's idle context's.
-    let next = unsafe { switch(&mut kernel.sched, cpu, frame) };
+    release_process(kernel, &mut w, (index, code), &handles, deferred.stack);
+    let next = match kernel.sched.idle(cpu) {
+        // SAFETY: trap context, and `frame` this core's idle context's.
+        true => unsafe { switch(&mut kernel.sched, cpu, frame) },
+        false => frame,
+    };
     kick(&mut kernel.sched, cpu);
     Resume::locked(next, core::mem::take(&mut kernel.deferred))
 }
 
-/// Releases the ended process at `index`, its last thread gone: its handles (under its lock, as every table write),
-/// then its address space and ASID, and only then makes it reapable (`exited`), so `wait` returns after its frames are
-/// free and its index is not reused before. Returns whether this core idles (for the release).
-fn release_process(root: &mut W<'_, level::Unlocked>, index: usize, code: u64) -> bool {
-    let entry = &PROCESSES[index];
-    let handles = entry.handles.take(&mut entry.lock.lock_masked(root));
-    let mut guard = KERNEL.lock_masked(root);
-    let (kernel, mut w) = guard.parts();
+/// Releases the ended process at `index`, its last thread gone and its `handles` taken from its table: those handles,
+/// then a kernel `stack` left to free, its address space and ASID, and only then makes it reapable (`exited`), so
+/// `wait` returns after its frames are free and its index is not reused before.
+fn release_process(
+    kernel: &mut Kernel,
+    w: &mut W<'_, level::Kernel>,
+    (index, code): (usize, u64),
+    handles: &Handles,
+    stack: Option<(PhysAddr, usize)>,
+) {
     for object in handles.objects() {
-        release(kernel, &mut w, (object, index), None);
+        release(kernel, w, (object, index), None);
+    }
+    let mut frames = FRAMES.lock_masked(w);
+    if let Some((stack, owner)) = stack {
+        free_stack(&mut frames, &PROCESSES[owner].budget, stack);
     }
     let l1 = kernel.sched.space(index);
     arch::flush_asid(index);
     // SAFETY: no thread of the process is left, so no TTBR0 is `l1`, and its tables hold only its frames.
-    unsafe { arch::free_space(l1, |f| FRAMES.lock_masked(&mut w).free(f)) };
+    unsafe { arch::free_space(l1, |f| frames.free(f)) };
+    drop(frames);
     kernel.sched.exited(index, code);
-    let cpu = arch::cpu();
     // The boot context may wait for the task count, which counted this release.
-    if cpu != 0 && kernel.sched.boot_waits() {
+    if arch::cpu() != 0 && kernel.sched.boot_waits() {
         send_sgi(0);
     }
-    kick(&mut kernel.sched, cpu);
-    kernel.sched.idle(cpu)
 }
 
 /// Saves `cpu`'s current `frame` and enters the next ready task, or its idle context (process 0); returns its frame.
