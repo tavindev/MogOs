@@ -22,7 +22,56 @@ Steps 39-41 are pure: MogFS v2 is built as a sibling crate, `crates/mogfs2` (saf
 - **39.** Benchmark (host, `cargo bench-host`): create + 100-byte write + commit and lookup in 400 entries, against v1's 1956 / 784 ns (v2 hashes and copies about three blocks per small commit against v1's one table block, so the number decides whether the allocation log below is needed); new rows: lookup in 100k entries, 1 GiB sequential write + commit and read on the in-memory disk (MiB/s), sequential read after N random 4 KiB overwrites (fragmentation), mount (requests and ns). Invariants: v1's (no block reachable from either slot is written; every on-disk value range-checked once; `NoSpace` decided before anything changes; sticky `Io`), the crafted-image rules below, plus: inode numbers are 64-bit and never reused, so a handle can never reach a later file; a data block is a whole 4096-byte page. Avoids: ext4's rename-without-fsync data loss (M8): the committed state is always a consistent snapshot (a written contract in `src/lib.rs`); copy-on-write data still fragments under random overwrites, as btrfs's does, so the fragmentation row measures it rather than assuming it away.
 - **39b.** Needs 39-41 and phase 5 step 24 (it gives the board's `KERNEL` the `Fs` cache memory, which phase 5 restructures). Benchmark (hvf): `test=bench-fs` round trip (136717 ns) and open + close (111 ns), boot with a mounted disk (342 us); the `Fs` static grows with its fixed memory, so the mount cost is measured, not assumed. Invariants: the kernel's `EBUSY`-on-open `unlink` rule stays (never-reused numbers make dropping its scan safe later); `Object` stays 24 bytes and `Call` 56 with a u64 `Inode`. Avoids: `getdents` offsets that skip or repeat entries across `unlink` (the cursor is a key, not a position).
 - **40.** Benchmark (host): snapshot create (requests, ns), a 4 KiB overwrite + commit in a snapshotted 1 GiB file, snapshot delete on a 1 GiB disk (requests, ns). Invariants: a block is free only if no root (live, both slots, any snapshot) reaches it; snapshots are read-only; commit never fails for space; a floor below the reserve is open only to snapshot delete and commit. Avoids: btrfs's ENOSPC wedge near full, where unlinks under a snapshot drained the space a delete needed.
+  - Plan (for review). (a) The snapshot list is items in the live tree, kind 3 under `ROOT` (`ROOT` has no extents,
+    so the key space is free and the rightmost path the inode-counter check reads is unchanged), offset = the
+    snapshot's generation (unique, ordered: the newest is the highest key). Value: tree root (block, sum, birth
+    generation, level), bitmap root (index block, sum, index height), 56 bytes. No fixed count, no new structure, CoW
+    and checksummed like any item, and scrub covers it. The superblock's root count stays 1. (b) `snapshot()` is a
+    commit that also inserts the entry and writes the live bitmap's changed pages (forcing the pages path, so the
+    bitmap on disk is pages and index with no log); with an inline list (at most 128 pages) it writes one level-1
+    index block listing the pages, which only the snapshot reaches. Everything joins the nodes' request: `[0, 2, 2]`,
+    blocks bounded by the log's capacity, not the disk. Its tree root is the committed root it records. (c) Pinned,
+    as decided: blocks the live tree freed that a snapshot holds, stored as pages and an index from the superblock's
+    reserved field, its changed words in the same superblock log (word index with bit 63 set), so a commit that
+    frees snapshot-held blocks stays `[0, 2, 2]`. A release tests the newest snapshot's bitmap, held in memory; the
+    snapshot's own index block is pinned at creation. A block is free only if live, pinned and both slots' (live |
+    pinned) are clear: `COMMITTED` becomes each slot's live | pinned, so a deleted snapshot's blocks wait out the
+    commit after next like any release. (d) `delete_snapshot(id)` deletes the item and rebuilds pinned as the
+    remaining snapshots' bitmaps, minus live, read page by page (requests grow with snapshots x pages: 8 pages per
+    GiB); deleting the newest loads the next newest's bitmap. (e) Reading: `Fs::view(id) -> View` with `lookup`,
+    `readdir`, `stat`, `read`, `map`, descending from the snapshot's root (memos keyed by root, or cleared on switch:
+    measured); there is no write method, so a snapshot is read-only by construction. The kernel is untouched (step 43
+    wires the `Volume` handle). (f) Reserve: `reserve` counts a snapshot's worst case (pages, index, one path); the
+    floor for unlink and truncate keeps back what one `delete_snapshot` and a commit need (one path, the pages and
+    the index), so unlinking under a snapshot until `NoSpace` leaves delete and commit able to run. (g) Memory: two
+    bitmaps more (pinned, newest snapshot) and pinned's page-dirty bits, through `bitmap_words`, so the board needs no
+    change. Mount reads pinned's pages and the newest snapshot's (only where they differ from live's, as the older
+    slot's are now). (h) Tests: the done-when rows; the 200-seed random test grows snapshot create, delete and view
+    reads checked against a model of each snapshot, and its free-space check counts pinned; the mutation test mutates
+    snapshot items and pinned pages; the power-cut workloads add create and delete. Decision needed: (a) items in the
+    tree, against entries in the superblock (simpler mount, but a fixed count or a spill chain, and less log room).
 - **41.** Benchmark (host): scrub MiB/s on the in-memory disk (hash-bound), and with one snapshot sharing most of the tree (the skip). Invariants: scrub only reads; each slice does at most a fixed number of requests and re-descends from the current committed root by key, so a cursor never points into freed blocks; a report names the block, never guesses a repair (one copy, no redundancy yet). Avoids: silent corruption that ext4 and XFS cannot detect without separate tooling (dm-integrity); here every byte is covered by a checksum its parent holds.
+  - Plan (for review). (a) API: `Fs::scrub(&mut self, cursor: &mut Scrub, requests: usize, report: impl
+    FnMut(Problem)) -> Result<bool, Error>` (true when every root is done); `Scrub` is a small value (root index,
+    next key, data page within an extent, generation it started at); `Problem` is `Corrupt { block }` (a superblock,
+    node, index block or bitmap page whose hash fails), `Data { block, inode, offset }`, `Unmarked { block }` (its
+    root's bitmap marks a reached block free) and `Twice { block }` (a block reached twice within one root, as an
+    extent block another extent or node also reaches). (b) Order: both superblocks (an older slot whose sum fails is
+    reported), then the snapshots oldest first, then the live root; each slice reads at most `requests` blocks, fresh
+    from the disk into the staging slots (never trusting the node cache), descending from the root's current committed
+    pointer by key, so a commit between slices never leaves the cursor in a freed block. (c) Shared subtrees: in a
+    root after the one scrubbed before it, a pointer whose birth generation is at most that root's generation is
+    skipped (it was reachable then, hence verified); extents inside skipped leaves are skipped with them. Data pages are
+    read and checked against their extent's sums. (d) Bitmap check: each reached block is tested against its root's
+    bitmap (live: memory; a snapshot: its pages, one cached in a staging slot). (e) Reached twice: a seen bitmap per
+    root walk in `Fs` memory (one more bitmap through `bitmap_words`), cleared when a root starts; `release` clears a
+    block's bit, so a block freed and reused by commits between slices never reports. (f) Scrub writes nothing and
+    changes no memo but the seen bits. (g) Tests: the done-when rows (a flip in each block kind, the two 39
+    inconsistencies built by hand, a clean image, slices of 1 request with commits that free and reuse blocks between
+    them, a snapshot's shared subtree read once: counted requests); the mutation test runs scrub and requires a
+    report or a clean pass, never a panic. Bench: scrub MiB/s in memory, and with one snapshot sharing most of the
+    tree. Decision needed: whether scrub also walks the older slot's tree (a fallback mount uses it; it is mostly
+    shared with live, so the generation skip makes it cheap) - the plan says yes.
 - **42.** Needs 39b, phase 5 step 24 (lock model) and step 28 (a completion wakes a task on another core). Benchmark (hvf): `test=bench-disk` grows a 4 KiB random-read IOPS row at queue depth 1 and 32, sequential 4 KiB and 256 KiB rows must not regress from 148 / 188 / 3415 / 8629 MiB/s; `test=bench-fs` round trip; the worst IRQ latency during a `sync` (was the whole sync); syscall, yield and pipe within noise. Invariants: rights are checked and buffers pinned at submit; the file-system task holds no authority of its own, only the op it was handed, charged to the submitter's budget (D8); it never waits for an IRQ while holding the big lock (the IRQ handler needs that lock to wake it); every op has exactly one completion, cancelled or not. Avoids: POSIX AIO and `O_NONBLOCK` that does not apply to files, which forced user-space thread pools (M9), and io_uring's privileged workers (D8).
 - **43.** Needs 42. If phase 6 steps 35-36 landed first, their cache fills switch to `map` (whole pages, nothing to strip). Benchmark (hvf): 1 GiB sequential write + `sync` and read through the file API (MiB/s), snapshot create latency, scrub MiB/s, and the latency of a 4 KiB write + `sync` while another process streams 1 GiB (commit is whole-file-system; a per-file log tree comes only if this number is bad). Invariants: a snapshot handle is read-only, whatever rights opened it; scrub and snapshot need the `Volume` handle (no ambient authority); a successful `sync` means its generation is durable, an error never clears (M8). Avoids: `CAP_SYS_ADMIN`-style overloaded privilege for snapshots (M6), and the ext3 stall where one `fsync` waits for everyone's data, measured rather than assumed.
 - **44.** Needs 42 and phase 5 steps 25 and 28 (SMP bring-up, per-CPU run queues). Benchmark (hvf, `-smp 4`): 4 KiB random-read IOPS at queue depth 32 per core, 1 core against 4; one-core numbers do not regress from 42. Invariants: a request is completed on the CPU that submitted it; no lock is shared between CPUs on the submit path. Avoids: the single-lock request queue blk-mq had to replace, and its I/O scheduler zoo (one scheduler, `none`).
