@@ -74,8 +74,8 @@ unsafe extern "C" fn board_unlock_work() {
 /// Releases the process whose last thread this hold ended (`Kernel::release`), once no core runs it: its handles, its
 /// address space and ASID, and only then makes it reapable (`exited`), all in the hold that ended it, so nothing sees it
 /// half released, `wait` returns after its frames are free and its index is not reused before. Then, from `next`, the
-/// frame this core resumes, switches again if what the release woke should run instead: this core idles or runs the
-/// boot context, or a ready task outranks it.
+/// frame this core resumes, switches again if what the release woke should run instead: this core idles, or a ready
+/// task outranks its own, which is not marked to end.
 ///
 /// # Safety
 /// Trap context, holding `KERNEL` through `kernel`, every switch of this hook made, and `next` the frame it resumes.
@@ -108,7 +108,8 @@ unsafe fn release_and_reschedule(
 ) -> usize {
     release_process(kernel, w, (index, code));
     let sched = &kernel.sched;
-    if sched.idle(cpu) || sched.current(cpu).0 == 0 || sched.outranked(cpu) {
+    // A marked thread stays: the signal its killer sent ends it here.
+    if sched.idle(cpu) || (sched.outranked(cpu) && sched.marked(cpu).is_none()) {
         // SAFETY: the caller's contract.
         return unsafe { switch(&mut kernel.sched, cpu, next) };
     }

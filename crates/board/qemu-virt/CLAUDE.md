@@ -151,7 +151,7 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
   no other core sees it half released. A core that ended its own process's last thread goes to its idle context for
   the release (`switch_after_end`, `Scheduler::to_idle`) and then picks a task, which the release may have woken,
   with no other core signalled for it; after a `kill` of another process it switches only if what the release woke
-  should run (it idles, runs the boot context, or a ready task outranks it).
+  should run (it idles, or a ready task outranks it and it is not marked to end).
 - Ending a process (`exit`, a fault, `kill`) ends every thread no other core runs (mutexes released, a lent boost
   dropped, stacks refunded) and marks the others, all before `switch` picks the next task.
 - Every new `Process` or `Thread` handle is counted (`Scheduler::held`): the one `spawn_process` hands out (the
