@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle, sleep};
 use std::time::{Duration, Instant};
 
@@ -37,15 +37,21 @@ fn boot_with(
     input: Option<(&str, &[&[u8]])>,
 ) -> (ExitStatus, Vec<String>) {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    // Once per run: even a fresh `cargo build` replaces `mog_os`, so a build beside a booting test can leave QEMU no ELF.
-    static BUILD: Once = Once::new();
-    BUILD.call_once(|| {
+    // Once per run, then boots a private hard link: any `cargo build` replaces `mog_os` (a new inode), and one beside a
+    // booting test left QEMU no ELF.
+    static KERNEL: OnceLock<PathBuf> = OnceLock::new();
+    let kernel = KERNEL.get_or_init(|| {
         let build = Command::new(env!("CARGO"))
             .args(["build", "-p", "qemu-virt"])
             .current_dir(&root)
             .status()
             .unwrap();
         assert!(build.success(), "kernel build failed");
+        let built = root.join("target/aarch64-unknown-none-softfloat/debug/mog_os");
+        let kernel = built.with_file_name(format!("mog_os-e2e-{}", std::process::id()));
+        let _ = std::fs::remove_file(&kernel);
+        std::fs::hard_link(&built, &kernel).unwrap();
+        kernel
     });
 
     let cpu = match extra.contains(&"-cpu") {
@@ -65,7 +71,7 @@ fn boot_with(
             "-nographic",
             "-kernel",
         ])
-        .arg(root.join("target/aarch64-unknown-none-softfloat/debug/mog_os"))
+        .arg(kernel)
         .args(match extra.contains(&"-smp") {
             true => &[][..],
             false => &["-smp", "4"],
