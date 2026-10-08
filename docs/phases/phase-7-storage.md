@@ -10,7 +10,7 @@ Steps 39-41 are pure: MogFS v2 is built as a sibling crate, `crates/mogfs2` (saf
 | --- | --- | --- |
 | 39 | MogFS v2 format (pure, `crates/mogfs2`) | Host: a 1 GiB file round-trips with every byte checked; 100k entries in one directory, each found by `lookup`; names of 255 bytes; deliberately colliding names fill a hash chain to its bound and the next is a named error; the power-cut test at every write and flush and the 200-seed random test pass; a seeded mutation test changes decoded fields, reseals the checksums up to the superblock, then runs mount and every operation (scrub joins in 41): no panic, no write to a block either slot reaches, only `Ok` or a named error. `block_io_per_operation` asserts a small commit at `[0, 2, 2]` on a tree of height 2 or more. |
 | 39b | Cutover to v2 | Needs 39-41 and phase 5 step 24. The kernel, board, e2e and `cargo mkfs` move to v2; v1 is deleted and `crates/mogfs2` takes back the name `crates/mogfs`. `readdir` resumes from an opaque u64 cursor (the hash key; `u64::MAX` is past the end) instead of an entry index. Migration is reformat only: the magic changes, and the AGENTS.md one-liner recreates a `disk.img` that does not mount as v2. e2e: `shell_files_survive_a_reboot_only_once_synced` and every other e2e pass on a v2 image; listing 100k entries costs O(n) requests in total; a v1 image prints `fs: Corrupt`. |
-| 40 | Snapshots and space reserve (pure, `crates/mogfs`) | Host: a snapshot writes only its root-table entry, so its commit stays `[0, 2, 2]` whatever the file system's size; a snapshot reads its old contents after the live tree overwrites, truncates and unlinks them; deleting a snapshot frees exactly the blocks no other root reaches (checked against a fresh mount's bitmaps); the power-cut test at every write covers snapshot create and delete; under a snapshot, unlinking until `NoSpace` still leaves snapshot delete and commit able to succeed. |
+| 40 | Snapshots and space reserve (pure, `crates/mogfs`) | Host: a snapshot writes only its entry and its changed bitmap pages, so its commit stays `[0, 2, 2]` whatever the file system's size while the request fits the 32 staging slots; a snapshot reads its old contents after the live tree overwrites, truncates and unlinks them; deleting a snapshot frees exactly the blocks no other root reaches (checked against a fresh mount's bitmaps), and the space returns after delete, commit, commit, including for two fully shared snapshots; the power-cut test at every write covers snapshot create and delete; under a snapshot, unlinking until `NoSpace` still leaves snapshot delete and commit able to succeed. |
 | 41 | Scrub (pure, `crates/mogfs`) | Host: scrub visits every block reachable from every root in resumable slices of bounded work, skipping data shared with the snapshot scrubbed before it; a bit flipped in each kind of block (superblock, tree node, bitmap, data) is reported with its block and, for data, its inode and offset; a bitmap that marks a reachable block free is reported; a clean image reports nothing; blocks freed and reused by commits between slices give no report. |
 | 42 | Async block path and async file ops | `Disk` takes a batch of scattered requests and virtio-blk keeps them all in flight, completed by interrupt (GIC SPI) instead of polling. `Fs` is owned by a kernel file-system task alone; file ops (`open`, `readdir`, `mkdir`, `unlink`, `rename`, `sync`, read, write) become completion ops it serves, data misses go through `map` so many are in flight at once, and no disk I/O runs with IRQs masked; `sync`s that arrive while a commit is in flight share the next commit (group commit); `io_cancel(token)` returns `Cancelled` (never started) or the op's own result (finished first). e2e: 32 reads in flight beat one in flight by a recorded factor; a cancel before and after completion gives each defined outcome; a `sync` no longer delays a timer tick. |
 | 43 | Large files, snapshots and scrub in the kernel (milestone) | A `Volume` handle (init gets it; rights: snapshot, scrub) creates and deletes snapshots and opens one as a read-only `Dir`; scrub runs in bounded slices in the file-system task and reports through the handle; file I/O per op rises from `MAX_BUFFER` to the extent size; `sync` on a file handle commits. e2e: the milestone's QEMU half (1 GiB file, snapshot, overwrite, kill at sampled points, remount shows a committed generation and the snapshot's original bytes, scrub names the flipped block); a process without the `Volume` handle cannot snapshot. |
@@ -26,7 +26,9 @@ Steps 39-41 are pure: MogFS v2 is built as a sibling crate, `crates/mogfs2` (saf
     under `ROOT` (no extents there, and the rightmost path the inode-counter check reads is unchanged), offset = the
     snapshot's generation `g`. Value (56 bytes): tree root (block, sum, birth generation, level), bitmap root (index
     block, sum, index height). A superblock field holds the newest snapshot's generation (0: none), so mount with no
-    snapshot does no extra descent. Decode rules: only under `ROOT`, length 56, `g` below the superblock's generation
+    snapshot does no extra descent; nonzero, mount checks its item exists, and view, delete and scrub treat a kind-3
+    item above it as Corrupt (the mutation test exempts that mutation). The field costs one log entry (the header grows
+    to 128 bytes; the root table's 4 zero bytes cannot hold a u64). Decode rules: only under `ROOT`, length 56, `g` below the superblock's generation
     and at most `OFFSET` (mount rejects a generation past `OFFSET`; `snapshot` past it is `TooBig`, since `Key::new`
     only debug-asserts), the root's birth generation at most `g`, level below `MAX_HEIGHT`, blocks in range, index
     height `ix_height(pages)`. Kind-3 items inside a snapshot's or the older slot's tree are inert for views and scrub.
@@ -49,7 +51,8 @@ Steps 39-41 are pure: MogFS v2 is built as a sibling crate, `crates/mogfs2` (saf
     which scrub reads as the committed live bitmap). Pinned's index blocks take `cache_blocks` slots.
     (d) Invariant: the snapshots holding a block are a contiguous run by generation (a block lives from its claim to
     its release, and each snapshot holds what live held at its generation). So deleting S_k unpins exactly
-    `S_k & !S_k-1 & !S_k+1` (for the newest, S_k+1 is the committed live bitmap), reading at most three bitmaps' pages
+    `S_k & !S_k-1 & !S_k+1`, and the newest `S_k & !S_k-1` (pinned and live are disjoint, so the live term is vacuous;
+    testing the committed live bitmap instead would leak a block an uncommitted change released), reading at most three bitmaps' pages
     and skipping pages whose block equals a neighbour's: requests independent of the snapshot count. Phase-9 writable
     clones or restore-from-snapshot break this invariant and must redo delete. Deleting the newest loads the next
     newest into S. Delete evicts clean cache slots whose block is no longer in live | pinned (at most 512), so a
@@ -61,8 +64,9 @@ Steps 39-41 are pure: MogFS v2 is built as a sibling crate, `crates/mogfs2` (saf
     the `Volume` handle).
     (f) Reserve: the commit term counts pinned's pages and index too; the floor for unlink and truncate keeps back what
     one `delete_snapshot` plus commits need (one path, both bitmaps' pages and index). Freed blocks leave `COMMITTED`
-    only at the commit after next, so a commit after a pinned drop writes a superblock even with no tree change
-    (`[0, 1, 1]`); done-when asserts the space returns after delete, commit, commit, and a test deletes two snapshots
+    only at the commit after next, so a commit with no change still writes a superblock-only generation (`[0, 1, 1]`)
+    whenever the older slot holds blocks the newest does not (`COMMITTED != NEWEST | pinned`, state known at mount and
+    after every commit, so it survives a remount and also closes the two-commit lag for plain unlinks); done-when asserts the space returns after delete, commit, commit, and a test deletes two snapshots
     sharing everything in a row at `NoSpace`.
     (g) Memory: S, pinned and the older slot's pinned, and pinned's page-dirty bits, through `bitmap_words` (no board
     change). Mount reads pinned's pages for both slots (into `COMMITTED`) and the newest snapshot's, only where they
@@ -85,9 +89,9 @@ Steps 39-41 are pure: MogFS v2 is built as a sibling crate, `crates/mogfs2` (saf
     a budget of 1 still progresses. (c) Sharing: every node is still read and checked under every root, so `Unmarked`
     and `Twice` hold per root; only data pages whose extent sits in a leaf born at or before the root scrubbed before
     (a later one, by the cursor's order) are skipped, since they were read then. Done-when rewords to "skipping data
-    shared with the snapshot scrubbed before it". (d) Bitmap check: the live root against `NEWEST` (the committed live
-    bitmap; `LIVE` holds uncommitted changes), a snapshot against its pages (one cached in a staging slot), the older
-    slot against its pages. (e) Reached twice: a seen bitmap per root walk in `Fs` memory (through `bitmap_words`),
+    shared with the snapshot scrubbed before it". (d) Bitmap check: when a root's walk ends, its seen bits are compared
+    with its bitmap, sequentially (the live root against `NEWEST`, the committed live bitmap, since `LIVE` holds
+    uncommitted changes; a snapshot and the older slot against their pages, at most one read per page). (e) Reached twice: a seen bitmap per root walk in `Fs` memory (through `bitmap_words`),
     cleared when a root starts; `mark` clears a block's bit (its only setter path: `alloc`, `lead_data`, `claim`), so a
     block claimed by commits between slices never reports. (f) Scrub writes nothing and changes no memo but the seen
     bits. (g) Tests: the done-when rows (a flip in each block kind, the two step-39 inconsistencies built by hand, a
