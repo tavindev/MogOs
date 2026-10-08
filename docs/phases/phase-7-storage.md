@@ -35,7 +35,7 @@ Steps 39-41 are pure: MogFS v2 is built as a sibling crate, `crates/mogfs2` (saf
 - Directory entries are keyed by a per-file-system seeded name hash (seed chosen at `mkfs`); a collision chain is bounded and a full one is a named error.
 - Tree nodes are 4 KiB blocks ending in v1's checksum of block number and payload; every pointer also carries its child's checksum and birth generation (a Merkle tree), so a lost or misdirected write of a valid old block is caught and scrub can skip shared subtrees.
 - Data blocks are whole 4096-byte pages, no trailer: an extent (at most 128 blocks, 512 KiB) carries its blocks' checksums inline. `map(inode, page) -> (block, checksum)` and a verify call let the block layer DMA straight into page-cache frames, with many misses in flight. Ripple for phase 6 step 35: on v1 its fills strip the 8-byte trailer; on v2 they use `map`.
-- Commit gives the dirty nodes (bitmap blocks included) consecutive block numbers, computes checksums bottom-up and writes them as one request, then flushes, writes the superblock (which holds the root table: the live tree and the snapshots, each a tree root and an allocation-bitmap root), and flushes: `[0, 2, 2]` at any tree height while a free run fits, one request per run otherwise. Nodes evicted from the cache before commit get their block at eviction. An allocation log in the superblock (sparing bitmap blocks) is added only if the host commit benchmark asks for it.
+- Commit gives the dirty nodes (bitmap blocks included) consecutive block numbers, computes checksums bottom-up and writes them as one request, then flushes, writes the superblock (which holds the root table: the live tree and the snapshots, each a tree root and an allocation-bitmap root), and flushes: `[0, 2, 2]` at any tree height while a free run fits, one request per run otherwise. Nodes evicted from the cache before commit get their block at eviction. The superblock carries an allocation log (the live bitmap's words changed since its pages were written), so a small commit writes no bitmap block; added in step 39b, when the kernel's `sync` benchmark asked for it.
 - Free space is stored, not derived: every root has a copy-on-write allocation bitmap. A block is free only if the live bitmap, both slots' bitmaps (so a fallback mount still finds the older tree intact, as in v1) and the pinned bitmap all have it clear. Pinned holds the blocks the live tree freed that a snapshot still holds: on each free only the newest snapshot's bitmap is tested (a block an older snapshot holds and the live tree still held is in the newest too); snapshot delete rebuilds pinned. Mount reads the superblock and the bitmap blocks (one per 128 MiB of disk), not the whole tree.
 - Fixed memory, no `alloc`: the caller gives `Fs` its node cache and bitmap memory, sized for the largest disk it accepts; a larger disk is a named error at mount.
 - Space reserve: each change reserves its worst case (tree height, bitmap blocks) before changing anything, as v1's `reserve`; a reserve below that is open to unlink, truncate, snapshot delete and commit, and a floor below it to snapshot delete and commit only.
@@ -70,12 +70,24 @@ Filled in as each step lands.
   against v1 (63 hvf rounds); create, mkdir, unlink and rename are 85-97% faster (v1 wrote blocks per change), `ls d1`
   -64%, `mkdir m` -84%, `mv` -77%. e2e: a 200-byte name, an 84 KB file appended past 64 KiB through busybox and
   1000 files in one directory survive a reboot; `shell_files_survive_a_reboot_only_once_synced` and every other e2e
-  pass on the B+tree image. Left for the orchestrator (`docs/BENCHMARKS.md` has the numbers): `sync-change` +6%
-  (two more blocks per commit, the bitmap page and index: the stored-bitmap design; the allocation log is the
-  prepared remedy), boot with a disk +54 us median (mount reads 4 requests against 3), `rm m` +11% (slotted-leaf
-  removes through `compiler_builtins`' unaligned `memmove`), `write w hello` +11% (same two block writes and fewer
-  instructions: host I/O latency), and `open` / `readdir` at +8-14 ns (v1's best case, a flat scan of a 5-entry
-  root). Not done: a v1 image is not tested (its magic differs, so it mounts as `Corrupt`); the kernel never calls
+  pass on the B+tree image. Then the slowdowns against v1 were removed: (1) `sync-change` wrote four blocks per small commit
+  (nodes, bitmap page, index, superblock) against v1's two: the index block is gone, the live bitmap's page list sits
+  in the superblock, and after it a log of the bitmap words changed since the pages were written (up to 120 entries
+  beside one page), so a small commit writes the nodes and the superblock; the pages are written, and the log
+  empties, only when it would overflow. `MAX_BLOCKS` drops to 16 GiB (128 pages) to leave the log room; snapshots
+  (step 40) take index blocks, only the live list is inline. Mount reads 3 requests on a fresh image, v1's count.
+  (2) `compiler_builtins`' `memcpy`/`memmove` assembled each unaligned word from bytes; `crates/arch` now provides
+  both (`mem.s`, 16 bytes per unaligned `ldp`/`stp`, no FP/SIMD), which also cut `pipe` 20% and `spawn` 19%.
+  (3) `open`, `open(TRUNC)` and `readdir` at opt-level 1: a memo of the last four lookups, the last leaf reached with
+  its key bounds, and `readdir`'s start index in it (each cleared before what it copies can change; the 200-seed
+  random test lists and looks up every directory twice after each step and fails if an invalidation is dropped).
+  (4) `unlink` skips the extent scans for an empty file or a directory. Against `96b22ab` (63 interleaved hvf rounds,
+  load 28-154): `open` -18%, `open(TRUNC)` -19%, `readdir` -12%, `read` -12%, `pipe` -20%, `spawn` -20%, create,
+  mkdir, unlink and rename -88..-97%, `sync-change` within noise (median +5%, min -2%; equal block writes and 72% fewer
+  TCG instructions). What remains: `write w hello` (+2% median, +20% min) issues 2 block writes against v1's 3
+  (`touch` -75%), and an instrumented A/B of the virtio request latency (15 boots each) shows the host's per-request
+  time, not the kernel, varying from 38 to 1129 us per write on both kernels; `rm m` (+9%) is v2's slotted-leaf
+  removes plus the directory's inode rewrite, about 55k TCG instructions on both (v1 55.5k). Not done: a v1 image is not tested (its magic differs, so it mounts as `Corrupt`); the kernel never calls
   `set_time`, so inode times read 0; `unlink` or truncate of a large file does its extent deletes with IRQs masked
   until step 42. The reviewer pass found the `getdents` re-list could skip or repeat an entry when a directory
   changed between its two calls (fixed: one call), `size_of` bisected every doubled range (fixed), and the
