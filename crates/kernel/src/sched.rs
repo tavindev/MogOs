@@ -358,8 +358,8 @@ impl<const N: usize, const P: usize> Scheduler<N, P> {
         let from = core.process;
         self.frame[core.current] = frame;
         self.on_core[core.current] = false;
-        (core.current, core.process, core.kicked) = (IDLE, 0, false);
-        self.sleepers += 1;
+        // Counted as signalled: it picks a task itself once the release is done, so no other core sends it an SGI.
+        (core.current, core.process, core.kicked) = (IDLE, 0, true);
         (core.idle, from, 0)
     }
 
