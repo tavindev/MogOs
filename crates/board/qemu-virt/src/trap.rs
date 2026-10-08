@@ -1144,14 +1144,19 @@ unsafe fn syscall(
             dir,
             ptr,
             len,
-            start,
+            cursor,
         } => {
+            frame.x[1] = u64::MAX;
             // SAFETY: trap context, and nothing here switches.
             unsafe {
                 BUF.with_masked(|buf| {
-                    with_output((ptr, len), buf, |out| match dir {
-                        Object::Dir(dir) => file::readdir(fs, dir, start, out),
-                        _ => file::list_archive(ARCHIVE, start, out),
+                    with_output((ptr, len), buf, |out| {
+                        let (n, next) = match dir {
+                            Object::Dir(dir) => file::readdir(fs, dir, cursor, out),
+                            _ => file::list_archive(ARCHIVE, cursor, out),
+                        }?;
+                        frame.x[1] = next;
+                        Ok(n)
                     })
                 })
             }

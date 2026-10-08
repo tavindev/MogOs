@@ -287,8 +287,9 @@ Filled in as each step lands.
   handle list, read from user memory after `dispatch`) clamps each with `Handle::new` and its own barrier. MogFS indexes
   a record's block pointers `% PTRS` in `read`, `write_data`, `write`'s block count and `scan`: in bounds by
   construction on a mispredicted loop bound, which runs one block past the end (`Disk` has no clamp). The socket calls
-  (20-25) take x0's clamped handle, and a receive or send the x2/x3 buffer. MogFS v2 (`crates/mogfs2`) is not wired
-  into the kernel yet; it joins the list when it is. `fsbench` now checks that reads at and past a file's end and a
+  (20-25) take x0's clamped handle, and a receive or send the x2/x3 buffer. Since phase 7 step 39b MogFS is the
+  B+tree format, which indexes an extent's sums `% EXTENT_MAX` in `read`, `map` and `write` instead, and takes the
+  `readdir` cursor (a key, indexing nothing) out of the clamp. `fsbench` now checks that reads at and past a file's end and a
   `readdir` from past the last entry return 0 (green before and after: regression guards), and both pinned `spec:`
   lines read `v1 mitigated`. Benchmarks (hvf, base: main `22c07bc` with 60a, 63 interleaved boots, load 50 to 78, so
   min is the steadier number; median/min before -> after): `-smp 1` syscall 61/45 -> 78/60 ns, `mutex` (no index

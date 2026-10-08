@@ -18,8 +18,9 @@ safe atomics (`Table`, a seqlock per entry) the board reads without one.
   `boot:` line, so probe and mount count toward boot time. A failed mount prints `fs: <error>` and never formats.
 - `file` (`src/file.rs`): the file syscalls' work over a `&mut Fs<D>` the board passes in: the path walk (one
   `lookup` per `/`-separated component), `open` (`CREATE`, `TRUNC`), `mkdir`, `unlink`, `rename`, `readdir` (one pass
-  writing whole `name\n` / `name/\n` entries, at most 64 per call), `list_archive`, and `errno` (mogfs error to musl
-  errno; `Io` and `Corrupt` are `EIO`).
+  from MogFS's opaque cursor writing whole `name\n` / `name/\n` entries, at most 64 per call, returning the cursor to
+  resume from), `list_archive` (its cursor an entry index), and `errno` (mogfs error to musl errno; `Io`, `Corrupt`
+  and `Unsupported` are `EIO`, a full hash chain `Collision` is `ENOSPC`).
 - `Scheduler<N, P>` (`src/sched.rs`): thread slots (frame, process, kernel stack, state, priorities) and the process
   table `Processes<P>` (address space, live threads (a slot bitmask), generation, and how many processes are
   releasing); states (`Ready`, `Blocked`, `Exited`, `Zombie`) for both; `end` (a thread; its process's last leaves the
@@ -85,7 +86,7 @@ safe atomics (`Table`, a seqlock per entry) the board reads without one.
   the parent's to the child.
 - **Boot archive**: the cpio of `crates/user` programs; `Object::Archive` / `Object::File` reach it, read-only.
 - **File system**: the mounted MogFS; `Object::Dir(Inode)` / `Object::Node(Inode)` (a file) reach it. Inode numbers
-  stay fixed while a file lives.
+  are never reused.
 
 ## Invariants & rules
 
@@ -93,8 +94,9 @@ safe atomics (`Table`, a seqlock per entry) the board reads without one.
   the compiler cannot drop); then each call clamps only the arguments it indexes kernel memory with, each to the
   capacity of what it indexes, together behind one barrier (`Clamp::clamp`: `csel`s then one `csdb` on the board, `min`
   on the host), before their first use, and passes on only the clamped values: a handle (x0, x3 for `rename`), a user
-  buffer and its length, the file offset, the `readdir` start. A call that indexes nothing pays no barrier. An index
-  derived from them is bounded by construction (MogFS's `% PTRS`). A value that only appears later keeps its own clamp:
+  buffer and its length, the file offset. A call that indexes nothing pays no barrier; a `readdir` cursor indexes
+  nothing (a key MogFS's tree search compares). An index derived from them is bounded by construction (MogFS's
+  `% EXTENT_MAX`). A value that only appears later keeps its own clamp:
   `spawn`'s handle list (`split`), `Handle::new`. Objects a handle reaches are kernel-written. A new syscall's indexing
   arguments get the same treatment (`docs/phases/phase-10-hardening.md`, 60b).
 
@@ -148,18 +150,20 @@ safe atomics (`Table`, a seqlock per entry) the board reads without one.
   strings, at most `MAX_ARGS` (32) and `MAX_BUFFER` bytes, `E2BIG`; checked by `syscall::argc`); `dispatch` reads
   x0-x6. `Call` stays 56 bytes (const-asserted), so `Spawn`'s small fields are `u8`/`u16`. Changing the archive is `EROFS`.
 - An inode a handle reaches is never freed: `unlink` is `EBUSY` while any handle reaches a `Dir` or `Node` (`file::Opens`,
-  a count per inode the board keeps as such handles open and close, at most one entry per open handle), since `create`
-  reuses freed inodes. `spawn` moves handles without changing a count; a process's release closes each of its own.
+  a count per inode the board keeps as such handles open and close, at most one entry per open handle; MogFS's
+  `unlink` asks it through its `busy` closure); MogFS never reuses an inode number, so dropping this rule later is
+  safe. `spawn` moves handles without changing a count; a process's release closes each of its own.
 - Paths resolve only below a directory handle: each component goes through `mogfs::lookup`, which rejects `.`, `..`
   and empty names, so `../x` and `/x` are `EINVAL`. Trust note: a crafted image can point an entry at `ROOT` or an
   ancestor, so a subdirectory handle may reach the root and the tree may cycle; nothing in the kernel recurses over
   the tree. File syscalls do their disk work under the big lock with IRQs masked, so each is bounded: a path has at most
-  `file::MAX_DEPTH` (16) components (`ENAMETOOLONG`), a lookup or a `readdir` scan reads at most a directory's 14
-  blocks, a `readdir` call lists at most 64 entries, and file I/O moves at most `MAX_BUFFER`. Worst case: `open(CREATE)`
-  on a 16-component path of full directories is about 240 block requests, about 5 ms with IRQs masked. A
-  directory `rename` across directories also reads every directory below the one moved (mogfs's cycle check), up to
-  the whole tree: about 500 requests, about 10.5 ms with IRQs masked, on a well-formed image (each directory read
-  once), and about 7000, about 150 ms, on a crafted one (504 directories of 14 blocks each).
+  `file::MAX_DEPTH` (16) components (`ENAMETOOLONG`), a lookup is a few descents of a tree of at most 8 levels
+  through MogFS's node cache, a `readdir` call lists at most 64 entries, and file I/O moves at most `MAX_BUFFER`. A
+  directory `rename` across directories also walks the target's parents up to the root (mogfs's cycle check, one
+  inode lookup each): the target's depth on a well-formed image, on a crafted one up to every directory on it.
+  `unlink` and `open(TRUNC)` of a file release its blocks one by one and delete its extents (at most 128 pages each), so
+  their work grows with the file: about 2048 extent deletes and 262144 releases for 1 GiB, all with IRQs masked, until
+  step 42 moves file work to the file-system task.
 - `Elf::parse` accepts only page-aligned, address-ordered, in-region `PT_LOAD`s, never W+X, entry in an executable one.
 - init's handles (`Handles::init`): 0 console (read, write, duplicate, transfer), 1 itself (kill), 2 the boot archive
   with `INIT_ARCHIVE` (read, exec); only msh (`test=shell`, `test=bench-shell`) and `nettest` (`test=sockets`, which hands it to a C program that spawns) get `SHELL_ARCHIVE` (also duplicate, transfer), since it

@@ -137,10 +137,10 @@ fn elf_rejects_segments_that_could_harm_the_kernel_or_each_other() {
 fn archive_lists_whole_entries() {
     let a = archive(&[("ab", b"12345"), ("child", b"xyz")]);
     let mut out = [0; 9];
-    assert_eq!(list_archive(&a, 0, &mut out), Ok(9));
+    assert_eq!(list_archive(&a, 0, &mut out), Ok((9, u64::MAX)));
     assert_eq!(&out, b"ab\nchild\n");
-    assert_eq!(list_archive(&a, 0, &mut out[..8]), Ok(3));
-    assert_eq!(list_archive(&a, 1, &mut out), Ok(6));
+    assert_eq!(list_archive(&a, 0, &mut out[..8]), Ok((3, 1)));
+    assert_eq!(list_archive(&a, 1, &mut out), Ok((6, u64::MAX)));
     assert_eq!(list_archive(&a, 0, &mut out[..2]), Err(EINVAL));
-    assert_eq!(list_archive(&a, 2, &mut out), Ok(0));
+    assert_eq!(list_archive(&a, 2, &mut out), Ok((0, u64::MAX)));
 }

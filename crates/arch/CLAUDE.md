@@ -4,7 +4,9 @@
 
 The only architecture-specific crate: boot and secondary-core entry (`src/aarch64/boot.s`), exception vectors and `TrapFrame`
 (`trap.rs`), the per-core vector table choice and the `spec:` report (`spec.rs`), MMU and page tables (`mmu.rs`), GICv3 (`gic.rs`: distributor and redistributor MMIO, CPU interface by system registers), the virtual timer (`timer.rs`), IRQ masking
-(`irq.rs`), the only lock and per-CPU primitives (`lock.rs`), `uptime_us` (`mod.rs`).
+(`irq.rs`), the only lock and per-CPU primitives (`lock.rs`), `uptime_us` (`mod.rs`), and the kernel's `memcpy` and
+`memmove` (`mem.s`, overriding `compiler_builtins`' weak ones: 16 bytes per unaligned `ldp`/`stp`, no FP/SIMD; with the
+MMU off a copy is legal only when both buffers and the length are 8-aligned).
 
 It is **NOT** board-specific: no MMIO addresses, no memory map, no drivers, no scheduling policy (those are
 `crates/board/qemu-virt` and `crates/kernel`).

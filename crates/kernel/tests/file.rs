@@ -3,7 +3,7 @@ use kernel::handle::Object;
 use kernel::syscall::{
     CREATE, EBUSY, EEXIST, EINVAL, EISDIR, ENAMETOOLONG, ENOENT, ENOTEMPTY, TRUNC,
 };
-use mogfs::{BLOCK_SIZE, Disk, Error, Fs, ROOT};
+use mogfs::{BLOCK_SIZE, Disk, Error, Fs, MIN_POOL, ROOT, bitmap_words, cache_blocks};
 
 struct MemDisk(Vec<[u8; BLOCK_SIZE]>);
 
@@ -29,17 +29,19 @@ impl Disk for MemDisk {
     }
 }
 
-fn fs() -> Box<Fs<MemDisk>> {
-    let mut fs = Box::new(Fs::new(MemDisk(vec![[0; BLOCK_SIZE]; 64])));
-    fs.format().unwrap();
+fn fs() -> Fs<'static, MemDisk> {
+    let cache = vec![[0; BLOCK_SIZE]; cache_blocks(64, MIN_POOL)].leak();
+    let bits = vec![0; bitmap_words(64)].leak();
+    let mut fs = Fs::new(MemDisk(vec![[0; BLOCK_SIZE]; 64]), cache, bits);
+    fs.format(1).unwrap();
     fs
 }
 
-/// `readdir` into a buffer of `len` bytes from entry `start`, as text.
-fn list(fs: &mut Fs<MemDisk>, start: u64, len: usize) -> Result<String, i64> {
+/// `readdir` into a buffer of `len` bytes from `cursor`, as text, and the cursor after it.
+fn list(fs: &mut Fs<MemDisk>, cursor: u64, len: usize) -> Result<(String, u64), i64> {
     let mut out = vec![0; len];
-    let n = readdir(fs, ROOT, start, &mut out)?;
-    Ok(String::from_utf8(out[..n].to_vec()).unwrap())
+    let (n, next) = readdir(fs, ROOT, cursor, &mut out)?;
+    Ok((String::from_utf8(out[..n].to_vec()).unwrap(), next))
 }
 
 #[test]
@@ -48,24 +50,38 @@ fn readdir_writes_whole_entries_and_never_overruns_a_tight_buffer() {
     mkdir(&mut fs, ROOT, b"a").unwrap();
     open(&mut fs, ROOT, b"f", CREATE).unwrap();
     mkdir(&mut fs, ROOT, b"b").unwrap();
+    let (all, end) = list(&mut fs, 0, 64).unwrap();
+    assert_eq!(end, u64::MAX);
+    let entries: Vec<&str> = all.split_inclusive('\n').collect();
+    let mut sorted = entries.clone();
+    sorted.sort();
+    assert_eq!(sorted, ["a/\n", "b/\n", "f\n"]);
     // Every buffer size from too small for the first entry to room for all: whole entries only, each `/` kept.
-    let expected = [
-        (2, Err(EINVAL)),
-        (3, Ok("a/\n")),
-        (4, Ok("a/\n")),
-        (5, Ok("a/\nf\n")),
-        (7, Ok("a/\nf\n")),
-        (8, Ok("a/\nf\nb/\n")),
-        (64, Ok("a/\nf\nb/\n")),
-    ];
-    for (len, want) in expected {
-        assert_eq!(list(&mut fs, 0, len).as_deref(), want.as_deref(), "{len}");
+    for len in 0..=all.len() {
+        let fit = entries
+            .iter()
+            .scan(0, |n, e| {
+                *n += e.len();
+                Some(*n)
+            })
+            .take_while(|&n| n <= len)
+            .last();
+        let got = list(&mut fs, 0, len).map(|(text, _)| text);
+        match fit {
+            None => assert_eq!(got, Err(EINVAL), "{len}"),
+            Some(n) => assert_eq!(got.as_deref(), Ok(&all[..n]), "{len}"),
+        }
     }
-    assert_eq!(list(&mut fs, 1, 64).as_deref(), Ok("f\nb/\n"));
-    // A file needs no room for a `/`.
-    assert_eq!(list(&mut fs, 1, 2).as_deref(), Ok("f\n"));
-    assert_eq!(list(&mut fs, 3, 64).as_deref(), Ok(""));
-    assert_eq!(list(&mut fs, u64::MAX, 64).as_deref(), Ok(""));
+    // Resuming from a cursor lists the rest, even after the entry before it is unlinked.
+    let (first, cursor) = list(&mut fs, 0, entries[0].len()).unwrap();
+    assert_eq!(first, entries[0]);
+    let name = entries[0].trim_end_matches(['/', '\n']);
+    unlink(&mut fs, ROOT, name.as_bytes(), |_| false).unwrap();
+    assert_eq!(
+        list(&mut fs, cursor, 64),
+        Ok((entries[1..].concat(), u64::MAX))
+    );
+    assert_eq!(list(&mut fs, u64::MAX, 64), Ok((String::new(), u64::MAX)));
 }
 
 #[test]
@@ -128,7 +144,7 @@ fn unlink_and_rename_walk_paths_like_open() {
     assert_eq!(unlink(&mut fs, ROOT, b"d/a", |_| false), Err(ENOENT));
     unlink(&mut fs, ROOT, b"d/c", |_| false).unwrap();
     unlink(&mut fs, ROOT, b"d", |_| false).unwrap();
-    assert_eq!(list(&mut fs, 0, 64).as_deref(), Ok("b\n"));
+    assert_eq!(list(&mut fs, 0, 64), Ok(("b\n".into(), u64::MAX)));
     let deep = [&b"x/"[..]; 16].concat();
     assert_eq!(unlink(&mut fs, ROOT, &deep, |_| false), Err(ENAMETOOLONG));
     assert_eq!(

@@ -14,7 +14,7 @@ runner = "qemu-system-aarch64 -M virt,gic-version=3 -cpu cortex-a72 -smp 4 -m 12
 test-host = "test --target aarch64-apple-darwin --workspace --exclude qemu-virt --exclude arch"
 # Host benchmarks (`benches/*.rs`, harness = false) for the same crates.
 bench-host = "bench --target aarch64-apple-darwin --workspace --exclude qemu-virt --exclude arch --bench *"
-# An empty 64 MiB MogFS image, `disk.img` in the current directory (overwrites it).
+# An empty, sparse 1 GiB MogFS image, `disk.img` in the current directory (overwrites it).
 mkfs = "run -p mogfs --example mkfs --target aarch64-apple-darwin -- disk.img"
 # Boots into msh with `disk.img` attached; `[ -f disk.img ] || cargo mkfs; cargo shell` formats it first if missing.
 shell = "run -- -drive file=disk.img,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0 -append test=shell"
