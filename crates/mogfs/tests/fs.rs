@@ -2,8 +2,8 @@ use std::cell::Cell;
 use std::slice::from_mut;
 
 use mogfs::{
-    BLOCK_SIZE, Buf, Disk, Error, Fs, Inode, Kind, MAX_FILE_SIZE, NAME_MAX, Page, ROOT,
-    bitmap_words, cache_blocks,
+    BLOCK_SIZE, Buf, Disk, Error, Fs, Inode, Kind, MAX_FILE_SIZE, NAME_MAX, Page, ROOT, Snapshot,
+    View, bitmap_words, cache_blocks,
 };
 
 /// In-memory disk with a write-back cache: writes stay pending until a flush makes them durable. After `cut` events
@@ -572,7 +572,8 @@ fn the_inode_counter_must_exceed_every_inode() {
 
 #[test]
 fn the_last_generation_commits_and_then_commits_fail() {
-    let mut disk = crafted(hello(), &[0], 1, u64::MAX - 1);
+    // Generations stop at 2^62 - 1, the largest a snapshot's key holds.
+    let mut disk = crafted(hello(), &[0], 1, (1 << 62) - 2);
     let mut mem = Mem::new(64, POOL);
     let mut fs = mount(&mut mem, &mut disk).unwrap();
     fs.create(ROOT, b"new").unwrap();
@@ -1064,7 +1065,7 @@ fn the_last_generation_is_not_passed_when_nodes_are_written_out() {
     let mut fs = format(&mut mem, &mut disk);
     fs.create(ROOT, b"a").unwrap();
     fs.commit().unwrap();
-    let mut disk = crafted(disk, &[1], 1, u64::MAX);
+    let mut disk = crafted(disk, &[1], 1, (1 << 62) - 1);
     let mut fs = mount(&mut mem, &mut disk).unwrap();
     let r = (0..300).try_for_each(|i| fs.create(ROOT, format!("{i:0>100}").as_bytes()).map(|_| ()));
     assert_eq!(r, Err(Error::Corrupt));
@@ -1635,5 +1636,126 @@ fn a_300_gib_file_system_lists_its_bitmap_through_an_index() {
     for i in [0u64, 33, 69] {
         assert_eq!(fs.read(big, (i << 20) + 7, &mut buf[..1]), Ok(1));
         assert_eq!(buf[0], i as u8 + 1);
+    }
+}
+
+/// Every path under `dir` in a snapshot with its contents, sorted, as `walk` does for the live tree.
+fn walk_view<D: Disk>(
+    v: &mut View<D>,
+    dir: Inode,
+    path: &str,
+    out: &mut Tree,
+) -> Result<(), Error> {
+    let mut entries = Vec::new();
+    v.readdir(dir, 0, |name, inode, kind| {
+        entries.push((String::from_utf8(name.to_vec()).unwrap(), inode, kind));
+        false
+    })?;
+    for (name, inode, kind) in entries {
+        let path = format!("{path}/{name}");
+        if kind == Kind::Dir {
+            out.push((format!("{path}/"), Vec::new()));
+            walk_view(v, inode, &path, out)?;
+        } else {
+            let size = v.stat(inode)?.size;
+            let mut buf = vec![0; size as usize];
+            assert_eq!(v.read(inode, 0, &mut buf)?, size as usize);
+            out.push((path, buf));
+        }
+    }
+    Ok(())
+}
+
+fn view_tree<D: Disk>(fs: &mut Fs<D>, s: Snapshot) -> Result<Tree, Error> {
+    let mut out = Vec::new();
+    walk_view(&mut fs.view(s)?, ROOT, "", &mut out)?;
+    out.sort();
+    Ok(out)
+}
+
+#[test]
+fn a_snapshot_reads_its_old_contents_after_the_live_tree_overwrites_truncates_and_unlinks_them() {
+    let mut disk = MemDisk::new(2048);
+    let mut mem = Mem::new(2048, POOL);
+    let mut fs = format(&mut mem, &mut disk);
+    let docs = fs.mkdir(ROOT, b"docs").unwrap();
+    let a = fs.create(docs, b"a").unwrap();
+    fs.write(a, 0, &[1; 3 * BLOCK_SIZE]).unwrap();
+    let b = fs.create(ROOT, b"b").unwrap();
+    fs.write(b, 0, b"bee").unwrap();
+    let c = fs.create(ROOT, b"c").unwrap();
+    fs.write(c, 0, &[3; 9000]).unwrap();
+    // Uncommitted changes are committed first: the snapshot is the file system as of its call.
+    let s = fs.snapshot().unwrap();
+    let old = vec![
+        entry("/b", b"bee"),
+        entry("/c", &[3; 9000]),
+        entry("/docs/", b""),
+        entry("/docs/a", &[1; 3 * BLOCK_SIZE]),
+    ];
+    assert_eq!(view_tree(&mut fs, s), Ok(old.clone()));
+    fs.write(a, BLOCK_SIZE as u64, &[9; 100]).unwrap();
+    fs.truncate(c).unwrap();
+    fs.unlink(ROOT, b"b", |_| false).unwrap();
+    fs.rename(docs, b"a", ROOT, b"moved").unwrap();
+    // Churn: the freed blocks must not be reused while the snapshot holds them.
+    for i in 0..50 {
+        let f = fs.create(ROOT, format!("n{i}").as_bytes()).unwrap();
+        fs.write(f, 0, &[i as u8; 2 * BLOCK_SIZE]).unwrap();
+        fs.commit().unwrap();
+        fs.unlink(ROOT, format!("n{i}").as_bytes(), |_| false)
+            .unwrap();
+    }
+    fs.commit().unwrap();
+    assert_eq!(view_tree(&mut fs, s), Ok(old.clone()));
+    let mut live = Vec::new();
+    walk(&mut fs, ROOT, "", &mut live).unwrap();
+    live.sort();
+    let mut moved = vec![1; 3 * BLOCK_SIZE];
+    moved[BLOCK_SIZE..BLOCK_SIZE + 100].fill(9);
+    assert_eq!(
+        live,
+        vec![
+            entry("/c", b""),
+            entry("/docs/", b""),
+            entry("/moved", &moved)
+        ]
+    );
+    // And after a remount.
+    fs.mount().unwrap();
+    assert_eq!(view_tree(&mut fs, s), Ok(old));
+    // The snapshot is not a file system to write: a view has no write call, and its inodes do not exist live.
+    assert_eq!(fs.read(b, 0, &mut [0; 3]), Err(Error::NotFound));
+}
+
+#[test]
+fn a_snapshot_writes_two_requests_whatever_the_file_system_size() {
+    for blocks in [1024, 70000] {
+        let mut disk = MemDisk::new(blocks);
+        let mut mem = Mem::new(blocks, POOL);
+        let mut fs = format(&mut mem, &mut disk);
+        for i in 0..200 {
+            let f = fs.create(ROOT, format!("{i:0>60}").as_bytes()).unwrap();
+            fs.write(f, 0, &[i as u8; 100]).unwrap();
+        }
+        fs.commit().unwrap();
+        fs.commit().unwrap();
+        let io = Cell::new([0; 3]);
+        let mut fs = mem.fs(Counted(&mut disk, &io));
+        fs.mount().unwrap();
+        io.take();
+        // One read after a cold mount: the leaf the item goes in.
+        let s = fs.snapshot().unwrap();
+        assert_eq!(io.take(), [1, 2, 2], "{blocks} blocks");
+        // A change under the snapshot, and its commit, stay at two writes too.
+        let f = fs.lookup(ROOT, format!("{:0>60}", 7).as_bytes()).unwrap();
+        fs.write(f, 0, b"changed").unwrap();
+        fs.commit().unwrap();
+        assert_eq!(io.take()[1..], [2, 2], "{blocks} blocks");
+        fs.mount().unwrap();
+        let mut v = fs.view(s).unwrap();
+        let mut buf = [0; 7];
+        assert_eq!(v.read(f, 0, &mut buf), Ok(7));
+        assert_eq!(buf, [7; 7]);
     }
 }

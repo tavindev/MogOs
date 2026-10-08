@@ -32,7 +32,8 @@ fn superblock_fields(disk: &[Buf], slot: u64) -> Option<[u64; 18]> {
         && f[11] <= f[1]
         && (2..blocks).contains(&f[9])
         && f[14] == h as u64
-        && f[15] == 0
+        && f[1] <= OFFSET
+        && f[15] < f[1]
         && (h == 0 || (2..blocks).contains(&f[16]))
         && end <= END as u128
         && sb[end as usize..END].iter().all(|&b| b == 0);

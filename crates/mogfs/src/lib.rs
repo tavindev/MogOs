@@ -102,6 +102,8 @@ const CAP: usize = END - HDR;
 const FANOUT: usize = CAP / ENTRY;
 const QUARTER: usize = CAP / 4;
 const INODE_LEN: usize = 56;
+/// A snapshot item: tree root (block, sum, birth generation, level), bitmap index root (block, sum) and height.
+const SNAP_LEN: usize = 56;
 const EXTENT_ITEM: usize = ITEM + 8 + 8 * EXTENT_MAX as usize;
 
 const OFFSET: u64 = (1 << 62) - 1;
@@ -154,6 +156,10 @@ pub trait Disk {
     fn flush(&mut self) -> Result<(), Error>;
     fn blocks(&self) -> u64;
 }
+
+/// A read-only snapshot of the file system as of a commit, named by that commit's generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Snapshot(u64);
 
 /// A file or directory; its number is never reused.
 #[repr(transparent)]
@@ -258,15 +264,23 @@ fn page_words(blocks: u64, p: usize) -> usize {
 
 /// Levels of the bitmap index for `pages` pages (0: the superblock lists them).
 const fn ix_height(pages: usize) -> usize {
-    let (mut n, mut h) = (pages, 0);
     if pages <= INLINE {
-        return 0;
+        0
+    } else {
+        fan_height(pages)
     }
-    while n > 1 {
+}
+
+/// Levels of an index listing `pages` pages, at least one.
+const fn fan_height(pages: usize) -> usize {
+    let (mut n, mut h) = (pages, 0);
+    loop {
         n = n.div_ceil(FAN);
         h += 1;
+        if n <= 1 {
+            return h;
+        }
     }
-    h
 }
 
 /// Cache slots the live page list takes: its index blocks, or one for an inline list.
@@ -317,6 +331,8 @@ enum ItemKind {
     Inode = 0,
     Entry = 1,
     Extent = 2,
+    /// Under `ROOT` only, offset the snapshot's generation.
+    Snapshot = 3,
 }
 
 /// A tree key: `inode << 64 | kind << 62 | offset`.
@@ -337,12 +353,12 @@ impl Key {
     }
 
     #[inline(always)]
-    fn kind(self) -> Option<ItemKind> {
+    fn kind(self) -> ItemKind {
         match (self.0 as u64) >> 62 {
-            0 => Some(ItemKind::Inode),
-            1 => Some(ItemKind::Entry),
-            2 => Some(ItemKind::Extent),
-            _ => None,
+            0 => ItemKind::Inode,
+            1 => ItemKind::Entry,
+            2 => ItemKind::Extent,
+            _ => ItemKind::Snapshot,
         }
     }
 
@@ -451,6 +467,10 @@ pub struct Fs<'a, D> {
     changed: bool,
     /// The older slot reaches blocks the newest does not, so a commit writes a superblock even with no change.
     lag: bool,
+    /// A `View` is reading a snapshot: its nodes and data may be pinned as well as live.
+    view: bool,
+    /// Staging slots `1..=staged` hold blocks the next commit writes ahead of the nodes (a new snapshot's bitmap).
+    staged: usize,
     free: u64,
     /// Every block below it is in use.
     hint: Block,
@@ -519,6 +539,8 @@ impl<'a, D: Disk> Fs<'a, D> {
             prev_span: (usize::MAX, 0),
             changed: false,
             lag: false,
+            view: false,
+            staged: 0,
             free: 0,
             hint: Block(0),
             base: 0,
@@ -653,34 +675,34 @@ impl<'a, D: Disk> Fs<'a, D> {
             let r = self.load_bitmap(s, LIVE).and_then(|()| {
                 (self.root, self.height) = (s.root, s.level + 1);
                 (self.generation, self.next_inode) = (s.generation, s.next_inode);
-                self.seed = s.seed;
-                self.check_counter()
+                (self.seed, self.newest) = (s.seed, s.newest);
+                self.check_counter()?;
+                self.load_snapshot()
             });
             match r {
                 Ok(()) => {}
                 Err(Error::Corrupt) => continue,
                 Err(e) => return Err(e),
             }
-            // The other slot's blocks (its live and pinned bitmaps, loaded into `COMMITTED` and `SNAP`) stay reserved
-            // while its bitmap holds, even if its tree failed above.
+            // The other slot's blocks (its live and pinned bitmaps, read into the committed copies' place) stay
+            // reserved while its bitmap holds, even if its tree failed above.
             let w = self.words;
-            self.bits[COMMITTED * w..(SNAP + 1) * w].fill(0);
+            self.bits[NEWEST * w..(NEWEST + 2) * w].fill(0);
             if let Some(o) = &slots[1 - i]
                 && o.valid
-                && let Err(e) = self.load_bitmap(o, COMMITTED)
+                && let Err(e) = self.load_bitmap(o, NEWEST)
             {
-                self.bits[COMMITTED * w..(SNAP + 1) * w].fill(0);
+                self.bits[NEWEST * w..(NEWEST + 2) * w].fill(0);
                 if e != Error::Corrupt {
                     return Err(e);
                 }
             }
-            self.bits.copy_within(..2 * w, NEWEST * w);
             for i in 0..w {
-                let (l, p, s) = (self.bits[i], self.bits[w + i], self.bits[SNAP * w + i]);
-                self.bits[COMMITTED * w + i] |= l | p | s;
+                let (l, p) = (self.bits[i], self.bits[w + i]);
+                let o = self.bits[NEWEST * w + i] | self.bits[(NEWEST + 1) * w + i];
+                self.bits[COMMITTED * w + i] = o | l | p;
             }
-            self.bits[SNAP * w..(SNAP + 1) * w].fill(0);
-            self.newest = s.newest;
+            self.bits.copy_within(..2 * w, NEWEST * w);
             let d = MAPS * w..MAPS * w + self.lpages().div_ceil(64);
             self.bits[d.clone()].fill(0);
             let d = d.start;
@@ -1006,10 +1028,281 @@ impl<'a, D: Disk> Fs<'a, D> {
         if !self.changed && !self.lag {
             return Ok(());
         }
-        let generation = self.generation.checked_add(1).ok_or(Error::Corrupt)?;
+        let generation = Some(self.generation + 1)
+            .filter(|&g| g <= OFFSET)
+            .ok_or(Error::Corrupt)?;
         let r = self.write_commit(generation);
         self.broken |= r.is_err();
         r
+    }
+
+    /// Snapshots the file system as of its last commit, committing first if anything changed. The snapshot reads
+    /// through `view` and keeps every block it reaches until it is deleted. Its item, and its bitmap's copies of the
+    /// pages changed since they were written and its index, join that commit's request.
+    pub fn snapshot(&mut self) -> Result<Snapshot, Error> {
+        if self.broken {
+            return Err(Error::Io);
+        }
+        if self.changed {
+            self.commit()?;
+        }
+        let g = self.generation;
+        if g > OFFSET {
+            return Err(Error::TooBig);
+        }
+        let ixb: usize = (1..=fan_height(self.pages))
+            .map(|l| ix_count(self.pages, l))
+            .sum();
+        self.reserve((self.pages + ixb) as u64, 1, ITEM + SNAP_LEN, false)?;
+        let r = self.write_snapshot(g, ixb);
+        self.tear(&r);
+        r?;
+        self.commit()?;
+        Ok(Snapshot(g))
+    }
+
+    /// Inserts generation `g`'s snapshot item and stages its bitmap: the committed live bitmap, plus its own blocks.
+    fn write_snapshot(&mut self, g: u64, ixb: usize) -> Result<(), Error> {
+        let (root, height, w) = (self.root, self.height, self.words);
+        // First, so the insert's copy-on-write releases of `g`'s nodes are pinned.
+        self.bits
+            .copy_within(NEWEST * w..(NEWEST + 1) * w, SNAP * w);
+        self.newest = g;
+        let (s, at) = self.insert(Key::new(ROOT, ItemKind::Snapshot, Offset(g)), SNAP_LEN)?;
+        // Its own blocks: a copy of each live page changed since the pages were written, and of each page they land
+        // in (its bitmap marks them), and its index. They are pinned: only the snapshot reaches them.
+        let mut need = (0..self.pages).filter(|&q| self.page_dirty(q)).count() + ixb;
+        let (mut b, mut last) = (self.start(need + 1), usize::MAX);
+        let first = self.next_free(b);
+        while need > 0 {
+            b = self.next_free(b);
+            if b.0 >= self.blocks {
+                return Err(Error::NoSpace);
+            }
+            self.pin(b);
+            let q = (b.0 / PAGE_BITS) as usize;
+            if q != last && !self.page_dirty(q) {
+                need += 1;
+            }
+            (last, need, b) = (q, need - 1, b + 1);
+        }
+        // Staged in block order: each page's copy, and each index block once its last entry is in. A level's open
+        // index block is built in the staging slot `base - level`, below which complete blocks are staged.
+        let h = fan_height(self.pages);
+        let lim = self.base - h;
+        for l in 1..=h {
+            self.cache[self.base - l].fill(0);
+        }
+        let (mut first_s, mut n, mut c) = (1, 1, first);
+        let mut ix = (Block(0), Sum(0));
+        for p in 0..self.pages {
+            let (lo, len) = (p * PAGE_WORDS, page_words(self.blocks, p));
+            let own = self.page_dirty(p)
+                || (lo..lo + len).any(|i| self.bits[PINNED * w + i] & self.bits[SNAP * w + i] != 0);
+            let e = if own {
+                c = self.next_snap(c);
+                let d = self.stage_in(&mut first_s, &mut n, lim)?;
+                for i in 0..len {
+                    let word = self.bits[SNAP * w + lo + i].to_le_bytes();
+                    self.cache[d][8 * i..8 * i + 8].copy_from_slice(&word);
+                }
+                self.cache[d][8 * len..].fill(0);
+                self.blk[d] = c;
+                let e = (c, checksum(c, &self.cache[d][..8 * len]));
+                c = c + 1;
+                e
+            } else {
+                let (s, at) = self.page_entry(p);
+                (
+                    Block(le64(&self.cache[s], at)),
+                    Sum(le64(&self.cache[s], at + 8)),
+                )
+            };
+            // Put the entry in its level-1 block; close each block whose last entry this is, up to the root.
+            let (mut l, mut i, mut e) = (1, p, e);
+            loop {
+                let o = self.base - l;
+                let at = 16 * (i % FAN);
+                self.cache[o][at..at + 8].copy_from_slice(&e.0.0.to_le_bytes());
+                self.cache[o][at + 8..at + 16].copy_from_slice(&e.1.0.to_le_bytes());
+                let j = i / FAN;
+                let kids = ix_children(self.pages, l, j);
+                if i % FAN + 1 < kids {
+                    break;
+                }
+                c = self.next_snap(c);
+                let sum = seal(c, &mut self.cache[o], 16 * kids);
+                let d = self.stage_in(&mut first_s, &mut n, lim)?;
+                let (src, dst) = pair(self.cache, o, d);
+                dst.copy_from_slice(src);
+                src.fill(0);
+                self.blk[d] = c;
+                (e, c) = ((c, sum), c + 1);
+                if l == h {
+                    ix = e;
+                    break;
+                }
+                (l, i) = (l + 1, j);
+            }
+        }
+        self.staged = n - first_s;
+        let v = &mut self.cache[s][at..at + SNAP_LEN];
+        for (j, f) in [
+            root.block.0,
+            root.sum.0,
+            root.generation,
+            height as u64 - 1,
+            ix.0.0,
+            ix.1.0,
+            h as u64,
+        ]
+        .iter()
+        .enumerate()
+        {
+            v[8 * j..8 * j + 8].copy_from_slice(&f.to_le_bytes());
+        }
+        Ok(())
+    }
+
+    /// Takes free block `b` for the newest snapshot's own bitmap: pinned, and marked in the snapshot's bitmap.
+    fn pin(&mut self, b: Block) {
+        let (w, i, bit) = (self.words, (b.0 / 64) as usize, 1 << (b.0 % 64));
+        self.bits[PINNED * w + i] |= bit;
+        self.bits[SNAP * w + i] |= bit;
+        self.touch(w + i);
+        self.free -= 1;
+        self.changed = true;
+    }
+
+    /// The first block from `b` on that the newest snapshot's own bitmap takes (pinned and in its bitmap).
+    fn next_snap(&self, mut b: Block) -> Block {
+        while !(self.has(PINNED, b) && self.has(SNAP, b)) {
+            b = b + 1;
+        }
+        b
+    }
+
+    /// The next staging slot below `lim`, writing the staged ones out first if none is left.
+    fn stage_in(&mut self, first: &mut usize, n: &mut usize, lim: usize) -> Result<usize, Error> {
+        if *n == lim {
+            self.write_slots(*first, *n)?;
+            (*first, *n) = (1, 1);
+        }
+        *n += 1;
+        Ok(*n - 1)
+    }
+
+    /// Snapshot `g`'s tree root and height and its bitmap index root, from its item in the live tree.
+    fn snap_item(&mut self, g: u64) -> Result<(Ptr, usize, (Block, Sum)), Error> {
+        let k = Key::new(ROOT, ItemKind::Snapshot, Offset(g.min(OFFSET)));
+        let (s, _) = self.leaf(k)?;
+        let n = &self.cache[s];
+        let i = search(n, k);
+        if g > OFFSET || i == count(n) || ikey(n, i) != k {
+            return Err(Error::NotFound);
+        }
+        let v = value(n, i);
+        let root = Ptr {
+            block: Block(le64(v, 0)),
+            sum: Sum(le64(v, 8)),
+            generation: le64(v, 16),
+        };
+        Ok((
+            root,
+            le64(v, 24) as usize + 1,
+            (Block(le64(v, 32)), Sum(le64(v, 40))),
+        ))
+    }
+
+    /// Reads the newest snapshot's bitmap into `SNAP`: a page it shares with the live list from the live words as of
+    /// that page's last write, else from the disk. It must mark its pages, its index blocks and its root.
+    fn load_snapshot(&mut self) -> Result<(), Error> {
+        let w = self.words;
+        self.bits[SNAP * w..(SNAP + 1) * w].fill(0);
+        if self.newest == 0 {
+            return Ok(());
+        }
+        let (root, _, ix) = match self.snap_item(self.newest) {
+            Err(Error::NotFound) => return Err(Error::Corrupt),
+            r => r?,
+        };
+        let (pages, h, saved) = (self.pages, fan_height(self.pages), self.base - 1);
+        if h >= AHEAD_AT {
+            self.ahead = 0;
+        }
+        let mut held = [usize::MAX; MAX_IX + 1];
+        for p in 0..pages {
+            let (b, sum) = self.index_entry(ix, h, pages, self.blocks, &mut held, p, None)?;
+            if (b, sum) == (Block(0), Sum(0)) {
+                continue;
+            }
+            if !(2..self.blocks).contains(&b.0) {
+                return Err(Error::Corrupt);
+            }
+            let (lo, n) = (p * PAGE_WORDS, page_words(self.blocks, p));
+            let (s, at) = self.page_entry(p);
+            if (
+                Block(le64(&self.cache[s], at)),
+                Sum(le64(&self.cache[s], at + 8)),
+            ) == (b, sum)
+            {
+                self.bits.copy_within(lo..lo + n, SNAP * w + lo);
+                for j in 0..self.nlog {
+                    let i = self.log[j] as usize;
+                    if (lo..lo + n).contains(&i) {
+                        self.bits[SNAP * w + i] = le64(&self.cache[saved], 8 * j);
+                    }
+                }
+                continue;
+            }
+            self.fetch(b, 0)?;
+            let page = &self.cache[0];
+            let tail = le64(page, 8 * (n - 1)) >> (self.blocks % 64);
+            if checksum(b, &page[..8 * n]) != sum
+                || page[8 * n..].iter().any(|&b| b != 0)
+                || (p == pages - 1 && !self.blocks.is_multiple_of(64) && tail != 0)
+            {
+                return Err(Error::Corrupt);
+            }
+            for i in 0..n {
+                self.bits[SNAP * w + lo + i] = le64(&self.cache[0], 8 * i);
+            }
+        }
+        let mut held = [usize::MAX; MAX_IX + 1];
+        for p in 0..pages {
+            let (b, _) = self.index_entry(ix, h, pages, self.blocks, &mut held, p, Some(SNAP))?;
+            if b != Block(0) && !self.has(SNAP, b) {
+                return Err(Error::Corrupt);
+            }
+        }
+        if !self.has(SNAP, root.block) {
+            return Err(Error::Corrupt);
+        }
+        Ok(())
+    }
+
+    /// A read-only view of `snapshot`'s files; `NotFound` once it is deleted.
+    pub fn view(&mut self, snapshot: Snapshot) -> Result<View<'_, 'a, D>, Error> {
+        if self.torn {
+            return Err(Error::Io);
+        }
+        let (root, height, _) = self.snap_item(snapshot.0)?;
+        Ok(View {
+            fs: self,
+            root,
+            height,
+        })
+    }
+
+    /// Reads from `root` (a snapshot's, with `view`) or back from the live tree; drops the memos, which copy the tree
+    /// left, and writes out the unwritten data page first.
+    fn switch(&mut self, root: Ptr, height: usize, view: bool) -> Result<(), Error> {
+        self.write_data()?;
+        (self.cached, self.items) = (None, [None; 2]);
+        (self.finger, self.start) = (None, (NONE, 0));
+        self.forget_names();
+        (self.root, self.height, self.view) = (root, height, view);
+        Ok(())
     }
 
     fn write_commit(&mut self, generation: u64) -> Result<(), Error> {
@@ -1083,12 +1376,16 @@ impl<'a, D: Disk> Fs<'a, D> {
             if (self.free as usize) < self.ndirty {
                 return Err(Error::NoSpace);
             }
-            match self.cached {
-                Some((d, ..)) if self.unwritten && self.run_free(d + 1, self.ndirty) => d + 1,
+            // After the blocks staged ahead of them if those are followed by a free run.
+            let staged = (self.staged > 0).then(|| self.blk[self.staged] + 1);
+            match (self.cached, staged) {
+                (_, Some(b)) if self.run_free(b, self.ndirty) => b,
+                (Some((d, ..)), _) if self.unwritten && self.run_free(d + 1, self.ndirty) => d + 1,
                 _ => self.start(self.ndirty),
             }
         };
-        let (mut first, mut n) = (1, 1);
+        let (mut first, mut n) = (1, 1 + self.staged);
+        self.staged = 0;
         // Staged ahead of the nodes, the page counts as written only once their request is.
         let staged = match self.cached {
             Some((d, ..)) if self.unwritten && !pages && start == d + 1 => {
@@ -1470,28 +1767,7 @@ impl<'a, D: Disk> Fs<'a, D> {
         } else if s.ix_h == 0 {
             (usize::MAX, SB_HDR + 16 * p)
         } else {
-            let pages = 2 * pages(s.blocks);
-            let mut ptr = s.ix;
-            for l in (1..=s.ix_h).rev() {
-                let i = (0..l).fold(p, |i, _| i / FAN);
-                if held[l] != i {
-                    self.read_ix(l, ptr, 16 * ix_children(pages, l, i), s.blocks)?;
-                    if let Some(map) = check
-                        && ptr.0 != Block(0)
-                        && !self.marked(map, ptr.0)
-                    {
-                        return Err(Error::Corrupt);
-                    }
-                    held[l] = i;
-                    held[..l].fill(usize::MAX);
-                }
-                let at = 16 * ((0..l - 1).fold(p, |i, _| i / FAN) % FAN);
-                ptr = (
-                    Block(le64(&self.cache[l], at)),
-                    Sum(le64(&self.cache[l], at + 8)),
-                );
-            }
-            return Ok(ptr);
+            return self.index_entry(s.ix, s.ix_h, 2 * pages(s.blocks), s.blocks, held, p, check);
         };
         let b = if slot == usize::MAX {
             &self.bufs[sb]
@@ -1499,6 +1775,43 @@ impl<'a, D: Disk> Fs<'a, D> {
             &self.cache[slot]
         };
         Ok((Block(le64(b, at)), Sum(le64(b, at + 8))))
+    }
+
+    /// Page `p`'s (block, sum) in the index of `pages` pages and height `h` under `root` on a disk of `blocks`, read
+    /// down one level per staging slot (`held` notes which block each holds). With `check`, each index block read
+    /// must be marked in that map.
+    #[allow(clippy::too_many_arguments)]
+    fn index_entry(
+        &mut self,
+        root: (Block, Sum),
+        h: usize,
+        pages: usize,
+        blocks: u64,
+        held: &mut [usize; MAX_IX + 1],
+        p: usize,
+        check: Option<usize>,
+    ) -> Result<(Block, Sum), Error> {
+        let mut ptr = root;
+        for l in (1..=h).rev() {
+            let i = (0..l).fold(p, |i, _| i / FAN);
+            if held[l] != i {
+                self.read_ix(l, ptr, 16 * ix_children(pages, l, i), blocks)?;
+                if let Some(map) = check
+                    && ptr.0 != Block(0)
+                    && !self.marked(map, ptr.0)
+                {
+                    return Err(Error::Corrupt);
+                }
+                held[l] = i;
+                held[..l].fill(usize::MAX);
+            }
+            let at = 16 * ((0..l - 1).fold(p, |i, _| i / FAN) % FAN);
+            ptr = (
+                Block(le64(&self.cache[l], at)),
+                Sum(le64(&self.cache[l], at + 8)),
+            );
+        }
+        Ok(ptr)
     }
 
     /// The counter exceeds every inode number: the last item down the rightmost path has the largest.
@@ -1906,6 +2219,11 @@ impl<'a, D: Disk> Fs<'a, D> {
         (2..self.blocks).contains(&b.0) && self.has(LIVE, b)
     }
 
+    /// A block in range the tree being read may reach: a snapshot's is live or pinned.
+    fn reaches(&self, b: Block) -> bool {
+        self.live(b) || (self.view && (2..self.blocks).contains(&b.0) && self.has(PINNED, b))
+    }
+
     fn mark(&mut self, b: Block) {
         self.bits[(b.0 / 64) as usize] |= 1 << (b.0 % 64);
         self.touch((b.0 / 64) as usize);
@@ -2203,7 +2521,7 @@ impl<'a, D: Disk> Fs<'a, D> {
                 if k < lo || k >= hi || prev.is_some_and(|q| k <= q) {
                     return Err(Error::Corrupt);
                 }
-                if e.generation > p.generation || !self.live(e.block) {
+                if e.generation > p.generation || !self.reaches(e.block) {
                     return Err(Error::Corrupt);
                 }
                 prev = Some(k);
@@ -2227,7 +2545,7 @@ impl<'a, D: Disk> Fs<'a, D> {
             let (inode, o) = (k.inode(), k.offset().0);
             let v = &n[off..off + len];
             let ok = match k.kind() {
-                Some(ItemKind::Inode) => {
+                ItemKind::Inode => {
                     o == 0
                         && len == INODE_LEN
                         && matches!(v[0], FILE | DIR)
@@ -2236,14 +2554,14 @@ impl<'a, D: Disk> Fs<'a, D> {
                         && le64(v, 8) <= MAX_FILE_SIZE
                         && le64(v, 24) <= OFFSET
                 }
-                Some(ItemKind::Entry) => {
+                ItemKind::Entry => {
                     (10..=9 + NAME_MAX).contains(&len)
                         && Inode(le64(v, 0)) != ROOT
                         && Inode(le64(v, 0)) != inode
                         && matches!(v[8], FILE | DIR)
                         && valid_name(&v[9..])
                 }
-                Some(ItemKind::Extent) => {
+                ItemKind::Extent => {
                     let (pages, start) = ((len as u64).saturating_sub(8) / 8, Block(le64(v, 0)));
                     let ok = len % 8 == 0
                         && (1..=EXTENT_MAX).contains(&pages)
@@ -2251,13 +2569,24 @@ impl<'a, D: Disk> Fs<'a, D> {
                         && prev_end.is_none_or(|e| e <= k)
                         && extent_key(inode, Page(o + pages - 1)) < hi
                         && start.0 < self.blocks
-                        && (0..pages).all(|j| self.live(start + j));
+                        && (0..pages).all(|j| self.reaches(start + j));
                     if ok {
                         prev_end = Some(extent_key(inode, Page(o + pages)));
                     }
                     ok
                 }
-                None => false,
+                // Generations are at most `OFFSET`, so an offset is one; none above the newest snapshot.
+                ItemKind::Snapshot => {
+                    inode == ROOT
+                        && len == SNAP_LEN
+                        && o < self.generation
+                        && o <= self.newest
+                        && le64(v, 16) <= o
+                        && le64(v, 24) < MAX_HEIGHT as u64
+                        && (2..self.blocks).contains(&le64(v, 0))
+                        && (2..self.blocks).contains(&le64(v, 32))
+                        && le64(v, 48) == fan_height(self.pages) as u64
+                }
             };
             if !ok {
                 return Err(Error::Corrupt);
@@ -2558,7 +2887,9 @@ impl<'a, D: Disk> Fs<'a, D> {
 
     /// Writes every dirty node out (not a commit), leaving them clean.
     fn spill(&mut self) -> Result<(), Error> {
-        let generation = self.generation.checked_add(1).ok_or(Error::Corrupt)?;
+        let generation = Some(self.generation + 1)
+            .filter(|&g| g <= OFFSET)
+            .ok_or(Error::Corrupt)?;
         if (self.free as usize) < self.ndirty {
             self.broken = true;
             return Err(Error::NoSpace);
@@ -2658,6 +2989,49 @@ impl<'a, D: Disk> Fs<'a, D> {
     }
 }
 
+/// A snapshot's files, read-only: the live file system's read calls, from the snapshot's tree.
+pub struct View<'f, 'a, D: Disk> {
+    fs: &'f mut Fs<'a, D>,
+    root: Ptr,
+    height: usize,
+}
+
+impl<'a, D: Disk> View<'_, 'a, D> {
+    fn with<T>(&mut self, f: impl FnOnce(&mut Fs<'a, D>) -> Result<T, Error>) -> Result<T, Error> {
+        let live = (self.fs.root, self.fs.height);
+        self.fs.switch(self.root, self.height, true)?;
+        let r = f(self.fs);
+        // A write-out failure on the way back leaves `broken` set; the read's result stands.
+        let _ = self.fs.switch(live.0, live.1, false);
+        r
+    }
+
+    pub fn lookup(&mut self, dir: Inode, name: &[u8]) -> Result<Inode, Error> {
+        self.with(|fs| fs.lookup(dir, name))
+    }
+
+    pub fn readdir(
+        &mut self,
+        dir: Inode,
+        cursor: u64,
+        f: impl FnMut(&[u8], Inode, Kind) -> bool,
+    ) -> Result<u64, Error> {
+        self.with(|fs| fs.readdir(dir, cursor, f))
+    }
+
+    pub fn stat(&mut self, inode: Inode) -> Result<Stat, Error> {
+        self.with(|fs| fs.stat(inode))
+    }
+
+    pub fn read(&mut self, file: Inode, offset: u64, buf: &mut [u8]) -> Result<usize, Error> {
+        self.with(|fs| fs.read(file, offset, buf))
+    }
+
+    pub fn map(&mut self, file: Inode, page: Page) -> Result<Option<(Block, Sum)>, Error> {
+        self.with(|fs| fs.map(file, page))
+    }
+}
+
 fn tagged(s: usize) -> Ptr {
     Ptr {
         block: Block(TAG | s as u64),
@@ -2738,7 +3112,8 @@ fn superblock(sb: &Buf, slot: u64, disk: u64) -> Option<Super> {
         && s.blocks <= MAX_BLOCKS
         && s.ix_h == ix_height(2 * pages)
         && (s.ix_h == 0 || (2..s.blocks).contains(&s.ix.0.0))
-        && s.newest == 0
+        && s.generation <= OFFSET
+        && s.newest < s.generation
         && log_ok
         && sb[end..END].iter().all(|&b| b == 0);
     s.log = if s.valid { log } else { 0 };
