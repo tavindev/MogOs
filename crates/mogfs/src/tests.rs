@@ -872,3 +872,213 @@ fn mutated_images_never_panic_or_write_reachable_blocks() {
         "{run} run, {mounted} mounted, {left_out} left out"
     );
 }
+
+/// A `Guarded` disk that fails one request in `rate` with `Io`, changing nothing, while `armed`.
+struct Faulty {
+    inner: Guarded,
+    rng: u64,
+    rate: u64,
+    armed: bool,
+}
+
+impl Faulty {
+    fn fails(&mut self) -> bool {
+        self.armed && next(&mut self.rng, self.rate) == 0
+    }
+}
+
+impl Disk for &mut Faulty {
+    fn read(&mut self, block: u64, bufs: &mut [Buf]) -> Result<(), Error> {
+        if self.fails() {
+            return Err(Error::Io);
+        }
+        (&mut self.inner).read(block, bufs)
+    }
+
+    fn write(&mut self, block: u64, bufs: &[Buf]) -> Result<(), Error> {
+        if self.fails() {
+            return Err(Error::Io);
+        }
+        (&mut self.inner).write(block, bufs)
+    }
+
+    fn flush(&mut self) -> Result<(), Error> {
+        if self.fails() {
+            return Err(Error::Io);
+        }
+        Ok(())
+    }
+
+    fn blocks(&self) -> u64 {
+        self.inner.blocks.len() as u64
+    }
+}
+
+type Files = Vec<(String, Option<Vec<u8>>)>;
+
+/// Every file and directory as seen through `readdir`, `lookup`, `stat` and `read`, sorted.
+fn files<D: Disk>(fs: &mut Fs<D>) -> Result<Files, Error> {
+    let (mut out, mut stack) = (vec![], vec![(ROOT, String::new())]);
+    while let Some((dir, path)) = stack.pop() {
+        let mut entries = vec![];
+        fs.readdir(dir, 0, |n, i, k| {
+            entries.push((n.to_vec(), i, k));
+            false
+        })?;
+        for (n, i, k) in entries {
+            let p = format!("{path}/{}", String::from_utf8_lossy(&n));
+            assert_eq!(fs.lookup(dir, &n)?, i, "{p}");
+            if k == Kind::Dir {
+                out.push((p.clone(), None));
+                stack.push((i, p));
+            } else {
+                let mut b = vec![0; fs.stat(i)?.size as usize];
+                fs.read(i, 0, &mut b)?;
+                out.push((p, Some(b)));
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Random changes on a disk that fails requests at random, and on disks that fill, against a model of the files: every
+/// view (listing, lookup, stat, read) shows what the changes so far should leave, checked only now and then so that
+/// the memos and the unwritten data page live across changes; `NoSpace` changes nothing; after a failed commit reads
+/// still show the state in memory, after any other error every call fails with `Io`, and a remount gives exactly the
+/// last committed state (either side of a commit whose outcome is unknown) with a consistent tree and bitmap.
+#[test]
+fn disk_errors_and_full_disks_never_leave_stale_state() {
+    type Model = std::collections::BTreeMap<String, Option<Vec<u8>>>;
+    let seeds = std::env::var("FAULT_SEEDS").map_or(300u64, |s| s.parse().unwrap());
+    for seed in 1..=seeds {
+        let rng = &mut seed.wrapping_mul(0x2545_f491_4f6c_dd1d);
+        let blocks = [64, 200, 3000][seed as usize % 3];
+        let mut disk = Faulty {
+            inner: Guarded::new(vec![[0; BLOCK_SIZE]; blocks], true),
+            rng: seed,
+            rate: 40,
+            armed: false,
+        };
+        let mut mem = Mem::new(blocks);
+        let mut fs = mem.fs(&mut disk);
+        fs.format(seed).unwrap();
+        let (mut model, mut committed) = (Model::new(), Model::new());
+        let view = |m: &Model| m.clone().into_iter().collect::<Files>();
+        for step in 0..300 {
+            let ctx = format!("seed {seed} step {step}");
+            let has_d = model.contains_key("/d");
+            let (dir, dp) = match next(rng, 2) {
+                1 if has_d => {
+                    fs.disk().armed = false;
+                    (fs.lookup(ROOT, b"d").unwrap(), "/d")
+                }
+                _ => (ROOT, ""),
+            };
+            let name = format!("n{}", next(rng, 12));
+            let other = format!("n{}", next(rng, 12));
+            let path = format!("{dp}/{name}");
+            let (len, at) = (
+                next(rng, 3 * BLOCK_SIZE as u64) as usize,
+                next(rng, 3 * BLOCK_SIZE as u64) as usize,
+            );
+            fs.disk().armed = true;
+            let op = next(rng, 14);
+            let r = match op {
+                0 | 1 => fs.create(dir, name.as_bytes()).map(|_| ()),
+                2 => fs.mkdir(ROOT, b"d").map(|_| ()),
+                3..=5 => fs
+                    .lookup(dir, name.as_bytes())
+                    .and_then(|f| fs.write(f, at as u64, &vec![step as u8; len])),
+                6 => fs.lookup(dir, name.as_bytes()).and_then(|f| fs.truncate(f)),
+                7 => fs.unlink(dir, name.as_bytes()),
+                8 => fs.rename(dir, name.as_bytes(), ROOT, other.as_bytes()),
+                9 | 10 => fs.commit(),
+                11 => fs.mount(),
+                // A read of one file, through the memos.
+                12 => fs.lookup(dir, name.as_bytes()).and_then(|f| {
+                    let mut b = vec![0; 7 * BLOCK_SIZE];
+                    let n = fs.read(f, 0, &mut b)?;
+                    if let Some(Some(want)) = model.get(&path) {
+                        assert_eq!(&b[..n], &want[..], "{ctx}: read {path}");
+                    }
+                    Ok(())
+                }),
+                _ => files(&mut fs).map(|got| assert_eq!(got, view(&model), "{ctx}")),
+            };
+            fs.disk().armed = false;
+            if fs.broken {
+                // A failed commit, or a read that failed to write the unwritten page out, leaves the tree in memory
+                // whole; an error in the middle of a change, or a failed mount, refuses reads too.
+                if matches!(op, 9 | 10 | 12 | 13) {
+                    assert_eq!(
+                        files(&mut fs),
+                        Ok(view(&model)),
+                        "{ctx}: after op {op}: {r:?}"
+                    );
+                } else {
+                    assert_eq!(
+                        files(&mut fs),
+                        Err(Error::Io),
+                        "{ctx}: reads after op {op}: {r:?}"
+                    );
+                }
+                assert_eq!(fs.create(ROOT, b"refused"), Err(Error::Io), "{ctx}");
+                assert_eq!(fs.commit(), Err(Error::Io), "{ctx}");
+                fs.mount().unwrap();
+                let now = files(&mut fs).unwrap();
+                let unknown = matches!(op, 9 | 10) && now == view(&model);
+                assert!(
+                    now == view(&committed) || unknown,
+                    "{ctx}: remount after op {op}: {r:?}"
+                );
+                model = now.into_iter().collect();
+                committed = model.clone();
+                check(&mut fs, &ctx);
+                continue;
+            }
+            let put = |m: &mut Model, at: usize, len: usize| {
+                if let Some(Some(b)) = m.get_mut(&path)
+                    && len > 0
+                {
+                    if b.len() < at + len {
+                        b.resize(at + len, 0);
+                    }
+                    b[at..at + len].fill(step as u8);
+                }
+            };
+            // The outcome the model predicts, `NoSpace` aside.
+            let exists = matches!(model.get(&path), Some(Some(_)));
+            let target = format!("/{other}");
+            let want = match op {
+                3..=8 | 12 if !exists => Err(Error::NotFound),
+                8 if target != path && model.contains_key(&target) => Err(Error::Exists),
+                2 if has_d => Err(Error::Exists),
+                _ => Ok(()),
+            };
+            // A read that fails before any change leaves the file system whole.
+            let refused = matches!(r, Err(Error::NoSpace | Error::Io));
+            assert!(r == want || refused, "{ctx}: op {op} on {path} gave {r:?}");
+            match (op, r) {
+                // `NoSpace` changes nothing; other refusals (`Exists`, `IsDir`, `NotFound`...) neither.
+                (_, Err(_)) => {}
+                (0 | 1, Ok(())) => _ = model.entry(path.clone()).or_insert(Some(vec![])),
+                (2, Ok(())) => _ = model.insert("/d".into(), None),
+                (3..=5, Ok(())) => put(&mut model, at, len),
+                (6, Ok(())) => _ = model.insert(path.clone(), Some(vec![])),
+                (7, Ok(())) => _ = model.remove(&path),
+                (8, Ok(())) => {
+                    if let Some(v) = model.remove(&path) {
+                        model.insert(format!("/{other}"), v);
+                    }
+                }
+                (9 | 10, Ok(())) => committed = model.clone(),
+                (11, Ok(())) => {
+                    model = committed.clone();
+                    assert_eq!(files(&mut fs), Ok(view(&model)), "{ctx}: mount");
+                }
+                _ => {}
+            }
+        }
+    }
+}

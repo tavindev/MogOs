@@ -86,7 +86,11 @@ or a device driver.
   `unlink`, which with `truncate` may use it, so a full disk can always be emptied (the floor for snapshot delete
   comes in step 40). After `Io` from a change, any error in the middle of
   one, or a failed `mount`, writes and commits fail with `Io` until a `mount` succeeds; `Io` from `commit` means the
-  commit may or may not be durable.
+  commit may or may not be durable. Fail closed: after an error in the middle of a change, or a failed or partial
+  `mount`/`format` (`torn`), reads fail with `Io` too, since the tree in memory may hold a change made halfway; after
+  a failed commit, or a failed write of the unwritten data page, reads go on from the tree in memory, which stays
+  whole (the page counts as written only once its request has been). `disk_errors_and_full_disks_never_leave_stale_state`
+  checks all of this against a model of the files with random request failures and full disks.
 - Performance is the moat: a slowdown is never accepted because it has an explanation (`docs/BENCHMARKS.md`). Disk
   requests per operation are asserted exactly by `block_io_per_operation`.
 

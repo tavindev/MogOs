@@ -454,6 +454,9 @@ pub struct Fs<'a, D> {
     finger: Option<(usize, Key, Key)>,
     start: (Key, usize),
     broken: bool,
+    /// `broken`, and the tree in memory may hold a change made halfway, or no file system is mounted: every call
+    /// fails with `Io` until a `mount` succeeds.
+    torn: bool,
 }
 
 impl<'a, D: Disk> Fs<'a, D> {
@@ -502,6 +505,7 @@ impl<'a, D: Disk> Fs<'a, D> {
             finger: None,
             start: (NONE, 0),
             broken: true,
+            torn: true,
         }
     }
 
@@ -563,13 +567,15 @@ impl<'a, D: Disk> Fs<'a, D> {
         let (s, at) = self.insert(Key::new(ROOT, ItemKind::Inode, Offset(0)), INODE_LEN)?;
         encode(&mut self.cache[s][at..at + INODE_LEN], &root);
         self.full = true;
-        self.commit()
+        self.commit()?;
+        self.torn = false;
+        Ok(())
     }
 
     /// Loads the newest valid slot, or the older one if the newest's bitmap or rightmost path is corrupt; drops
     /// uncommitted changes. Blocks the other slot's bitmap marks stay reserved.
     pub fn mount(&mut self) -> Result<(), Error> {
-        self.broken = true;
+        (self.broken, self.torn) = (true, true);
         (self.cached, self.unwritten, self.items) = (None, false, [None; 2]);
         (self.finger, self.start) = (None, (NONE, 0));
         self.forget_names();
@@ -634,7 +640,7 @@ impl<'a, D: Disk> Fs<'a, D> {
                 .sum();
             self.free = self.blocks - used;
             self.hint = Block(0);
-            self.broken = false;
+            (self.broken, self.torn) = (false, false);
             return Ok(());
         }
         Err(Error::Corrupt)
@@ -791,7 +797,7 @@ impl<'a, D: Disk> Fs<'a, D> {
             (it.mtime, it.ctime) = (self.now, self.now);
             self.set_inode(file, &it)
         });
-        self.broken |= r.is_err();
+        self.tear(&r);
         r
     }
 
@@ -813,7 +819,7 @@ impl<'a, D: Disk> Fs<'a, D> {
             (it.mtime, it.ctime) = (self.now, self.now);
             self.set_inode(file, &it)
         });
-        self.broken |= r.is_err();
+        self.tear(&r);
         r
     }
 
@@ -860,7 +866,7 @@ impl<'a, D: Disk> Fs<'a, D> {
                 (d.mtime, d.ctime) = (self.now, self.now);
                 self.set_inode(dir, &d)
             });
-        self.broken |= r.is_err();
+        self.tear(&r);
         r
     }
 
@@ -914,7 +920,7 @@ impl<'a, D: Disk> Fs<'a, D> {
                 }
                 Ok(())
             });
-        self.broken |= r.is_err();
+        self.tear(&r);
         r
     }
 
@@ -999,15 +1005,20 @@ impl<'a, D: Disk> Fs<'a, D> {
             }
         };
         let (mut first, mut n) = (1, 1);
-        match self.cached {
+        // Staged ahead of the nodes, the page counts as written only once their request is.
+        let staged = match self.cached {
             Some((d, ..)) if self.unwritten && !pages && start == d + 1 => {
                 let s = self.stage(&mut first, &mut n)?;
                 let (src, dst) = (&self.bufs[DATA], &mut self.cache[s]);
                 dst.copy_from_slice(src);
-                (self.blk[s], self.unwritten) = (d, false);
+                self.blk[s] = d;
+                true
             }
-            _ => self.write_data()?,
-        }
+            _ => {
+                self.write_data()?;
+                false
+            }
+        };
         // Blocks in the order they are written: the pages, the index bottom up, the nodes. A page's or index block's
         // goes into the pointer to it until its sum is known.
         let mut b = start;
@@ -1083,6 +1094,7 @@ impl<'a, D: Disk> Fs<'a, D> {
             }
         }
         self.write_out(first, n)?;
+        self.unwritten &= !staged;
         self.flush()?;
         let list = 16 * self.list_entries();
         let sb = &mut self.bufs[META];
@@ -1153,7 +1165,7 @@ impl<'a, D: Disk> Fs<'a, D> {
 
     /// Sizes the memory for a disk of `blocks` and drops every cached node.
     fn setup(&mut self, blocks: u64) -> Result<(), Error> {
-        self.broken = true;
+        (self.broken, self.torn) = (true, true);
         let pages = pages(blocks);
         let base = 1 + STAGE;
         let pool = min(
@@ -1408,6 +1420,9 @@ impl<'a, D: Disk> Fs<'a, D> {
     /// `inode`'s item, from the memo of the last two read or else the tree. A reference, since the kernel's dev build
     /// instantiates this at opt-level 1, where each move of an `Item` is a `memcpy` call.
     fn inode(&mut self, inode: Inode) -> Result<&Item, Error> {
+        if self.torn {
+            return Err(Error::Io);
+        }
         let at = match &self.items {
             [Some((i, _)), _] if *i == inode => 0,
             [_, Some((i, _))] if *i == inode => 1,
@@ -1541,7 +1556,7 @@ impl<'a, D: Disk> Fs<'a, D> {
                 (d.mtime, d.ctime) = (self.now, self.now);
                 self.set_inode(dir, &d)
             });
-        self.broken |= r.is_err();
+        self.tear(&r);
         r.map(|()| inode)
     }
 
@@ -1988,6 +2003,13 @@ impl<'a, D: Disk> Fs<'a, D> {
     }
 
     /// Writes the data page in `bufs[DATA]` to its block if it is not written yet.
+    /// After an error in the middle of a change, refuses every call until a `mount`.
+    fn tear(&mut self, r: &Result<(), Error>) {
+        if r.is_err() {
+            (self.broken, self.torn) = (true, true);
+        }
+    }
+
     fn write_data(&mut self) -> Result<(), Error> {
         if let (Some((b, ..)), true) = (self.cached, self.unwritten) {
             let r = self.disk.write(b.0, from_ref(&self.bufs[DATA]));
