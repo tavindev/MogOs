@@ -73,7 +73,9 @@ or a device driver.
 - Memos skip tree work on repeated access, and must never outlive what they copy: the last two inode items read
   (cleared by `set_inode`, an inode's delete, `mount` and `format`); the data page in `bufs[DATA]`, tagged with its
   block, sum, inode and page (cleared before any rewrite of `bufs[DATA]` and by `release` of its block; a page maps to
-  another block only through `write`, which retags it); the last four lookups that found their entry (cleared before
+  another block only through `write`, which retags it). A `write` leaves its page there unwritten: the block is
+  written when the buffer is needed for another page, by `map` of that page, and first thing in `commit`; a `release`
+  of its block drops it unwritten, and `mount` discards it (the committed state never names an unwritten block); the last four lookups that found their entry (cleared before
   `create`, `mkdir`, `unlink` or `rename` change an entry, and by `mount` and `format`); and the leaf the last descent
   reached with `readdir`'s last start index in it (cleared before a cache slot is reused or an insert or delete
   changes the tree). `truncate` and `unlink` take a file of size 0 to have no extents (they end within the size); a

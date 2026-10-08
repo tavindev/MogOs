@@ -439,8 +439,10 @@ pub struct Fs<'a, D> {
     clock: u64,
     /// `DATA` (a data page) and `META` (superblocks, and scratch for an extent's value).
     bufs: [Buf; 2],
-    /// The block and sum `bufs[DATA]` holds unchanged, and the file page it is.
+    /// The block and sum `bufs[DATA]` holds, and the file page it is; `unwritten` if its block is not written yet
+    /// (a write goes to the disk only when the buffer is needed for another page, at `commit` or at `map`).
     cached: Option<(Block, Sum, Inode, Page)>,
+    unwritten: bool,
     /// The last two inode items read, newest first; any change to an inode item clears them.
     items: [Option<(Inode, Item)>; 2],
     /// The last lookups that found their entry: directory, name length (0: none) and bytes, and the inode; any change
@@ -493,6 +495,7 @@ impl<'a, D: Disk> Fs<'a, D> {
             clock: 0,
             bufs: [[0; BLOCK_SIZE]; 2],
             cached: None,
+            unwritten: false,
             items: [None; 2],
             names: [(ROOT, 0, [0; NAME_MAX], ROOT); NAMES],
             next_name: 0,
@@ -567,7 +570,7 @@ impl<'a, D: Disk> Fs<'a, D> {
     /// uncommitted changes. Blocks the other slot's bitmap marks stay reserved.
     pub fn mount(&mut self) -> Result<(), Error> {
         self.broken = true;
-        (self.cached, self.items) = (None, [None; 2]);
+        (self.cached, self.unwritten, self.items) = (None, false, [None; 2]);
         (self.finger, self.start) = (None, (NONE, 0));
         self.forget_names();
         self.disk.read(0, &mut self.bufs)?;
@@ -754,6 +757,9 @@ impl<'a, D: Disk> Fs<'a, D> {
     /// The block holding `page` of `file` and that page's sum (check it with `verify`), or `None` for a hole.
     pub fn map(&mut self, file: Inode, page: Page) -> Result<Option<(Block, Sum)>, Error> {
         self.file(file)?;
+        if self.cached.is_some_and(|(.., i, p)| i == file && p == page) {
+            self.write_data()?;
+        }
         if page.0 >= MAX_FILE_SIZE / BLOCK_SIZE as u64 {
             return Ok(None);
         }
@@ -921,7 +927,9 @@ impl<'a, D: Disk> Fs<'a, D> {
             return Ok(());
         }
         let generation = self.generation.checked_add(1).ok_or(Error::Corrupt)?;
-        let r = self.write_commit(generation);
+        let r = self
+            .write_data()
+            .and_then(|()| self.write_commit(generation));
         self.broken |= r.is_err();
         r
     }
@@ -1145,7 +1153,7 @@ impl<'a, D: Disk> Fs<'a, D> {
         let d = 3 * self.words;
         self.bits[d..d + pages.div_ceil(64)].fill(0);
         (self.span, self.prev_span) = ((usize::MAX, 0), (0, pages * PAGE_WORDS));
-        (self.cached, self.items) = (None, [None; 2]);
+        (self.cached, self.unwritten, self.items) = (None, false, [None; 2]);
         (self.finger, self.start) = (None, (NONE, 0));
         self.forget_names();
         Ok(())
@@ -1565,7 +1573,14 @@ impl<'a, D: Disk> Fs<'a, D> {
             let n = min(BLOCK_SIZE - at, (end - pos) as usize);
             let old = self.extent_at(inode, page)?;
             let old_block = old.map(|(off, start, _)| start + (page - off));
+            let held = self
+                .cached
+                .is_some_and(|(.., i, p)| i == inode && p == page);
+            if !held {
+                self.write_data()?;
+            }
             match old {
+                _ if held => {}
                 Some((off, start, _)) if n < BLOCK_SIZE => {
                     let sum = Sum(le64(
                         &self.bufs[META],
@@ -1575,18 +1590,15 @@ impl<'a, D: Disk> Fs<'a, D> {
                 }
                 _ => self.bufs[DATA].fill(0),
             }
-            self.cached = None;
+            (self.cached, self.unwritten) = (None, false);
             self.bufs[DATA][at..at + n].copy_from_slice(&data[(pos - offset) as usize..][..n]);
             let b = match old_block {
                 Some(b) if !self.has(COMMITTED, b) => b,
                 _ => self.alloc()?,
             };
             let sum = checksum(b, &self.bufs[DATA]);
-            let r = self.disk.write(b.0, from_ref(&self.bufs[DATA]));
-            self.broken |= r.is_err();
-            r?;
             self.set_page(inode, page, b, sum, old)?;
-            self.cached = Some((b, sum, inode, page));
+            (self.cached, self.unwritten) = (Some((b, sum, inode, page)), true);
             pos += n as u64;
         }
         Ok(())
@@ -1903,7 +1915,7 @@ impl<'a, D: Disk> Fs<'a, D> {
             self.hint = min(self.hint, b);
         }
         if self.cached.is_some_and(|(c, ..)| c == b) {
-            self.cached = None;
+            (self.cached, self.unwritten) = (None, false);
         }
         self.changed = true;
         Ok(())
@@ -1913,10 +1925,22 @@ impl<'a, D: Disk> Fs<'a, D> {
         if self.cached == Some((b, sum, inode, page)) {
             return Ok(());
         }
+        self.write_data()?;
         self.cached = None;
         self.disk.read(b.0, from_mut(&mut self.bufs[DATA]))?;
         verify(b, &self.bufs[DATA], sum)?;
         self.cached = Some((b, sum, inode, page));
+        Ok(())
+    }
+
+    /// Writes the data page in `bufs[DATA]` to its block if it is not written yet.
+    fn write_data(&mut self) -> Result<(), Error> {
+        if let (Some((b, ..)), true) = (self.cached, self.unwritten) {
+            let r = self.disk.write(b.0, from_ref(&self.bufs[DATA]));
+            self.broken |= r.is_err();
+            r?;
+            self.unwritten = false;
+        }
         Ok(())
     }
 

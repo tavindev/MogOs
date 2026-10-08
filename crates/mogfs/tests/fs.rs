@@ -1,4 +1,5 @@
 use std::cell::Cell;
+use std::slice::from_mut;
 
 use mogfs::{
     BLOCK_SIZE, Buf, Disk, Error, Fs, Inode, Kind, MAX_FILE_SIZE, NAME_MAX, Page, ROOT,
@@ -430,6 +431,20 @@ fn map_gives_each_page_block_and_sum_for_verify() {
         assert_eq!(page[0], if i < 2 { 1 } else { b'e' });
         assert_eq!(mogfs::verify(block + 1, &page, sum), Err(Error::Corrupt));
     }
+}
+
+#[test]
+fn map_writes_a_page_still_in_the_buffer() {
+    let mut disk = MemDisk::new(64);
+    let mut mem = Mem::new(64, POOL);
+    let mut fs = format(&mut mem, &mut disk);
+    let f = fs.create(ROOT, b"f").unwrap();
+    fs.write(f, 0, b"buffered").unwrap();
+    let (block, sum) = fs.map(f, Page(0)).unwrap().unwrap();
+    let mut page = [0; BLOCK_SIZE];
+    fs.disk().read(block.0, from_mut(&mut page)).unwrap();
+    assert_eq!(mogfs::verify(block, &page, sum), Ok(()));
+    assert_eq!(&page[..8], b"buffered");
 }
 
 #[test]
@@ -1180,20 +1195,25 @@ fn block_io_per_operation() {
     // Every node it changes is cached and stays dirty in memory until the commit.
     let b = fs.create(docs, b"b.txt").unwrap();
     assert_eq!(io.take(), [0, 0, 0]);
+    // A data page stays in the buffer until the buffer is needed, `map` or a commit: both writes change it there.
     fs.write(b, 0, &[1; 100]).unwrap();
-    assert_eq!(io.take(), [0, 1, 0]);
-    // The page written since the last commit is rewritten in place from the buffer.
     fs.write(b, 100, &[2; 100]).unwrap();
-    assert_eq!(io.take(), [0, 1, 0]);
-    // The dirty nodes in one request, then the superblock, its log holding the bitmap's changes, between two
-    // flushes.
+    assert_eq!(io.take(), [0, 0, 0]);
+    // The data page, the dirty nodes in one request, then the superblock, its log holding the bitmap's changes,
+    // between two flushes.
     fs.commit().unwrap();
-    assert_eq!(io.take(), [0, 2, 2]);
+    assert_eq!(io.take(), [0, 3, 2]);
     fs.commit().unwrap();
     assert_eq!(io.take(), [0, 0, 0]);
     let a = fs.lookup(docs, b"a.txt").unwrap();
     fs.read(a, 0, &mut [0; 5]).unwrap();
     assert_eq!(io.take(), [1, 0, 0]);
+    // Another page needs the buffer: the unwritten one is written first.
+    fs.write(b, 0, b"x").unwrap();
+    fs.read(a, 0, &mut [0; 5]).unwrap();
+    assert_eq!(io.take(), [2, 1, 0]);
+    fs.commit().unwrap();
+    assert_eq!(io.take(), [0, 2, 2]);
     // The entry's leaf and the leaf with its inode.
     fs.lookup(many, format!("{:0>100}", 7).as_bytes()).unwrap();
     assert_eq!(io.take(), [2, 0, 0]);
