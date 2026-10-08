@@ -118,8 +118,9 @@ pub trait Board {
     fn online_cpus(&self) -> usize;
     /// Acquisitions of the board's kernel lock that had to wait, so far (wrapping).
     fn contended(&self) -> u32;
-    /// Prints the `spec:` line (speculative-execution vulnerabilities and the vector table) for the worst core, once
-    /// every core `start_cpus` started has installed its vectors.
+    /// Chooses this core's vector table (until then an exception from EL0 panics), then prints the `spec:` line
+    /// (speculative-execution vulnerabilities and the vector table) for the worst core, once every core `start_cpus`
+    /// started has chosen its own. Call before any EL0 code runs on this core.
     fn report_speculation(&mut self);
 }
 
@@ -311,6 +312,13 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
     board.start_cpus(bootargs.split_whitespace().any(|a| a == "test=smp"));
     let boot_us = board.uptime_us();
     let _ = writeln!(board.console(), "boot: {boot_us} us");
+    // Runs EL0 code before `report_speculation`, against its rule, on purpose: the boot table must stop it.
+    if bootargs
+        .split_whitespace()
+        .any(|a| a == "test=el0-before-spec")
+    {
+        run_alone(board, Program::SyscallBench);
+    }
     board.report_speculation();
     match blocks {
         Some(blocks) => writeln!(board.console(), "disk: {blocks} blocks"),
