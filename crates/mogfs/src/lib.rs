@@ -702,9 +702,23 @@ impl<'a, D: Disk> Fs<'a, D> {
                     return Err(e);
                 }
             }
+            // A larger older slot may mark blocks past this disk's size; they reserve nothing and must not count.
+            let end = self.blocks.div_ceil(64) as usize;
+            let tail = if self.blocks.is_multiple_of(64) {
+                !0
+            } else {
+                (1 << (self.blocks % 64)) - 1
+            };
             for i in 0..w {
                 let (l, p) = (self.bits[i], self.bits[w + i]);
                 let o = self.bits[NEWEST * w + i] | self.bits[(NEWEST + 1) * w + i];
+                let o = if i + 1 < end {
+                    o
+                } else if i + 1 == end {
+                    o & tail
+                } else {
+                    0
+                };
                 self.bits[COMMITTED * w + i] = o | l | p;
             }
             self.bits.copy_within(..2 * w, NEWEST * w);
@@ -1300,10 +1314,8 @@ impl<'a, D: Disk> Fs<'a, D> {
             }
             for i in 0..n {
                 let mut u = le64(&self.cache[3 * h + 1], 8 * i);
-                for j in 1..3 {
-                    if e[j].is_some() {
-                        u &= !le64(&self.cache[3 * h + 1 + j], 8 * i);
-                    }
+                for (j, _) in e.iter().enumerate().skip(1).filter(|(_, e)| e.is_some()) {
+                    u &= !le64(&self.cache[3 * h + 1 + j], 8 * i);
                 }
                 let at = w + lo + i;
                 if self.bits[at] & u != 0 {

@@ -1759,3 +1759,45 @@ fn a_snapshot_writes_two_requests_whatever_the_file_system_size() {
         assert_eq!(buf, [7; 7]);
     }
 }
+
+#[test]
+fn an_older_slot_marking_blocks_past_the_newest_slots_size_counts_none_of_them() {
+    let mut disk = MemDisk::new(70000);
+    let mut mem = Mem::new(70000, POOL);
+    let mut fs = format(&mut mem, &mut disk);
+    fs.create(ROOT, b"a").unwrap();
+    fs.commit().unwrap();
+    // Generation 1's page, before slot 0's log is folded into it below.
+    let mut older = disk.durable[le64(&disk.durable[1], SB_HDR) as usize];
+    // Slot 0 (generation 2) shrinks to 16384 blocks, as above.
+    let sb = disk.durable[0];
+    let page = le64(&sb, SB_HDR) as usize;
+    for j in 0..le64(&sb, 13 * 8) as usize {
+        let at = SB_HDR + 16 * 6 + 16 * j;
+        let w = le64(&sb, at) as usize;
+        disk.durable[page][8 * w..8 * w + 8].copy_from_slice(&sb[at + 8..at + 16]);
+    }
+    disk.durable[0][SB_HDR + 16..BLOCK_SIZE - 8].fill(0);
+    let s = sum(page as u64, &disk.durable[page][..2048]);
+    let disk = crafted(disk, &[0], 13, 0);
+    let disk = crafted(disk, &[0], 17, s);
+    let mut disk = crafted(disk, &[0], 2, 16384);
+    // Slot 1 (generation 1, 70000 blocks) marks every block from 16384 to 32767, more than the newest slot has, in a
+    // page of its own at block 20000, which it marks.
+    older[2048..4096].fill(0xff);
+    disk.durable[20000] = older;
+    let disk = crafted(disk, &[1], 16, 20000);
+    let mut disk = crafted(disk, &[1], 17, sum(20000, &older));
+    let mut small = Mem::new(16384, POOL);
+    let mut fs = small.fs(&mut disk);
+    fs.mount().unwrap();
+    assert_eq!(names(&mut fs, ROOT), ["a"]);
+    // Blocks past 16384 are not this file system's; the free count holds and allocation goes on below them.
+    for i in 0..100 {
+        let f = fs.create(ROOT, format!("f{i}").as_bytes()).unwrap();
+        fs.write(f, 0, &[1; 3 * BLOCK_SIZE]).unwrap();
+    }
+    fs.commit().unwrap();
+    fs.mount().unwrap();
+    assert_eq!(names(&mut fs, ROOT).len(), 101);
+}
