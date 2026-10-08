@@ -132,6 +132,8 @@ pub enum Error {
     TooBig,
     NoSpace,
     NotEmpty,
+    /// `unlink`'s caller holds the inode the name reaches.
+    Busy,
     /// Every slot of the name's hash chain in the directory is taken.
     Collision,
     /// The newest superblock needs a feature this version does not know.
@@ -849,7 +851,14 @@ impl<'a, D: Disk> Fs<'a, D> {
     }
 
     /// Removes a file or an empty directory with its blocks. `NoSpace` changes nothing.
-    pub fn unlink(&mut self, dir: Inode, name: &[u8]) -> Result<(), Error> {
+    /// Removes `name`'s entry from `dir` and its inode, a file or an empty directory; `Busy` if `busy` holds that
+    /// inode.
+    pub fn unlink(
+        &mut self,
+        dir: Inode,
+        name: &[u8],
+        busy: impl FnOnce(Inode) -> bool,
+    ) -> Result<(), Error> {
         if self.broken {
             return Err(Error::Io);
         }
@@ -863,6 +872,9 @@ impl<'a, D: Disk> Fs<'a, D> {
             .ok_or(Error::NotFound)?;
         let (off, inode, _) = e;
         let it = *self.child(dir, e)?;
+        if busy(inode) {
+            return Err(Error::Busy);
+        }
         if it.kind == DIR
             && let Some((s, i, _)) = self.seek(Key::new(inode, ItemKind::Entry, Offset(0)))?
             && ikey(&self.cache[s], i) < Key::new(inode, ItemKind::Extent, Offset(0))

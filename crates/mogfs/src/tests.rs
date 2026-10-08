@@ -447,7 +447,7 @@ fn random_changes_keep_the_tree_and_free_space_consistent() {
                     let burst = if seed % 8 == 0 { 600 } else { 40 };
                     (0..next(rng, burst)).try_for_each(|_| match pick(&mut fs, d, rng) {
                         Some((name, i)) if fs.kind(i) == Ok(Kind::File) => {
-                            fs.unlink(d, &name).map(|()| {
+                            fs.unlink(d, &name, |_| false).map(|()| {
                                 files.retain(|&f| f != i);
                             })
                         }
@@ -491,7 +491,7 @@ fn random_changes_keep_the_tree_and_free_space_consistent() {
                     match pick(&mut fs, d, rng) {
                         Some((name, i)) => {
                             let _ = fs.lookup(d, &name);
-                            fs.unlink(d, &name).map(|()| {
+                            fs.unlink(d, &name, |_| false).map(|()| {
                                 assert_eq!(fs.lookup(d, &name), Err(Error::NotFound), "{ctx}");
                                 files.retain(|&f| f != i);
                                 dirs.retain(|&d| d != i);
@@ -572,7 +572,8 @@ fn mutation_base() -> Vec<Buf> {
     fs.commit().unwrap();
     fs.write(big, 5 * BLOCK_SIZE as u64, &[1; 10]).unwrap();
     for i in 0..10 {
-        fs.unlink(ROOT, format!("{i:0>40}").as_bytes()).unwrap();
+        fs.unlink(ROOT, format!("{i:0>40}").as_bytes(), |_| false)
+            .unwrap();
     }
     fs.rename(ROOT, b"sparse", sub, b"moved").unwrap();
     fs.commit().unwrap();
@@ -814,7 +815,7 @@ fn exercise<D: Disk>(fs: &mut Fs<D>) {
             let _ = fs.truncate(f);
         }
         for (d, n) in names.iter().take(15) {
-            let _ = fs.unlink(*d, n);
+            let _ = fs.unlink(*d, n, |_| false);
         }
         for (k, (d, n)) in names.iter().skip(15).take(10).enumerate() {
             let _ = fs.rename(*d, n, dirs[k % dirs.len()], format!("moved{k}").as_bytes());
@@ -993,7 +994,7 @@ fn disk_errors_and_full_disks_never_leave_stale_state() {
                     .lookup(dir, name.as_bytes())
                     .and_then(|f| fs.write(f, at as u64, &vec![step as u8; len])),
                 6 => fs.lookup(dir, name.as_bytes()).and_then(|f| fs.truncate(f)),
-                7 => fs.unlink(dir, name.as_bytes()),
+                7 => fs.unlink(dir, name.as_bytes(), |_| false),
                 8 => fs.rename(dir, name.as_bytes(), ROOT, other.as_bytes()),
                 9 | 10 => fs.commit(),
                 11 => fs.mount(),
@@ -1104,7 +1105,7 @@ fn a_moved_data_page_keeps_its_block_when_its_extent_rewrite_spills() {
     fs.write(a, 0, &[1; BLOCK_SIZE]).unwrap();
     fs.write(b, 0, &[2; BLOCK_SIZE]).unwrap();
     fs.commit().unwrap();
-    fs.unlink(ROOT, b"a").unwrap();
+    fs.unlink(ROOT, b"a", |_| false).unwrap();
     fs.commit().unwrap();
     fs.commit().unwrap();
     // `c`'s page takes `a`'s old block, followed by `b`'s.

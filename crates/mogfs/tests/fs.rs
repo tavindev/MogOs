@@ -288,15 +288,17 @@ fn unlink_removes_files_and_empty_directories_and_never_reuses_inodes() {
     let d = fs.mkdir(ROOT, b"d").unwrap();
     fs.create(d, b"x").unwrap();
     fs.commit().unwrap();
-    assert_eq!(fs.unlink(ROOT, b"d"), Err(Error::NotEmpty));
-    assert_eq!(fs.unlink(ROOT, b"missing"), Err(Error::NotFound));
-    assert_eq!(fs.unlink(ROOT, b".."), Err(Error::InvalidName));
-    assert_eq!(fs.unlink(a, b"x"), Err(Error::NotDir));
-    fs.unlink(ROOT, b"a").unwrap();
+    assert_eq!(fs.unlink(ROOT, b"d", |_| false), Err(Error::NotEmpty));
+    assert_eq!(fs.unlink(ROOT, b"missing", |_| false), Err(Error::NotFound));
+    assert_eq!(fs.unlink(ROOT, b"..", |_| false), Err(Error::InvalidName));
+    assert_eq!(fs.unlink(a, b"x", |_| false), Err(Error::NotDir));
+    assert_eq!(fs.unlink(ROOT, b"a", |i| i == a), Err(Error::Busy));
+    assert_eq!(fs.lookup(ROOT, b"a"), Ok(a));
+    fs.unlink(ROOT, b"a", |_| false).unwrap();
     assert_eq!(names(&mut fs, ROOT), ["b", "d"]);
     assert_eq!(fs.kind(a), Err(Error::NotFound));
-    fs.unlink(d, b"x").unwrap();
-    fs.unlink(ROOT, b"d").unwrap();
+    fs.unlink(d, b"x", |_| false).unwrap();
+    fs.unlink(ROOT, b"d", |_| false).unwrap();
     // Freed blocks of committed and uncommitted files come back; inode numbers do not.
     let mut seen = vec![a, d];
     for _ in 0..100 {
@@ -305,7 +307,7 @@ fn unlink_removes_files_and_empty_directories_and_never_reuses_inodes() {
         seen.push(f);
         fs.write(f, 0, &[2; 9000]).unwrap();
         fs.commit().unwrap();
-        fs.unlink(ROOT, b"f").unwrap();
+        fs.unlink(ROOT, b"f", |_| false).unwrap();
     }
     fs.commit().unwrap();
     assert_eq!(fs.read(a, 0, &mut [0; 1]), Err(Error::NotFound));
@@ -633,7 +635,7 @@ fn failed_mount_leaves_the_fs_read_only() {
     assert_eq!(fs.mount(), Err(Error::Io));
     assert_eq!(fs.write(a, 0, b"HE"), Err(Error::Io));
     assert_eq!(fs.truncate(a), Err(Error::Io));
-    assert_eq!(fs.unlink(docs, b"a.txt"), Err(Error::Io));
+    assert_eq!(fs.unlink(docs, b"a.txt", |_| false), Err(Error::Io));
     assert_eq!(fs.rename(docs, b"a.txt", ROOT, b"a.txt"), Err(Error::Io));
     assert_eq!(fs.create(docs, b"new"), Err(Error::Io));
     assert_eq!(fs.commit(), Err(Error::Io));
@@ -663,9 +665,9 @@ fn remove(disk: &mut MemDisk) -> Result<(), Error> {
     let mut fs = mount(&mut mem, disk)?;
     let src = fs.lookup(ROOT, b"src")?;
     let docs = fs.lookup(src, b"docs")?;
-    fs.unlink(src, b"a.txt")?;
-    fs.unlink(docs, b"c.txt")?;
-    fs.unlink(src, b"docs")?;
+    fs.unlink(src, b"a.txt", |_| false)?;
+    fs.unlink(docs, b"c.txt", |_| false)?;
+    fs.unlink(src, b"docs", |_| false)?;
     fs.commit()
 }
 
@@ -898,7 +900,7 @@ fn the_last_hash_chain_holds_its_names() {
     assert_eq!(fs.lookup(ROOT, &name), Ok(f));
     assert_eq!(fs.create(ROOT, &name), Ok(f));
     fs.commit().unwrap();
-    fs.unlink(ROOT, &name).unwrap();
+    fs.unlink(ROOT, &name, |_| false).unwrap();
     assert_eq!(fs.lookup(ROOT, &name), Err(Error::NotFound));
 }
 
@@ -924,7 +926,7 @@ fn colliding_names_fill_a_bounded_chain() {
         assert_eq!(fs.lookup(ROOT, n), Ok(*f));
     }
     // Freeing a slot in the middle of the chain makes room.
-    fs.unlink(ROOT, &names[3]).unwrap();
+    fs.unlink(ROOT, &names[3], |_| false).unwrap();
     assert_eq!(fs.lookup(ROOT, &names[4]), Ok(files[4]));
     let ninth = fs.create(ROOT, &names[8]).unwrap();
     fs.commit().unwrap();
@@ -980,13 +982,13 @@ fn readdir_resumes_from_its_cursor_without_skipping_or_repeating() {
             .map(String::into_bytes)
             .collect();
         if let Some(a) = all.iter().find(|a| listed.contains(a)) {
-            fs.unlink(ROOT, a).unwrap();
+            fs.unlink(ROOT, a, |_| false).unwrap();
         }
         if let Some(b) = all
             .iter()
             .find(|b| !listed.contains(b) && Some(*b) != stopped.as_ref())
         {
-            fs.unlink(ROOT, b).unwrap();
+            fs.unlink(ROOT, b, |_| false).unwrap();
             gone_early.push(b.clone());
         }
     }
@@ -1042,7 +1044,10 @@ fn an_inode_is_reached_only_through_the_entry_it_records() {
     let mut fs = mount(&mut mem, &mut bad).unwrap();
     let docs = fs.lookup(ROOT, b"docs").unwrap();
     assert_eq!(fs.lookup(ROOT, b"elsewhere"), Err(Error::Corrupt));
-    assert_eq!(fs.unlink(ROOT, b"elsewhere"), Err(Error::Corrupt));
+    assert_eq!(
+        fs.unlink(ROOT, b"elsewhere", |_| false),
+        Err(Error::Corrupt)
+    );
     assert_eq!(
         fs.rename(ROOT, b"elsewhere", docs, b"x"),
         Err(Error::Corrupt)
@@ -1241,7 +1246,7 @@ fn block_io_per_operation() {
     // Renames and unlinks change cached nodes only; the commit after them is one request again.
     fs.rename(docs, b"b.txt", docs, b"c.txt").unwrap();
     fs.rename(docs, b"c.txt", many, b"c.txt").unwrap();
-    fs.unlink(many, b"c.txt").unwrap();
+    fs.unlink(many, b"c.txt", |_| false).unwrap();
     assert_eq!(io.take(), [0, 0, 0]);
     fs.commit().unwrap();
     assert_eq!(io.take(), [0, 2, 2]);
@@ -1313,7 +1318,7 @@ fn a_directory_of_100k_entries_lists_in_linear_requests() {
     assert!(reads < N / 50, "{reads} reads");
     // Unlinking nine in ten merges leaves and internal nodes back together.
     for i in (0..N).filter(|i| i % 10 != 0) {
-        fs.unlink(d, name(i).as_bytes()).unwrap();
+        fs.unlink(d, name(i).as_bytes(), |_| false).unwrap();
     }
     fs.commit().unwrap();
     let mut fs = mount(&mut mem, &mut disk).unwrap();
@@ -1450,7 +1455,8 @@ fn a_full_disk_can_still_be_emptied() {
         assert!(n > 10, "{blocks}: {n}");
         let mut fs = mount(&mut mem, &mut disk).unwrap();
         for i in 0..n {
-            fs.unlink(ROOT, format!("{i:0>60}").as_bytes()).unwrap();
+            fs.unlink(ROOT, format!("{i:0>60}").as_bytes(), |_| false)
+                .unwrap();
             fs.commit().unwrap();
         }
         fs.create(ROOT, b"room again").unwrap();
@@ -1505,7 +1511,8 @@ fn image_workload(disk: &mut MemDisk) {
     fs.write(big, 5100, b"again").unwrap();
     fs.truncate(t).unwrap();
     for i in (0..400).filter(|i| i % 4 != 0) {
-        fs.unlink(ROOT, image_name(i).as_bytes()).unwrap();
+        fs.unlink(ROOT, image_name(i).as_bytes(), |_| false)
+            .unwrap();
     }
     fs.rename(docs, b"big", ROOT, b"big").unwrap();
     fs.commit().unwrap();

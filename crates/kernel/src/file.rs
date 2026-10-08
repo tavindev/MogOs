@@ -28,6 +28,7 @@ pub fn errno(error: Error) -> i64 {
         Error::TooBig => EFBIG,
         Error::NoSpace | Error::Collision => ENOSPC,
         Error::NotEmpty => ENOTEMPTY,
+        Error::Busy => EBUSY,
         Error::Io | Error::Corrupt | Error::Unsupported => EIO,
     }
 }
@@ -83,10 +84,7 @@ pub fn unlink<D: Disk>(
     held: impl Fn(Inode) -> bool,
 ) -> Result<(), i64> {
     let (dir, name) = parent(fs, dir, path)?;
-    if held(fs.lookup(dir, name).map_err(errno)?) {
-        return Err(EBUSY);
-    }
-    fs.unlink(dir, name).map_err(errno)
+    fs.unlink(dir, name, held).map_err(errno)
 }
 
 /// Moves the entry at `from` under `from_dir` to `to` under `to_dir`; `EEXIST` if `to` exists.
