@@ -1,16 +1,18 @@
 //! MogFS: a checksummed copy-on-write B+tree file system over 4 KiB blocks.
 //!
 //! Format (little-endian):
-//! - Blocks 0 and 1 are superblock slots; generation `g` goes to slot `g % 2`, and mount takes the valid slot with
-//!   the highest generation. Superblock: magic u64, generation u64, block count u64, incompatible features u64 (none
-//!   are known yet; a set bit refuses the mount), next inode u64, name-hash seed u64, pinned bitmap index (block u64,
-//!   sum u64; zero until snapshots), root count u32 (1: the live root), 4 zero bytes, the live root (tree root block
-//!   u64, sum u64, birth generation u64, level u64), log length u64, bitmap index height u64, then the live bitmap's
-//!   page list: for height 0 (at most 128 pages) a (block u64, sum u64) for each 128 MiB page of the disk (block 0:
-//!   an all-zero page), else the (block, sum) of the index root; then the log, (word u64, value u64) in increasing
-//!   word order, and zeros. An index block at level 1 lists up to 255 pages' (block, sum), one at level `l` up to 255
-//!   level `l - 1` blocks', zeros after them (block 0: all of its pages are zero); the root is the one block at the
-//!   top level, the height the fewest levels that list every page.
+//! - Blocks 0 and 1 are superblock slots; generation `g` (at most 2^62 - 1) goes to slot `g % 2`, and mount takes the
+//!   valid slot with the highest generation. Superblock: magic u64, generation u64, block count u64, incompatible
+//!   features u64 (none are known yet; a set bit refuses the mount), next inode u64, name-hash seed u64, 16 zero bytes,
+//!   root count u32 (1: the live root), 4 zero bytes, the live root (tree root block u64, sum u64, birth generation
+//!   u64, level u64), log length u64, page list index height u64, the newest snapshot's generation u64 (0: none), then
+//!   the page list: the live bitmap's pages, then pinned's (the blocks the live tree freed that a snapshot holds),
+//!   one per 128 MiB of the disk each. For height 0 (at most 128 entries) a (block u64, sum u64) for each (block 0: an
+//!   all-zero page), else the (block, sum) of the index root; then the log, (word u64, value u64) in increasing word
+//!   order (word `w + i`, past the live bitmap's `w` page-rounded words, is pinned's word `i`), and zeros. An index
+//!   block at level 1 lists up to 255 pages' (block, sum), one at level `l` up to 255 level `l - 1` blocks', zeros
+//!   after them (block 0: all of its pages are zero); the root is the one block at the top level, the height the
+//!   fewest levels that list every page.
 //! - Superblocks, tree nodes and index blocks end in a 64-bit hash of their block number and their bytes (an index
 //!   block's entries), and every pointer to one holds that hash (a node pointer also its birth generation), so a lost
 //!   or misdirected write of a valid old block reads as corrupt.
@@ -29,13 +31,18 @@
 //!   (ns). Directory entry (kind 1; offset: the seeded hash of the name, low 3 bits the slot in its collision chain of
 //!   8): inode u64 (never the root or the directory itself), kind u8, name; it is followed only if that inode records
 //!   it back (parent, entry and kind). Extent (kind 2; offset: its first page): first block u64, then each of its 1
-//!   to 128 pages' sums.
+//!   to 128 pages' sums. Snapshot (kind 3, under the root inode only; offset: the generation it is a snapshot of, at
+//!   most the newest's): its tree root (block u64, sum u64, birth generation u64, level u64) and its bitmap's index
+//!   root (block u64, sum u64) and height u64 (the fewest levels, at least one, listing its live-bitmap pages). Its
+//!   bitmap is the live one of that generation and marks its own pages and index blocks; it shares the live list's
+//!   pages that had not changed since they were written and has its own copies of the rest.
 //! - Inode numbers come from the superblock's counter and are never reused.
-//! - Copy-on-write: no block reachable from either slot is written. Data pages go to free blocks (or over one written
-//!   since the last commit), the last one written held in memory until its buffer is needed or the commit. `commit` gives the dirty nodes consecutive free blocks, writes them
-//!   in one request, flushes, writes the other slot with every word changed since the pages were written in its log,
-//!   and flushes; when the log would overflow, the changed pages and the index blocks above them join the nodes'
-//!   request and the log empties.
+//! - Copy-on-write: no block reachable from either slot, or from a snapshot either slot lists, is written. Data pages
+//!   go to free blocks (or over one written since the last commit), the last one written held in memory until its
+//!   buffer is needed or the commit. `commit` gives the dirty nodes consecutive free blocks, writes them in one
+//!   request, flushes, writes the other slot with every word changed since the pages were written in its log, and
+//!   flushes; when the log would overflow, the changed pages and the index blocks above them join the nodes' request
+//!   and the log empties.
 //!   Contract: the committed state is always a consistent snapshot of the file system as of a `commit` call.
 #![cfg_attr(not(test), no_std)]
 

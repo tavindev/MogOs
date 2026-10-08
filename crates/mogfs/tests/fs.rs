@@ -1536,7 +1536,7 @@ fn image_name(i: usize) -> String {
 }
 
 /// A fixed workload: a height-2 tree with leaf splits, nodes written out early, an extent split, a sum updated in
-/// place, a truncate, merges and a rename. `image.bin` is what it wrote with step 39b's format (superblock page list and log).
+/// place, a truncate, merges and a rename. `image.bin` is what it wrote with step 40's format (one page list for the live and pinned bitmaps).
 fn image_workload(disk: &mut MemDisk) {
     let mut mem = Mem::new(IMAGE_BLOCKS, POOL);
     let mut fs = mem.fs(disk);
