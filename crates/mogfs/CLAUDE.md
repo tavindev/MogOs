@@ -5,7 +5,7 @@
 The on-disk format (described at the top of `src/lib.rs`) and `Fs<'a, D: Disk>` over memory its caller gives
 (`cache_blocks`, `bitmap_words`): `new` (const), in-place `format(seed)` and `mount`, `disk`, `set_time`, `height`,
 `lookup`, `readdir` (from an opaque u64 cursor; returns the cursor of the entry its callback stopped at, `u64::MAX` past
-the end), `kind`, `stat`, `mkdir`, `create` (opens an existing name), `read`, `write`, `truncate`, `unlink`,
+the end), `kind`, `stat`, `mkdir`, `create` (opens an existing name), `read`, `write`, `truncate`, `unlink` (`Busy` if the caller's predicate holds the inode it found),
 `rename`, `map(file, Page) -> (Block, Sum)` with the free function `verify`, and `commit`. It also defines the `Disk`
 trait (block numbers stay `u64` there; `Block` converts at that boundary), over `Buf` (one block's bytes), that the
 kernel re-exports and the board's `VirtioBlk` implements. Inode, block, page, sum and key offset are

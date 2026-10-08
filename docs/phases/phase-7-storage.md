@@ -99,9 +99,12 @@ Filled in as each step lands.
   equal, create, mkdir, unlink, rename and `file-write` 92-98% faster, `pipe` and `spawn` -19..-21%, `ls d1` -53%,
   `write w hello` -83%, `mkdir m` -87%, `mv` -77..-81%, boot 318 -> 291 us, open+write+sync -22%; host lookup -9%,
   create+write+commit -1..-4%. Within this run's noise: `readdir` +1.0% (TCG +37 instructions per call),
-  `sync-change` +1.7% median, +0.2% min. Open: `rm m` +5.9% (min +8.6%) with fewer instructions than v1; a timer
-  around the `unlink` call inside it reads 57 ticks median against v1's 37, so the extra 0.8 us is the cold B+tree path
-  (node searches and three copy-on-write paths touched right after `rm`'s spawn) against v1's flat table. Not done: a
+  `sync-change` +1.7% median, +0.2% min. `rm m` was +5.9% (min +8.6%) with fewer instructions than v1: the kernel looked the
+  name up for its open-handle check and `unlink` searched for it again. `Fs::unlink` now takes the caller's busy
+  predicate and searches once (`Busy` maps to `EBUSY`): +3.0% median, +4.8% min, the `unlink` call 51 counter ticks
+  median against v1's 38. Open, for the coordinator: the rest is cold memory, 40 distinct cache lines in three nodes
+  (66 key probes over 10 node visits, and a 1200-byte item-array shift in the root directory's leaf) against about 11
+  in v1 (eight 56-byte entries in one directory block and two records). Not done: a
   v1 image is not tested (its magic differs, so it mounts as `Corrupt`); the kernel never calls `set_time`, so inode
   times read 0; `unlink` or truncate of a large file does its extent deletes with IRQs masked until step 42. The first
   reviewer pass found the `getdents` re-list could skip or repeat an entry when a directory changed between its two
