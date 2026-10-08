@@ -430,33 +430,33 @@ pub fn user_writable(va: u64) -> bool {
     par & 1 == 0
 }
 
-/// Cleans `start..start + len` to the point of unification, the first half of making instructions written there
-/// visible to instruction fetch; `invalidate_icache` completes it for every range cleaned before it.
+/// Makes instructions written to `start..start + len` visible to instruction fetch on every core: cleans its D-cache
+/// lines to the point of unification, then invalidates its I-cache lines by address, which reaches every alias of a
+/// line in the PIPT I-caches of QEMU `virt`'s Cortex-A72 (CTR_EL0.L1Ip) and under hvf; `icache_synced` completes it
+/// for every range before it. Line by line beats `ic ialluis` on spawn (`bench-smp`, k = 2 to 8).
 ///
 /// # Safety
 ///
 /// The range must be mapped.
-pub unsafe fn clean_dcache(start: usize, len: usize) {
+pub unsafe fn sync_icache(start: usize, len: usize) {
     let ctr: usize;
     // SAFETY: reading CTR_EL0 has no side effects.
     unsafe { asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack, preserves_flags)) };
-    let line = 4 << ((ctr >> 16) & 0xf);
-    for addr in (start & !(line - 1)..start + len).step_by(line) {
+    let (dline, iline) = (4 << ((ctr >> 16) & 0xf), 4 << (ctr & 0xf));
+    for addr in (start & !(dline - 1)..start + len).step_by(dline) {
         // SAFETY: cleaning a mapped line to the point of unification does not change memory contents.
         unsafe { asm!("dc cvau, {}", in(reg) addr, options(nostack, preserves_flags)) };
     }
+    // SAFETY: a barrier only orders the cleans before the invalidates.
+    unsafe { asm!("dsb ish", options(nostack, preserves_flags)) };
+    for addr in (start & !(iline - 1)..start + len).step_by(iline) {
+        // SAFETY: invalidating a mapped line only discards stale instructions.
+        unsafe { asm!("ic ivau, {}", in(reg) addr, options(nostack, preserves_flags)) };
+    }
 }
 
-/// Waits for the cleans before it, then discards every stale instruction in every core's I-cache.
-pub fn invalidate_icache() {
-    // SAFETY: barriers and an I-cache invalidate only discard stale instructions.
-    unsafe {
-        asm!(
-            "dsb ish",
-            "ic ialluis",
-            "dsb ish",
-            "isb",
-            options(nostack, preserves_flags)
-        )
-    };
+/// Waits for the `sync_icache` invalidates before it to complete everywhere.
+pub fn icache_synced() {
+    // SAFETY: barriers only.
+    unsafe { asm!("dsb ish", "isb", options(nostack, preserves_flags)) };
 }

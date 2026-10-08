@@ -218,7 +218,7 @@ fn spawn_process(
             map_filled((page, &mut take), (l1, va, access), (0, bytes));
             if !segment.writable {
                 // SAFETY: `page` is identity-mapped RAM.
-                unsafe { arch::clean_dcache(page.0 as usize, PAGE) };
+                unsafe { arch::sync_icache(page.0 as usize, PAGE) };
             }
         }
     }
@@ -231,7 +231,7 @@ fn spawn_process(
         let page = take();
         map_filled((page, &mut take), below, (0, &[]));
     }
-    arch::invalidate_icache();
+    arch::icache_synced();
     let at = USER_STACK_TOP - args.len() as u64;
     let x = [argc as u64, at, args.len() as u64];
     // SAFETY: the kernel stack below `stack.end` is fresh and owned by the new process.

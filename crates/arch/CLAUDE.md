@@ -32,7 +32,7 @@ It is **NOT** board-specific: no MMIO addresses, no memory map, no drivers, no s
   `map_page` (`None` on a level-1 or level-2 block on the way, never writing a table into kernel memory), `unmap_page`,
   `free_space`, `set_ttbr0`, `flush_asid` (`tlbi aside1is`), `clamp` (each of N values bounded by its max by
   `cmp`/`csel`, then one `csdb`), `mask` (an `and` the compiler cannot see through), `user_readable` /
-  `user_writable` (`at` probes), `clean_dcache` / `invalidate_icache` (`ic ialluis`; clean each code page, invalidate once).
+  `user_writable` (`at` probes), `sync_icache` / `icache_synced` (`dc cvau` then `ic ivau` per code page, which the A72's PIPT I-cache allows; one barrier after all).
 - `irq::disable` / `restore` / `wait` / `window`, `gic::enable` / `affinity` / `enable_cpu` / `route` / `unmask` / `unmask_local` / `send_sgi` / `ack` / `eoi`, `mpidr`,
   `timer::arm` / `stop`, `timer::allow_user_counter`.
 - `Lock<T>`, a ticket spinlock (it counts the acquisitions that had to wait, `contended`, on the slow path only): `lock()` masks IRQs, then acquires, and its `Guard` releases, then restores DAIF;
