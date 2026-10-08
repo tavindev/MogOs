@@ -35,10 +35,12 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
   (`Scheduler::start_cores`).
 - `Nospec`, the `kernel::Clamp` `dispatch` and `split` use (`arch::clamp`).
 - `KERNEL: Lock<Kernel>` (`Scheduler` with its process table, `FrameAllocator`, `Pipes`, `Mutexes`, console `Line`,
-  the MogFS `Fs<FsDisk>` and whether it is mounted, and `buf`, the 8 KiB a syscall copies user inputs into), `HEAP` and
-  `CONSOLE: Lock<Uart>` statics. `Fs::new` is const, so the 48 KiB file system is built in the static with an empty
-  `FsDisk(None)` (`Io` until `Board::mount` puts the `VirtioBlk` in through `Fs::disk`). File syscalls run their disk I/O inside the trap under `KERNEL`: a `sync` holds it
-  for its writes and two flushes. Boot-spawned processes get the root directory as handle 3 once mounted (`spawn_init`).
+  the MogFS `Fs<'static, FsDisk>` and whether it is mounted, and `buf`, the 8 KiB a syscall copies user inputs into),
+  `HEAP` and `CONSOLE: Lock<Uart>` statics. `Fs::new` is const, so the static starts with an empty `FsDisk(None)` and
+  no memory (`Io` until mounted); `Board::mount` sizes the memory to the disk (`FS_POOL` node slots, the bitmaps of
+  `min(blocks, MAX_BLOCKS)`), takes it from `FrameAllocator::alloc_contiguous` for good (none left: `TooBig`) and
+  builds the `Fs` with the `VirtioBlk` on core 0's boot stack, where the 22 KiB temporary fits. File syscalls run their disk I/O inside the trap under `KERNEL`: a `sync` holds it
+  for its writes and two flushes. `readdir` returns its next cursor in x1. Boot-spawned processes get the root directory as handle 3 once mounted (`spawn_init`).
 - Trap hooks `task_switch`, `board_irq`, `board_syscall`, `board_user_fault`: execute the `kernel::syscall::Call`
   that `dispatch` returns (user buffers, pages, frames, wake/block). `board_unlock`, called by the trap exit, releases `KERNEL`.
 - `Board::console` writes (`Console`) hold `CONSOLE` for a whole `write_fmt`, so no other `Console` line splits it (the unlocked writers below can); it is the PL011

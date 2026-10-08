@@ -24,8 +24,8 @@ extern "C" fn _start() -> ! {
         || buf != *b"kept"
         || read_at(held as u64, &mut buf, 4) != 0
         || read_at(held as u64, &mut buf, 1 << 40) != 0
-        || readdir(ROOT, &mut list, 1) != 0
-        || readdir(ROOT, &mut list, 1 << 40) != 0
+        || readdir(ROOT, &mut list, u64::MAX).0 != 0
+        || readdir(ROOT, &mut list, 1 << 62).0 != 0
     {
         exit(1);
     }

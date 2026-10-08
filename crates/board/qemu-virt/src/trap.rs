@@ -527,11 +527,18 @@ unsafe fn syscall(kernel: &mut Kernel, cpu: usize, frame: &mut arch::TrapFrame) 
                 dir,
                 ptr,
                 len,
-                start,
-            }) => with_output((ptr, len), buf, |out| match dir {
-                Object::Dir(dir) => file::readdir(fs, dir, start, out),
-                _ => file::list_archive(ARCHIVE, start, out),
-            }),
+                cursor,
+            }) => {
+                frame.x[1] = u64::MAX;
+                with_output((ptr, len), buf, |out| {
+                    let (n, next) = match dir {
+                        Object::Dir(dir) => file::readdir(fs, dir, cursor, out),
+                        _ => file::list_archive(ARCHIVE, cursor, out),
+                    }?;
+                    frame.x[1] = next;
+                    Ok(n)
+                })
+            }
             Ok(Call::Unlink { dir, ptr, len }) => ok(with_input((ptr, len), buf, |path| {
                 let held = |i| sched.holds(|o| o == Object::Dir(i) || o == Object::Node(i));
                 file::unlink(fs, dir, path, held)

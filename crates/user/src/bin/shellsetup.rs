@@ -1,14 +1,13 @@
 //! `test=bench-shell`'s first init: makes the fixtures msh's timed commands use in the MogFS root (handle 3):
-//! directories `d1`, `d100`, `d390` with that many empty files, `small` (4 KiB), `big` (the largest file MogFS v1
-//! holds, 57232 bytes) and `a` (empty, for `mv`). With msh's `w` and `m`, that is 500 of MogFS's 504 inodes.
+//! directories `d1`, `d100`, `d390` with that many empty files, `small` (4 KiB), `big` (57232 bytes) and `a` (empty,
+//! for `mv`). The sizes stay as first recorded, so the timed rows compare across changes.
 #![no_std]
 #![no_main]
 
 use user::*;
 
 const ROOT: u64 = 3;
-/// 14 blocks of 4088 bytes each.
-const BIG: u64 = 14 * 4088;
+const BIG: u64 = 57232;
 /// One line of file content: no line starts with `bench `.
 const LINE: &[u8; 64] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.\n";
 
