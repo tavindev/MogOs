@@ -122,6 +122,9 @@ impl<const WORDS: usize> FrameAllocator<WORDS> {
 
     /// Fills `out` with free frames in one pass over the bitmap; false, taking none, if too few are free.
     pub fn alloc_many(&mut self, out: &mut [PhysAddr]) -> bool {
+        if out.is_empty() {
+            return true;
+        }
         let mut taken = 0;
         for w in self.hint..WORDS {
             let word = &mut self.used[w];
