@@ -14,6 +14,7 @@ use kernel::handle::{
 };
 use kernel::syscall::{EAGAIN, EFAULT, ENOEXEC, ENOMEM, MAX_BUFFER};
 use kernel::{FRAME_WORDS, Memory, Program};
+use lock_order::{self as level, W};
 use mm::{Budget, FrameAllocator, PhysAddr};
 use mogfs::ROOT;
 
@@ -213,7 +214,9 @@ pub(crate) fn spawn_init(
     args: &[u8],
 ) -> Result<(), i64> {
     let argc = kernel::syscall::argc(args)?;
-    let mut kernel = KERNEL.lock();
+    // SAFETY: called from `Board` methods, which the kernel crate calls holding no lock.
+    let mut root = unsafe { arch::root() };
+    let mut kernel = KERNEL.lock(&mut root);
     let Kernel {
         sched,
         frames,
@@ -245,7 +248,7 @@ pub(crate) fn spawn_init(
 /// moved from `cpu`'s current process, which gets a handle to the child, at `priority` capped at that process's own,
 /// with the arguments at user address `args`, both copied in through `buf`; on failure nothing moves.
 pub(crate) fn spawn(
-    (sched, cpu): (&mut Sched, usize),
+    (sched, w, cpu): (&mut Sched, &mut W<'_, level::Kernel>, usize),
     frames: &mut FrameAllocator<FRAME_WORDS>,
     buf: &mut [u8],
     file: Range<usize>,
@@ -275,7 +278,7 @@ pub(crate) fn spawn(
     let handle = parent.insert(Object::Process { index, generation }, WAIT | KILL)?;
     let priority = priority.min(sched.priority(cpu));
     let mut child_budget = Budget::new(budget);
-    crate::net::spawn_charge(&child, &mut child_budget)?;
+    crate::net::spawn_charge(&child, &mut child_budget, w)?;
     let moved = child;
     let child = (process, slot, child, priority);
     let memory = Memory {
@@ -285,7 +288,7 @@ pub(crate) fn spawn(
     spawn_process(sched, frames, executable, memory, child, (args, argc))?;
     sched.memory(current).budget.shrink(budget);
     *sched.handles(cpu) = parent;
-    crate::net::spawned(sched, cpu, index, &moved);
+    crate::net::spawned((sched, w), cpu, index, &moved);
     Ok(handle)
 }
 

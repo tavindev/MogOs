@@ -16,6 +16,7 @@ pub mod syscall;
 pub use mogfs::{BLOCK_SIZE, Disk};
 pub use sched::{Event, Full, Memory, PRIORITIES, Scheduler};
 
+use alloc::string::ToString;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::Write;
@@ -118,6 +119,11 @@ pub trait Board {
     fn online_cpus(&self) -> usize;
     /// Acquisitions of the board's kernel lock that had to wait, so far (wrapping).
     fn contended(&self) -> u32;
+    /// The counter in microseconds from its start (not from the board's entry), as EL0 reads it.
+    fn counter_us(&self) -> u64;
+    /// Takes the board's kernel lock, and unless the counter has reached `start_us` by then, holds it until `waiters`
+    /// more acquisitions have waited for it; returns whether it was taken in time.
+    fn hold_kernel(&mut self, start_us: u64, waiters: u32) -> bool;
     /// Prints the `spec:` line (speculative-execution vulnerabilities and the vector table) for the worst core, once
     /// every core `start_cpus` started has installed its vectors.
     fn report_speculation(&mut self);
@@ -371,6 +377,7 @@ pub fn run<B: Board>(board: &mut B, dtb: Dtb, reserved: &[Range<PhysAddr>]) -> !
             "test=bench-pipe" => pipe_bench(board),
             "test=bench-lock" => lock_bench(board),
             "test=bench-smp" => smp_bench(board),
+            "test=lock-split" => lock_split(board),
             "test=bench-ipi" if board.cpus() > 1 => {
                 let start = board.uptime_us();
                 board.ipi_round_trips(IPI_ROUND_TRIPS);
@@ -654,6 +661,34 @@ fn pipe_bench<B: Board>(board: &mut B) {
     wait(board);
     let ns = (board.uptime_us() - start) * 1000 / PIPE_ROUND_TRIPS;
     let _ = writeln!(board.console(), "pipe: {ns} ns/round-trip");
+}
+
+/// `test=lock-split`'s workers, one per secondary core of four.
+const LOCK_SPLIT_WORKERS: u32 = 3;
+/// How far ahead of now the workers start: they must all be running by then (TCG under load spawns slowly).
+const LOCK_SPLIT_MARGIN_US: u64 = 500_000;
+
+/// `test=lock-split`: `lockwork` processes spin until a start time, then make calls that need no big lock; the boot
+/// context takes the kernel's big lock just before that time and holds it until all three wait on it (their exits),
+/// so every `W: done` line precedes `released`. `late` if it took the lock only after the start.
+fn lock_split<B: Board>(board: &mut B) {
+    run_checked(board, "lock-split", |board| {
+        let start = board.counter_us() + LOCK_SPLIT_MARGIN_US;
+        let args = [&b"lockwork\0"[..], start.to_string().as_bytes(), b"\0"].concat();
+        for _ in 0..LOCK_SPLIT_WORKERS {
+            board
+                .spawn_archived("lockwork", SMP_WORK_BUDGET, INIT_ARCHIVE, &args)
+                .expect("spawn");
+        }
+        while board.counter_us() < start - LOCK_SPLIT_MARGIN_US / 4 {
+            core::hint::spin_loop();
+        }
+        let line = match board.hold_kernel(start, LOCK_SPLIT_WORKERS) {
+            true => "lock-split: released",
+            false => "lock-split: late",
+        };
+        let _ = writeln!(board.console(), "{line}");
+    });
 }
 
 /// `test=bench-smp`: k `smpwork` processes at once for each mode, timed from their spawn until all exited; prints the

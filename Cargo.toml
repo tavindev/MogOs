@@ -5,6 +5,7 @@ members = [
     "crates/dtb",
     "crates/e2e",
     "crates/kernel",
+    "crates/lock-order",
     "crates/mm",
     "crates/mogfs",
     "crates/net",

@@ -6,6 +6,8 @@ use core::ops::{Deref, DerefMut};
 use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 use core::sync::atomic::{AtomicU16, AtomicU32};
 
+use lock_order::{Held, Leaf, LockAfter, Unlocked, W};
+
 use super::irq;
 
 /// This core's index: TPIDR_EL1's bits 48-63 (bits 0-47 hold its per-CPU area's offset; all 0 on core 0 until
@@ -47,50 +49,73 @@ pub unsafe fn enter_percpu(index: usize, area: usize) {
     };
 }
 
-/// A ticket spinlock: waiters take a ticket and are served in order, each spinning on `ldarh` of the owner ticket.
-/// Taking one is an exclusive read-modify-write, so only once the MMU is on.
-pub struct Lock<T> {
+/// The witness of a context holding no lock (`lock_order`), for a trap hook's entry or a board method the kernel
+/// crate calls.
+///
+/// # Safety
+///
+/// The caller holds no lock: a witness made while locks are held would let locks be taken out of order.
+pub unsafe fn root() -> W<'static, Unlocked> {
+    lock_order::root()
+}
+
+/// A ticket spinlock at lock level `L`: waiters take a ticket and are served in order, each spinning on `ldarh` of the
+/// owner ticket. Taking one is an exclusive read-modify-write, so only once the MMU is on, and needs the witness of the
+/// level held now, which `L` must come after.
+pub struct Lock<T, L> {
     next: AtomicU16,
     owner: AtomicU16,
     /// Acquisitions that had to wait (wrapping); in the padding before an 8-byte aligned `data`.
     contended: AtomicU32,
     data: UnsafeCell<T>,
+    _level: PhantomData<fn() -> L>,
 }
 
 // SAFETY: the lock hands out one reference to `data` at a time, so cores only pass `T` between them.
-unsafe impl<T: Send> Sync for Lock<T> {}
+unsafe impl<T: Send, L> Sync for Lock<T, L> {}
 
-impl<T> Lock<T> {
+impl<T, L> Lock<T, L> {
     pub const fn new(data: T) -> Self {
         Self {
             next: AtomicU16::new(0),
             owner: AtomicU16::new(0),
             contended: AtomicU32::new(0),
             data: UnsafeCell::new(data),
+            _level: PhantomData,
         }
     }
 
-    /// Masks IRQs, then acquires; the guard releases, then restores the mask.
-    pub fn lock(&self) -> Guard<'_, T> {
+    /// Masks IRQs, then acquires under the witness `w`; the guard releases, then restores the mask.
+    pub fn lock<'a, P>(&'a self, w: &'a mut W<'_, P>) -> Guard<'a, T, L>
+    where
+        L: LockAfter<P>,
+    {
         let irq = irq::disable();
-        let mut guard = self.lock_masked();
+        let mut guard = self.lock_masked(w);
         guard.irq = Some(irq);
         guard
     }
 
-    /// Acquires without touching DAIF, for code entered with IRQs masked (trap hooks).
-    pub fn lock_masked(&self) -> Guard<'_, T> {
+    /// Acquires under the witness `w` without touching DAIF, for code entered with IRQs masked (trap hooks).
+    pub fn lock_masked<'a, P>(&'a self, w: &'a mut W<'_, P>) -> Guard<'a, T, L>
+    where
+        L: LockAfter<P>,
+    {
+        self.acquire();
+        Guard {
+            lock: self,
+            irq: None,
+            held: w.after(),
+        }
+    }
+
+    fn acquire(&self) {
         let ticket = self.next.fetch_add(1, Relaxed);
         if self.owner.load(Acquire) != ticket {
             self.contended.fetch_add(1, Relaxed);
             while self.owner.load(Acquire) != ticket {
                 spin_loop();
             }
-        }
-        Guard {
-            lock: self,
-            irq: None,
-            _data: PhantomData,
         }
     }
 
@@ -110,26 +135,48 @@ impl<T> Lock<T> {
     }
 }
 
-/// Exclusive access to a `Lock`'s data until dropped.
-#[must_use = "dropping it releases the lock"]
-pub struct Guard<'a, T> {
-    lock: &'a Lock<T>,
-    /// DAIF to restore after the release; `None` from `lock_masked`.
-    irq: Option<irq::State>,
-    /// Shared only where `T` may be, as the `&T` it derefs to is.
-    _data: PhantomData<&'a mut T>,
-}
-
-impl<'a, T> Guard<'a, T> {
-    /// Keeps the lock held past the guard, until `Lock::unlock`; the IRQ mask stays as it is.
-    pub fn leak(guard: Self) -> &'a mut T {
-        let guard = core::mem::ManuallyDrop::new(guard);
-        // SAFETY: the lock stays held, and without the guard nothing else reaches `data` until `unlock`.
-        unsafe { &mut *guard.lock.data.get() }
+impl<T> Lock<T, Leaf> {
+    /// Masks IRQs, then acquires a leaf lock, which needs no witness: nothing is taken under it.
+    pub fn lock_leaf(&self) -> Guard<'_, T, Leaf> {
+        let irq = irq::disable();
+        self.acquire();
+        Guard {
+            lock: self,
+            irq: Some(irq),
+            held: lock_order::leaf(),
+        }
     }
 }
 
-impl<T> Deref for Guard<'_, T> {
+/// Exclusive access to a `Lock`'s data until dropped; locks taken under it use its witness (`parts`).
+#[must_use = "dropping it releases the lock"]
+pub struct Guard<'a, T, L> {
+    lock: &'a Lock<T, L>,
+    /// DAIF to restore after the release; `None` from `lock_masked`.
+    irq: Option<irq::State>,
+    /// The order proof, borrowing the witness the lock was taken under.
+    held: Held<'a, L>,
+}
+
+impl<'a, T, L> Guard<'a, T, L> {
+    /// Keeps the lock held past the guard, until `Lock::unlock`; the IRQ mask stays as it is. Returns the data and the
+    /// witness for locks taken under it.
+    pub fn leak(guard: Self) -> (&'a mut T, W<'a, L>) {
+        let guard = core::mem::ManuallyDrop::new(guard);
+        // SAFETY: the guard is never dropped, so its proof is not read again after this copy.
+        let held = unsafe { core::ptr::read(&guard.held) };
+        // SAFETY: the lock stays held, and without the guard nothing else reaches `data` until `unlock`.
+        (unsafe { &mut *guard.lock.data.get() }, held.into_witness())
+    }
+
+    /// The data and the witness for locks taken under this one, both borrowing the guard.
+    pub fn parts(&mut self) -> (&mut T, W<'_, L>) {
+        // SAFETY: the guard holds the lock, and `&mut self` makes this the only reference from it.
+        (unsafe { &mut *self.lock.data.get() }, self.held.witness())
+    }
+}
+
+impl<T, L> Deref for Guard<'_, T, L> {
     type Target = T;
 
     fn deref(&self) -> &T {
@@ -138,14 +185,14 @@ impl<T> Deref for Guard<'_, T> {
     }
 }
 
-impl<T> DerefMut for Guard<'_, T> {
+impl<T, L> DerefMut for Guard<'_, T, L> {
     fn deref_mut(&mut self) -> &mut T {
         // SAFETY: as in `deref`, and `&mut self` makes this the only one from the guard.
         unsafe { &mut *self.lock.data.get() }
     }
 }
 
-impl<T> Drop for Guard<'_, T> {
+impl<T, L> Drop for Guard<'_, T, L> {
     fn drop(&mut self) {
         // SAFETY: the guard holds the lock and its references ended with the borrow of `self`.
         unsafe { self.lock.unlock() };

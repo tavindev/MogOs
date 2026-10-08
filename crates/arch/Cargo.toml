@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+lock-order = { path = "../lock-order" }
 mm = { path = "../mm" }
 
 # Architecture crate: allowed `unsafe` behind safe wrappers, no board addresses.
