@@ -186,3 +186,42 @@ Filled in as each step lands.
   reviewer pass found the `getdents` re-list could skip or repeat an entry when a directory changed between its two
   calls (fixed: one call), `size_of` bisected every doubled range (fixed), and the unbounded large-file unlink
   (documented in the kernel contract).
+- Step 40: snapshots and the space reserve, in `crates/mogfs` (the kernel wires them in step 43). `snapshot()` commits
+  pending changes, then records that commit `g` as an item in the live tree (kind 3 under the root inode, offset `g`):
+  `g`'s tree root and the root of the snapshot's own bitmap, `g`'s live bitmap. That bitmap shares the live list's
+  pages that had not changed since they were written and has its own copies of the others, of the pages its own
+  blocks land in, and its own index; those blocks are staged ahead of the commit's nodes (`[0, 2, 2]` while the
+  staging slots hold them; 1 GiB: `[0, 2, 2]`). `snapshots()` lists them, `view(Snapshot)` reads one (`lookup`,
+  `readdir`, `stat`, `read`, `map`; no write call), `delete_snapshot` removes one (1 GiB, with its commit: `[10, 2,
+  2]`). One deviation from the reviewed plan: pinned (the blocks the live tree freed that a snapshot holds) is not a
+  page list of its own but the second half of the live one (one index, one log, one set of dirty bits), so the pages
+  path covers it unchanged and an all-zero pinned page is a zero pointer; the superblock's reserved pinned-index
+  field stays zero. A release pins a block the newest snapshot's bitmap (in memory) marks; pinned blocks are also in
+  the map of blocks either slot reaches, so the free test still reads two maps, and an unpinned block waits out the
+  commit after next like a freed one. A commit with no change writes a superblock-only generation (`[0, 1, 1]`) while
+  the older slot reaches blocks the newest does not, state known at mount and after each commit. Delete unpins what
+  the snapshot marks and neither neighbour does (the snapshots holding a block are a run of consecutive generations),
+  reading at most three bitmaps, finds the neighbours by a seek and a step back, and evicts clean cache slots whose
+  block is neither live nor pinned. `reserve` has three levels: a change that adds keeps room for an unlink, which
+  keeps room for a snapshot delete and its commit. Pinned's memory is not even zeroed until a slot holds pinned words
+  or a snapshot exists. Generations stop at 2^62 - 1, the largest key offset (mount rejects more, commit refuses to
+  pass it). Tests: the done-when rows (old contents after overwrites, truncates, unlinks, churn and a remount; the
+  commit's requests at 1024 and 70000 blocks; delete frees exactly what no other root's bitmap marks, against a fresh
+  mount, also with 120 snapshots spanning leaves; power cut at every write and flush across a snapshot of a changed
+  file system, changes under it and its delete; two fully shared snapshots deleted at `NoSpace` under them, space
+  back after delete, commit, commit); the random test takes and deletes snapshots and checks each through a view
+  against a model and pinned against the snapshots' bitmaps; the mutation test's base holds a snapshot (20k seeds in
+  debug clean); the fault test takes and deletes snapshots under failing requests. Reviews: the first found the
+  newest snapshot's bitmap reloaded at run time through mount's shortcut (blocks a snapshot held could be freed; now
+  read from the disk), the second that deleting the last snapshot left its bitmap in memory during the item's delete
+  (a merge could pin a block forever) and that a crafted item at offset 0 passed decode; all fixed with tests. Found
+  on the way: a new snapshot's own blocks were taken as those pinned and in its bitmap, which also matched the nodes
+  its item's insert released. A security audit of main's 39b code in the middle of this step found an older slot's
+  marks past a smaller disk's size counted as used (free underflowed: a debug-build panic), fixed on main (`12e4e5f`)
+  and here. Numbers (release kernels, 63 interleaved hvf rounds with an A/A first, load 5-11): every call and shell
+  command within its A/A spread against `ddcbacd`; boot within noise over six runs (medians -21 to +10 us; a timer
+  around mount: 1297 against 1332 ticks median, 989 against 897 min). Host (11 rounds, A/A within 0.6%): mount of a
+  1 GiB file -33%, create+write+commit, 1 GiB read and write within noise; lookup +1.7..2.7% in three runs while the
+  kernel's lookup path runs the same TCG instruction count (`open` 619 both) and `open` is -1.0% on hvf: host codegen,
+  open for the coordinator. New rows: snapshot create 10.9 us, delete + commit 20.7 us, a 4 KiB overwrite + commit
+  under a snapshot 10.4 us, mount with 8 snapshots 14.1 us, 400 lookups through a view 58.7 us (all 1 GiB file).
