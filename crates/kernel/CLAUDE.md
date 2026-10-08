@@ -10,7 +10,8 @@ touches memory through raw addresses: the board reads user buffers, copies pages
 
 ## Responsibilities
 
-- `Board` trait, `Clamp` port, `Violation` (`Board::violate`, `test=wx-*`) and `Program` enum (`src/lib.rs`); `run` drives boot and the `test=*` bootargs scenarios; the board turns on the MMU before calling it (its locks need the MMU), and `run` starts the other cores (`Board::start_cpus`) as the last step of boot, inside the `boot:` time; right after the `boot:` line it calls `Board::report_speculation` (the `spec:` line), which waits for every core, outside the boot time. The crate has no lock: its tables are plain data the board keeps under its big lock.
+- `Board` trait, `Clamp` port, `Violation` (`Board::violate`, `test=wx-*`) and `Program` enum (`src/lib.rs`); `run` drives boot and the `test=*` bootargs scenarios; the board turns on the MMU before calling it (its locks need the MMU), and `run` starts the other cores (`Board::start_cpus`) as the last step of boot, inside the `boot:` time; right after the `boot:` line it calls `Board::report_speculation` (the `spec:` line), which waits for every core, outside the boot time. The crate has no lock: its tables are plain data the board keeps under its locks, and a process's handle table is
+safe atomics (`Table`, a seqlock per entry) the board reads without one.
 - `Disk` and `BLOCK_SIZE` (4096) are `mogfs`'s, re-exported (`src/lib.rs`): synchronous `read`/`write` of
   consecutive blocks, `flush`, `blocks`; every failure is `mogfs::Error::Io`. `Board::disk` is called once in `run`,
   then `Board::mount` (except under `test=disk` and `test=bench-disk`, which keep the raw device), both before the
@@ -20,16 +21,22 @@ touches memory through raw addresses: the board reads user buffers, copies pages
   writing whole `name\n` / `name/\n` entries, at most 64 per call), `list_archive`, and `errno` (mogfs error to musl
   errno; `Io` and `Corrupt` are `EIO`).
 - `Scheduler<N, P>` (`src/sched.rs`): thread slots (frame, process, kernel stack, state, priorities) and the process
-  table `Processes<P>` (address space, `Handles`, `Memory` with the budget and map cursor, live threads (a slot bitmask),
-  generation); states (`Ready`, `Blocked`, `Exited`, `Zombie`) for both; `end` (a thread, and its process with its last
-  thread), `reap` (a process), `join` (a thread).
-- `Handles` (`src/handle.rs`): per-process handle tables, rights, `dup`, `split` for `spawn`; lookups take a `Handle`, a
-  user value with its index clamped (by `dispatch`, or `Handle::new` / `split` with their own barrier).
+  table `Processes<P>` (address space, live threads (a slot bitmask), generation, and how many processes are
+  releasing); states (`Ready`, `Blocked`, `Exited`, `Zombie`) for both; `end` (a thread; its process's last leaves the
+  process to be released and then `exited`), `reap` (a process), `join` (a thread), `to_idle` (a core that releases a
+  process before it picks a task). `Process` is what a process's own lock guards in the board (its map cursor), and
+  the proof a handle-table write holds it.
+- `Table` and `Handles` (`src/handle.rs`): a process's live handle table, its lookups (`entry`, `get`) lock-free (each
+  entry's words behind a 64-bit sequence; the entries read go in a `Seen`, which `unchanged` rechecks), its writes
+  (`insert`, `close`, `commit`, `take`, `vacant`) under the process lock; `Handles` is a plain copy (`snapshot`) for
+  `split` in `spawn` and building a child's. Rights; lookups take a `Handle`, a user value with its index clamped (by
+  `dispatch`, or `Handle::new` / `split` with their own barrier).
 - `Pipes<N>` (`src/pipe.rs`), `Mutexes<N>` (`src/mutex.rs`): fixed tables of kernel objects. `Pipe::read` and
   `Pipe::write` hand the caller each chunk of the ring through a closure, so the board copies straight between user
   memory and the pipe page; `read_waits` lets it skip probing the user buffer when the read would wait.
-- `syscall::dispatch` (`src/syscall.rs`): returns `ENOSYS` above the last syscall, jumps on the masked number, and each call clamps the user values it indexes kernel memory with behind one `Clamp` barrier; decodes `x8`/`x0`-`x5`, checks handles and rights, returns a `Call` for the
-  board to execute. Syscall numbers and error constants are defined here.
+- `syscall::dispatch` (`src/syscall.rs`): returns `ENOSYS` above the last syscall, jumps on the masked number, and each call clamps the user values it indexes kernel memory with behind one `Clamp` barrier; decodes `x8`/`x0`-`x5`, checks handles and rights against the caller's
+  `Table` without a lock (the entries read go in a `Seen`), returns a `Call` for the board to execute; `dup` and
+  `close` are calls the board runs under the process lock. Syscall numbers and error constants are defined here.
 - `cpio::find`, `cpio::entries`, `elf::Elf::parse` (`src/cpio.rs`, `src/elf.rs`).
 - `network` (`src/network.rs`, design notes at its top): `Network`, up to three `net::Stack`s (`ETH` on the NIC,
   the loopback pair `LO` 127.0.0.1 and `PEER` 127.0.0.2 over a `Wire`, since a stack never sends to itself) and the
@@ -97,10 +104,12 @@ touches memory through raw addresses: the board reads user buffers, copies pages
 - Thread slots and process indices share one lifecycle (`Entries`): state, generation, a count of open handles
   (`held` on each new `Process` or `Thread` handle, `close` / `close_thread` on each closed one, ignored for an older
   generation) and a bitmask of free entries, so `end` and `free_slot` / `free_process` are O(1) (at most 64 entries,
-  const-asserted). `end` makes a thread, and with its last thread the process, a zombie while its count is above 0;
-  the caller first takes and releases the process's own handles (`take_handles`), so its handle to itself does not
-  keep it. `reap` hands out the budget limit once (later calls get 0); the last `close` / `close_thread` of a zombie
-  frees its index or slot like `reap` / `join` (`src/sched.rs`).
+  const-asserted). `end` makes a thread a zombie while its count is above 0; its process's last thread leaves the
+  process releasing: neither live (`process_live` is false, so a `kill` finds nothing to end) nor reapable, and counted
+  as a task, until the board has released its handles and memory and calls `exited`, which ends it alike (its handle to
+  itself was among those released). `reap` and the last `close` of a zombie free its index (the board takes the budget
+  with it, `Budget::take`, so only the first reaper gets the limit); `close_thread` and `join` free a slot
+  (`src/sched.rs`).
 - One run queue for every core (`start_cores` sizes the per-core state at boot from `Board::cpus`); every call about
   "the current task" takes the core. `switch(cpu, frame)` runs the highest effective priority `Ready` slot that is no core's current one
   (`on_core`: a kernel task blocks and yields in two holds of the lock, so a wake can make it `Ready` while it still
@@ -117,7 +126,7 @@ touches memory through raw addresses: the board reads user buffers, copies pages
 - Pipes and mutexes: entry reached by `index` + `generation`, counted handles, freed when the count hits zero.
   `End::index` and `Mutex::index` are `u32` so copying an `Object` stays a plain move on the syscall path.
 - Pipe writes are all-or-nothing (`Pipe::write`); `MAX_BUFFER <= pipe::SIZE` is const-asserted in `src/syscall.rs`.
-- `MAX_BUFFER` (4 KiB) and `MAX_MAP` (16 pages) bound the work a syscall does under the board's big lock (IRQs masked); `user_buffer` checks
+- `MAX_BUFFER` (4 KiB) and `MAX_MAP` (16 pages) bound the work a syscall does under a board lock (IRQs masked); `user_buffer` checks
   every user range lies in `USER` (4 GiB..512 GiB).
 - Errors are negated musl errno values; `KILLED` (256) sits outside `exit`'s 0..=255.
 - Syscalls 20-25 (phase 8 step 50): socket, bind, listen, io_submit, io_wait (result in x0, tag in x1, an accept's
@@ -134,9 +143,9 @@ touches memory through raw addresses: the board reads user buffers, copies pages
   object gets the directory handle's rights, so a child never has more. `spawn` takes arguments in x5/x6 (NUL-ended
   strings, at most `MAX_ARGS` (32) and `MAX_BUFFER` bytes, `E2BIG`; checked by `syscall::argc`); `dispatch` reads
   x0-x6. `Call` stays 56 bytes (const-asserted), so `Spawn`'s small fields are `u8`/`u16`. Changing the archive is `EROFS`.
-- An inode a handle reaches is never freed: `unlink` is `EBUSY` while any table holds a `Dir` or `Node` handle to it
-  (`Scheduler::holds`, at most `MAX_PROCESSES * MAX_HANDLES` entries), since `create` reuses freed inodes. The scan sees
-  every handle: `spawn` moves handles within one syscall, and an exiting process's table is emptied as it releases.
+- An inode a handle reaches is never freed: `unlink` is `EBUSY` while any handle reaches a `Dir` or `Node` (`file::Opens`,
+  a count per inode the board keeps as such handles open and close, at most one entry per open handle), since `create`
+  reuses freed inodes. `spawn` moves handles without changing a count; a process's release closes each of its own.
 - Paths resolve only below a directory handle: each component goes through `mogfs::lookup`, which rejects `.`, `..`
   and empty names, so `../x` and `/x` are `EINVAL`. Trust note: a crafted image can point an entry at `ROOT` or an
   ancestor, so a subdirectory handle may reach the root and the tree may cycle; nothing in the kernel recurses over

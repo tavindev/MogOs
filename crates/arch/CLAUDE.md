@@ -35,25 +35,35 @@ It is **NOT** board-specific: no MMIO addresses, no memory map, no drivers, no s
   `user_writable` (`at` probes), `sync_icache` / `icache_synced` (`dc cvau` then `ic ivau` per code page, which the A72's PIPT I-cache allows; one barrier after all).
 - `irq::disable` / `restore` / `wait` / `window`, `gic::enable` / `affinity` / `enable_cpu` / `route` / `unmask` / `unmask_local` / `send_sgi` / `ack` / `eoi`, `mpidr`,
   `timer::arm` / `stop`, `timer::allow_user_counter`.
-- `Lock<T>`, a ticket spinlock (it counts the acquisitions that had to wait, `contended`, on the slow path only): `lock()` masks IRQs, then acquires, and its `Guard` releases, then restores DAIF;
-  `lock_masked()` skips DAIF, for code entered masked; `Guard::leak` keeps it held until the `unsafe` `Lock::unlock`
-  (how trap hooks return holding the board's kernel lock). TPIDR_EL1 holds the core's dense index in bits 48-63 and its per-CPU area's
+- `Lock<T, L>`, a ticket spinlock at lock level `L` (`crates/lock-order`; it counts the acquisitions that had to wait,
+  `contended`, on the slow path only): `lock(&mut w)` takes the witness of the level held now (`L: LockAfter<P>`),
+  masks IRQs, then acquires, and its `Guard` releases, then restores DAIF; `lock_masked(&mut w)` skips DAIF, for code
+  entered masked; `lock_leaf()` (the heap's `Leaf` level) takes no witness. `Guard::parts` hands out the data and the
+  witness for locks taken under it, both borrowing the guard; `Guard::leak` keeps the lock held until the `unsafe`
+  `Lock::unlock` (how trap hooks return holding the board's kernel lock) and returns the data and witness for the
+  witness's lifetime; `unsafe` `Lock::unpublished` reaches data nothing else can reach yet (a spawn's child); `unsafe`
+  `root()` makes the witness of a context holding no lock. TPIDR_EL1 holds the core's dense index in bits 48-63 and its per-CPU area's
   signed offset from the `.percpu` template in bits 0-47 (0 on core 0 until `enter_percpu`): `cpu()` is `mrs` + `lsr`,
   `PerCpu<T>::with` (a `RefCell<T>` template static in `.percpu`, its `new` `unsafe`) is `mrs` + `sbfx` + add, IRQs
-  masked, reentry panics. `enter_percpu` (core 0; copies the template, sets TPIDR_EL1), `percpu_size`, `mpidr`.
+  masked, reentry panics; `unsafe` `with_masked` is the same for code entered masked (trap hooks). `enter_percpu` (core
+  0; copies the template, sets TPIDR_EL1), `percpu_size`, `mpidr`.
+- `Resume`, a trap hook's two-word return (the frame, and 0 / 1 / 2: the board's kernel lock not held / held / held with
+  work left), `user_table` (TTBR0's table, the running process's in its syscall), `missing_tables` (how many level-2
+  and level-3 tables `map_page` would add over a range).
 
 ## Boundaries (hard)
 
-- `#![no_std]`, depends only on `mm`. Opts out of `forbid(unsafe_code)` (lints: `docs/DEVELOPMENT.md` settings
+- `#![no_std]`, depends only on `mm` and `lock-order`. Opts out of `forbid(unsafe_code)` (lints: `docs/DEVELOPMENT.md` settings
   table); no board addresses.
 - Every `unsafe` block carries a one-line `// SAFETY:`; every `unsafe fn` has a `# Safety` section stating the
   caller's obligation. Expose safe wrappers where the obligation can be met inside the crate.
 - `boot.s` needs `kmain`, `kmain_secondary` (a secondary core's first Rust code: MMU on, own stack, IRQs still masked from PSCI's entry state) and the linker symbols `__stack_top`, `__bss_start`, `__bss_end` from the board. Traps call out
   through four `extern "C"` hooks the board must define: `task_switch`, `board_irq`,
-  `board_syscall`, `board_user_fault`, each entered with IRQs masked and returning holding the board's kernel lock;
-  the trap exit releases it through a fifth, `board_unlock`, right after `mov sp, x0`, so no other core can run the
-  task whose stack this core just left. The `brk #0` self-test runs no hook, so `breakpoint_self_test` is `unsafe`:
-  its caller takes the lock first.
+  `board_syscall`, `board_user_fault`, each entered with IRQs masked and returning a `Resume` that says whether it holds
+  the board's kernel lock (one that switched always does); right after `mov sp, x0` the trap exit releases it through
+  `board_unlock`, or through `board_unlock_work(frame)` when the hook left work, which returns a `Resume` of its own
+  that the exit loops on, so no other core can run the task whose stack this core just left. The `brk #0` self-test
+  runs no hook and holds no lock.
 - Built only for `aarch64-unknown-none-softfloat`; excluded from `cargo test-host`. Code lives under
   `#[cfg(target_arch = "aarch64")]`.
 

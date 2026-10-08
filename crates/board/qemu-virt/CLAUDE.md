@@ -34,13 +34,21 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
   boot stack), its first frame built by `init_frames`, which also gives the scheduler its cores
   (`Scheduler::start_cores`).
 - `Nospec`, the `kernel::Clamp` `dispatch` and `split` use (`arch::clamp`).
-- `KERNEL: Lock<Kernel>` (`Scheduler` with its process table, `FrameAllocator`, `Pipes`, `Mutexes`, console `Line`,
-  the MogFS `Fs<FsDisk>` and whether it is mounted, and `buf`, the 8 KiB a syscall copies user inputs into), `HEAP` and
-  `CONSOLE: Lock<Uart>` statics. `Fs::new` is const, so the 48 KiB file system is built in the static with an empty
+- `KERNEL: Lock<Kernel, Kernel>` (`Scheduler` with its process table, `Pipes`, `Mutexes`, console `Line`, the MogFS
+  `Fs<FsDisk>` and whether it is mounted, the per-inode open counts `Opens`), `FRAMES` (the `FrameAllocator`), `HEAP`
+  and `CONSOLE: Lock<Uart, Console>` statics; `PROCESSES` (`process.rs`), per process index its lock (`kernel::Process`,
+  the map cursor), its atomic `Budget` and its handle `Table`, each starting a 128-byte line, reached without
+  `KERNEL`; per-CPU `CURRENT` (the core's current process index, written by its own `switch`), `BUF` (the 8 KiB a
+  syscall copies user inputs into) and `DEFERRED` (`trap.rs`). `Fs::new` is const, so the 48 KiB file system is built in the static with an empty
   `FsDisk(None)` (`Io` until `Board::mount` puts the `VirtioBlk` in through `Fs::disk`). File syscalls run their disk I/O inside the trap under `KERNEL`: a `sync` holds it
   for its writes and two flushes. Boot-spawned processes get the root directory as handle 3 once mounted (`spawn_init`).
 - Trap hooks `task_switch`, `board_irq`, `board_syscall`, `board_user_fault`: execute the `kernel::syscall::Call`
-  that `dispatch` returns (user buffers, pages, frames, wake/block). `board_unlock`, called by the trap exit, releases `KERNEL`.
+  that `dispatch` returns (user buffers, pages, frames, wake/block). `board_syscall` looks the caller's handles up
+  without a lock: a console write takes only `CONSOLE` and `map` only its process's lock and `FRAMES`; a call that
+  writes the table (`dup`, `close`, `pipe`, `mutex`, `open`, `spawn`, `thread`, `socket`, `io_wait`) takes the process
+  lock, then `KERNEL`, and releases both before it returns; the rest take `KERNEL` and return holding it, after
+  rechecking the entries they read (a change reruns the call). `board_unlock` and `board_unlock_work`, called by the
+  trap exit, release `KERNEL`, the second after the hook's deferred work.
 - `Board::console` writes (`Console`) hold `CONSOLE` for a whole `write_fmt`, so no other `Console` line splits it (the unlocked writers below can); it is the PL011
   at `UART0`, like every other UART access. `test=bench-lock`'s `round_trips` (ticket vs test-and-set lock, `cpu()`, `PerCpu::with`) and `add_locked`; `test=bench-ipi`'s `ipi_round_trips` (`PING_SGI`, answered in `board_irq`);
   `test=smp`'s `cpus`, `cpu`, `online_cpus` (`ONLINE`) and `ticked_cpus` (`TICKED`, a count each core adds 1 to on
@@ -98,13 +106,18 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
 
 ## Invariants & rules
 
-- Kernel state is reached only through `arch::Lock`s: `KERNEL` (the big lock), then `NET` (the NIC and stack, only
-  under `KERNEL`), then `HEAP` or `CONSOLE` (leaves, nothing taken under them); never another order. Every trap hook takes `KERNEL` with `lock_masked` and returns holding
-  it (`Guard::leak`); the trap exit releases it once, after `mov sp, x0`, through `board_unlock`, so no core resumes a
-  task whose kernel stack another core still runs on. `breakpoint_self_test` takes it before its `brk`. `Board`
-  methods take `lock()` guards and never hold one across a switch (`run_others` drops it before `yield_now`). Fault,
-  echo and every non-empty user `write` take `CONSOLE` (under `KERNEL`, so each write is whole on any core); only panic
-  output uses `UART0` directly, so a panic under `CONSOLE` still prints.
+- Kernel state is reached only through `arch::Lock`s, in one order, which the lock levels check at compile time
+  (`crates/lock-order`): a process's lock, then `KERNEL`, then `NET` and `SETUP`, then `FRAMES`, then `CONSOLE`;
+  `HEAP` is the only leaf (no witness, nothing taken under it). No step holds two locks of one level: `spawn` holds
+  only the parent's and writes the unpublished child through `Lock::unpublished`. Each trap hook and `Board` method
+  starts from `arch::root()`. A hook that switches takes `KERNEL` and returns holding it; the trap exit releases it
+  after `mov sp, x0`. A frame is never freed by the core running on it: a thread's stack and an ended process's release
+  are deferred per-CPU work (`DEFERRED`) the trap exit's `board_unlock_work` runs after `mov sp, x0` in the same trap;
+  a process index (its ASID) is freed only after `flush_asid` and `free_space`, and `wait` returns only after that. No
+  hook holds a process lock across a switch (`io_wait` blocks in two holds). `Board` methods take `lock()` guards and
+  never hold one across a switch (`run_others` drops it before `yield_now`). Fault, echo and every non-empty user
+  `write` take `CONSOLE`, so each write is whole on any core; only panic output uses `UART0` directly, so a panic under
+  `CONSOLE` still prints.
 - Locks need the MMU on (exclusives), so `kmain` calls `enable_mmu` first, before any output, trap or secondary core.
 - Every core runs tasks from the one run queue under `KERNEL`; each hook reads `arch::cpu()` once and passes it to the
   scheduler. A core with no task runs its idle context (process 0, so `switch` loads the boot table); an idle core's
@@ -126,15 +139,17 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
   keeps ASID 0 (`switch`). Tables: `MAX_TASKS` (8) threads, the boot context included, and `MAX_PROCESSES` (8)
   processes, the kernel included.
 - Every frame a process uses (tables, pages, each thread's kernel stack, pipe pages it creates) is charged to its
-  `Budget`; a thread's end refunds its stack (`free_stack`). `spawn_process` returns every frame on failure; a failed
+  `Budget`; a thread's end refunds its stack under `KERNEL` and frees its frames (`free_stack`), at once or at the trap
+  exit. `spawn_process` takes nothing on failure; a failed
   `spawn` or `thread` changes nothing.
-- A thread's end frees the kernel stack it may run on, and a process's end frees its index before `exit_process` has
-  switched away from its address space and freed it (`flush_asid`, then `free_space`): sound because both go back
-  under `KERNEL`, which no core can take until the trap exit has left that stack and released it. Step 25b, with
-  threads on other cores, makes the last thread to leave a core do the free, and frees the index only after it.
-- Ending a process (`exit`, a fault, `kill`) takes and releases its handles first, then ends every thread (mutexes
-  released, a lent boost dropped, stacks refunded), all before `switch` picks the next task, so whatever they woke can
-  be it.
+- A thread's end frees a kernel stack no core runs on at once, and parks the one its own core runs on (`DEFERRED`)
+  until the trap exit has left it. A process's last thread leaves its release to the trap exit of the core that ended
+  it: its handles (under its lock), then its memory (`flush_asid`, `free_space`), then `Scheduler::exited`, so it is
+  reapable, and its index free, only once nothing of it is left. Until then it is neither live (a `kill` ends nothing)
+  nor reapable, and counts as a task. A core that ended a process's last thread goes to its idle context
+  (`switch_after_end`) and picks a task after the release, which may wake a better one.
+- Ending a process (`exit`, a fault, `kill`) ends every thread no other core runs (mutexes released, a lent boost
+  dropped, stacks refunded) and marks the others, all before `switch` picks the next task.
 - Every new `Process` or `Thread` handle is counted (`Scheduler::held`): the one `spawn_process` hands out (the
   spawner's, or init's own), `thread`'s, and each `dup`; `release` uncounts each closed one.
 - A blocking call rewinds its `svc` (`block` calls `TrapFrame::restart`) and reruns when woken.
@@ -142,8 +157,8 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
   clamped into user space, then probe every page with
   `arch::user_readable` / `user_writable` once and then move bytes by raw copy, in the same trap, before any switch;
   never through a reference, since a sibling thread may write the memory meanwhile. Inputs the kernel parses (paths,
-  spawn arguments and handle lists) are copied into `buf` (`copy_in`) once and validated there; bulk data goes straight
-  between user memory and its destination (a pipe page) or through `buf` (console, files, `readdir`). A pipe read that
+  spawn arguments and handle lists) are copied into the core's `BUF` (`copy_in`) once and validated there; bulk data
+  goes straight between user memory and its destination (a pipe page) or through `BUF` (console, files, `readdir`). A pipe read that
   would wait skips the probe (`Pipe::read_waits`): under hvf a probe costs more than the rest of the call.
 - User layout: code at `USER_BASE` (4 GiB), ELF segments within `IMAGE` (below the top two pages and an unmapped guard page, so a stack overflow faults), one stack page
   below `USER_STACK_TOP`; a `spawn` with arguments copies them to the end of that page and adds a stack page below it
