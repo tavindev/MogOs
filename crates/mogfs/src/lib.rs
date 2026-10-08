@@ -1438,6 +1438,27 @@ impl<'a, D: Disk> Fs<'a, D> {
         Ok(())
     }
 
+    /// Calls `f` with each snapshot, oldest first.
+    pub fn snapshots(&mut self, mut f: impl FnMut(Snapshot)) -> Result<(), Error> {
+        if self.torn {
+            return Err(Error::Io);
+        }
+        let mut k = Key::new(ROOT, ItemKind::Snapshot, Offset(0));
+        let end = Key::new(ROOT, ItemKind::Snapshot, Offset(OFFSET));
+        while let Some((s, i, hi)) = self.seek(k)? {
+            let n = &self.cache[s];
+            if ikey(n, i) > end {
+                break;
+            }
+            f(Snapshot(ikey(n, i).offset().0));
+            k = if i + 1 < count(n) { ikey(n, i + 1) } else { hi };
+            if k == NONE {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     /// A read-only view of `snapshot`'s files; `NotFound` once it is deleted.
     pub fn view(&mut self, snapshot: Snapshot) -> Result<View<'_, 'a, D>, Error> {
         if self.torn {

@@ -685,23 +685,64 @@ fn grow(disk: &mut MemDisk) -> Result<(), Error> {
     fs.commit()
 }
 
+/// Mounts `disk` and takes a snapshot.
+fn take(disk: &mut MemDisk) -> Result<(), Error> {
+    let mut mem = Mem::new(disk.durable.len(), POOL);
+    let mut fs = mount(&mut mem, disk)?;
+    fs.snapshot().map(|_| ())
+}
+
+/// Mounts `disk` and deletes every snapshot, then commits.
+fn drop_snapshots(disk: &mut MemDisk) -> Result<(), Error> {
+    let mut mem = Mem::new(disk.durable.len(), POOL);
+    let mut fs = mount(&mut mem, disk)?;
+    let mut all = vec![];
+    fs.snapshots(|s| all.push(s))?;
+    for s in all {
+        fs.delete_snapshot(s)?;
+    }
+    fs.commit()
+}
+
+/// The live files and each snapshot's, after a mount.
+fn state(disk: &mut MemDisk) -> Result<(Tree, Vec<(Snapshot, Tree)>), Error> {
+    let live = snapshot(&mut disk.clone())?;
+    let mut mem = Mem::new(disk.durable.len(), POOL);
+    let mut fs = mount(&mut mem, disk)?;
+    let mut all = vec![];
+    fs.snapshots(|s| all.push(s))?;
+    let snaps = all
+        .into_iter()
+        .map(|s| Ok((s, view_tree(&mut fs, s)?)))
+        .collect::<Result<_, Error>>()?;
+    Ok((live, snaps))
+}
+
 #[test]
 fn power_cut_anywhere_leaves_the_old_or_the_new_state() {
     let mut changed = hello();
     change(&mut changed).unwrap();
     power_cut(hello(), change);
-    power_cut(changed, remove);
+    power_cut(changed.clone(), remove);
     let mut big = MemDisk::new(256);
     let mut mem = Mem::new(256, POOL);
     format(&mut mem, &mut big);
     power_cut(big, grow);
+    // A snapshot of a changed file system (its bitmap copies the pages the log changed), changes under it, and its
+    // delete.
+    power_cut(changed.clone(), take);
+    let mut snapped = changed;
+    take(&mut snapped).unwrap();
+    power_cut(snapped.clone(), remove);
+    remove(&mut snapped).unwrap();
+    power_cut(snapped, drop_snapshots);
 }
 
 fn power_cut(base: MemDisk, change: fn(&mut MemDisk) -> Result<(), Error>) {
-    let old = snapshot(&mut base.clone()).unwrap();
+    let old = state(&mut base.clone()).unwrap();
     let mut full = base.with_cut(usize::MAX);
     change(&mut full).unwrap();
-    let new = snapshot(&mut full).unwrap();
+    let new = state(&mut full).unwrap();
     assert_ne!(old, new);
 
     for cut in 0..=full.events {
@@ -718,11 +759,11 @@ fn power_cut(base: MemDisk, change: fn(&mut MemDisk) -> Result<(), Error>) {
             lands.push(Box::new(move |i, _| i != skip));
         }
         for keep in &lands {
-            let state = snapshot(&mut disk.crash(keep)).unwrap();
+            let state = state(&mut disk.crash(keep)).unwrap();
             assert!(state == old || state == new, "cut {cut}: {state:?}");
         }
         if cut == full.events {
-            assert_eq!(snapshot(&mut disk.crash(|_, _| true)), Ok(new.clone()));
+            assert_eq!(state(&mut disk.crash(|_, _| true)), Ok(new.clone()));
         }
     }
 }

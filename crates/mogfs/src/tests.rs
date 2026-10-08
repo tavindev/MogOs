@@ -631,7 +631,8 @@ fn random_changes_keep_the_tree_and_free_space_consistent() {
 }
 
 /// An image both slots reach parts of: a root of 150 long-named files (a tree of height 2), a directory with files, a
-/// 20-page file and a sparse one; the second commit overwrites a page, unlinks and renames.
+/// 20-page file and a sparse one; then a snapshot, under which the last commit overwrites a page, unlinks and renames
+/// (so it pins blocks).
 fn mutation_base() -> Vec<Buf> {
     // Six bitmap pages under the unit tests' sizes: two index levels.
     let blocks = 3000;
@@ -651,7 +652,7 @@ fn mutation_base() -> Vec<Buf> {
     fs.write(big, 0, &[9; 20 * BLOCK_SIZE]).unwrap();
     let sparse = fs.create(ROOT, b"sparse").unwrap();
     fs.write(sparse, 50 * BLOCK_SIZE as u64, b"tail").unwrap();
-    fs.commit().unwrap();
+    fs.snapshot().unwrap();
     fs.write(big, 5 * BLOCK_SIZE as u64, &[1; 10]).unwrap();
     for i in 0..10 {
         fs.unlink(ROOT, format!("{i:0>40}").as_bytes(), |_| false)
@@ -756,9 +757,12 @@ fn mutate(disk: &mut [Buf], rng: &mut u64) -> bool {
     let inline = if f[14] == 0 { 2 * pages(f[2]) } else { 1 };
     match next(rng, 9) {
         0 => {
-            write(disk, slot as u64, 8 * next(rng, 15) as usize, 8, rng);
+            let field = next(rng, 16) as usize;
+            write(disk, slot as u64, 8 * field, 8, rng);
             reseal_superblock(disk, slot);
-            true
+            // A newest-snapshot field below a snapshot item leaves that snapshot unloaded, so its blocks may be
+            // reused: mount reads no item to check it (it costs a descent), scrub does.
+            field != 15
         }
         1 => {
             // A page list or log field; a log value may then free a reachable block, which only scrub can catch.
@@ -908,6 +912,28 @@ fn exercise<D: Disk>(fs: &mut Fs<D>) {
                 let _ = fs.create(d, format!("{round}{k}-{i:0>100}").as_bytes());
             }
             let _ = fs.mkdir(d, format!("new{round}").as_bytes());
+        }
+        // Every snapshot read through a view, then one taken and the oldest deleted.
+        let mut snaps = vec![];
+        let _ = fs.snapshots(|s| snaps.push(s));
+        for &s in &snaps {
+            if let Ok(mut v) = fs.view(s) {
+                let mut entries = vec![];
+                let _ = v.readdir(ROOT, 0, |n, inode, _| {
+                    entries.push((n.to_vec(), inode));
+                    entries.len() > 200
+                });
+                for (n, inode) in entries {
+                    let _ = v.lookup(ROOT, &n);
+                    let _ = v.stat(inode);
+                    let _ = v.read(inode, 0, &mut buf);
+                    let _ = v.map(inode, Page(1));
+                }
+            }
+        }
+        let _ = fs.snapshot();
+        if let Some(&s) = snaps.first() {
+            let _ = fs.delete_snapshot(s);
         }
         let _ = fs.commit();
         let _ = fs.mount();
@@ -1100,7 +1126,7 @@ fn disk_errors_and_full_disks_never_leave_stale_state() {
                 next(rng, 3 * BLOCK_SIZE as u64) as usize,
             );
             fs.disk().armed = true;
-            let op = next(rng, 14);
+            let op = next(rng, 16);
             let r = match op {
                 0 | 1 => fs.create(dir, name.as_bytes()).map(|_| ()),
                 2 => fs.mkdir(ROOT, b"d").map(|_| ()),
@@ -1121,6 +1147,13 @@ fn disk_errors_and_full_disks_never_leave_stale_state() {
                     }
                     Ok(())
                 }),
+                // A snapshot commits first; the oldest is deleted.
+                14 => fs.snapshot().map(|_| ()),
+                15 => {
+                    let mut oldest = None;
+                    fs.snapshots(|s| _ = oldest.get_or_insert(s))
+                        .and_then(|()| oldest.map_or(Ok(()), |s| fs.delete_snapshot(s)))
+                }
                 _ => files(&mut fs).map(|got| assert_eq!(got, view(&model), "{ctx}")),
             };
             fs.disk().armed = false;
@@ -1133,6 +1166,13 @@ fn disk_errors_and_full_disks_never_leave_stale_state() {
                         Ok(view(&model)),
                         "{ctx}: after op {op}: {r:?}"
                     );
+                } else if op == 14 {
+                    // Its commits leave the tree whole; an error between them, in its item and bitmap, does not.
+                    let r = files(&mut fs);
+                    assert!(
+                        r == Ok(view(&model)) || r == Err(Error::Io),
+                        "{ctx}: after a snapshot: {r:?}"
+                    );
                 } else {
                     assert_eq!(
                         files(&mut fs),
@@ -1144,7 +1184,7 @@ fn disk_errors_and_full_disks_never_leave_stale_state() {
                 assert_eq!(fs.commit(), Err(Error::Io), "{ctx}");
                 fs.mount().unwrap();
                 let now = files(&mut fs).unwrap();
-                let unknown = matches!(op, 9 | 10) && now == view(&model);
+                let unknown = matches!(op, 9 | 10 | 14) && now == view(&model);
                 assert!(
                     now == view(&committed) || unknown,
                     "{ctx}: remount after op {op}: {r:?}"
@@ -1189,7 +1229,7 @@ fn disk_errors_and_full_disks_never_leave_stale_state() {
                         model.insert(format!("/{other}"), v);
                     }
                 }
-                (9 | 10, Ok(())) => committed = model.clone(),
+                (9 | 10 | 14, Ok(())) => committed = model.clone(),
                 (11, Ok(())) => {
                     model = committed.clone();
                     assert_eq!(files(&mut fs), Ok(view(&model)), "{ctx}: mount");
