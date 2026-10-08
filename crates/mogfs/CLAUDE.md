@@ -63,10 +63,12 @@ or a device driver.
   a bitmap that marks a reachable block free, and an extent pointed at blocks another reference reaches (overwriting
   or truncating it frees them unread). The mutation test leaves exactly these out. An entry's key is not checked
   against its name's hash, so a crafted directory can list a name twice.
-- Two memos skip tree descents on repeated access, and must never outlive what they copy: the last two inode items
-  read (cleared by `set_inode`, an inode's delete, `mount` and `format`), and the data page in `bufs[DATA]`, tagged
-  with its block, sum, inode and page (cleared before any rewrite of `bufs[DATA]` and by `release` of its block; a page
-  maps to another block only through `write`, which retags it). `truncate` takes a file of size 0 to have no extents
+- Memos skip tree work on repeated access, and must never outlive what they copy: the last two inode items read
+  (cleared by `set_inode`, an inode's delete, `mount` and `format`); the data page in `bufs[DATA]`, tagged with its
+  block, sum, inode and page (cleared before any rewrite of `bufs[DATA]` and by `release` of its block; a page maps to
+  another block only through `write`, which retags it); the last four lookups that found their entry (cleared before
+  `create`, `mkdir`, `unlink` or `rename` change an entry, and by `mount`); and the leaf the last descent reached with
+  `readdir`'s last start index in it (cleared before a cache slot is reused or an insert or delete changes the tree). `truncate` takes a file of size 0 to have no extents
   (they end within the size); a crafted image that breaks this keeps those extents until `unlink`.
 - `NoSpace` is decided before anything changes (`reserve`: the operation's data blocks, a bound on the nodes it can
   dirty, and what commit needs), so commit never fails for space. Changes that add also keep back room for an

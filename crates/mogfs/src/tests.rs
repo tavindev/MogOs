@@ -280,6 +280,30 @@ fn check<D: Disk>(fs: &mut Fs<D>, ctx: &str) {
         assert!(child < fs.next_inode, "{ctx}: inode past the counter");
     }
     assert_eq!(seen.len(), inodes.len(), "{ctx}: unnamed inode");
+    // Listings and lookups, twice so the second runs from the memos, agree with the items.
+    for (&dir, _) in inodes.iter().filter(|(_, k)| **k == DIR) {
+        let want: Vec<(Vec<u8>, u64)> = items
+            .iter()
+            .filter(|(k, _)| (k >> 64) as u64 == dir && (*k as u64) >> 62 == ItemKind::Entry as u64)
+            .map(|(_, v)| (v[9..].to_vec(), le64(v, 0)))
+            .collect();
+        for _ in 0..2 {
+            let mut got = vec![];
+            fs.readdir(Inode(dir), 0, |n, i, _| {
+                got.push((n.to_vec(), i.0));
+                false
+            })
+            .unwrap();
+            assert_eq!(got, want, "{ctx}: listing of {dir}");
+            for (n, i) in &want {
+                assert_eq!(
+                    fs.lookup(Inode(dir), n),
+                    Ok(Inode(*i)),
+                    "{ctx}: lookup in {dir}"
+                );
+            }
+        }
+    }
     blocks.extend([0, 1]);
     blocks.extend(
         (0..fs.pages)
@@ -408,10 +432,14 @@ fn random_changes_keep_the_tree_and_free_space_consistent() {
                 10 => {
                     let d = dirs[next(rng, dirs.len() as u64) as usize];
                     match pick(&mut fs, d, rng) {
-                        Some((name, i)) => fs.unlink(d, &name).map(|()| {
-                            files.retain(|&f| f != i);
-                            dirs.retain(|&d| d != i);
-                        }),
+                        Some((name, i)) => {
+                            let _ = fs.lookup(d, &name);
+                            fs.unlink(d, &name).map(|()| {
+                                assert_eq!(fs.lookup(d, &name), Err(Error::NotFound), "{ctx}");
+                                files.retain(|&f| f != i);
+                                dirs.retain(|&d| d != i);
+                            })
+                        }
                         None => Ok(()),
                     }
                 }
@@ -420,11 +448,23 @@ fn random_changes_keep_the_tree_and_free_space_consistent() {
                     let to = dirs[next(rng, dirs.len() as u64) as usize];
                     match pick(&mut fs, from, rng) {
                         Some((name, i)) => {
+                            let _ = fs.lookup(from, &name);
                             match fs.rename(from, &name, to, format!("r{step}").as_bytes()) {
                                 Err(Error::InvalidName) => {
                                     assert!(
                                         subtree_has(&mut fs, i, to),
                                         "{ctx}: refused a legal move"
+                                    );
+                                    Ok(())
+                                }
+                                Ok(())
+                                    if (from, name.as_slice())
+                                        != (to, format!("r{step}").as_bytes()) =>
+                                {
+                                    assert_eq!(
+                                        fs.lookup(from, &name),
+                                        Err(Error::NotFound),
+                                        "{ctx}"
                                     );
                                     Ok(())
                                 }

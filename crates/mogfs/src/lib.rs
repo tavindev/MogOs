@@ -66,6 +66,8 @@ const MIN_BLOCKS: u64 = 16;
 const MAX_HEIGHT: usize = 8;
 const MAGIC: u64 = u64::from_le_bytes(*b"MogFS\0\0\x02");
 const CHAIN: u64 = 8;
+/// Lookups `lookup` remembers.
+const NAMES: usize = 4;
 
 const END: usize = BLOCK_SIZE - 8;
 const HDR: usize = 8;
@@ -383,6 +385,14 @@ pub struct Fs<'a, D> {
     cached: Option<(Block, Sum, Inode, Page)>,
     /// The last two inode items read, newest first; any change to an inode item clears them.
     items: [Option<(Inode, Item)>; 2],
+    /// The last lookups that found their entry: directory, name length (0: none) and bytes, and the inode; any change
+    /// to an entry clears them.
+    names: [(Inode, u8, [u8; NAME_MAX], Inode); NAMES],
+    next_name: usize,
+    /// The leaf the last descent reached, with its key bounds; cleared before a slot is reused or the tree's shape
+    /// changes. `readdir` keeps there the last key it searched for and its item index.
+    finger: Option<(usize, Key, Key)>,
+    start: (Key, usize),
     broken: bool,
 }
 
@@ -425,6 +435,10 @@ impl<'a, D: Disk> Fs<'a, D> {
             bufs: [[0; BLOCK_SIZE]; 2],
             cached: None,
             items: [None; 2],
+            names: [(ROOT, 0, [0; NAME_MAX], ROOT); NAMES],
+            next_name: 0,
+            finger: None,
+            start: (NONE, 0),
             broken: true,
         }
     }
@@ -491,6 +505,8 @@ impl<'a, D: Disk> Fs<'a, D> {
     pub fn mount(&mut self) -> Result<(), Error> {
         self.broken = true;
         (self.cached, self.items) = (None, [None; 2]);
+        (self.finger, self.start) = (None, (NONE, 0));
+        self.forget_names();
         self.disk.read(0, &mut self.bufs)?;
         let disk = min(self.disk.blocks(), MAX_BLOCKS);
         let mut slots = [
@@ -562,8 +578,18 @@ impl<'a, D: Disk> Fs<'a, D> {
             return Err(Error::InvalidName);
         }
         self.dir(dir)?;
+        for j in 0..NAMES {
+            let (d, len, n, i) = &self.names[j];
+            if *d == dir && *len as usize == name.len() && n[..name.len()] == *name {
+                return Ok(*i);
+            }
+        }
         let e = self.find_entry(dir, name)?.0.ok_or(Error::NotFound)?;
         self.child(dir, e)?;
+        let (d, len, n, i) = &mut self.names[self.next_name];
+        (*d, *len, *i) = (dir, name.len() as u8, e.1);
+        n[..name.len()].copy_from_slice(name);
+        self.next_name = (self.next_name + 1) % NAMES;
         Ok(e.1)
     }
 
@@ -584,7 +610,12 @@ impl<'a, D: Disk> Fs<'a, D> {
         loop {
             let (s, hi) = self.leaf(k)?;
             let n = &self.cache[s];
-            for i in search(n, k)..count(n) {
+            let first = match self.start {
+                (key, i) if key == k => i,
+                _ => search(n, k),
+            };
+            self.start = (k, first);
+            for i in first..count(n) {
                 let k = ikey(n, i);
                 if k >= end {
                     return Ok(u64::MAX);
@@ -736,6 +767,7 @@ impl<'a, D: Disk> Fs<'a, D> {
         }
         let bytes = self.extent_bytes(inode)?;
         self.reserve(0, 4, bytes, true)?;
+        self.forget_names();
         let r = self
             .delete(Key::new(dir, ItemKind::Entry, off))
             .and_then(|()| self.remove_extents(inode))
@@ -786,6 +818,7 @@ impl<'a, D: Disk> Fs<'a, D> {
             return Err(Error::InvalidName);
         }
         self.reserve(0, 5, 0, false)?;
+        self.forget_names();
         let r = self
             .delete(Key::new(from_dir, ItemKind::Entry, off))
             .and_then(|()| self.put_entry(to_dir, slot, inode, kind, to_name))
@@ -961,6 +994,8 @@ impl<'a, D: Disk> Fs<'a, D> {
         self.dirty = [0; 4];
         (self.span, self.prev_span) = ((usize::MAX, 0), (0, pages * PAGE_WORDS));
         (self.cached, self.items) = (None, [None; 2]);
+        (self.finger, self.start) = (None, (NONE, 0));
+        self.forget_names();
         Ok(())
     }
 
@@ -1121,6 +1156,12 @@ impl<'a, D: Disk> Fs<'a, D> {
         Ok(it)
     }
 
+    fn forget_names(&mut self) {
+        for j in 0..NAMES {
+            self.names[j].1 = 0;
+        }
+    }
+
     fn set_inode(&mut self, inode: Inode, it: &Item) -> Result<(), Error> {
         self.items = [None; 2];
         let (s, at) = self.value_mut(Key::new(inode, ItemKind::Inode, Offset(0)))?;
@@ -1178,6 +1219,7 @@ impl<'a, D: Disk> Fs<'a, D> {
             return Err(Error::Io);
         }
         let slot = slot.ok_or(Error::Collision)?;
+        self.forget_names();
         let inode = Inode(self.next_inode);
         let next = self.next_inode.checked_add(1).ok_or(Error::NoSpace)?;
         self.reserve(0, 3, ITEM + 9 + name.len() + ITEM + INODE_LEN, false)?;
@@ -1547,6 +1589,7 @@ impl<'a, D: Disk> Fs<'a, D> {
             return Ok(s);
         }
         let s = self.victim();
+        (self.finger, self.start) = (None, (NONE, 0));
         self.blk[s] = EMPTY;
         self.disk.read(p.block.0, from_mut(&mut self.cache[s]))?;
         self.check(s, p, level, lo, hi)?;
@@ -1653,10 +1696,19 @@ impl<'a, D: Disk> Fs<'a, D> {
 
     /// The leaf whose range holds `k`, and the leaf's upper bound (`NONE` for the last), without changing anything.
     fn leaf(&mut self, k: Key) -> Result<(usize, Key), Error> {
+        if let Some((s, lo, hi)) = self.finger
+            && lo <= k
+            && k < hi
+        {
+            self.clock += 1;
+            self.stamp[s] = self.clock;
+            return Ok((s, hi));
+        }
         let (mut p, mut level, mut lo, mut hi) = (self.root, self.height - 1, Key(0), NONE);
         loop {
             let s = self.node(p, level, lo, hi)?;
             if level == 0 {
+                self.finger = Some((s, lo, hi));
                 return Ok((s, hi));
             }
             let n = &self.cache[s];
@@ -1731,6 +1783,7 @@ impl<'a, D: Disk> Fs<'a, D> {
     /// A new, empty dirty node at `level`.
     fn new_node(&mut self, level: usize) -> usize {
         let s = self.victim();
+        (self.finger, self.start) = (None, (NONE, 0));
         self.cache[s][..HDR].copy_from_slice(&[level as u8, 0, 0, 0, 0, 0, 0, 0]);
         (self.blk[s], self.dirt[s]) = (EMPTY, true);
         self.ndirty += 1;
@@ -1740,6 +1793,7 @@ impl<'a, D: Disk> Fs<'a, D> {
 
     /// Frees node slot `s` and the block of the node it held.
     fn drop_node(&mut self, s: usize) -> Result<(), Error> {
+        (self.finger, self.start) = (None, (NONE, 0));
         if self.dirt[s] {
             self.dirt[s] = false;
             self.ndirty -= 1;
@@ -1763,6 +1817,7 @@ impl<'a, D: Disk> Fs<'a, D> {
 
     /// Adds item `k` with a `len`-byte value to fill; returns its slot and value offset.
     fn insert(&mut self, k: Key, len: usize) -> Result<(usize, usize), Error> {
+        (self.finger, self.start) = (None, (NONE, 0));
         let path = self.cow(k)?;
         let s = path.slot[0];
         let i = search(&self.cache[s], k);
@@ -1842,6 +1897,7 @@ impl<'a, D: Disk> Fs<'a, D> {
 
     /// Removes item `k`, merging nodes that fall below a quarter full into a sibling where they fit.
     fn delete(&mut self, k: Key) -> Result<(), Error> {
+        (self.finger, self.start) = (None, (NONE, 0));
         let path = self.cow(k)?;
         let s = path.slot[0];
         let i = search(&self.cache[s], k);
