@@ -129,10 +129,10 @@ fn release_process(kernel: &mut Kernel, w: &mut W<'_, level::Kernel>, (index, co
     let entry = &PROCESSES[index];
     // SAFETY: the process's last thread ended under the `KERNEL` this hold has, so no thread of it holds or takes its
     // lock, and no other process takes it.
-    let handles = entry.handles.take(unsafe { entry.lock.unshared() });
-    for object in handles.objects() {
-        release(kernel, w, (object, index), None);
-    }
+    let process = unsafe { entry.lock.unshared() };
+    entry
+        .handles
+        .take(process, |object| release(kernel, w, (object, index), None));
     let mut frames = FRAMES.lock_masked(w);
     let l1 = kernel.sched.space(index);
     arch::flush_asid(index);

@@ -393,15 +393,17 @@ impl Table {
         self.0[i].words.each_ref().map(|w| w.load(Relaxed))
     }
 
-    /// Empties the table for the next process at its index; returns what it held.
-    pub fn take(&self, _: &mut Process) -> Handles {
-        Handles(core::array::from_fn(|i| {
+    /// Empties the table for the next process at its index, handing `f` each object it held.
+    pub fn take(&self, _: &mut Process, mut f: impl FnMut(Object)) {
+        for i in 0..MAX_HANDLES {
             let words = self.words(i);
             if words.iter().any(|&w| w != 0) {
                 self.store(i, [0; 3]);
             }
-            decode(words)
-        }))
+            if let (_, Some((object, _))) = decode(words) {
+                f(object);
+            }
+        }
     }
 
     fn store(&self, i: usize, words: Words) {

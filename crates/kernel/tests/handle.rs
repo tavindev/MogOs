@@ -169,9 +169,8 @@ fn a_table_write_changes_the_sequence_a_lookup_saw() {
     assert_eq!(table.close(&mut process, h(console)), Ok(Object::Console));
     assert!(!table.unchanged(&seen), "its entry closed");
     assert_eq!(table.entry(h(console), &mut Seen::default()), Err(EBADF));
-    assert_eq!(
-        table.take(&mut process).objects().collect::<Vec<_>>(),
-        [Object::Archive]
-    );
+    let mut taken = Vec::new();
+    table.take(&mut process, |object| taken.push(object));
+    assert_eq!(taken, [Object::Archive]);
     assert_eq!(table.entry(h(other), &mut Seen::default()), Err(EBADF));
 }
