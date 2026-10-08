@@ -628,9 +628,8 @@ fn failed_mount_leaves_the_fs_read_only() {
     let mut fs = mount(&mut mem, &mut disk).unwrap();
     let docs = fs.lookup(ROOT, b"docs").unwrap();
     let a = fs.lookup(docs, b"a.txt").unwrap();
-    // The live root (one leaf) fails to read after the superblocks and bitmap did.
-    let root = le64(&disk.durable[0], 9 * 8);
-    let mut fs = mem.fs(FailReads(&mut disk, root, usize::MAX));
+    // The first request, for the superblocks, fails.
+    let mut fs = mem.fs(FailReads(&mut disk, 0, usize::MAX));
     assert_eq!(fs.mount(), Err(Error::Io));
     assert_eq!(fs.write(a, 0, b"HE"), Err(Error::Io));
     assert_eq!(fs.truncate(a), Err(Error::Io));
@@ -1170,6 +1169,19 @@ fn small_commits_log_the_bitmap_until_the_log_fills() {
 }
 
 #[test]
+fn a_small_image_mounts_in_one_request() {
+    // The superblocks, the bitmap page and the root leaf all lie in blocks 0 to 7.
+    let mut disk = hello();
+    let io = Cell::new([0; 3]);
+    let mut mem = Mem::new(64, POOL);
+    let mut fs = mem.fs(Counted(&mut disk, &io));
+    fs.mount().unwrap();
+    assert_eq!(io.take(), [1, 0, 0]);
+    let docs = fs.lookup(ROOT, b"docs").unwrap();
+    assert_eq!(fs.lookup(docs, b"a.txt").map(|_| ()), Ok(()));
+}
+
+#[test]
 fn block_io_per_operation() {
     let mut disk = MemDisk::new(1024);
     let mut mem = Mem::new(1024, POOL);
@@ -1184,10 +1196,10 @@ fn block_io_per_operation() {
     fs.commit().unwrap();
     let io = Cell::new([0; 3]);
     let mut fs = mem.fs(Counted(&mut disk, &io));
-    // [reads, writes, flushes]: both superblocks in one request, the live bitmap page (the older slot shares it), and
-    // the rightmost path (root and last leaf).
+    // [reads, writes, flushes]: blocks 0 to 7 in one request (the superblocks and here the bitmap page, which the
+    // older slot shares), then the rightmost path (root and last leaf), past them.
     fs.mount().unwrap();
-    assert_eq!(io.take(), [4, 0, 0]);
+    assert_eq!(io.take(), [3, 0, 0]);
     assert_eq!(fs.height(), 2);
     // The leaf with the root's entries and the first inodes; the root node is cached.
     let docs = fs.lookup(ROOT, b"docs").unwrap();

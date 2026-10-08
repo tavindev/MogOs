@@ -79,6 +79,10 @@ const MAX_POOL: usize = 512;
 /// Cache slots that stage a commit's request (the last also the mount's pre-log words), after the scratch slot.
 const STAGE: usize = 32;
 const MAX_CACHE: usize = 1 + STAGE + MAX_POOL;
+/// Blocks `mount` reads from block 0 in its first request, into the staging slots from `AHEAD_AT`: on a fresh or small
+/// image they hold the bitmap page and the root beside the superblocks.
+const AHEAD: usize = 8;
+const AHEAD_AT: usize = STAGE - AHEAD;
 /// Superblock bytes before the page list: the header and a root table of one root.
 const SB_HDR: usize = 120;
 /// Log entries the superblock has room for beside one page.
@@ -457,6 +461,8 @@ pub struct Fs<'a, D> {
     /// `broken`, and the tree in memory may hold a change made halfway, or no file system is mounted: every call
     /// fails with `Io` until a `mount` succeeds.
     torn: bool,
+    /// Blocks from 0 that `cache[AHEAD_AT..]` holds while `mount` runs.
+    ahead: usize,
 }
 
 impl<'a, D: Disk> Fs<'a, D> {
@@ -506,6 +512,7 @@ impl<'a, D: Disk> Fs<'a, D> {
             start: (NONE, 0),
             broken: true,
             torn: true,
+            ahead: 0,
         }
     }
 
@@ -579,7 +586,24 @@ impl<'a, D: Disk> Fs<'a, D> {
         (self.cached, self.unwritten, self.items) = (None, false, [None; 2]);
         (self.finger, self.start) = (None, (NONE, 0));
         self.forget_names();
-        self.disk.read(0, &mut self.bufs)?;
+        let n = min(AHEAD as u64, self.disk.blocks()) as usize;
+        let r = if self.cache.len() > STAGE && n >= 2 {
+            self.disk
+                .read(0, &mut self.cache[AHEAD_AT..AHEAD_AT + n])
+                .map(|()| {
+                    self.bufs
+                        .copy_from_slice(&self.cache[AHEAD_AT..AHEAD_AT + 2]);
+                    self.ahead = n;
+                })
+        } else {
+            self.disk.read(0, &mut self.bufs)
+        };
+        let r = r.and_then(|()| self.mount_slots());
+        self.ahead = 0;
+        r
+    }
+
+    fn mount_slots(&mut self) -> Result<(), Error> {
         let disk = min(self.disk.blocks(), MAX_BLOCKS);
         let mut slots = [
             superblock(&self.bufs[0], 0, disk),
@@ -1198,6 +1222,9 @@ impl<'a, D: Disk> Fs<'a, D> {
     fn load_bitmap(&mut self, s: &Super, map: usize) -> Result<(), Error> {
         let (live, sb) = (map == LIVE, (s.generation % 2) as usize);
         let (pages, w) = (pages(s.blocks), self.words);
+        if s.ix_h >= AHEAD_AT {
+            self.ahead = 0;
+        }
         let words = s.blocks.div_ceil(64) as usize;
         let saved = self.base - 1;
         if live {
@@ -1248,7 +1275,7 @@ impl<'a, D: Disk> Fs<'a, D> {
                 }
                 continue;
             }
-            self.disk.read(b.0, from_mut(&mut self.cache[0]))?;
+            self.fetch(b, 0)?;
             let (page, n) = (&self.cache[0], min(PAGE_WORDS, words - p * PAGE_WORDS));
             let tail = le64(page, 8 * (n - 1)) >> (s.blocks % 64);
             if checksum(b, &page[..8 * n]) != sum
@@ -1323,6 +1350,16 @@ impl<'a, D: Disk> Fs<'a, D> {
                 != 0
     }
 
+    /// Reads block `b` into cache slot `s`, from `mount`'s first request if that holds it.
+    fn fetch(&mut self, b: Block, s: usize) -> Result<(), Error> {
+        if b.0 < self.ahead as u64 {
+            let (src, dst) = pair(self.cache, AHEAD_AT + b.0 as usize, s);
+            dst.copy_from_slice(src);
+            return Ok(());
+        }
+        self.disk.read(b.0, from_mut(&mut self.cache[s]))
+    }
+
     /// Reads index block `ptr` into slot `slot`; it lists `len` bytes of entries. A zero pointer is an all-zero block.
     fn read_ix(
         &mut self,
@@ -1338,7 +1375,7 @@ impl<'a, D: Disk> Fs<'a, D> {
         if !(2..blocks).contains(&ptr.0.0) {
             return Err(Error::Corrupt);
         }
-        self.disk.read(ptr.0.0, from_mut(&mut self.cache[slot]))?;
+        self.fetch(ptr.0, slot)?;
         let n = &self.cache[slot];
         if Sum(le64(n, END)) != ptr.1
             || checksum(ptr.0, &n[..len]) != ptr.1
@@ -2042,7 +2079,7 @@ impl<'a, D: Disk> Fs<'a, D> {
         let s = self.victim();
         (self.finger, self.start) = (None, (NONE, 0));
         self.blk[s] = EMPTY;
-        self.disk.read(p.block.0, from_mut(&mut self.cache[s]))?;
+        self.fetch(p.block, s)?;
         self.check(s, p, level, lo, hi)?;
         (self.blk[s], self.stamp[s]) = (p.block, self.clock);
         Ok(s)
