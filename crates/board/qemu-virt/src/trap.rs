@@ -77,9 +77,8 @@ unsafe extern "C" fn board_unlock_work(frame: usize) -> Resume {
     // SAFETY: trap context.
     let deferred = unsafe { DEFERRED.with_masked(core::mem::take) };
     if let Some(stack) = deferred.stack {
-        // Before `KERNEL` goes, so a count of free frames taken under it sees the stack. The witness of no lock is
-        // `FRAMES`'s: it comes after `KERNEL` in the order.
-        // SAFETY: the trap exit holds only `KERNEL`, which `FRAMES` comes after.
+        // Before `KERNEL` goes: core 0 cannot resume the boot context and count free frames until it is free.
+        // SAFETY: the trap exit holds only `KERNEL`, and `FRAMES`, the one lock taken under this witness, comes after it.
         free_stack(&mut FRAMES.lock_masked(&mut unsafe { arch::root() }), stack);
     }
     // SAFETY: the caller's contract.

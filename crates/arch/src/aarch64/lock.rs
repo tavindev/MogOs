@@ -54,7 +54,8 @@ pub unsafe fn enter_percpu(index: usize, area: usize) {
 ///
 /// # Safety
 ///
-/// The caller holds no lock: a witness made while locks are held would let locks be taken out of order.
+/// The caller holds no lock, or only locks that every lock it takes under this witness comes after: a witness made
+/// while other locks are held would let locks be taken out of order.
 pub unsafe fn root() -> W<'static, Unlocked> {
     lock_order::root()
 }

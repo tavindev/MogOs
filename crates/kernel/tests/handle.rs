@@ -102,11 +102,12 @@ fn a_lookup_racing_close_and_dup_sees_the_old_or_the_new_entry_never_a_torn_one(
     use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
     let table = Table::new();
-    let done = AtomicBool::new(false);
+    let (done, saw_change) = (AtomicBool::new(false), AtomicBool::new(false));
     std::thread::scope(|scope| {
         scope.spawn(|| {
             let mut process = Process { next: 0 };
-            for i in 1..200_000usize {
+            // Until the reader has seen a write land under it, however the host schedules the two.
+            for i in (1..).take_while(|&i| i < 200_000 || !saw_change.load(Relaxed)) {
                 let mut handles = Handles::new();
                 let object = match i % 3 {
                     0 => Some(Object::Process {
@@ -138,7 +139,10 @@ fn a_lookup_racing_close_and_dup_sees_the_old_or_the_new_entry_never_a_torn_one(
                 other => panic!("torn: {other:?}"),
             }
             read += 1;
-            changed += !table.unchanged(&seen) as u32;
+            if !table.unchanged(&seen) {
+                changed += 1;
+                saw_change.store(true, Relaxed);
+            }
         }
         assert!(read > 0 && changed > 0, "the recheck saw the writes");
     });

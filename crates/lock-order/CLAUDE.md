@@ -27,6 +27,8 @@ borrowing the guard, so no witness outlives its lock.
   nothing and has nothing after it (`lock_leaf`, no witness). A new level adds an impl for every earlier level, never
   a blanket impl.
 - Levels are types, not a const `LEVEL`: stable Rust cannot bound one const generic below another.
+- `ProcessTable` takes no lock yet: allocating and freeing a process index (`free_process`, `add_process`, `reap`,
+  `close`, `exited`) all run under `KERNEL` (step 26a), so a lock of its own would guard nothing `KERNEL` does not.
 
 ## How it's tested
 
