@@ -526,6 +526,7 @@ impl kernel::Board for QemuVirt {
     }
 
     fn report_speculation(&mut self) {
+        arch::install_vectors(conduit());
         records()[0].store(arch::record_speculation(conduit()), Release);
         let spec = loop {
             if let Some(spec) = arch::speculation(records()) {
@@ -589,7 +590,8 @@ extern "C" fn kmain() -> ! {
         _ => 0,
     };
     CONDUIT.store(method, Relaxed);
-    arch::install_vectors(conduit());
+    // The choice waits for `report_speculation`, after the `boot:` line and before any EL0 code on this core.
+    arch::install_boot_vectors();
     arch::timer::allow_user_counter();
     // The cores' table (`CPU_TABLE`), in one DTB walk for the cores: the boot core first.
     let table = &raw const __kernel_end as *mut u64;

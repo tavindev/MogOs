@@ -15,7 +15,7 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
 ## Responsibilities
 
 - `kmain`: turns on the MMU (`arch::enable_mmu`, first), reads the DTB at RAM base, stores its PSCI `method` (`CONDUIT`)
-  and installs core 0's vectors with it (`arch::install_vectors`), and, in one walk of its cores, writes the cores'
+  and installs core 0's boot table (`arch::install_boot_vectors`; the choice waits for `report_speculation`), and, in one walk of its cores, writes the cores'
   table right after the image (reserved with it): the MPIDR of each core by dense index (0 the boot core, the rest in
   DTB order), then the GIC's redistributor regions (base, frame count); maps any GiB of those regions past
   `KERNEL_ENTRIES` into the boot table (`arch::map_device_gib`; spawned address spaces copy them too, `gic_gibs`);
@@ -47,7 +47,7 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
   at `UART0`, like every other UART access. `test=bench-lock`'s `round_trips` (ticket vs test-and-set lock, `cpu()`, `PerCpu::with`) and `add_locked`; `test=bench-ipi`'s `ipi_round_trips` (`PING_SGI`, answered in `board_irq`);
   `test=smp`'s `cpus`, `cpu`, `online_cpus` (`ONLINE`) and `ticked_cpus` (`TICKED`, a count each core adds 1 to on
   its first tick, guarded by its `PerCpu<bool>` `TICK_COUNTED`, so no core reads another's per-CPU area).
-  `report_speculation` records core 0's vectors, waits until every started core has recorded its own
+  `report_speculation` chooses and records core 0's vectors (before any EL0 code on core 0), waits until every started core has recorded its own
   (`arch::speculation`), then prints `spec: ...`.
 - Processes and threads: `spawn_process`, `spawn`, `thread`, `map` (`src/process.rs`); `end_thread`, `end_process`,
   `exit_thread`, `exit_process`, `kill`, `release`, and `switch`, which moves SP_EL0 and TPIDR_EL0 on every switch with

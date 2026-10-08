@@ -30,11 +30,14 @@ enum Table {
     Firmware(Conduit),
     /// The branch loop `k` times, then `sb` (true) or `dsb nsh; isb`.
     Loop(u8, bool),
+    /// Until `install_vectors`: an exception from EL0 panics.
+    Boot,
 }
 
 /// The tables in `aarch64_vectors` order, 2 KiB apart (`trap.rs`).
-const TABLES: [Table; 16] = {
-    let mut tables = [Table::Plain; 16];
+const TABLES: [Table; 17] = {
+    let mut tables = [Table::Plain; 17];
+    tables[16] = Table::Boot;
     tables[1] = Table::ClearBhb;
     tables[2] = Table::Firmware(Conduit::Hvc);
     tables[3] = Table::Firmware(Conduit::Smc);
@@ -211,10 +214,29 @@ fn decide(conduit: Option<Conduit>) -> (u32, u32, Table) {
     (v2, bhb, table)
 }
 
-/// Picks this core's vector table from its own ID registers and the firmware behind `conduit` and writes `VBAR_EL1`,
-/// once; clears PSTATE.SSBS where FEAT_SSBS exists. `record_speculation` follows, off the boot path.
+/// Points `VBAR_EL1` at the boot table: the plain table for exceptions from EL1, a panic for any from EL0, so the
+/// decision (`install_vectors`) can wait until after boot but not past this core's first entry from EL0.
+pub fn install_boot_vectors() {
+    write_vbar(Table::Boot);
+}
+
+/// Picks this core's vector table from its own ID registers and the firmware behind `conduit` and writes `VBAR_EL1`;
+/// clears PSTATE.SSBS where FEAT_SSBS exists. Call before this core runs EL0 code; `record_speculation` follows.
 pub fn install_vectors(conduit: Option<Conduit>) {
     let (_, _, table) = decide(conduit);
+    write_vbar(table);
+    if field(sysreg!("id_aa64pfr1_el1"), 4) != 0 {
+        // SAFETY: `msr ssbs, #0`, which FEAT_SSBS defines; DSSBS = 0 in SCTLR_EL1 clears it on every later entry.
+        unsafe { asm!(".inst 0xd503403f", options(nomem, nostack, preserves_flags)) };
+    }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn aarch64_unchosen_vectors() -> ! {
+    panic!("exception from EL0 before this core chose its vector table")
+}
+
+fn write_vbar(table: Table) {
     let index = TABLES.iter().position(|&t| t == table).unwrap();
     // SAFETY: each table is a complete, 2 KiB aligned EL1 vector table, and the tables lie 2 KiB apart from
     // `aarch64_vectors` in `TABLES` order.
@@ -229,10 +251,6 @@ pub fn install_vectors(conduit: Option<Conduit>) {
             offset = in(reg) index * 2048,
         )
     };
-    if field(sysreg!("id_aa64pfr1_el1"), 4) != 0 {
-        // SAFETY: `msr ssbs, #0`, which FEAT_SSBS defines; DSSBS = 0 in SCTLR_EL1 clears it on every later entry.
-        unsafe { asm!(".inst 0xd503403f", options(nomem, nostack, preserves_flags)) };
-    }
 }
 
 /// This core's record for `speculation`: the table read back from `VBAR_EL1`, and v2, BHB, SSB, Meltdown and BSE as
@@ -385,6 +403,7 @@ impl fmt::Display for Speculation {
         )?;
         match TABLES[(self.record & 0xff) as usize] {
             Table::Plain => write!(f, "plain")?,
+            Table::Boot => write!(f, "boot")?,
             Table::ClearBhb => write!(f, "clearbhb")?,
             Table::Firmware(Conduit::Hvc) => write!(f, "fw3-hvc")?,
             Table::Firmware(Conduit::Smc) => write!(f, "fw3-smc")?,

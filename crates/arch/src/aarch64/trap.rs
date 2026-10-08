@@ -26,9 +26,11 @@ impl TrapFrame {
 global_asm!(
     r#"
 // kind: 0 plain, 1 clearbhb, 2 and 3 firmware workaround 3 by hvc and smc, 4 and 5 a loop of k with `dsb nsh; isb`
-// and with `sb`.
+// and with `sb`, 6 the boot table: an entry from EL0 before the core chose its table panics.
 .macro MITIGATE kind, k
-    .if \kind == 1
+    .if \kind == 6
+    bl aarch64_unchosen_vectors
+    .elseif \kind == 1
     hint #22 // clrbhb
     isb
     .elseif \kind == 2 || \kind == 3
@@ -42,7 +44,7 @@ global_asm!(
     smc #0
     .endif
     ldp x2, x3, [sp, #16]
-    .elseif \kind >= 4
+    .elseif \kind == 4 || \kind == 5
     mov x0, #\k
 1:  b . + 4
     subs x0, x0, #1
@@ -86,6 +88,7 @@ aarch64_vectors:
     TABLE 4, \k
     TABLE 5, \k
     .endr
+    TABLE 6
 
 .Ltrap:
     stp x2, x3, [sp, #16]
@@ -159,7 +162,7 @@ unsafe extern "C" {
     fn task_switch(frame: usize) -> usize;
 }
 
-/// Executes `brk #0`, which the handler skips; returning proves it was caught. Call after `install_vectors`.
+/// Executes `brk #0`, which the handler skips; returning proves it was caught. Call after a table is installed.
 ///
 /// # Safety
 ///
