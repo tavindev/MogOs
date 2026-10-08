@@ -53,7 +53,7 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
   read before `dispatch`: only the caller's own `thread` raises the count) skips the process lock and the recheck:
   its `TABLE_CALLS` take `KERNEL` first like the shared ones, its `dup` of a stateless object and its `close` take
   no lock but what the object's release needs, and its table writes skip the seqlock (`ProcessEntry::unshared` marks
-  the process `alone`; a holder under the lock clears it). `board_unlock` and `board_unlock_work`, called by the
+  the process `alone`; a table writer under the lock clears it). `board_unlock` and `board_unlock_work`, called by the
   trap exit, release `KERNEL`, the second after the hook's deferred work.
 - `Board::console` writes (`Console`) hold `CONSOLE` for a whole `write_fmt`, so no other `Console` line splits it (the unlocked writers below can); it is the PL011
   at `UART0`, like every other UART access. `test=bench-lock`'s `round_trips` (ticket vs test-and-set lock, `cpu()`, `PerCpu::with`) and `add_locked`; `test=bench-ipi`'s `ipi_round_trips` (`PING_SGI`, answered in `board_irq`);

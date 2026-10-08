@@ -15,7 +15,7 @@ pub struct Full;
 pub struct Process {
     pub next: u64,
     /// Whether its holder is the process's only thread, set by each holder before a table write: then no lookup can
-    /// race the write, which skips the seqlock's sequence and barriers. A holder under the lock sets it false.
+    /// race the write, which skips the seqlock's sequence and barriers. A table writer under the lock sets it false.
     pub alone: bool,
 }
 
