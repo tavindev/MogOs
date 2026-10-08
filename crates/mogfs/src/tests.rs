@@ -1435,7 +1435,17 @@ fn deleting_a_snapshot_frees_exactly_the_blocks_no_other_root_reaches() {
     fs.mount().unwrap();
     check_pinned(&mut fs, &snaps, "remount");
     for g in [snaps[1], snaps[3], snaps[0], snaps[2]] {
+        // Its nodes into the cache; none may answer for its blocks once they are free.
+        view_files(&mut fs, Snapshot(g)).unwrap();
         fs.delete_snapshot(Snapshot(g)).unwrap();
+        for s in fs.base..fs.top {
+            let b = fs.blk[s];
+            assert!(
+                fs.dirt[s] || b == EMPTY || fs.has(LIVE, b) || fs.has(PINNED, b),
+                "delete {g}: slot {s} still caches block {}",
+                b.0
+            );
+        }
         snaps.retain(|&s| s != g);
         check_pinned(&mut fs, &snaps, &format!("delete {g}"));
         fs.commit().unwrap();
