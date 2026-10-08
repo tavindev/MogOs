@@ -108,6 +108,7 @@ impl<const M: usize> Entries<M> {
     }
 
     /// As `live`, but once the entry ended, frees it and returns its code.
+    #[inline]
     fn reap(&mut self, i: usize, generation: u64) -> Result<Option<u64>, i64> {
         if self.generation[i] != generation {
             return Err(EBADF);

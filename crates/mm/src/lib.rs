@@ -236,7 +236,7 @@ impl Budget {
 
     /// Refunds `count` frames `charge` took.
     pub fn refund(&self, count: usize) {
-        self.update(|limit, used| Some((limit, used - count as u64)));
+        self.0.fetch_sub(count as u64, Relaxed);
     }
 
     /// Lowers the limit by `frames`, which move to a child's budget; false, changing nothing, if fewer remain.
@@ -248,7 +248,7 @@ impl Budget {
 
     /// Raises the limit by `frames`, which came back from an exited child's budget.
     pub fn grow(&self, frames: usize) {
-        self.update(|limit, used| Some((limit + frames as u64, used)));
+        self.0.fetch_add((frames as u64) << 32, Relaxed);
     }
 
     /// Starts the budget over at `limit` with nothing charged, for the next process at an index.

@@ -208,9 +208,12 @@ impl Default for Handles {
 /// Words an entry's object is stored in: its tag, rights and handle generation, then two words of fields.
 type Words = [u64; 3];
 
-/// A mutex's tag, which `Table::mutex` tests alone.
-const MUTEX: u64 = 9;
-const MUTEX_TAG: u8 = MUTEX as u8;
+/// The tags the typed lookups (`Table::mutex`, `Table::io`) test alone.
+const CONSOLE: u8 = 1;
+const DIR: u8 = 6;
+const NODE: u8 = 7;
+const PIPE: u8 = 8;
+const MUTEX: u8 = 9;
 
 /// A handle table read without a lock: each entry is its words behind a 64-bit sequence (no wrap), a seqlock. Writers
 /// (every method taking `&mut Process`, the proof that the caller holds a process lock, this table's) store the
@@ -258,12 +261,29 @@ impl Table {
     #[inline(always)]
     pub fn mutex(&self, handle: Handle, seen: &mut Seen) -> Result<Mutex, i64> {
         match self.read(handle, seen)? {
-            [head, index, generation] if head >> 32 & 0xff == MUTEX => Ok(Mutex {
+            [head, index, generation] if (head >> 32) as u8 == MUTEX => Ok(Mutex {
                 index: index as u32,
                 generation,
             }),
             _ => Err(EACCES),
         }
+    }
+
+    /// The object an `io` on `handle` reaches if it holds every right in `need`, decoding only the console, a pipe end,
+    /// a file and a directory (`None` for another object); recorded in `seen`.
+    #[inline(always)]
+    pub fn io(&self, handle: Handle, need: Rights, seen: &mut Seen) -> Result<Option<Object>, i64> {
+        let [head, a, b] = self.read(handle, seen)?;
+        if (head >> 40) & need != need {
+            return Err(EACCES);
+        }
+        Ok(match (head >> 32) as u8 {
+            CONSOLE => Some(Object::Console),
+            PIPE => Some(Object::Pipe(pipe_end(a, b))),
+            NODE => Some(Object::Node(Inode::from_raw(a))),
+            DIR => Some(Object::Dir(Inode::from_raw(a))),
+            _ => None,
+        })
     }
 
     /// The words of the entry `handle` names, read without a lock (`EBADF` if it is empty or another generation's);
@@ -415,15 +435,15 @@ fn encode((generation, entry): (u32, Option<(Object, Rights)>)) -> Words {
         return [u64::from(generation), 0, 0];
     };
     let (tag, a, b) = match object {
-        Object::Console => (1, 0, 0),
+        Object::Console => (CONSOLE, 0, 0),
         Object::Process { index, generation } => (2, index as u64, generation),
         Object::Thread { slot, generation } => (3, slot as u64, generation),
         Object::Archive => (4, 0, 0),
         Object::File { start, end } => (5, start as u64, end as u64),
-        Object::Dir(inode) => (6, inode.raw(), 0),
-        Object::Node(inode) => (7, inode.raw(), 0),
+        Object::Dir(inode) => (DIR, inode.raw(), 0),
+        Object::Node(inode) => (NODE, inode.raw(), 0),
         Object::Pipe(end) => (
-            8,
+            PIPE,
             u64::from(end.index) | u64::from(end.write) << 32,
             end.generation,
         ),
@@ -431,13 +451,23 @@ fn encode((generation, entry): (u32, Option<(Object, Rights)>)) -> Words {
         Object::NetStack => (10, 0, 0),
         Object::Socket(sock) => (11, sock.index.into(), sock.generation),
     };
+    let tag = u64::from(tag);
     [u64::from(generation) | tag << 32 | rights << 40, a, b]
+}
+
+#[inline(always)]
+fn pipe_end(a: u64, generation: u64) -> End {
+    End {
+        index: a as u32,
+        write: a >> 32 != 0,
+        generation,
+    }
 }
 
 #[inline(always)]
 fn decode([head, a, b]: Words) -> (u32, Option<(Object, Rights)>) {
     let object = match (head >> 32) as u8 {
-        1 => Object::Console,
+        CONSOLE => Object::Console,
         2 => Object::Process {
             index: a as usize,
             generation: b,
@@ -451,14 +481,10 @@ fn decode([head, a, b]: Words) -> (u32, Option<(Object, Rights)>) {
             start: a as usize,
             end: b as usize,
         },
-        6 => Object::Dir(Inode::from_raw(a)),
-        7 => Object::Node(Inode::from_raw(a)),
-        8 => Object::Pipe(End {
-            index: a as u32,
-            write: a >> 32 != 0,
-            generation: b,
-        }),
-        MUTEX_TAG => Object::Mutex(Mutex {
+        DIR => Object::Dir(Inode::from_raw(a)),
+        NODE => Object::Node(Inode::from_raw(a)),
+        PIPE => Object::Pipe(pipe_end(a, b)),
+        MUTEX => Object::Mutex(Mutex {
             index: a as u32,
             generation: b,
         }),

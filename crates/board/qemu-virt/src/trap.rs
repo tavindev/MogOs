@@ -384,6 +384,7 @@ fn release(
 
 /// The exited process `child` was freed (reaped, or its last handle closed): its budget's limit moves to `holder`, but
 /// for the pipe pages still charged to it, which stay held until those pipes close.
+#[inline(always)]
 fn reaped(pipes: &mut Pipes<MAX_PIPES>, child: (usize, u64), holder: usize) {
     let limit = PROCESSES[child.0].budget.take();
     let held = pipes.charged_to(child);
@@ -539,7 +540,10 @@ unsafe extern "C" fn board_syscall(frame: &mut arch::TrapFrame) -> Resume {
     }
     // SAFETY: the caller masked IRQs.
     let entry = &PROCESSES[unsafe { CURRENT.with_masked(|current| *current) }];
-    if nr != IO && nr < 64 && TABLE_CALLS >> nr & 1 != 0 && entry.alone() {
+    // Read before `dispatch`, so a lookup it vouches for needs no recheck; only the caller's own `thread` changes it.
+    // `io` rechecks instead: no read on the console path.
+    let alone = nr != IO && entry.alone();
+    if alone && nr < 64 && TABLE_CALLS >> nr & 1 != 0 {
         // SAFETY: the caller's contract, and it is its process's only thread.
         return unsafe { kernel_first(&mut root, frame) };
     }
@@ -556,13 +560,13 @@ unsafe extern "C" fn board_syscall(frame: &mut arch::TrapFrame) -> Resume {
             object:
                 object @ (Object::Console | Object::Archive | Object::File { .. } | Object::NetStack),
             rights,
-        }) if entry.alone() => {
+        }) if alone => {
             // SAFETY: the caller is its process's only thread, so nothing else reaches the process's data (`alone`).
             let process = unsafe { entry.lock.unshared() };
             let handle = entry.handles.insert(process, object, rights);
             handle.unwrap_or_else(|error| error as u64)
         }
-        Ok(Call::Close(handle)) if entry.alone() => {
+        Ok(Call::Close(handle)) if alone => {
             // SAFETY: as above.
             let process = unsafe { entry.lock.unshared() };
             close(&mut root, (&entry.handles, process), handle).unwrap_or_else(|error| error as u64)
@@ -576,7 +580,7 @@ unsafe extern "C" fn board_syscall(frame: &mut arch::TrapFrame) -> Resume {
             | Call::Spawn { .. }
             | Call::Thread { .. }
             | Call::Net(NetCall::Socket(_) | NetCall::IoWait)),
-        ) => return table_call(&mut root, entry, &seen, frame, call),
+        ) => return table_call(&mut root, entry, (alone, &seen), frame, call),
         Ok(Call::Pipe { end, ptr, len }) => {
             return pipe_call(&mut root, entry, &seen, frame, (end, ptr, len));
         }
@@ -600,7 +604,7 @@ fn pipe_call(
 ) -> Resume {
     let (kernel, mut w) = Guard::leak(KERNEL.lock_masked(root));
     let at = frame as *mut arch::TrapFrame as usize;
-    if !entry.alone() && !entry.handles.unchanged(seen) {
+    if !entry.handles.unchanged(seen) {
         frame.restart();
         return Resume::locked(at, false);
     }
@@ -660,7 +664,7 @@ fn kernel_call(
     call: Call,
 ) -> Resume {
     let (kernel, mut w) = Guard::leak(KERNEL.lock_masked(root));
-    if !entry.alone() && !entry.handles.unchanged(seen) {
+    if !entry.handles.unchanged(seen) {
         frame.restart();
         return Resume::locked(frame as *mut arch::TrapFrame as usize, false);
     }
@@ -690,8 +694,6 @@ fn write(root: &mut W<'_, level::Unlocked>, ptr: u64, len: usize) -> u64 {
     }
 }
 
-/// A call that writes the current process's handle table: under its lock, then `KERNEL` (released before returning,
-/// as no table call switches), each table write after every step that can fail. An `io_wait` that must block marks
 /// A call that writes the current process's handle table: under its lock (unless the caller is its only thread, which
 /// then needs neither the lock nor the recheck of its lookups), then `KERNEL` (released before returning, as no table
 /// call switches), each table write after every step that can fail. An `io_wait` that must block marks itself blocked
@@ -700,13 +702,13 @@ fn write(root: &mut W<'_, level::Unlocked>, ptr: u64, len: usize) -> u64 {
 fn table_call(
     root: &mut W<'_, level::Unlocked>,
     entry: &ProcessEntry,
-    seen: &Seen,
+    (alone, seen): (bool, &Seen),
     frame: &mut arch::TrapFrame,
     call: &Call,
 ) -> Resume {
     let at = frame as *mut arch::TrapFrame as usize;
     let table = &*entry.handles;
-    let result = if entry.alone() {
+    let result = if alone {
         // SAFETY: the caller is its process's only thread, so nothing else reaches the process's data (`alone`).
         let process = unsafe { entry.lock.unshared() };
         table_work(root, (table, process), frame, call)
@@ -1180,7 +1182,11 @@ unsafe fn syscall(
 ///
 /// # Safety
 /// Trap context.
+#[inline(always)]
 unsafe fn read_line(line: &mut kernel::console::Line, ptr: u64, len: usize) -> Option<u64> {
+    if len == 0 {
+        return Some(0);
+    }
     let Some(out) = UserOut::new(ptr, len) else {
         return Some(EFAULT as u64);
     };

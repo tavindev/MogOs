@@ -439,23 +439,23 @@ pub fn dispatch<C: Clamp>(
                 [handle(args[0]), offset(args[2]), io_len, args[4]],
                 [HANDLE, room(io_len), LEN, MAX_FILE_SIZE + 1],
             );
-            let object = handles.get(Handle::clamped(args[0], h), need, seen)?;
+            let object = handles.io(Handle::clamped(args[0], h), need, seen)?;
             user_buffer(args[2], io_len)?;
             let (ptr, len) = (USER.start + ptr, len as usize);
             match object {
-                Object::Console if op == IO_WRITE => Ok(Call::Write { ptr, len }),
-                Object::Console => Ok(Call::Read { ptr, len }),
-                Object::Pipe(end) if end.write == (op == IO_WRITE) => {
+                Some(Object::Console) if op == IO_WRITE => Ok(Call::Write { ptr, len }),
+                Some(Object::Console) => Ok(Call::Read { ptr, len }),
+                Some(Object::Pipe(end)) if end.write == (op == IO_WRITE) => {
                     Ok(Call::Pipe { end, ptr, len })
                 }
-                Object::Node(inode) => Ok(Call::File {
+                Some(Object::Node(inode)) => Ok(Call::File {
                     inode,
                     write: op == IO_WRITE,
                     offset: file_offset,
                     ptr,
                     len,
                 }),
-                Object::Dir(_) => Err(EISDIR),
+                Some(Object::Dir(_)) => Err(EISDIR),
                 _ => Err(EACCES),
             }
         }
