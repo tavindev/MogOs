@@ -6,13 +6,13 @@ use core::ops::{Deref, Range};
 use core::ptr;
 use core::slice;
 use core::sync::atomic::AtomicU32;
-use core::sync::atomic::Ordering::{Acquire, Relaxed};
+use core::sync::atomic::Ordering::Relaxed;
 
 use arch::{Lock, UserAccess, user_page};
 use kernel::elf::{Elf, Segment};
 use kernel::handle::{
-    CONNECT, DUPLICATE, Handles, KILL, LISTEN, MAX_HANDLES, Object, READ, Rights, TRANSFER, Table,
-    WAIT, WRITE,
+    Alone, CONNECT, DUPLICATE, Handles, KILL, LISTEN, MAX_HANDLES, Object, OnlyThread, READ,
+    Rights, TRANSFER, Table, WAIT, WRITE, Writer,
 };
 use kernel::syscall::{EAGAIN, EFAULT, ENOBUFS, ENOEXEC, ENOMEM, MAX_BUFFER, MAX_MAP};
 use kernel::{FRAME_WORDS, Process, Program};
@@ -39,26 +39,24 @@ pub(crate) struct ProcessEntry {
 }
 
 impl ProcessEntry {
-    /// Whether the calling thread is its process's only one. Then nothing else writes the process's table or reaches
-    /// its lock's data (a sibling that ended released the lock before the end that lowered the count), so the call
-    /// may skip that lock and the recheck of its lookups, if it read this before them: a sibling may end between.
+    /// Proof that the calling thread is its process's only one: then nothing else writes the process's table or
+    /// reaches its lock's data (a sibling that ended released the lock before the end that lowered the count), and no
+    /// other core looks the table up, so the call may skip that lock, the recheck of lookups made after this read, and
+    /// the seqlock of its table writes. Only the caller's own `thread` raises the count, so the proof holds for the
+    /// rest of the call.
     #[inline(always)]
-    pub(crate) fn alone(&self) -> bool {
-        self.threads.load(Acquire) == 1
+    pub(crate) fn alone(&self) -> Option<OnlyThread> {
+        OnlyThread::of(&self.threads)
     }
 
-    /// The process's data without its lock, marked `alone`, so its table's writes skip the seqlock.
+    /// The process's data without its lock, as a table writer that skips the seqlock.
     ///
     /// # Safety
-    /// Nothing else reaches the process's data or looks its table up: the caller is its only thread, or none is left
-    /// or started yet.
+    /// Nothing else reaches the process's data: the caller is its only thread (`only`), or none is left or started.
     #[inline(always)]
-    #[allow(clippy::mut_from_ref)]
-    pub(crate) unsafe fn unshared(&self) -> &mut Process {
+    pub(crate) unsafe fn unshared(&self, only: OnlyThread) -> Alone<'_> {
         // SAFETY: the caller's contract.
-        let process = unsafe { self.lock.unshared() };
-        process.alone = true;
-        process
+        Alone::new(unsafe { self.lock.unshared() }, only)
     }
 }
 
@@ -75,10 +73,7 @@ impl<T> Deref for Line<T> {
 
 pub(crate) static PROCESSES: [ProcessEntry; MAX_PROCESSES] = [const {
     ProcessEntry {
-        lock: Line(Lock::new(Process {
-            next: 0,
-            alone: false,
-        })),
+        lock: Line(Lock::new(Process { next: 0 })),
         budget: Line(Budget::new(0)),
         threads: Line(AtomicU32::new(0)),
         handles: Line(Table::new()),
@@ -94,11 +89,14 @@ pub(crate) static PROCESSES: [ProcessEntry; MAX_PROCESSES] = [const {
 unsafe fn start_entry(index: usize, next: u64, budget: usize, handles: &Handles) {
     let entry = &PROCESSES[index];
     // SAFETY: the caller's contract: nothing else reaches the unpublished process's data.
-    let process = unsafe { entry.unshared() };
-    process.next = next;
+    unsafe { entry.lock.unshared() }.next = next;
     entry.threads.store(1, Relaxed);
     entry.budget.reset(budget);
-    entry.handles.commit(process, handles);
+    let only = entry.alone().expect("one thread, not yet started");
+    // SAFETY: as above.
+    entry
+        .handles
+        .commit(&mut unsafe { entry.unshared(only) }, handles);
 }
 
 /// Returns a thread's kernel stack at `stack` to `frames` (its process's budget refunded apart, under `KERNEL`).
@@ -153,7 +151,7 @@ pub(crate) fn map(
 ) -> Option<u64> {
     if alone {
         // SAFETY: the caller is its process's only thread, so nothing else reaches the process's data (`alone`).
-        return map_pages(entry, unsafe { entry.unshared() }, root, pages);
+        return map_pages(entry, unsafe { entry.lock.unshared() }, root, pages);
     }
     let mut guard = entry.lock.lock_masked(root);
     let (process, mut w) = guard.parts();
@@ -377,7 +375,7 @@ pub(crate) fn spawn_init(
 /// table (`table`, under its lock) changes last, once the child is complete.
 pub(crate) fn spawn(
     (sched, w, cpu): (&mut Sched, &mut W<'_, level::Kernel>, usize),
-    (table, parent): (&Table, &mut Process),
+    (table, parent): (&Table, &mut impl Writer),
     buf: &mut [u8],
     file: Range<usize>,
     (ptr, len): (u64, usize),
@@ -428,7 +426,7 @@ pub(crate) fn spawn(
 /// end gets `EAGAIN`, so a process being ended gains no thread.
 pub(crate) fn thread(
     (sched, w, cpu): (&mut Sched, &mut W<'_, level::Kernel>, usize),
-    (table, process): (&Table, &mut Process),
+    (table, process): (&Table, &mut impl Writer),
     entry: u64,
     (sp, tls): (u64, u64),
     arg: u64,
@@ -449,6 +447,7 @@ pub(crate) fn thread(
     PROCESSES[index].threads.fetch_add(1, Relaxed);
     let thread = Object::Thread { slot, generation };
     sched.held(thread);
+    // An `Alone` writer stays one: the new thread starts only once this hold of `KERNEL` ends, after the fill.
     Ok(table.fill(process, at, thread, WAIT | KILL | DUPLICATE | TRANSFER))
 }
 

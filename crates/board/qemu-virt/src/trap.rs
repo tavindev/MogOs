@@ -4,13 +4,15 @@ use core::fmt::Write;
 use core::sync::atomic::Ordering::{Relaxed, Release};
 
 use arch::{Guard, Resume};
-use kernel::handle::{DUPLICATE, Handle, Handles, Object, READ, Seen, TRANSFER, Table, WRITE};
+use kernel::handle::{
+    DUPLICATE, Handle, Handles, Object, OnlyThread, READ, Seen, TRANSFER, Table, WRITE, Writer,
+};
 use kernel::pipe::{self, End, Pipes};
 use kernel::syscall::{
     Call, EBADF, EFAULT, ENFILE, ENOENT, ENOMEM, IO, KILLED, MAX_BUFFER, NetCall, SHARED_CALLS,
-    TABLE_CALLS, dispatch,
+    TABLE_CALLS, dispatch, dispatch_io,
 };
-use kernel::{Event, Process, file};
+use kernel::{Event, file};
 use lock_order::{self as level, LockAfter, W};
 use mm::PhysAddr;
 
@@ -127,12 +129,13 @@ unsafe fn after_end(
 /// `finish_release`'s release.
 fn release_process(kernel: &mut Kernel, w: &mut W<'_, level::Kernel>, (index, code): (usize, u64)) {
     let entry = &PROCESSES[index];
+    let only = entry.alone().expect("no thread left");
     // SAFETY: the process's last thread ended under the `KERNEL` this hold has, so no thread of it holds or takes its
     // lock, and no other process takes it.
-    let process = unsafe { entry.unshared() };
-    entry
-        .handles
-        .take(process, |object| release(kernel, w, (object, index), None));
+    let mut process = unsafe { entry.unshared(only) };
+    entry.handles.take(&mut process, |object| {
+        release(kernel, w, (object, index), None)
+    });
     let mut frames = FRAMES.lock_masked(w);
     let l1 = kernel.sched.space(index);
     arch::flush_asid(index);
@@ -396,7 +399,7 @@ fn new_pipe(
     kernel: &mut Kernel,
     w: &mut W<'_, level::Kernel>,
     cpu: usize,
-    (table, process): (&Table, &mut Process),
+    (table, process): (&Table, &mut impl Writer),
 ) -> Result<(u64, u64), i64> {
     let Kernel { sched, pipes, .. } = kernel;
     let read = pipes.free().ok_or(ENFILE)?;
@@ -530,46 +533,98 @@ fn with_output(
 /// Trap context (IRQs masked), and `frame` the current process's.
 #[unsafe(no_mangle)]
 unsafe extern "C" fn board_syscall(frame: &mut arch::TrapFrame) -> Resume {
-    // SAFETY: a trap hook's entry, which holds no lock.
+    // Each a function of its own: `io`'s path saves no register it does not use.
+    match frame.x[8] {
+        // SAFETY: the caller's contract.
+        IO => unsafe { io_call(frame) },
+        // SAFETY: the caller's contract.
+        nr if nr < 64 && SHARED_CALLS >> nr & 1 != 0 => unsafe { shared_call(frame) },
+        nr => {
+            // SAFETY: the caller masked IRQs.
+            let entry = &PROCESSES[unsafe { CURRENT.with_masked(|current| *current) }];
+            // Read before `dispatch`, so a lookup it vouches for needs no recheck; only the caller's own `thread`
+            // raises it.
+            match entry.alone() {
+                // SAFETY: the caller's contract.
+                Some(only) if nr < 64 && TABLE_CALLS >> nr & 1 != 0 => unsafe {
+                    alone_table_call(frame, entry, only)
+                },
+                // SAFETY: the caller's contract.
+                alone => unsafe { other_call(frame, entry, alone) },
+            }
+        }
+    }
+}
+
+/// A call on shared state alone (`SHARED_CALLS`): takes `KERNEL` before its lookups, so a sibling's `close` of an entry
+/// they read releases the object only after the call, and returns holding it.
+///
+/// # Safety
+/// As `board_syscall`.
+#[inline(never)]
+unsafe extern "C" fn shared_call(frame: &mut arch::TrapFrame) -> Resume {
+    // SAFETY: a trap hook's call, which holds no lock.
+    let mut root = unsafe { arch::root() };
+    // SAFETY: the caller's contract.
+    unsafe { kernel_first(&mut root, frame, None) }
+}
+
+/// A table call of a process's only thread (`entry`'s): `KERNEL` first, no process lock.
+///
+/// # Safety
+/// As `board_syscall`, and the caller is its process's only thread.
+#[inline(never)]
+#[allow(improper_ctypes_definitions)] // `extern "C"` for the tail call, from Rust only.
+unsafe extern "C" fn alone_table_call(
+    frame: &mut arch::TrapFrame,
+    entry: &ProcessEntry,
+    only: OnlyThread,
+) -> Resume {
+    // SAFETY: a trap hook's call, which holds no lock.
+    let mut root = unsafe { arch::root() };
+    // SAFETY: the caller's contract.
+    unsafe { kernel_first(&mut root, frame, Some((entry, only))) }
+}
+
+/// Every call but `io`, the shared ones and an only thread's table calls: the caller's own process's (`entry`), under
+/// its lock or none (`alone`, read before any lookup).
+///
+/// # Safety
+/// As `board_syscall`.
+#[inline(never)]
+#[allow(improper_ctypes_definitions)] // `extern "C"` for the tail call, from Rust only.
+unsafe extern "C" fn other_call(
+    frame: &mut arch::TrapFrame,
+    entry: &ProcessEntry,
+    alone: Option<OnlyThread>,
+) -> Resume {
+    // SAFETY: a trap hook's call, which holds no lock.
     let mut root = unsafe { arch::root() };
     let nr = frame.x[8];
-    // `io` (the hot calls) is neither shared nor a table call: one test.
-    if nr != IO && nr < 64 && SHARED_CALLS >> nr & 1 != 0 {
-        // SAFETY: the caller's contract.
-        return unsafe { kernel_first(&mut root, frame, None) };
-    }
-    // SAFETY: the caller masked IRQs.
-    let entry = &PROCESSES[unsafe { CURRENT.with_masked(|current| *current) }];
-    // Read before `dispatch`, so a lookup it vouches for needs no recheck; only the caller's own `thread` raises it.
-    // `io` rechecks instead: no read on the console path.
-    let alone = nr != IO && entry.alone();
-    if alone && nr < 64 && TABLE_CALLS >> nr & 1 != 0 {
-        // SAFETY: the caller's contract, and it is its process's only thread.
-        return unsafe { kernel_first(&mut root, frame, Some(entry)) };
-    }
     let mut seen = Seen::default();
     let args = frame.x.first_chunk().unwrap();
     let call = dispatch::<Nospec>(nr, args, &entry.handles, &mut seen);
     let at = frame as *mut arch::TrapFrame as usize;
-    // `Write` first and alone: the hot path tests one discriminant.
     frame.x[0] = match call {
-        Ok(Call::Write { ptr, len }) => write(&mut root, ptr, len),
-        Ok(Call::Map { pages }) => map((entry, alone), &mut root, pages).unwrap_or(ENOMEM as u64),
+        Ok(Call::Map { pages }) => {
+            map((entry, alone.is_some()), &mut root, pages).unwrap_or(ENOMEM as u64)
+        }
         // The caller alone: no lock, unless a closed handle's object needs `KERNEL`.
         Ok(Call::Dup {
             object:
                 object @ (Object::Console | Object::Archive | Object::File { .. } | Object::NetStack),
             rights,
-        }) if alone => {
-            // SAFETY: the caller is its process's only thread, so nothing else reaches the process's data (`alone`).
-            let process = unsafe { entry.unshared() };
-            let handle = entry.handles.insert(process, object, rights);
+        }) if let Some(only) = alone => {
+            // SAFETY: the caller is its process's only thread, so nothing else reaches the process's data.
+            let mut process = unsafe { entry.unshared(only) };
+            let handle = entry.handles.insert(&mut process, object, rights);
             handle.unwrap_or_else(|error| error as u64)
         }
-        Ok(Call::Close(handle)) if alone => {
+        Ok(Call::Close(handle)) if let Some(only) = alone => {
             // SAFETY: as above.
-            let process = unsafe { entry.unshared() };
-            close(&mut root, (&entry.handles, process), handle).unwrap_or_else(|error| error as u64)
+            let mut process = unsafe { entry.unshared(only) };
+            let table = (&*entry.handles, &mut process);
+            close(&mut root, table, handle).unwrap_or_else(|error| error as u64)
         }
         Ok(
             ref call @ (Call::Dup { .. }
@@ -581,13 +636,34 @@ unsafe extern "C" fn board_syscall(frame: &mut arch::TrapFrame) -> Resume {
             | Call::Thread { .. }
             | Call::Net(NetCall::Socket(_) | NetCall::IoWait)),
         ) => return table_call(&mut root, entry, (alone, &seen), frame, call),
+        Ok(_) => unreachable!("a shared call or io"),
+        Err(error) => error as u64,
+    };
+    Resume::unlocked(at)
+}
+
+/// `io`, a function of its own so its arms inline: a console write takes `CONSOLE` alone; the rest take `KERNEL`,
+/// recheck their lookup and return holding it.
+///
+/// # Safety
+/// As `board_syscall`.
+#[inline(never)]
+unsafe extern "C" fn io_call(frame: &mut arch::TrapFrame) -> Resume {
+    // SAFETY: a trap hook's call, which holds no lock.
+    let mut root = unsafe { arch::root() };
+    // SAFETY: the caller masked IRQs.
+    let entry = &PROCESSES[unsafe { CURRENT.with_masked(|current| *current) }];
+    let mut seen = Seen::default();
+    let args = frame.x.first_chunk().unwrap();
+    let call = dispatch_io::<Nospec>(args, &entry.handles, &mut seen);
+    let at = frame as *mut arch::TrapFrame as usize;
+    // `Write` first and alone: the hot path tests one discriminant.
+    frame.x[0] = match call {
+        Ok(Call::Write { ptr, len }) => write(&mut root, ptr, len),
         Ok(Call::Pipe { end, ptr, len }) => {
             return pipe_call(&mut root, entry, &seen, frame, (end, ptr, len));
         }
-        Ok(call @ (Call::Read { .. } | Call::File { .. })) => {
-            return kernel_call(&mut root, entry, &seen, frame, call);
-        }
-        Ok(_) => unreachable!("a shared call"),
+        Ok(call) => return kernel_call(&mut root, entry, &seen, frame, call),
         Err(error) => error as u64,
     };
     Resume::unlocked(at)
@@ -642,16 +718,19 @@ fn pipe_call(
 unsafe fn kernel_first(
     root: &mut W<'_, level::Unlocked>,
     frame: &mut arch::TrapFrame,
-    entry: Option<&ProcessEntry>,
+    entry: Option<(&ProcessEntry, OnlyThread)>,
 ) -> Resume {
     let (kernel, mut w) = Guard::leak(KERNEL.lock_masked(root));
     // Before `dispatch`: nothing between it and the match keeps the two from fusing.
     let cpu = arch::cpu();
-    let entry = entry.unwrap_or_else(|| &PROCESSES[kernel.sched.process(cpu)]);
+    let (entry, only) = match entry {
+        Some((entry, only)) => (entry, Some(only)),
+        None => (&PROCESSES[kernel.sched.process(cpu)], None),
+    };
     let args = frame.x.first_chunk().unwrap();
     let call = dispatch::<Nospec>(frame.x[8], args, &entry.handles, &mut Seen::default());
     // SAFETY: the caller's contract.
-    let next = unsafe { syscall(kernel, &mut w, (cpu, entry), frame, call) };
+    let next = unsafe { syscall(kernel, &mut w, (cpu, entry, only), frame, call) };
     // SAFETY: trap context, and `next` the frame this hook resumes.
     let (next, parked) = unsafe { finish_release(kernel, &mut w, cpu, next) };
     kick(&mut kernel.sched, cpu);
@@ -674,7 +753,7 @@ fn kernel_call(
     }
     let cpu = arch::cpu();
     // SAFETY: trap context, and `frame` the current process's (`board_syscall`'s contract).
-    let next = unsafe { syscall(kernel, &mut w, (cpu, entry), frame, Ok(call)) };
+    let next = unsafe { io_locked(kernel, &mut w, cpu, frame, call) };
     // SAFETY: trap context, and `next` the frame this hook resumes.
     let (next, parked) = unsafe { finish_release(kernel, &mut w, cpu, next) };
     kick(&mut kernel.sched, cpu);
@@ -706,20 +785,19 @@ fn write(root: &mut W<'_, level::Unlocked>, ptr: u64, len: usize) -> u64 {
 fn table_call(
     root: &mut W<'_, level::Unlocked>,
     entry: &ProcessEntry,
-    (alone, seen): (bool, &Seen),
+    (alone, seen): (Option<OnlyThread>, &Seen),
     frame: &mut arch::TrapFrame,
     call: &Call,
 ) -> Resume {
     let at = frame as *mut arch::TrapFrame as usize;
     let table = &*entry.handles;
-    let result = if alone {
-        // SAFETY: the caller is its process's only thread, so nothing else reaches the process's data (`alone`).
-        let process = unsafe { entry.unshared() };
-        table_work(root, (table, process), frame, call)
+    let result = if let Some(only) = alone {
+        // SAFETY: the caller is its process's only thread, so nothing else reaches the process's data.
+        let mut process = unsafe { entry.unshared(only) };
+        table_work(root, (table, &mut process), frame, call)
     } else {
         let mut guard = entry.lock.lock_masked(root);
         let (process, mut pw) = guard.parts();
-        process.alone = false;
         if !table.unchanged(seen) {
             frame.restart();
             return Resume::unlocked(at);
@@ -741,7 +819,7 @@ fn table_call(
 #[inline(always)]
 fn table_work<P>(
     w: &mut W<'_, P>,
-    (table, process): (&Table, &mut Process),
+    (table, process): (&Table, &mut impl Writer),
     frame: &mut arch::TrapFrame,
     call: &Call,
 ) -> Option<Result<u64, i64>>
@@ -771,7 +849,7 @@ where
 #[inline(always)]
 fn close<P>(
     w: &mut W<'_, P>,
-    (table, process): (&Table, &mut Process),
+    (table, process): (&Table, &mut impl Writer),
     handle: Handle,
 ) -> Result<u64, i64>
 where
@@ -819,7 +897,7 @@ fn locked_table_call(
     kernel: &mut Kernel,
     w: &mut W<'_, level::Kernel>,
     cpu: usize,
-    (table, process): (&Table, &mut Process),
+    (table, process): (&Table, &mut impl Writer),
     frame: &mut arch::TrapFrame,
     call: &Call,
 ) -> Option<Result<u64, i64>> {
@@ -943,67 +1021,26 @@ fn locked_table_call(
     })
 }
 
-/// Runs a syscall of `cpu`'s current process (`entry`) that needs `KERNEL`, or returns `dispatch`'s error; returns the
-/// frame to resume.
+/// Runs `io`'s console read or file call of `cpu`'s current process under `KERNEL`; returns the frame to resume.
 ///
 /// # Safety
-/// Trap context (IRQs masked), and `frame` `cpu`'s current process's; for a table call (`TABLE_CALLS`), the caller is
-/// its process's only thread.
+/// Trap context (IRQs masked), and `frame` `cpu`'s current process's.
 #[inline(always)]
-unsafe fn syscall(
+unsafe fn io_locked(
     kernel: &mut Kernel,
     w: &mut W<'_, level::Kernel>,
-    (cpu, entry): (usize, &ProcessEntry),
+    cpu: usize,
     frame: &mut arch::TrapFrame,
-    call: Result<Call, i64>,
+    call: Call,
 ) -> usize {
     let at = frame as *mut arch::TrapFrame as usize;
-    let Kernel {
-        sched,
-        pipes,
-        mutexes,
-        line,
-        fs,
-        opens,
-        ..
-    } = kernel;
-    let ok = |result: Result<(), i64>| result.map_or_else(|error| error as u64, |()| 0);
-    let call = match call {
-        Ok(call) => call,
-        Err(error) => {
-            frame.x[0] = error as u64;
-            return at;
-        }
-    };
+    let Kernel { line, fs, .. } = kernel;
     frame.x[0] = match call {
-        Call::Exit(code) => {
-            // SAFETY: the caller masked IRQs, and `frame` is the current process's.
-            return unsafe { exit_process(kernel, w, cpu, at, code) };
-        }
-        Call::ThreadExit(code) => {
-            // SAFETY: as above.
-            return unsafe { exit_thread(kernel, w, cpu, at, code) };
-        }
         // SAFETY: trap context, and nothing here switches.
         Call::Read { ptr, len } => match unsafe { read_line(line, ptr, len) } {
             Some(n) => n,
             // SAFETY: the caller masked IRQs, and `frame` is the current process's.
             None => return unsafe { block(kernel, w, cpu, frame, Event::Console) },
-        },
-        Call::Wait { index, generation } => match sched.reap(index, generation) {
-            Ok(Some(code)) => {
-                reaped(pipes, (index, generation), sched.process(cpu));
-                code
-            }
-            // SAFETY: the caller masked IRQs, and `frame` is the current process's.
-            Ok(None) => return unsafe { block(kernel, w, cpu, frame, Event::Exit(index)) },
-            Err(error) => error as u64,
-        },
-        Call::Join { slot, generation } => match sched.join(slot, generation) {
-            Ok(Some(code)) => code,
-            // SAFETY: the caller masked IRQs, and `frame` is the current process's.
-            Ok(None) => return unsafe { block(kernel, w, cpu, frame, Event::Join(slot)) },
-            Err(error) => error as u64,
         },
         Call::File {
             inode,
@@ -1038,6 +1075,66 @@ unsafe fn syscall(
                 })
             }
         }
+        _ => unreachable!("not io under KERNEL"),
+    };
+    at
+}
+
+/// Runs a syscall of `cpu`'s current process (`entry`) that needs `KERNEL`, or returns `dispatch`'s error; returns the
+/// frame to resume.
+///
+/// # Safety
+/// Trap context (IRQs masked), and `frame` `cpu`'s current process's; for a table call (`TABLE_CALLS`), the caller is
+/// its process's only thread.
+#[inline(always)]
+unsafe fn syscall(
+    kernel: &mut Kernel,
+    w: &mut W<'_, level::Kernel>,
+    (cpu, entry, only): (usize, &ProcessEntry, Option<OnlyThread>),
+    frame: &mut arch::TrapFrame,
+    call: Result<Call, i64>,
+) -> usize {
+    let at = frame as *mut arch::TrapFrame as usize;
+    let Kernel {
+        sched,
+        pipes,
+        mutexes,
+        fs,
+        opens,
+        ..
+    } = kernel;
+    let ok = |result: Result<(), i64>| result.map_or_else(|error| error as u64, |()| 0);
+    let call = match call {
+        Ok(call) => call,
+        Err(error) => {
+            frame.x[0] = error as u64;
+            return at;
+        }
+    };
+    frame.x[0] = match call {
+        Call::Exit(code) => {
+            // SAFETY: the caller masked IRQs, and `frame` is the current process's.
+            return unsafe { exit_process(kernel, w, cpu, at, code) };
+        }
+        Call::ThreadExit(code) => {
+            // SAFETY: as above.
+            return unsafe { exit_thread(kernel, w, cpu, at, code) };
+        }
+        Call::Wait { index, generation } => match sched.reap(index, generation) {
+            Ok(Some(code)) => {
+                reaped(pipes, (index, generation), sched.process(cpu));
+                code
+            }
+            // SAFETY: the caller masked IRQs, and `frame` is the current process's.
+            Ok(None) => return unsafe { block(kernel, w, cpu, frame, Event::Exit(index)) },
+            Err(error) => error as u64,
+        },
+        Call::Join { slot, generation } => match sched.join(slot, generation) {
+            Ok(Some(code)) => code,
+            // SAFETY: the caller masked IRQs, and `frame` is the current process's.
+            Ok(None) => return unsafe { block(kernel, w, cpu, frame, Event::Join(slot)) },
+            Err(error) => error as u64,
+        },
         Call::Mkdir { dir, ptr, len } => {
             // SAFETY: trap context, and nothing here switches.
             ok(unsafe {
@@ -1156,9 +1253,10 @@ unsafe fn syscall(
         | Call::Spawn { .. }
         | Call::Thread { .. }
         | Call::Net(NetCall::Socket(_) | NetCall::IoWait)) => {
-            // SAFETY: the caller's contract: its process's only thread, so nothing else reaches the process's data.
-            let process = unsafe { entry.unshared() };
-            let table = (&*entry.handles, process);
+            let only = only.expect("a table call by its process's only thread");
+            // SAFETY: the caller is its process's only thread, so nothing else reaches the process's data.
+            let mut process = unsafe { entry.unshared(only) };
+            let table = (&*entry.handles, &mut process);
             match locked_table_call(kernel, w, cpu, table, frame, &call) {
                 Some(result) => result.unwrap_or_else(|error| error as u64),
                 // Marked blocked (`io_wait`): a thread marked to end ends instead.

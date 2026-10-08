@@ -6,8 +6,9 @@
 //! lock; `Handles` is a plain copy for building one (a spawned child's) or staging a change before it is committed.
 
 use core::hint::spin_loop;
+use core::marker::PhantomData;
 use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
-use core::sync::atomic::{AtomicU64, fence};
+use core::sync::atomic::{AtomicU32, AtomicU64, fence};
 
 use mogfs::Inode;
 
@@ -215,11 +216,62 @@ const NODE: u8 = 7;
 const PIPE: u8 = 8;
 const MUTEX: u8 = 9;
 
-/// A handle table read without a lock: each entry is its words behind a 64-bit sequence (no wrap), a seqlock. Writers
-/// (every method taking `&mut Process`, the proof that the caller holds this table's process lock or is the process's
-/// only thread) store the sequence odd, then the words, then the sequence even, but for the only thread
-/// (`Process::alone`), which no lookup races; a lookup that sees the sequence change or odd retries, so it stores
-/// nothing and sibling threads' lookups share the line.
+/// What a table write holds, which decides how it stores: the process's lock (`Process`), while lookups may run on
+/// other cores, so each store is sequenced; or `Alone`, proof that none can, so stores skip the sequence and its
+/// barriers. Sealed: no other writer exists.
+pub trait Writer: sealed::Sealed {
+    const SEQUENCED: bool;
+}
+
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for crate::Process {}
+    impl Sealed for super::Alone<'_> {}
+}
+
+impl Writer for Process {
+    const SEQUENCED: bool = true;
+}
+
+/// Proof that a process had at most one thread when `of` read its count (Acquire, so after any sibling's end, which
+/// lowers it with Release): no other core looks its table up until that thread starts another, as only it can. Only
+/// `of` makes one.
+///
+/// ```compile_fail,E0423
+/// let _forged = kernel::handle::OnlyThread(());
+/// ```
+pub struct OnlyThread(());
+
+impl OnlyThread {
+    #[inline(always)]
+    pub fn of(threads: &AtomicU32) -> Option<Self> {
+        (threads.load(Acquire) <= 1).then_some(Self(()))
+    }
+}
+
+/// A process's data in the hands of its only thread, or of no thread (`OnlyThread`): a `Writer` whose table writes no
+/// lookup races, so they skip the seqlock.
+///
+/// ```compile_fail,E0423
+/// let _forged = kernel::handle::Alone(core::marker::PhantomData);
+/// ```
+pub struct Alone<'a>(PhantomData<&'a mut Process>);
+
+impl<'a> Alone<'a> {
+    #[inline(always)]
+    pub fn new(_: &'a mut Process, _: OnlyThread) -> Self {
+        Self(PhantomData)
+    }
+}
+
+impl Writer for Alone<'_> {
+    const SEQUENCED: bool = false;
+}
+
+/// A handle table read without a lock: each entry is its words behind a 64-bit sequence (no wrap), a seqlock. A
+/// `Writer` stores the sequence odd, then the words, then the sequence even, but for `Alone`, which no lookup races; a
+/// lookup that sees the sequence change or odd retries, so it stores nothing and sibling threads' lookups share the
+/// line.
 pub struct Table([Entry; MAX_HANDLES]);
 
 struct Entry {
@@ -326,25 +378,25 @@ impl Table {
     }
 
     /// A copy of the table. Writers are serialized by the process lock, so this reads without retrying.
-    pub fn snapshot(&self, _: &mut Process) -> Handles {
+    pub fn snapshot(&self, _: &mut impl Writer) -> Handles {
         Handles(core::array::from_fn(|i| decode(self.words(i))))
     }
 
     /// Writes every entry of `handles` (a `snapshot`, changed) that differs from the table.
-    pub fn commit(&self, process: &mut Process, handles: &Handles) {
+    pub fn commit<P: Writer>(&self, _: &mut P, handles: &Handles) {
         for (i, new) in handles.0.iter().enumerate() {
             let new = encode(*new);
             if (self.0[i].words.iter())
                 .zip(new)
                 .any(|(w, n)| w.load(Relaxed) != n)
             {
-                self.store(process, i, new);
+                self.store::<P>(i, new);
             }
         }
     }
 
     /// The first `N` free entries, to `fill` once every step that can fail is done; `EMFILE` with fewer.
-    pub fn reserve<const N: usize>(&self, _: &mut Process) -> Result<[usize; N], i64> {
+    pub fn reserve<const N: usize>(&self, _: &mut impl Writer) -> Result<[usize; N], i64> {
         let (mut found, mut n) = ([0; N], 0);
         for (i, entry) in self.0.iter().enumerate() {
             if n == N {
@@ -361,16 +413,16 @@ impl Table {
     }
 
     /// A handle to `object` with `rights` in the free entry `i` (from `reserve`); returns its value.
-    pub fn fill(&self, process: &mut Process, i: usize, object: Object, rights: Rights) -> u64 {
+    pub fn fill<P: Writer>(&self, _: &mut P, i: usize, object: Object, rights: Rights) -> u64 {
         let generation = self.0[i].words[0].load(Relaxed) as u32;
-        self.store(process, i, encode((generation, Some((object, rights)))));
+        self.store::<P>(i, encode((generation, Some((object, rights)))));
         u64::from(generation) << 32 | i as u64
     }
 
     /// A new handle to `object` with `rights`.
     pub fn insert(
         &self,
-        process: &mut Process,
+        process: &mut impl Writer,
         object: Object,
         rights: Rights,
     ) -> Result<u64, i64> {
@@ -379,10 +431,10 @@ impl Table {
     }
 
     /// Closes `handle`; returns the object it reached.
-    pub fn close(&self, process: &mut Process, handle: Handle) -> Result<Object, i64> {
+    pub fn close<P: Writer>(&self, _: &mut P, handle: Handle) -> Result<Object, i64> {
         match decode(self.words(handle.index)) {
             (generation, Some((object, _))) if handle.valid(generation) => {
-                self.store(process, handle.index, encode((generation + 1, None)));
+                self.store::<P>(handle.index, encode((generation + 1, None)));
                 Ok(object)
             }
             _ => Err(EBADF),
@@ -395,11 +447,11 @@ impl Table {
     }
 
     /// Empties the table for the next process at its index, handing `f` each object it held.
-    pub fn take(&self, process: &mut Process, mut f: impl FnMut(Object)) {
+    pub fn take<P: Writer>(&self, _: &mut P, mut f: impl FnMut(Object)) {
         for i in 0..MAX_HANDLES {
             let words = self.words(i);
             if words.iter().any(|&w| w != 0) {
-                self.store(process, i, [0; 3]);
+                self.store::<P>(i, [0; 3]);
             }
             if let (_, Some((object, _))) = decode(words) {
                 f(object);
@@ -407,9 +459,9 @@ impl Table {
         }
     }
 
-    fn store(&self, process: &Process, i: usize, words: Words) {
+    fn store<P: Writer>(&self, i: usize, words: Words) {
         let entry = &self.0[i];
-        if process.alone {
+        if !P::SEQUENCED {
             for (word, value) in entry.words.iter().zip(words) {
                 word.store(value, Relaxed);
             }

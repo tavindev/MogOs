@@ -4,10 +4,12 @@ use core::sync::atomic::Ordering::Relaxed;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 
 use arch::Lock;
-use kernel::handle::{DUPLICATE, Handles, MAX_HANDLES, Object, READ, TRANSFER, Table, WRITE};
+use kernel::handle::{
+    DUPLICATE, Handles, MAX_HANDLES, Object, READ, TRANSFER, Table, WRITE, Writer,
+};
 use kernel::network::{self, Network, Owner, Sock, UserMemory};
 use kernel::syscall::{EINVAL, NetCall};
-use kernel::{Board, Event, Process};
+use kernel::{Board, Event};
 use lock_order::{self as level, W};
 use mm::PhysAddr;
 use net::Config;
@@ -245,7 +247,7 @@ pub fn syscall(
 pub fn socket(
     (sched, w): (&mut Sched, &mut W<'_, level::Kernel>),
     cpu: usize,
-    table: (&Table, &mut Process),
+    table: (&Table, &mut impl Writer),
     allowed: u64,
 ) -> i64 {
     let mut net = NET.lock_masked(w);
@@ -262,7 +264,7 @@ pub fn socket(
 fn handle(
     (sched, w): (&mut Sched, &mut W<'_, level::Kernel>),
     cpu: usize,
-    (table, process): (&Table, &mut Process),
+    (table, process): (&Table, &mut impl Writer),
     sock: Sock,
     rights: u64,
 ) -> i64 {
@@ -305,7 +307,7 @@ fn submit(
 pub fn io_wait(
     (sched, w): (&mut Sched, &mut W<'_, level::Kernel>),
     cpu: usize,
-    table: (&Table, &mut Process),
+    table: (&Table, &mut impl Writer),
     out: &mut [u64; 2],
 ) -> Option<i64> {
     let current = (sched.process(cpu), sched.generation(cpu));

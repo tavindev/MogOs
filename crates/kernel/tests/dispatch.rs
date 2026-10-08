@@ -28,13 +28,7 @@ const USER: u64 = 1 << 32;
 /// A live table holding `handles`.
 fn table(handles: &Handles) -> Table {
     let table = Table::new();
-    table.commit(
-        &mut Process {
-            next: 0,
-            alone: false,
-        },
-        handles,
-    );
+    table.commit(&mut Process { next: 0 }, handles);
     table
 }
 

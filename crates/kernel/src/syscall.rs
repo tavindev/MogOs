@@ -398,6 +398,45 @@ pub enum NetCall {
 
 const _: () = assert!(size_of::<Call>() == 56, "every syscall returns a Call");
 
+/// `dispatch`'s `io`, for a board that knows the number: the same checks, without the jump table.
+#[inline(always)]
+pub fn dispatch_io<C: Clamp>(
+    args: &[u64; 7],
+    handles: &Table,
+    seen: &mut Seen,
+) -> Result<Call, i64> {
+    let op = args[1];
+    let need = match op {
+        IO_READ => READ,
+        IO_WRITE => WRITE,
+        _ => return Err(EINVAL),
+    };
+    let io_len = args[3].min(MAX_BUFFER);
+    let [h, ptr, len, file_offset] = C::clamp(
+        [handle(args[0]), offset(args[2]), io_len, args[4]],
+        [HANDLE, room(io_len), LEN, MAX_FILE_SIZE + 1],
+    );
+    let object = handles.io(Handle::clamped(args[0], h), need, seen)?;
+    user_buffer(args[2], io_len)?;
+    let (ptr, len) = (USER.start + ptr, len as usize);
+    match object {
+        Some(Object::Console) if op == IO_WRITE => Ok(Call::Write { ptr, len }),
+        Some(Object::Console) => Ok(Call::Read { ptr, len }),
+        Some(Object::Pipe(end)) if end.write == (op == IO_WRITE) => {
+            Ok(Call::Pipe { end, ptr, len })
+        }
+        Some(Object::Node(inode)) => Ok(Call::File {
+            inode,
+            write: op == IO_WRITE,
+            offset: file_offset,
+            ptr,
+            len,
+        }),
+        Some(Object::Dir(_)) => Err(EISDIR),
+        _ => Err(EACCES),
+    }
+}
+
 /// Runs syscall `nr` with arguments `args` (`x0`-`x6`) against the caller's `handles`, read without a lock (the entries
 /// read go in `seen`), leaving the board the parts that touch hardware, tasks or the table; `Err` holds the result to
 /// return.
@@ -427,38 +466,7 @@ pub fn dispatch<C: Clamp>(
             tls: args[2],
             arg: args[3],
         }),
-        IO => {
-            let op = args[1];
-            let need = match op {
-                IO_READ => READ,
-                IO_WRITE => WRITE,
-                _ => return Err(EINVAL),
-            };
-            let io_len = args[3].min(MAX_BUFFER);
-            let [h, ptr, len, file_offset] = C::clamp(
-                [handle(args[0]), offset(args[2]), io_len, args[4]],
-                [HANDLE, room(io_len), LEN, MAX_FILE_SIZE + 1],
-            );
-            let object = handles.io(Handle::clamped(args[0], h), need, seen)?;
-            user_buffer(args[2], io_len)?;
-            let (ptr, len) = (USER.start + ptr, len as usize);
-            match object {
-                Some(Object::Console) if op == IO_WRITE => Ok(Call::Write { ptr, len }),
-                Some(Object::Console) => Ok(Call::Read { ptr, len }),
-                Some(Object::Pipe(end)) if end.write == (op == IO_WRITE) => {
-                    Ok(Call::Pipe { end, ptr, len })
-                }
-                Some(Object::Node(inode)) => Ok(Call::File {
-                    inode,
-                    write: op == IO_WRITE,
-                    offset: file_offset,
-                    ptr,
-                    len,
-                }),
-                Some(Object::Dir(_)) => Err(EISDIR),
-                _ => Err(EACCES),
-            }
-        }
+        IO => dispatch_io::<C>(args, handles, seen),
         DUP => {
             let (object, held) = handles.entry(h0(), seen)?;
             if held & DUPLICATE == 0 || args[1] & !held != 0 {

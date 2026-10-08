@@ -43,17 +43,20 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
   `FsDisk(None)` (`Io` until `Board::mount` puts the `VirtioBlk` in through `Fs::disk`). File syscalls run their disk I/O inside the trap under `KERNEL`: a `sync` holds it
   for its writes and two flushes. Boot-spawned processes get the root directory as handle 3 once mounted (`spawn_init`).
 - Trap hooks `task_switch`, `board_irq`, `board_syscall`, `board_user_fault`: execute the `kernel::syscall::Call`
-  that `dispatch` returns (user buffers, pages, frames, wake/block). `board_syscall` looks the caller's handles up
+  that `dispatch` returns (user buffers, pages, frames, wake/block). `board_syscall` only sorts the call into a
+  function per class, each a tail call so a path saves only the registers it uses: `io_call` (`io`, decoded by
+  `dispatch_io`, no jump table), `shared_call`, `alone_table_call` and `other_call`. It looks the caller's handles up
   without a lock: a console write takes only `CONSOLE` and `map` only its process's lock and `FRAMES`; a call on
   shared state alone (`SHARED_CALLS`: `exit`, `wait`, `lock`, `kill`, the file and socket calls but `open`, ...) takes
   `KERNEL` before its lookups (no recheck) and returns holding it; a call that writes the table (`dup`, `close`,
   `pipe`, `mutex`, `open`, `spawn`, `thread`, `socket`, `io_wait`) takes the process lock, then `KERNEL`, and releases
   both before it returns, rechecking the entries it read (a change reruns the call); `io` on a pipe, console read or
   file takes `KERNEL` and returns holding it after the same recheck. A process's only thread (`ProcessEntry::alone`,
-  read before `dispatch`: only the caller's own `thread` raises the count) skips the process lock and the recheck:
+  an `OnlyThread` read before `dispatch`: only the caller's own `thread` raises the count) skips the process lock and
+  the recheck:
   its `TABLE_CALLS` take `KERNEL` first like the shared ones, its `dup` of a stateless object and its `close` take
-  no lock but what the object's release needs, and its table writes skip the seqlock (`ProcessEntry::unshared` marks
-  the process `alone`; a table writer under the lock clears it). `board_unlock` and `board_unlock_work`, called by the
+  no lock but what the object's release needs, and its table writes skip the seqlock (`ProcessEntry::unshared` takes
+  the `OnlyThread` and gives the `Alone` writer; the locked path's writer is the guard's `Process`). `board_unlock` and `board_unlock_work`, called by the
   trap exit, release `KERNEL`, the second after the hook's deferred work.
 - `Board::console` writes (`Console`) hold `CONSOLE` for a whole `write_fmt`, so no other `Console` line splits it (the unlocked writers below can); it is the PL011
   at `UART0`, like every other UART access. `test=bench-lock`'s `round_trips` (ticket vs test-and-set lock, `cpu()`, `PerCpu::with`) and `add_locked`; `test=bench-ipi`'s `ipi_round_trips` (`PING_SGI`, answered in `board_irq`);

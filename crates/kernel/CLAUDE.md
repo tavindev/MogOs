@@ -25,11 +25,13 @@ safe atomics (`Table`, a seqlock per entry) the board reads without one.
   releasing); states (`Ready`, `Blocked`, `Exited`, `Zombie`) for both; `end` (a thread; its process's last leaves the
   process to be released and then `exited`), `reap` (a process), `join` (a thread), `to_idle` (a core that releases a
   process before it picks a task). `Process` is what a process's own lock guards in the board (its map cursor), and
-  the proof a handle-table write holds it or is its process's only thread.
+  the proof a sequenced handle-table write holds it.
 - `Table` and `Handles` (`src/handle.rs`): a process's live handle table, its lookups (`entry`, `get`) lock-free (each
   entry's words behind a 64-bit sequence; the entries read go in a `Seen`, which `unchanged` rechecks), its writes
-  (`insert`, `reserve` + `fill`, `close`, `commit`, `take`) under the process lock, or by the process's only thread
-  (`Process::alone`, set by each table writer), whose writes no lookup can race and so skip the sequence and its barriers;
+  (`insert`, `reserve` + `fill`, `close`, `commit`, `take`) by a `Writer`, a sealed typestate: `Process` (the lock
+  held, each store sequenced) or `Alone` (made only from an `OnlyThread`, which only `OnlyThread::of` makes, from a
+  thread count read with Acquire at most 1: no lookup races its stores, which skip the sequence and its barriers; the
+  compile-fail doctests keep both unforgeable);
   typed lookups (`mutex`, `io`) decode only the objects their call takes; `Handles` is a plain copy (`snapshot`) for
   `split` in `spawn` and building a child's. Rights; lookups take a `Handle`, a user value with its index clamped (by
   `dispatch`, or `Handle::new` / `split` with their own barrier).

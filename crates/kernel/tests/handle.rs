@@ -105,10 +105,7 @@ fn a_lookup_racing_close_and_dup_sees_the_old_or_the_new_entry_never_a_torn_one(
     let (done, saw_change) = (AtomicBool::new(false), AtomicBool::new(false));
     std::thread::scope(|scope| {
         scope.spawn(|| {
-            let mut process = Process {
-                next: 0,
-                alone: false,
-            };
+            let mut process = Process { next: 0 };
             // Until the reader has seen a write land under it, however the host schedules the two.
             for i in (1..).take_while(|&i| i < 200_000 || !saw_change.load(Relaxed)) {
                 let mut handles = Handles::new();
@@ -157,10 +154,7 @@ fn a_table_write_changes_the_sequence_a_lookup_saw() {
     use kernel::handle::{Seen, Table};
 
     let table = Table::new();
-    let mut process = Process {
-        next: 0,
-        alone: false,
-    };
+    let mut process = Process { next: 0 };
     let mut handles = Handles::new();
     let console = handles.insert(Object::Console, WRITE).unwrap();
     table.commit(&mut process, &handles);
@@ -184,13 +178,14 @@ fn a_table_write_changes_the_sequence_a_lookup_saw() {
 #[test]
 fn the_only_threads_writes_are_seen_by_its_lookups() {
     use kernel::Process;
-    use kernel::handle::{Seen, Table};
+    use kernel::handle::{Alone, OnlyThread, Seen, Table};
+    use std::sync::atomic::AtomicU32;
 
     let table = Table::new();
-    let mut process = Process {
-        next: 0,
-        alone: true,
-    };
+    let mut process = Process { next: 0 };
+    assert!(OnlyThread::of(&AtomicU32::new(2)).is_none(), "two threads");
+    let only = OnlyThread::of(&AtomicU32::new(1)).unwrap();
+    let mut process = Alone::new(&mut process, only);
     let console = table.insert(&mut process, Object::Console, WRITE).unwrap();
     assert_eq!(
         table.entry(h(console), &mut Seen::default()),

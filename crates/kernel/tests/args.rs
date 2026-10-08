@@ -40,13 +40,7 @@ fn spawn_checks_the_argument_buffer() {
         .insert(Object::File { start: 0, end: 0 }, EXEC)
         .unwrap();
     let table = Table::new();
-    table.commit(
-        &mut Process {
-            next: 0,
-            alone: false,
-        },
-        &handles,
-    );
+    table.commit(&mut Process { next: 0 }, &handles);
     let user = 1 << 32;
     let spawn = |_: &mut Handles, ptr: u64, len: u64| {
         let args = [exe, 0, 0, 0, 0, ptr, len];
