@@ -1082,3 +1082,50 @@ fn disk_errors_and_full_disks_never_leave_stale_state() {
         }
     }
 }
+
+/// Commit moves an unwritten page whose next block is taken to a free run; the extent rewrite that moves it can write
+/// dirty nodes out early, which must not take the page's new block.
+#[test]
+fn a_moved_data_page_keeps_its_block_when_its_extent_rewrite_spills() {
+    let blocks = 3000;
+    let mut disk = Guarded::new(vec![[0; BLOCK_SIZE]; blocks], true);
+    let mut mem = Mem::new(blocks);
+    let mut fs = mem.fs(&mut disk);
+    fs.format(1).unwrap();
+    let files: Vec<Inode> = (0..2000)
+        .map(|i| fs.create(ROOT, format!("f{i}").as_bytes()).unwrap())
+        .collect();
+    let (a, b) = (
+        fs.create(ROOT, b"a").unwrap(),
+        fs.create(ROOT, b"b").unwrap(),
+    );
+    fs.write(a, 0, &[1; BLOCK_SIZE]).unwrap();
+    fs.write(b, 0, &[2; BLOCK_SIZE]).unwrap();
+    fs.commit().unwrap();
+    fs.unlink(ROOT, b"a").unwrap();
+    fs.commit().unwrap();
+    fs.commit().unwrap();
+    // `c`'s page takes `a`'s old block, followed by `b`'s.
+    let c = fs.create(ROOT, b"c").unwrap();
+    fs.write(c, 0, &[3; BLOCK_SIZE]).unwrap();
+    let d = fs.cached.unwrap().0;
+    // Leave the pool short of slots, so the next path made dirty writes the dirty nodes out first.
+    for &f in files.iter().step_by(7) {
+        if fs.top - fs.base - fs.ndirty < 3 * (fs.height + 2) {
+            break;
+        }
+        fs.cow(
+            Key::new(f, ItemKind::Inode, Offset(0)),
+            &mut Path::default(),
+        )
+        .unwrap();
+    }
+    assert!(fs.top - fs.base - fs.ndirty < 3 * (fs.height + 2));
+    fs.commit().unwrap();
+    assert_ne!(fs.cached.unwrap().0, d, "moved");
+    fs.mount().unwrap();
+    check(&mut fs, "remount");
+    let mut got = [0; BLOCK_SIZE];
+    assert_eq!(fs.read(c, 0, &mut got), Ok(BLOCK_SIZE));
+    assert_eq!(got, [3; BLOCK_SIZE]);
+}

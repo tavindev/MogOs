@@ -963,6 +963,17 @@ impl<'a, D: Disk> Fs<'a, D> {
     }
 
     fn write_commit(&mut self, generation: u64) -> Result<(), Error> {
+        // An unwritten data page leads the nodes' request: where it is if the blocks after it are free, else moved
+        // to the start of their run when the block after the run is free too. Moving it changes the log.
+        if let Some((d, ..)) = self.cached
+            && self.unwritten
+            && !self.run_free(d + 1, self.ndirty)
+        {
+            let b = self.start(self.ndirty);
+            if self.run_free(b, self.ndirty + 1) {
+                self.lead_data(b)?;
+            }
+        }
         // Each node claimed adds at most one word to the log.
         let pages = self.full || self.nlog + self.ndirty > self.log_cap();
         let start = if pages {
@@ -1013,18 +1024,8 @@ impl<'a, D: Disk> Fs<'a, D> {
             if (self.free as usize) < self.ndirty {
                 return Err(Error::NoSpace);
             }
-            // An unwritten data page leads the nodes' request: where it is if the blocks after it are free, else
-            // moved to the start of their run when the block after the run is free too.
             match self.cached {
                 Some((d, ..)) if self.unwritten && self.run_free(d + 1, self.ndirty) => d + 1,
-                Some(_) if self.unwritten => {
-                    let b = self.start(self.ndirty);
-                    if self.run_free(b, self.ndirty + 1) && self.lead_data(b)? {
-                        b + 1
-                    } else {
-                        b
-                    }
-                }
                 _ => self.start(self.ndirty),
             }
         };
@@ -1961,30 +1962,31 @@ impl<'a, D: Disk> Fs<'a, D> {
         Block(self.blocks)
     }
 
-    /// Moves the unwritten data page to free block `b` if an extent of its own maps it; false if not.
-    fn lead_data(&mut self, b: Block) -> Result<bool, Error> {
+    /// Moves the unwritten data page to free block `b` if an extent of its own maps it.
+    fn lead_data(&mut self, b: Block) -> Result<(), Error> {
         let Some((d, _, inode, page)) = self.cached else {
-            return Ok(false);
+            return Ok(());
         };
         // Its extent's path may need new dirty nodes; a commit must never run short of space.
         if self.reserve(1, 1, 0, true).is_err() {
-            return Ok(false);
+            return Ok(());
         }
         let Some((off, _, 1)) = self.extent_at(inode, page)? else {
-            return Ok(false);
+            return Ok(());
         };
-        let (s, at) = self.value_mut(extent_key(inode, off))?;
-        let sum = checksum(b, &self.bufs[DATA]);
-        self.cache[s][at..at + 8].copy_from_slice(&b.0.to_le_bytes());
-        self.cache[s][at + 8..at + 16].copy_from_slice(&sum.0.to_le_bytes());
+        // Marked first: the rewrite can write dirty nodes out early, into free blocks.
         if b == self.next_free(self.hint) {
             self.hint = b + 1;
         }
         self.mark(b);
+        let (s, at) = self.value_mut(extent_key(inode, off))?;
+        let sum = checksum(b, &self.bufs[DATA]);
+        self.cache[s][at..at + 8].copy_from_slice(&b.0.to_le_bytes());
+        self.cache[s][at + 8..at + 16].copy_from_slice(&sum.0.to_le_bytes());
         (self.cached, self.unwritten) = (None, false);
         self.release(d)?;
         (self.cached, self.unwritten) = (Some((b, sum, inode, page)), true);
-        Ok(true)
+        Ok(())
     }
 
     /// Whether the `k` blocks from `b` on are free.
