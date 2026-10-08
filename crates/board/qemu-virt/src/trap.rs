@@ -536,7 +536,7 @@ unsafe extern "C" fn board_syscall(frame: &mut arch::TrapFrame) -> Resume {
     // `io` (the hot calls) is neither shared nor a table call: one test.
     if nr != IO && nr < 64 && SHARED_CALLS >> nr & 1 != 0 {
         // SAFETY: the caller's contract.
-        return unsafe { kernel_first(&mut root, frame) };
+        return unsafe { kernel_first(&mut root, frame, None) };
     }
     // SAFETY: the caller masked IRQs.
     let entry = &PROCESSES[unsafe { CURRENT.with_masked(|current| *current) }];
@@ -545,7 +545,7 @@ unsafe extern "C" fn board_syscall(frame: &mut arch::TrapFrame) -> Resume {
     let alone = nr != IO && entry.alone();
     if alone && nr < 64 && TABLE_CALLS >> nr & 1 != 0 {
         // SAFETY: the caller's contract, and it is its process's only thread.
-        return unsafe { kernel_first(&mut root, frame) };
+        return unsafe { kernel_first(&mut root, frame, Some(entry)) };
     }
     let mut seen = Seen::default();
     let args = frame.x.first_chunk().unwrap();
@@ -634,16 +634,20 @@ fn pipe_call(
 
 /// A call on shared state alone, or a table call of a process's only thread: takes `KERNEL` before its lookups, so a
 /// sibling's `close` of an entry they read releases the object only after the call (and the only thread needs no
-/// process lock), and returns holding it.
+/// process lock), and returns holding it. `entry` is the caller's process if the caller already has it.
 ///
 /// # Safety
 /// As `board_syscall`; for a table call (`TABLE_CALLS`), the caller is its process's only thread.
 #[inline(always)]
-unsafe fn kernel_first(root: &mut W<'_, level::Unlocked>, frame: &mut arch::TrapFrame) -> Resume {
+unsafe fn kernel_first(
+    root: &mut W<'_, level::Unlocked>,
+    frame: &mut arch::TrapFrame,
+    entry: Option<&ProcessEntry>,
+) -> Resume {
     let (kernel, mut w) = Guard::leak(KERNEL.lock_masked(root));
     // Before `dispatch`: nothing between it and the match keeps the two from fusing.
     let cpu = arch::cpu();
-    let entry = &PROCESSES[kernel.sched.process(cpu)];
+    let entry = entry.unwrap_or_else(|| &PROCESSES[kernel.sched.process(cpu)]);
     let args = frame.x.first_chunk().unwrap();
     let call = dispatch::<Nospec>(frame.x[8], args, &entry.handles, &mut Seen::default());
     // SAFETY: the caller's contract.
