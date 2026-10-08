@@ -689,7 +689,7 @@ impl<'a, D: Disk> Fs<'a, D> {
                 (self.generation, self.next_inode) = (s.generation, s.next_inode);
                 (self.seed, self.newest) = (s.seed, s.newest);
                 self.check_counter()?;
-                self.load_snapshot()
+                self.load_snapshot(s.newest)
             });
             match r {
                 Ok(()) => {}
@@ -716,6 +716,8 @@ impl<'a, D: Disk> Fs<'a, D> {
             } else {
                 (1 << (self.blocks % 64)) - 1
             };
+            // One pass: both slots' reach, the committed copies, whether the older slot reaches more, the used count.
+            let (mut lag, mut used) = (false, 0);
             for i in 0..w {
                 let (l, p) = (self.bits[i], self.bits[w + i]);
                 let o = self.bits[NEWEST * w + i] | self.bits[(NEWEST + 1) * w + i];
@@ -726,9 +728,12 @@ impl<'a, D: Disk> Fs<'a, D> {
                 } else {
                     0
                 };
-                self.bits[COMMITTED * w + i] = o | l | p;
+                let c = o | l | p;
+                (self.bits[COMMITTED * w + i], self.bits[NEWEST * w + i]) = (c, l);
+                self.bits[(NEWEST + 1) * w + i] = p;
+                lag |= o & !(l | p) != 0;
+                used += c.count_ones() as u64;
             }
-            self.bits.copy_within(..2 * w, NEWEST * w);
             let d = MAPS * w..MAPS * w + self.lpages().div_ceil(64);
             self.bits[d.clone()].fill(0);
             let d = d.start;
@@ -737,15 +742,7 @@ impl<'a, D: Disk> Fs<'a, D> {
                 self.bits[d + p / 64] |= 1 << (p % 64);
             }
             self.prev_span = (0, w);
-            self.changed = false;
-            self.lag = (0..w).any(|i| {
-                self.bits[COMMITTED * w + i]
-                    != self.bits[NEWEST * w + i] | self.bits[(NEWEST + 1) * w + i]
-            });
-            self.free = self.blocks
-                - (0..w)
-                    .map(|i| self.reach(i).count_ones() as u64)
-                    .sum::<u64>();
+            (self.changed, self.lag, self.free) = (false, lag, self.blocks - used);
             self.hint = Block(0);
             (self.broken, self.torn) = (false, false);
             return Ok(());
@@ -1129,7 +1126,7 @@ impl<'a, D: Disk> Fs<'a, D> {
                     .any(|i| self.bits[SNAP * w + i] & !self.bits[NEWEST * w + i] != 0);
             let e = if own {
                 c = self.next_snap(c);
-                let d = self.stage_in(&mut first_s, &mut n, lim)?;
+                let d = self.stage(&mut first_s, &mut n, lim)?;
                 for i in 0..len {
                     let word = self.bits[SNAP * w + lo + i].to_le_bytes();
                     self.cache[d][8 * i..8 * i + 8].copy_from_slice(&word);
@@ -1160,7 +1157,7 @@ impl<'a, D: Disk> Fs<'a, D> {
                 }
                 c = self.next_snap(c);
                 let sum = seal(c, &mut self.cache[o], 16 * kids);
-                let d = self.stage_in(&mut first_s, &mut n, lim)?;
+                let d = self.stage(&mut first_s, &mut n, lim)?;
                 let (src, dst) = pair(self.cache, o, d);
                 dst.copy_from_slice(src);
                 src.fill(0);
@@ -1196,6 +1193,7 @@ impl<'a, D: Disk> Fs<'a, D> {
     fn pin(&mut self, b: Block) {
         let (w, i, bit) = (self.words, (b.0 / 64) as usize, 1 << (b.0 % 64));
         self.bits[PINNED * w + i] |= bit;
+        self.bits[COMMITTED * w + i] |= bit;
         self.bits[SNAP * w + i] |= bit;
         self.touch(w + i);
         self.free -= 1;
@@ -1211,16 +1209,6 @@ impl<'a, D: Disk> Fs<'a, D> {
         b
     }
 
-    /// The next staging slot below `lim`, writing the staged ones out first if none is left.
-    fn stage_in(&mut self, first: &mut usize, n: &mut usize, lim: usize) -> Result<usize, Error> {
-        if *n == lim {
-            self.write_slots(*first, *n)?;
-            (*first, *n) = (1, 1);
-        }
-        *n += 1;
-        Ok(*n - 1)
-    }
-
     /// Deletes `snapshot`: its item, and the blocks only it holds come free (after the commit after next, as the live
     /// tree's do). Open even when a removal would be refused for space.
     pub fn delete_snapshot(&mut self, snapshot: Snapshot) -> Result<(), Error> {
@@ -1232,12 +1220,16 @@ impl<'a, D: Disk> Fs<'a, D> {
         let (prev, next) = self.neighbours(g)?;
         self.reserve(0, 1, 0, DELETE)?;
         let r = self.unpin(ix, prev, next).and_then(|()| {
+            // The item's delete releases nodes the next newest may hold: its bitmap first, then `newest`, which the
+            // item's leaf must still satisfy when decoded.
             if next.is_none() {
-                self.newest = prev.map_or(0, |p| p.0);
-                self.load_snapshot()?;
+                self.load_snapshot(prev.map_or(0, |p| p.0))?;
             }
             self.forget_names();
             self.delete(Key::new(ROOT, ItemKind::Snapshot, Offset(g)))?;
+            if next.is_none() {
+                self.newest = prev.map_or(0, |p| p.0);
+            }
             // A clean node only the snapshot reached must not answer for its block once that is reused.
             for s in self.base..self.top {
                 if !self.dirt[s]
@@ -1327,12 +1319,11 @@ impl<'a, D: Disk> Fs<'a, D> {
                 for (j, _) in e.iter().enumerate().skip(1).filter(|(_, e)| e.is_some()) {
                     u &= !le64(&self.cache[3 * h + 1 + j], 8 * i);
                 }
+                // The blocks stay reserved (in `COMMITTED`) until the commit after next.
                 let at = w + lo + i;
                 if self.bits[at] & u != 0 {
-                    let before = self.reach(lo + i).count_ones();
                     self.bits[at] &= !u;
                     self.touch(at);
-                    self.free += (before - self.reach(lo + i).count_ones()) as u64;
                 }
             }
         }
@@ -1377,15 +1368,16 @@ impl<'a, D: Disk> Fs<'a, D> {
         ))
     }
 
-    /// Reads the newest snapshot's bitmap into `SNAP`: a page it shares with the live list from the live words as of
-    /// that page's last write, else from the disk. It must mark its pages, its index blocks and its root.
-    fn load_snapshot(&mut self) -> Result<(), Error> {
-        let w = self.words;
-        self.bits[SNAP * w..(SNAP + 1) * w].fill(0);
-        if self.newest == 0 {
+    /// Reads snapshot `g`'s bitmap into `SNAP` (nothing for 0): at mount, a page it shares with the live list from
+    /// the live words as of that page's last write, else from the disk. It must mark its pages, its index blocks and
+    /// its root.
+    fn load_snapshot(&mut self, g: u64) -> Result<(), Error> {
+        if g == 0 {
             return Ok(());
         }
-        let (root, _, ix) = match self.snap_item(self.newest) {
+        let w = self.words;
+        self.bits[SNAP * w..(SNAP + 1) * w].fill(0);
+        let (root, _, ix) = match self.snap_item(g) {
             Err(Error::NotFound) => return Err(Error::Corrupt),
             r => r?,
         };
@@ -1404,10 +1396,12 @@ impl<'a, D: Disk> Fs<'a, D> {
             }
             let (lo, n) = (p * PAGE_WORDS, page_words(self.blocks, p));
             let (s, at) = self.page_entry(p);
-            if (
-                Block(le64(&self.cache[s], at)),
-                Sum(le64(&self.cache[s], at + 8)),
-            ) == (b, sum)
+            // Only mount (`torn` until it succeeds) has the words the log replaced.
+            if self.torn
+                && (
+                    Block(le64(&self.cache[s], at)),
+                    Sum(le64(&self.cache[s], at + 8)),
+                ) == (b, sum)
             {
                 self.bits.copy_within(lo..lo + n, SNAP * w + lo);
                 for j in 0..self.nlog {
@@ -1574,7 +1568,7 @@ impl<'a, D: Disk> Fs<'a, D> {
         // Staged ahead of the nodes, the page counts as written only once their request is.
         let staged = match self.cached {
             Some((d, ..)) if self.unwritten && !pages && start == d + 1 => {
-                let s = self.stage(&mut first, &mut n)?;
+                let s = self.stage(&mut first, &mut n, self.base)?;
                 let (src, dst) = (&self.bufs[DATA], &mut self.cache[s]);
                 dst.copy_from_slice(src);
                 self.blk[s] = d;
@@ -1619,7 +1613,7 @@ impl<'a, D: Disk> Fs<'a, D> {
         if pages {
             let mut p = self.next_dirty(0);
             while let Some(q) = p {
-                let d = self.stage(&mut first, &mut n)?;
+                let d = self.stage(&mut first, &mut n, self.base)?;
                 let len = 8 * page_words(self.blocks, q);
                 let page = &mut self.cache[d];
                 for (i, word) in self.bits[q * PAGE_WORDS..][..len / 8].iter().enumerate() {
@@ -1636,7 +1630,7 @@ impl<'a, D: Disk> Fs<'a, D> {
             for l in 1..=self.ix_h {
                 let mut i = self.next_ix(l, 0);
                 while let Some(j) = i {
-                    let d = self.stage(&mut first, &mut n)?;
+                    let d = self.stage(&mut first, &mut n, self.base)?;
                     let slot = self.ix_level(l).0 + j;
                     let len = 16 * ix_children(self.lpages(), l, j);
                     let parent = self.ix_parent(l, j);
@@ -1894,7 +1888,13 @@ impl<'a, D: Disk> Fs<'a, D> {
     fn marked(&self, map: usize, b: Block) -> bool {
         let (w, i) = (self.words, (b.0 / 64) as usize);
         b.0 >= self.blocks
-            || (self.bits[map * w + i] | if map == LIVE { 0 } else { self.bits[i] }) >> (b.0 % 64)
+            || (self.bits[map * w + i]
+                | if map == LIVE || map == SNAP {
+                    0
+                } else {
+                    self.bits[i]
+                })
+                >> (b.0 % 64)
                 & 1
                 != 0
     }
@@ -2401,10 +2401,9 @@ impl<'a, D: Disk> Fs<'a, D> {
         self.reach((b.0 / 64) as usize) >> (b.0 % 64) & 1 != 0
     }
 
-    /// Word `i` of the blocks in use: live, pinned or reached by either slot.
+    /// Word `i` of the blocks in use: live, or reached by either slot (which holds every pinned block too).
     fn reach(&self, i: usize) -> u64 {
-        let w = self.words;
-        self.bits[i] | self.bits[PINNED * w + i] | self.bits[COMMITTED * w + i]
+        self.bits[i] | self.bits[COMMITTED * self.words + i]
     }
 
     /// Pages in the list: the live bitmap's, then pinned's.
@@ -2518,9 +2517,9 @@ impl<'a, D: Disk> Fs<'a, D> {
         Ok(())
     }
 
-    /// The next staging slot, writing the staged ones out first if none is left.
-    fn stage(&mut self, first: &mut usize, n: &mut usize) -> Result<usize, Error> {
-        if *n == self.base {
+    /// The next staging slot below `lim`, writing the staged ones out first if none is left.
+    fn stage(&mut self, first: &mut usize, n: &mut usize, lim: usize) -> Result<usize, Error> {
+        if *n == lim {
             self.write_slots(*first, *n)?;
             (*first, *n) = (1, 1);
         }
@@ -2613,9 +2612,11 @@ impl<'a, D: Disk> Fs<'a, D> {
         let (i, bit) = ((b.0 / 64) as usize, 1 << (b.0 % 64));
         self.bits[i] &= !bit;
         self.touch(i);
-        if self.bits[SNAP * self.words + i] & bit != 0 {
-            self.bits[PINNED * self.words + i] |= bit;
-            self.touch(self.words + i);
+        let w = self.words;
+        if self.newest != 0 && self.bits[SNAP * w + i] & bit != 0 {
+            self.bits[PINNED * w + i] |= bit;
+            self.bits[COMMITTED * w + i] |= bit;
+            self.touch(w + i);
         } else if !self.has(COMMITTED, b) {
             self.free += 1;
             self.hint = min(self.hint, b);

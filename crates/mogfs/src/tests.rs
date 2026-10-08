@@ -538,6 +538,12 @@ fn random_changes_keep_the_tree_and_free_space_consistent() {
                     let mut m = Mem::new(blocks);
                     let mut fresh = m.fs(&mut d);
                     fresh.mount().unwrap();
+                    // The newest snapshot's map means nothing without one.
+                    let w = fs.words;
+                    if fs.newest == 0 {
+                        fresh.bits[SNAP * w..(SNAP + 1) * w]
+                            .copy_from_slice(&fs.bits[SNAP * w..(SNAP + 1) * w]);
+                    }
                     assert_eq!(fresh.bits, fs.bits, "{ctx}: bitmaps");
                     assert_eq!(fresh.free, fs.free, "{ctx}: free");
                     check(&mut fresh, &ctx);
@@ -1461,4 +1467,52 @@ fn deleting_a_snapshot_frees_exactly_the_blocks_no_other_root_reaches() {
         assert_eq!(fs.view(Snapshot(g)).map(|_| ()), Err(Error::NotFound));
     }
     assert!((0..fs.words).all(|i| fs.bits[PINNED * fs.words + i] == 0));
+}
+
+/// Deleting the newest snapshot loads the next newest's bitmap at run time: a page it shares with the live list must
+/// come from the disk (the live words since changed, and only mount knows the words the log replaced).
+#[test]
+fn deleting_the_newest_snapshot_loads_the_next_newests_bitmap_from_the_disk() {
+    let blocks = 3000;
+    let mut disk = Guarded::new(vec![[0; BLOCK_SIZE]; blocks], true);
+    let mut mem = Mem::new(blocks);
+    let mut fs = mem.fs(&mut disk);
+    fs.format(5).unwrap();
+    // A file over the first three bitmap pages (512 blocks each under the unit sizes).
+    let a = fs.create(ROOT, b"a").unwrap();
+    fs.write(a, 0, &[1; 1200 * BLOCK_SIZE]).unwrap();
+    // The pages written: the first snapshot shares the live list's clean pages 0 and 1 (its own blocks land after
+    // the file).
+    fs.full = true;
+    fs.commit().unwrap();
+    let s1 = fs.snapshot().unwrap();
+    // Overwrites free blocks in those pages: their words are logged, and the second snapshot copies them.
+    fs.write(a, 0, &[2; 10 * BLOCK_SIZE]).unwrap();
+    fs.write(a, 600 * BLOCK_SIZE as u64, &[2; 10 * BLOCK_SIZE])
+        .unwrap();
+    fs.commit().unwrap();
+    let s2 = fs.snapshot().unwrap();
+    fs.delete_snapshot(s2).unwrap();
+    let disk_now = fs.disk().blocks.clone();
+    let marks = snapshot_bitmap(&disk_now, &mut fs, s1.0);
+    for blk in 0..fs.blocks {
+        assert_eq!(
+            fs.has(SNAP, Block(blk)),
+            marks.contains(&blk),
+            "snapshot bit {blk}"
+        );
+    }
+    // What the first snapshot holds stays: unlink it, let the blocks come free, write over the disk, read it back.
+    fs.unlink(ROOT, b"a", |_| false).unwrap();
+    for _ in 0..3 {
+        fs.commit().unwrap();
+    }
+    let c = fs.create(ROOT, b"c").unwrap();
+    let _ = fs.write(c, 0, &vec![9; 200 * BLOCK_SIZE]);
+    fs.commit().unwrap();
+    let files = view_files(&mut fs, s1).unwrap();
+    assert_eq!(
+        files,
+        vec![("/a".to_string(), Some(vec![1; 1200 * BLOCK_SIZE]))]
+    );
 }
