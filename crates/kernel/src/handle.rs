@@ -208,6 +208,10 @@ impl Default for Handles {
 /// Words an entry's object is stored in: its tag, rights and handle generation, then two words of fields.
 type Words = [u64; 3];
 
+/// A mutex's tag, which `Table::mutex` tests alone.
+const MUTEX: u64 = 9;
+const MUTEX_TAG: u8 = MUTEX as u8;
+
 /// A handle table read without a lock: each entry is its words behind a 64-bit sequence (no wrap), a seqlock. Writers
 /// (every method taking `&mut Process`, the proof that the caller holds a process lock, this table's) store the
 /// sequence odd, then the words, then the sequence even; a lookup that sees the sequence change or odd retries, so it
@@ -245,6 +249,26 @@ impl Table {
     /// The object `handle` reaches and its rights, read without a lock; recorded in `seen`.
     #[inline(always)]
     pub fn entry(&self, handle: Handle, seen: &mut Seen) -> Result<(Object, Rights), i64> {
+        let words = self.read(handle, seen)?;
+        Ok(decode(words).1.expect("read checks the tag"))
+    }
+
+    /// The mutex `handle` reaches (`EACCES` for another object), decoding only a mutex's fields; recorded in `seen`.
+    #[inline(always)]
+    pub fn mutex(&self, handle: Handle, seen: &mut Seen) -> Result<Mutex, i64> {
+        match self.read(handle, seen)? {
+            [head, index, generation] if head >> 32 & 0xff == MUTEX => Ok(Mutex {
+                index: index as u32,
+                generation,
+            }),
+            _ => Err(EACCES),
+        }
+    }
+
+    /// The words of the entry `handle` names, read without a lock (`EBADF` if it is empty or another generation's);
+    /// recorded in `seen`.
+    #[inline(always)]
+    fn read(&self, handle: Handle, seen: &mut Seen) -> Result<Words, i64> {
         let entry = &self.0[handle.index];
         let (sequence, words) = loop {
             let sequence = entry.sequence.load(Acquire);
@@ -257,10 +281,10 @@ impl Table {
             spin_loop();
         };
         seen.0 = [(handle.index, sequence), seen.0[0]];
-        match decode(words) {
-            (generation, Some(entry)) if handle.valid(generation) => Ok(entry),
-            _ => Err(EBADF),
+        if words[0] >> 32 & 0xff == 0 || !handle.valid(words[0] as u32) {
+            return Err(EBADF);
         }
+        Ok(words)
     }
 
     /// The object `handle` reaches, if it holds every right in `need`; recorded in `seen`.
@@ -299,19 +323,39 @@ impl Table {
         }
     }
 
-    /// How many handles `insert` can still add.
-    pub fn vacant(&self, _: &mut Process) -> usize {
-        (0..MAX_HANDLES).filter(|&i| free(self.words(i)[0])).count()
+    /// The first `N` free entries, to `fill` once every step that can fail is done; `EMFILE` with fewer.
+    pub fn reserve<const N: usize>(&self, _: &mut Process) -> Result<[usize; N], i64> {
+        let (mut found, mut n) = ([0; N], 0);
+        for (i, entry) in self.0.iter().enumerate() {
+            if n == N {
+                break;
+            }
+            if free(entry.words[0].load(Relaxed)) {
+                (found[n], n) = (i, n + 1);
+            }
+        }
+        if n < N {
+            return Err(EMFILE);
+        }
+        Ok(found)
+    }
+
+    /// A handle to `object` with `rights` in the free entry `i` (from `reserve`); returns its value.
+    pub fn fill(&self, _: &mut Process, i: usize, object: Object, rights: Rights) -> u64 {
+        let generation = self.0[i].words[0].load(Relaxed) as u32;
+        self.store(i, encode((generation, Some((object, rights)))));
+        u64::from(generation) << 32 | i as u64
     }
 
     /// A new handle to `object` with `rights`.
-    pub fn insert(&self, _: &mut Process, object: Object, rights: Rights) -> Result<u64, i64> {
-        let i = (0..MAX_HANDLES)
-            .find(|&i| free(self.words(i)[0]))
-            .ok_or(EMFILE)?;
-        let generation = self.words(i)[0] as u32;
-        self.store(i, encode((generation, Some((object, rights)))));
-        Ok(u64::from(generation) << 32 | i as u64)
+    pub fn insert(
+        &self,
+        process: &mut Process,
+        object: Object,
+        rights: Rights,
+    ) -> Result<u64, i64> {
+        let [i] = self.reserve(process)?;
+        Ok(self.fill(process, i, object, rights))
     }
 
     /// Closes `handle`; returns the object it reached.
@@ -384,7 +428,7 @@ fn encode((generation, entry): (u32, Option<(Object, Rights)>)) -> Words {
             u64::from(end.index) | u64::from(end.write) << 32,
             end.generation,
         ),
-        Object::Mutex(mutex) => (9, mutex.index.into(), mutex.generation),
+        Object::Mutex(mutex) => (MUTEX, mutex.index.into(), mutex.generation),
         Object::NetStack => (10, 0, 0),
         Object::Socket(sock) => (11, sock.index.into(), sock.generation),
     };
@@ -415,7 +459,7 @@ fn decode([head, a, b]: Words) -> (u32, Option<(Object, Rights)>) {
             write: a >> 32 != 0,
             generation: b,
         }),
-        9 => Object::Mutex(Mutex {
+        MUTEX_TAG => Object::Mutex(Mutex {
             index: a as u32,
             generation: b,
         }),

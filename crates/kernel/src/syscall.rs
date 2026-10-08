@@ -20,7 +20,7 @@ const EXIT: u64 = 0;
 /// `pwrite`; a file is read or written at `offset` (a read at or past its end returns 0), which the console and pipes
 /// ignore. A `len` over `MAX_BUFFER` moves at most `MAX_BUFFER` bytes (a short read or write). Reading the console
 /// waits for a line (`console::Line`); with two readers, whichever runs first gets it.
-const IO: u64 = 1;
+pub const IO: u64 = 1;
 /// `dup(handle, rights)`: returns a new handle to the same object with `rights`, a subset of `handle`'s (duplicate right).
 const DUP: u64 = 2;
 /// `close(handle)`: returns 0.
@@ -121,6 +121,29 @@ const IO_WAIT: u64 = 24;
 const SHUTDOWN: u64 = 25;
 
 /// Most arguments a `spawn` passes.
+/// The syscalls that write no handle table and are not process-local, a bit per number: a board may take its lock over
+/// the shared state before `dispatch` for them, so their lookups need no recheck.
+pub const SHARED_CALLS: u64 = 1 << EXIT
+    | 1 << WAIT
+    | 1 << LOCK
+    | 1 << UNLOCK
+    | 1 << KILL
+    | 1 << MKDIR
+    | 1 << READDIR
+    | 1 << SYNC
+    | 1 << UNLINK
+    | 1 << RENAME
+    | 1 << THREAD_EXIT
+    | 1 << BIND
+    | 1 << LISTEN_CALL
+    | 1 << IO_SUBMIT
+    | 1 << SHUTDOWN;
+
+/// The syscalls that write the caller's handle table and need the shared state too, a bit per number: a board may
+/// take its lock over that state before `dispatch` for them when nothing else can write the table.
+pub const TABLE_CALLS: u64 =
+    1 << OPEN | 1 << PIPE | 1 << MUTEX | 1 << SPAWN | 1 << THREAD | 1 << SOCKET | 1 << IO_WAIT;
+
 pub const MAX_ARGS: usize = 32;
 
 /// The exit code `wait` reports for a process a fault killed: outside `exit`'s 0..=255.
@@ -383,6 +406,7 @@ const _: () = assert!(size_of::<Call>() == 56, "every syscall returns a Call");
 /// indexes kernel memory with to the capacity of what they index, together behind one barrier (`C`), before their
 /// first use, and passes on only the clamped values: a handle (x0, and x3 for `rename`), a user buffer and its length,
 /// a file offset (x4), a `readdir` start (x3).
+#[inline(always)]
 pub fn dispatch<C: Clamp>(
     nr: u64,
     args: &[u64; 7],
@@ -524,11 +548,8 @@ pub fn dispatch<C: Clamp>(
             _ => Err(EACCES),
         },
         MUTEX => Ok(Call::NewMutex),
-        LOCK | UNLOCK => match handles.get(h0(), 0, seen)? {
-            Object::Mutex(mutex) if nr == LOCK => Ok(Call::Lock(mutex)),
-            Object::Mutex(mutex) => Ok(Call::Unlock(mutex)),
-            _ => Err(EACCES),
-        },
+        LOCK => Ok(Call::Lock(handles.mutex(h0(), seen)?)),
+        UNLOCK => Ok(Call::Unlock(handles.mutex(h0(), seen)?)),
         KILL => match handles.get(h0(), KILL_RIGHT, seen)? {
             Object::Process { index, generation } => Ok(Call::Kill { index, generation }),
             Object::Thread { slot, generation } => Ok(Call::KillThread { slot, generation }),

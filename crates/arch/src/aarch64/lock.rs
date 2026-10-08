@@ -90,9 +90,9 @@ impl<T, L> Lock<T, L> {
     ///
     /// # Safety
     ///
-    /// Nothing else reaches the data while the reference lives: it is not yet published to another core or task.
+    /// Nothing else reaches the data while the reference lives (nothing else has it yet, or can reach it any more).
     #[allow(clippy::mut_from_ref)]
-    pub unsafe fn unpublished(&self) -> &mut T {
+    pub unsafe fn unshared(&self) -> &mut T {
         // SAFETY: the caller's contract.
         unsafe { &mut *self.data.get() }
     }

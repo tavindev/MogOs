@@ -4,7 +4,8 @@ use core::arch::global_asm;
 use core::ops::{Deref, Range};
 use core::ptr;
 use core::slice;
-use core::sync::atomic::Ordering::Relaxed;
+use core::sync::atomic::AtomicU32;
+use core::sync::atomic::Ordering::{Acquire, Relaxed};
 
 use arch::{Lock, UserAccess, user_page};
 use kernel::elf::{Elf, Segment};
@@ -12,9 +13,9 @@ use kernel::handle::{
     CONNECT, DUPLICATE, Handles, KILL, LISTEN, MAX_HANDLES, Object, READ, Rights, TRANSFER, Table,
     WAIT, WRITE,
 };
-use kernel::syscall::{EAGAIN, EFAULT, EMFILE, ENOBUFS, ENOEXEC, ENOMEM, MAX_BUFFER, MAX_MAP};
+use kernel::syscall::{EAGAIN, EFAULT, ENOBUFS, ENOEXEC, ENOMEM, MAX_BUFFER, MAX_MAP};
 use kernel::{FRAME_WORDS, Process, Program};
-use lock_order::{self as level, W};
+use lock_order::{self as level, LockAfter, W};
 use mm::{Budget, FrameAllocator, MAX_FRAMES, PhysAddr};
 use mogfs::ROOT;
 
@@ -24,14 +25,26 @@ use crate::{
     Sched, TASK_STACK_FRAMES, USER_BASE, USER_END, USER_STACK_TOP, gic_gibs,
 };
 
-/// What a process index has outside `KERNEL`: its lock, budget and handle table, each starting a 128-byte line (the M4
-/// host's) so a sibling's charge or lookup does not bounce the lock's. An index's entry serves one process from its
-/// spawn until its release frees the index.
+/// What a process index has outside `KERNEL`: its lock, budget, live thread count and handle table, each starting a
+/// 128-byte line (the M4 host's) so a sibling's charge or lookup does not bounce the lock's. An index's entry serves one
+/// process from its spawn until its release frees the index.
 #[repr(C)]
 pub(crate) struct ProcessEntry {
     pub(crate) lock: Line<Lock<Process, level::Process>>,
     pub(crate) budget: Line<Budget>,
+    /// Its live threads: raised only by its own `thread` call, lowered under `KERNEL` (release) when one ends.
+    pub(crate) threads: Line<AtomicU32>,
     pub(crate) handles: Line<Table>,
+}
+
+impl ProcessEntry {
+    /// Whether the calling thread is its process's only one. Then nothing else writes the process's table or reaches
+    /// its lock's data (a sibling that ended released the lock before the end that lowered the count), so the call
+    /// may skip that lock and the recheck of its lookups.
+    #[inline(always)]
+    pub(crate) fn alone(&self) -> bool {
+        self.threads.load(Acquire) == 1
+    }
 }
 
 #[repr(align(128))]
@@ -49,6 +62,7 @@ pub(crate) static PROCESSES: [ProcessEntry; MAX_PROCESSES] = [const {
     ProcessEntry {
         lock: Line(Lock::new(Process { next: 0 })),
         budget: Line(Budget::new(0)),
+        threads: Line(AtomicU32::new(0)),
         handles: Line(Table::new()),
     }
 }; MAX_PROCESSES];
@@ -62,8 +76,9 @@ pub(crate) static PROCESSES: [ProcessEntry; MAX_PROCESSES] = [const {
 unsafe fn start_entry(index: usize, next: u64, budget: usize, handles: &Handles) {
     let entry = &PROCESSES[index];
     // SAFETY: the caller's contract: nothing else reaches the unpublished process's data.
-    let process = unsafe { entry.lock.unpublished() };
+    let process = unsafe { entry.lock.unshared() };
     process.next = next;
+    entry.threads.store(1, Relaxed);
     entry.budget.reset(budget);
     entry.handles.commit(process, handles);
 }
@@ -106,15 +121,34 @@ fn map_filled(
 
 /// Maps `pages` zeroed read-write pages at the current process's next map address, charged to its budget, taking the
 /// frames and any new tables in one pass of the bitmap; returns their address, or `None` with nothing mapped if the
-/// budget or the frames run out or the pages would reach `USER_END`. Under the process's lock only.
+/// budget or the frames run out or the pages would reach `USER_END`. Under the process's lock only, unless the caller
+/// is its only thread.
 #[inline(never)]
 pub(crate) fn map(
     entry: &ProcessEntry,
     root: &mut W<'_, level::Unlocked>,
     pages: usize,
 ) -> Option<u64> {
+    if entry.alone() {
+        // SAFETY: the caller is its process's only thread, so nothing else reaches the process's data (`alone`).
+        return map_pages(entry, unsafe { entry.lock.unshared() }, root, pages);
+    }
     let mut guard = entry.lock.lock_masked(root);
     let (process, mut w) = guard.parts();
+    map_pages(entry, process, &mut w, pages)
+}
+
+/// `map` with the process's data in hand, `w` the witness of the locks held.
+#[inline(always)]
+fn map_pages<P>(
+    entry: &ProcessEntry,
+    process: &mut Process,
+    w: &mut W<'_, P>,
+    pages: usize,
+) -> Option<u64>
+where
+    level::Frames: LockAfter<P>,
+{
     let l1 = arch::user_table();
     let start = process.next;
     let end = start + (pages * PAGE) as u64;
@@ -128,7 +162,7 @@ pub(crate) fn map(
         return None;
     }
     let mut taken = [PhysAddr(0); MAP_FRAMES];
-    if !FRAMES.lock_masked(&mut w).alloc_many(&mut taken[..count]) {
+    if !FRAMES.lock_masked(w).alloc_many(&mut taken[..count]) {
         entry.budget.refund(count);
         return None;
     }
@@ -377,9 +411,7 @@ pub(crate) fn thread(
         return Err(EAGAIN);
     }
     let (slot, generation) = sched.free_slot().ok_or(EAGAIN)?;
-    if table.vacant(process) == 0 {
-        return Err(EMFILE);
-    }
+    let [at] = table.reserve(process)?;
     let index = sched.process(cpu);
     let stack = (PROCESSES[index].budget)
         .alloc_contiguous(&mut FRAMES.lock_masked(w), TASK_STACK_FRAMES)
@@ -388,11 +420,10 @@ pub(crate) fn thread(
     let frame = unsafe { arch::new_user_task(stack.end.0 as usize, entry, (sp, tls), [arg, 0, 0]) };
     let priority = sched.priority(cpu);
     sched.add((slot, generation), index, (frame, stack.start), priority);
+    PROCESSES[index].threads.fetch_add(1, Relaxed);
     let thread = Object::Thread { slot, generation };
     sched.held(thread);
-    Ok(table
-        .insert(process, thread, WAIT | KILL | DUPLICATE | TRANSFER)
-        .expect("vacant"))
+    Ok(table.fill(process, at, thread, WAIT | KILL | DUPLICATE | TRANSFER))
 }
 
 global_asm!(include_str!("user.s"), USER_BASE = const USER_BASE);
