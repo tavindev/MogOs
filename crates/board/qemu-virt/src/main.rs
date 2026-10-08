@@ -54,6 +54,8 @@ const UNMAPPED: PhysAddr = PhysAddr(0x8000_0000);
 /// The boot table's entries every address space copies: device memory (GiB 0) and RAM (GiB 1), EL1-only, global.
 const KERNEL_ENTRIES: usize = 2;
 const PAGE: usize = 4096;
+/// What `hold_kernel` raises each live process's budget by: a page and the tables a first `map` may need.
+const GATE_FRAMES: usize = 4;
 /// Where user programs' code is mapped; one 2 MiB region, so a process needs a single level-3 table.
 const USER_BASE: u64 = 1 << 32;
 /// Each process's one stack page ends here.
@@ -558,22 +560,20 @@ impl kernel::Board for QemuVirt {
         ]
     }
 
-    fn counter_us(&self) -> u64 {
-        arch::uptime_us()
-    }
-
-    fn hold_kernel(&mut self, start_us: u64, waiters: u32) -> bool {
+    fn hold_kernel(&mut self, waiters: u32) {
         // SAFETY: a `Board` method, which the kernel crate calls holding no lock.
         let mut root = unsafe { arch::root() };
         let _kernel = KERNEL.lock(&mut root);
-        if arch::uptime_us() >= start_us {
-            return false;
-        }
         let from = KERNEL.contended();
+        for entry in PROCESSES
+            .iter()
+            .filter(|entry| entry.threads.load(Relaxed) > 0)
+        {
+            entry.budget.grow(GATE_FRAMES);
+        }
         while KERNEL.contended().wrapping_sub(from) < waiters {
             spin_loop();
         }
-        true
     }
 
     fn report_speculation(&mut self) {

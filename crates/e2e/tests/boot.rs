@@ -712,10 +712,6 @@ fn lock_bench(cpus: usize, secs: u64) {
 #[test]
 fn process_local_calls_run_while_another_core_holds_the_big_lock() {
     let (status, lines) = boot(&["-smp", "4", "-append", "test=lock-split"]);
-    assert!(
-        !lines.iter().any(|l| l == "lock-split: late"),
-        "the boot context took the big lock after the start time"
-    );
     let released = lines
         .iter()
         .position(|l| l == "lock-split: released")

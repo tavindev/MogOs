@@ -17,7 +17,6 @@ pub use mogfs::{BLOCK_SIZE, Disk};
 pub use sched::{Event, Full, PRIORITIES, Process, Scheduler};
 
 use alloc::format;
-use alloc::string::ToString;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::Write;
@@ -121,11 +120,9 @@ pub trait Board {
     /// Lock acquisitions that had to wait, so far (wrapping), per lock level, summed over the level's locks, in
     /// `LOCK_LEVELS` order.
     fn contended(&self) -> [u32; LOCK_LEVELS.len()];
-    /// The counter in microseconds from its start (not from the board's entry), as EL0 reads it.
-    fn counter_us(&self) -> u64;
-    /// Takes the board's kernel lock, and unless the counter has reached `start_us` by then, holds it until `waiters`
-    /// more acquisitions have waited for it; returns whether it was taken in time.
-    fn hold_kernel(&mut self, start_us: u64, waiters: u32) -> bool;
+    /// Takes the board's kernel lock, then raises every live process's budget by a page's worth (and its tables), and
+    /// holds the lock until `waiters` more acquisitions have waited for it.
+    fn hold_kernel(&mut self, waiters: u32);
     /// Chooses this core's vector table (until then an exception from EL0 panics), then prints the `spec:` line
     /// (speculative-execution vulnerabilities and the vector table) for the worst core, once every core `start_cpus`
     /// started has chosen its own. Call before any EL0 code runs on this core.
@@ -205,6 +202,8 @@ const IPI_ROUND_TRIPS: u64 = 1000;
 const CONTENDED_LOCKS: u64 = 100_000;
 /// `test=bench-lock`'s adders that are done.
 static ADDERS_DONE: AtomicUsize = AtomicUsize::new(0);
+/// `test=bench-lock`'s adders past their first half.
+static ADDERS_HALFWAY: AtomicUsize = AtomicUsize::new(0);
 /// `test=smp`'s kernel tasks that each take a core at once (the full N-task form is step 31's `test=limits`).
 const MAX_SPINNERS: usize = 32;
 /// `test=smp`'s spinners that have started, and those that have printed their core.
@@ -681,29 +680,27 @@ fn pipe_bench<B: Board>(board: &mut B) {
 
 /// `test=lock-split`'s workers, one per secondary core of four.
 const LOCK_SPLIT_WORKERS: u32 = 3;
-/// How far ahead of now the workers start: they must all be running by then (TCG under load spawns slowly).
-const LOCK_SPLIT_MARGIN_US: u64 = 500_000;
-
-/// `test=lock-split`: `lockwork` processes spin until a start time, then make calls that need no big lock; the boot
-/// context takes the kernel's big lock just before that time and holds it until all three wait on it (their exits),
-/// so every `W: done` line precedes `released`. `late` if it took the lock only after the start.
+/// `test=lock-split`: `lockwork` processes, spawned with the least budget their spawn takes, so none can `map`, spin
+/// on a one-page `map`, then make calls that need no big lock; the boot context takes the kernel's big lock, only
+/// then raises their budgets (atomic, outside it), and holds it until all three wait on it (their exits), so every
+/// `W: done` line precedes `released`, however the host schedules the cores.
 fn lock_split<B: Board>(board: &mut B) {
     run_checked(board, "lock-split", |board| {
-        let start = board.counter_us() + LOCK_SPLIT_MARGIN_US;
-        let args = [&b"lockwork\0"[..], start.to_string().as_bytes(), b"\0"].concat();
-        for _ in 0..LOCK_SPLIT_WORKERS {
+        let args = b"lockwork\0";
+        let budget = (1..=SMP_WORK_BUDGET)
+            .find(|&budget| {
+                board
+                    .spawn_archived("lockwork", budget, INIT_ARCHIVE, args)
+                    .is_ok()
+            })
+            .expect("spawn");
+        for _ in 1..LOCK_SPLIT_WORKERS {
             board
-                .spawn_archived("lockwork", SMP_WORK_BUDGET, INIT_ARCHIVE, &args)
+                .spawn_archived("lockwork", budget, INIT_ARCHIVE, args)
                 .expect("spawn");
         }
-        while board.counter_us() < start - LOCK_SPLIT_MARGIN_US / 4 {
-            core::hint::spin_loop();
-        }
-        let line = match board.hold_kernel(start, LOCK_SPLIT_WORKERS) {
-            true => "lock-split: released",
-            false => "lock-split: late",
-        };
-        let _ = writeln!(board.console(), "{line}");
+        board.hold_kernel(LOCK_SPLIT_WORKERS);
+        let _ = writeln!(board.console(), "lock-split: released");
     });
 }
 
@@ -746,7 +743,8 @@ fn smp_bench<B: Board>(board: &mut B) {
 /// Times uncontended acquire + release of the ticket and the test-and-set lock, reading the core index and a per-CPU
 /// access; then the boot context and a task per other core (at least one,
 /// so the timer interleaves them on one) each adds `CONTENDED_LOCKS` to a counter under the board's lock, timed from
-/// their spawn until all are done, and the total must be exact.
+/// their spawn until all are done, and the total must be exact. Each waits for every other's first half before its
+/// second (`add_in_halves`), so the adders overlap however the host schedules them.
 fn lock_bench<B: Board>(board: &mut B) {
     for (name, kind) in [
         ("ticket", RoundTrip::Ticket),
@@ -763,10 +761,10 @@ fn lock_bench<B: Board>(board: &mut B) {
     let adders = board.cpus().max(2);
     let start = board.uptime_us();
     for _ in 1..adders {
-        board.spawn(add_and_yield, 0).expect("spawn");
+        board.spawn(add_and_yield, adders).expect("spawn");
     }
     board.start_timer();
-    board.add_locked(CONTENDED_LOCKS);
+    add_in_halves(board, adders);
     while ADDERS_DONE.load(Relaxed) < adders - 1 {
         board.idle();
     }
@@ -776,8 +774,18 @@ fn lock_bench<B: Board>(board: &mut B) {
     let _ = writeln!(board.console(), "lock: count {count}");
 }
 
-fn add_and_yield<B: Board>(board: &mut B, _: usize) -> ! {
-    let count = board.add_locked(CONTENDED_LOCKS);
+/// Adds `CONTENDED_LOCKS` in two halves, the second once all `adders` finished their first; returns the count after.
+fn add_in_halves<B: Board>(board: &mut B, adders: usize) -> u64 {
+    board.add_locked(CONTENDED_LOCKS / 2);
+    ADDERS_HALFWAY.fetch_add(1, Relaxed);
+    while ADDERS_HALFWAY.load(Relaxed) < adders {
+        board.yield_now();
+    }
+    board.add_locked(CONTENDED_LOCKS - CONTENDED_LOCKS / 2)
+}
+
+fn add_and_yield<B: Board>(board: &mut B, adders: usize) -> ! {
+    let count = add_in_halves(board, adders);
     let _ = writeln!(board.console(), "lock: adder done at {count}");
     ADDERS_DONE.fetch_add(1, Relaxed);
     loop {

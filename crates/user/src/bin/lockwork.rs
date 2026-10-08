@@ -1,6 +1,6 @@
-//! A `test=lock-split` worker: spins until the counter reaches its argument (microseconds), then makes `WRITES` 0-byte
-//! console writes and a one-page `map` and prints `W: done`; none of it needs the kernel's big lock, which the boot
-//! context holds from just before that time on. Exits 1 on any failure.
+//! A `test=lock-split` worker: spawned with no budget to spare, spins on a one-page `map` until the boot context, holding
+//! the kernel's big lock, raises its budget; then makes `WRITES` 0-byte console writes and prints `W: done`. None of it
+//! needs that lock. Exits 1 on any failure.
 #![no_std]
 #![no_main]
 
@@ -14,15 +14,11 @@ extern "C" fn _start(argc: usize, _: usize, len: usize) -> ! {
     unsafe { start(argc, len, main) }
 }
 
-fn main(args: &[&[u8]]) -> u64 {
-    let start = arg(args, 1)
-        .iter()
-        .fold(0, |n, &d| n * 10 + (d - b'0') as u64);
-    while now_ns() / 1000 < start {
+fn main(_: &[&[u8]]) -> u64 {
+    while map(4096).is_none() {
         core::hint::spin_loop();
     }
-    let ok = (0..WRITES).all(|_| write(CONSOLE, &[]) == 0) && map(4096).is_some();
-    if !ok {
+    if !(0..WRITES).all(|_| write(CONSOLE, &[]) == 0) {
         return 1;
     }
     write(CONSOLE, b"W: done\n");
