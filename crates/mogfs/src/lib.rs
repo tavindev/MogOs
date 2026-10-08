@@ -57,8 +57,7 @@ pub const MIN_POOL: usize = 32;
 /// The root directory.
 pub const ROOT: Inode = Inode(0);
 
-// Unit tests shrink pages, index blocks, the inline list and the log, so small disks reach several index levels and
-// write their pages often.
+// Unit tests shrink pages, index blocks and the inline list, so small disks reach several index levels.
 #[cfg(not(test))]
 const PAGE_BITS: u64 = 8 * BLOCK_SIZE as u64;
 #[cfg(test)]
@@ -74,11 +73,6 @@ const FAN: usize = 4;
 const INLINE: usize = 128;
 #[cfg(test)]
 const INLINE: usize = 2;
-/// Log entries a commit keeps before it writes the pages.
-#[cfg(not(test))]
-const LOG_CAP: usize = LOG_MAX;
-#[cfg(test)]
-const LOG_CAP: usize = 6;
 /// Index levels `mount` accepts; past `MAX_BLOCKS` with real sizes.
 const MAX_IX: usize = 24;
 const MAX_POOL: usize = 512;
@@ -969,10 +963,13 @@ impl<'a, D: Disk> Fs<'a, D> {
     }
 
     fn write_commit(&mut self, generation: u64) -> Result<(), Error> {
-        // An unwritten data page leads the nodes' request: where it is if the blocks after it are free, else moved
-        // to the start of their run when the block after the run is free too. Moving it changes the log.
+        // Each node claimed adds at most one word to the log.
+        let pages = |fs: &Self| fs.full || fs.nlog + fs.ndirty > fs.log_cap();
+        // An unwritten data page leads a small commit's request: where it is if the blocks after it are free, else
+        // moved to the start of their run when the block after the run is free too. Moving it changes the log.
         if let Some((d, ..)) = self.cached
             && self.unwritten
+            && !pages(self)
             && !self.run_free(d + 1, self.ndirty)
         {
             let b = self.start(self.ndirty);
@@ -980,8 +977,7 @@ impl<'a, D: Disk> Fs<'a, D> {
                 self.lead_data(b)?;
             }
         }
-        // Each node claimed adds at most one word to the log.
-        let pages = self.full || self.nlog + self.ndirty > self.log_cap();
+        let pages = pages(self);
         let start = if pages {
             // Release the old copies of the pages that change and of the index blocks above them (each pointer zeroed
             // once released), then find blocks for them and the nodes; releasing or claiming blocks may change more
@@ -1857,7 +1853,7 @@ impl<'a, D: Disk> Fs<'a, D> {
             return;
         }
         if let Err(at) = self.log[..self.nlog].binary_search(&(i as u64)) {
-            if self.nlog == self.log_cap() {
+            if self.nlog >= self.log_cap() {
                 self.full = true;
             } else {
                 self.log.copy_within(at..self.nlog, at + 1);
@@ -1873,7 +1869,7 @@ impl<'a, D: Disk> Fs<'a, D> {
 
     /// Log entries the superblock has room for after the page list.
     fn log_cap(&self) -> usize {
-        min(LOG_CAP, (END - SB_HDR) / 16 - self.list_entries())
+        (END - SB_HDR) / 16 - self.list_entries()
     }
 
     fn page_dirty(&self, p: usize) -> bool {

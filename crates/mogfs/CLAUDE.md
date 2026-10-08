@@ -39,8 +39,8 @@ or a device driver.
 - `Fs` is about 22 KiB plus the caller's memory: `cache` (a scratch slot, 32 commit staging slots, a node pool of 32 to
   512 slots, and the live page list: its index blocks, or one slot) and `bits` (three bitmaps and a bit per page),
   neither needing to be zeroed. A disk past that memory is `TooBig` at mount. Unit tests (`src/tests.rs`) build the
-  crate with small pages (512 blocks), index blocks of 4 entries, an inline list of 2 and a log of 6, so their
-  small disks reach several index levels and write their pages every few commits; the integration tests use the real sizes.
+  crate with small pages (512 blocks), index blocks of 4 entries and an inline list of 2, so their small disks reach
+  several index levels; the integration tests use the real sizes.
 
 ## Invariants & rules
 
@@ -106,7 +106,7 @@ or a device driver.
   writing nodes out early), the exact I/O table at height 2, 100k entries in one directory (each looked up; listing
   in about one read per leaf; nine in ten unlinked), and a 1 GiB file on a sparse host file with every byte checked
   (about 7 s), and `image.bin` (written by a height-2 workload, regenerated when the format changed in step 39b) mounted and rewritten bit for bit.
-- `src/tests.rs`: 200 seeds of random changes, commits and remounts with the smallest cache through a disk that panics
+- `src/tests.rs`: 200 seeds of random changes, commits (half forced to write the pages) and remounts with the smallest cache through a disk that panics
   on a write to a block a valid slot reaches, checking the tree and the live bitmap after every step and a fresh
   mount's free space after every commit; and the seeded mutation test (1 to 3 decoded fields changed and resealed up
   to the superblock, then mount and every operation; `MUTATION_SEEDS=n` runs more than the default 1500). Targeted: pages commits on an aged 20000-block disk (every

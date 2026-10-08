@@ -470,6 +470,8 @@ fn random_changes_keep_the_tree_and_free_space_consistent() {
                     fs.truncate(f)
                 }
                 7 if next(rng, 3) == 0 => {
+                    // Half write the pages, which small disks otherwise do only at format.
+                    fs.full |= next(rng, 2) == 0;
                     fs.commit().unwrap();
                     let mut d = Guarded::new(fs.disk.blocks.clone(), true);
                     let mut m = Mem::new(blocks);
@@ -1130,7 +1132,7 @@ fn a_moved_data_page_keeps_its_block_when_its_extent_rewrite_spills() {
     assert_eq!(got, [3; BLOCK_SIZE]);
 }
 
-/// Commits that write the pages, on a disk whose index and pages were written by earlier ones: releasing an old page or
+/// Commits that write the pages (forced), on a disk whose index and pages were written by earlier ones: releasing an old page or
 /// index block changes a page the pass already went by, which must be written too, every old block freed.
 #[test]
 fn pages_commits_on_an_aged_disk_release_every_old_block() {
@@ -1149,6 +1151,7 @@ fn pages_commits_on_an_aged_disk_release_every_old_block() {
                 let at = next(rng, 10000) * BLOCK_SIZE as u64;
                 fs.write(f, at, &[step as u8; BLOCK_SIZE]).unwrap();
             }
+            fs.full = true;
             fs.commit().unwrap();
             fs.mount().unwrap();
             check(&mut fs, &format!("seed {seed} step {step}"));
