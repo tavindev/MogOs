@@ -48,13 +48,14 @@ or a device driver.
   log, flushes (`[0, 2, 2]` while a run fits and the staging slots hold them). When the log would overflow, the
   pages changed since they were last written join that request (after their old copies are released) and the log
   empties. Mount reads both superblocks, each live page, and the rightmost path; the older slot's pages only where
-  it does not share them, rebuilding a shared page's older words from the live log's replaced values. When the pool runs short, dirty nodes are written out early (not a commit) at the start of a tree
-  operation, never in the middle of one.
+  it does not share them (same block and sum), rebuilding a shared page's older words from the live log's replaced
+  values. When the pool runs short, dirty nodes are written out early (not a commit) at the start of a tree operation,
+  never in the middle of one.
 - Every on-disk value is checked once when decoded: a node's sum, level, layout, sorted keys within its bounds, every
   pointer in range and set in the live bitmap, birth generations, value shapes (extents within the disk, not
-  overlapping, at most 128 pages); a superblock's fields and log (words increasing, within the disk, zero tail); a bitmap's sums, zero tails
-  and marks for its own blocks. A
-  crafted image gives a named error (or a fallback mount), never a panic.
+  overlapping, at most 128 pages); a superblock's fields and log (words increasing, within the disk, zero tail); a
+  bitmap's sums, zero tails and marks for its own blocks. A crafted image gives a named error (or a fallback mount),
+  never a panic.
 - An entry never names the root or its own directory (checked when decoded), and is followed only if the inode it
   names records it back (parent, entry offset, kind): no directory handle reaches outside its subtree, and no inode is
   reached by two entries through `lookup`. `readdir` reports the inode and kind entries hold without that check; open
@@ -67,9 +68,10 @@ or a device driver.
   (cleared by `set_inode`, an inode's delete, `mount` and `format`); the data page in `bufs[DATA]`, tagged with its
   block, sum, inode and page (cleared before any rewrite of `bufs[DATA]` and by `release` of its block; a page maps to
   another block only through `write`, which retags it); the last four lookups that found their entry (cleared before
-  `create`, `mkdir`, `unlink` or `rename` change an entry, and by `mount`); and the leaf the last descent reached with
-  `readdir`'s last start index in it (cleared before a cache slot is reused or an insert or delete changes the tree). `truncate` takes a file of size 0 to have no extents
-  (they end within the size); a crafted image that breaks this keeps those extents until `unlink`.
+  `create`, `mkdir`, `unlink` or `rename` change an entry, and by `mount` and `format`); and the leaf the last descent
+  reached with `readdir`'s last start index in it (cleared before a cache slot is reused or an insert or delete
+  changes the tree). `truncate` and `unlink` take a file of size 0 to have no extents (they end within the size); a
+  crafted image that breaks this leaks those blocks (still marked used, never written) until scrub.
 - `NoSpace` is decided before anything changes (`reserve`: the operation's data blocks, a bound on the nodes it can
   dirty, and what commit needs), so commit never fails for space. Changes that add also keep back room for an
   `unlink`, which with `truncate` may use it, so a full disk can always be emptied (the floor for snapshot delete

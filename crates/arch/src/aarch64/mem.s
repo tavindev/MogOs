@@ -1,5 +1,5 @@
 // The kernel's memcpy and memmove, 16 bytes per unaligned ldp/stp (free on Normal memory), no FP/SIMD registers.
-// With the MMU off every access is Device and must be aligned to its size: it is whenever dst and src are 8-aligned.
+// With the MMU off every access is Device and must be aligned to its size: it is when dst, src and n are 8-aligned.
 
 .section .text.memmove
 .global memcpy

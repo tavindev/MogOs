@@ -1099,6 +1099,31 @@ impl Disk for Counted<'_> {
 }
 
 #[test]
+fn an_older_slot_sharing_a_page_block_needs_its_sum() {
+    // Both slots list the same bitmap page; the older slot's sum for it, changed and resealed, makes that slot
+    // invalid, so its blocks are not held back from the live tree.
+    let disk = hello();
+    let sum_at = SB_HDR + 8;
+    let good = le64(&disk.durable[1], sum_at);
+    assert_eq!(
+        le64(&disk.durable[1], SB_HDR),
+        le64(&disk.durable[0], SB_HDR)
+    );
+    let bad = crafted(disk.clone(), &[1], sum_at / 8, good ^ 1);
+    let fill = |mut d: MemDisk| {
+        let mut mem = Mem::new(64, POOL);
+        let mut fs = mount(&mut mem, &mut d).unwrap();
+        let f = fs.create(ROOT, b"f").unwrap();
+        (0..)
+            .take_while(|&p| fs.write(f, p * BLOCK_SIZE as u64, &[1; BLOCK_SIZE]).is_ok())
+            .count()
+    };
+    let mut no_older = disk.clone();
+    no_older.durable[1].fill(0);
+    assert_eq!(fill(bad), fill(no_older));
+}
+
+#[test]
 fn small_commits_log_the_bitmap_until_the_log_fills() {
     let mut disk = MemDisk::new(16384);
     let mut mem = Mem::new(16384, POOL);

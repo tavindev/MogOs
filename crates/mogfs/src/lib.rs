@@ -1036,7 +1036,11 @@ impl<'a, D: Disk> Fs<'a, D> {
             if !(2..s.blocks).contains(&b.0) {
                 return Err(Error::Corrupt);
             }
-            if !live && p < self.pages && Block(le64(&self.cache[0], 16 * p)) == b {
+            if !live
+                && p < self.pages
+                && Block(le64(&self.cache[0], 16 * p)) == b
+                && Sum(le64(&self.cache[0], 16 * p + 8)) == sum
+            {
                 let lo = p * PAGE_WORDS;
                 let hi = min(lo + PAGE_WORDS, w);
                 self.bits.copy_within(lo..hi, map * w + lo);

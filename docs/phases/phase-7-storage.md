@@ -72,8 +72,8 @@ Filled in as each step lands.
   1000 files in one directory survive a reboot; `shell_files_survive_a_reboot_only_once_synced` and every other e2e
   pass on the B+tree image. Then the slowdowns against v1 were removed: (1) `sync-change` wrote four blocks per small commit
   (nodes, bitmap page, index, superblock) against v1's two: the index block is gone, the live bitmap's page list sits
-  in the superblock, and after it a log of the bitmap words changed since the pages were written (up to 120 entries
-  beside one page), so a small commit writes the nodes and the superblock; the pages are written, and the log
+  in the superblock, and after it a log of the bitmap words changed since the pages were written (247 entries beside
+  one page, at least 120 at 128 pages), so a small commit writes the nodes and the superblock; the pages are written, and the log
   empties, only when it would overflow. `MAX_BLOCKS` drops to 16 GiB (128 pages) to leave the log room; snapshots
   (step 40) take index blocks, only the live list is inline. Mount reads 3 requests on a fresh image, v1's count.
   (2) `compiler_builtins`' `memcpy`/`memmove` assembled each unaligned word from bytes; `crates/arch` now provides
