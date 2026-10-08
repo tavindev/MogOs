@@ -1,9 +1,9 @@
 # Phase 10: Observability, debugging, security hardening
 
-Goal: production-grade visibility and a hardened, fuzzed trust boundary. Only the early hardening block below is
-written; steps 60-66 (trace tooling, debug handle, crash dumps, audit and revocation, fuzzing CI, signed images,
-mitigation completion) follow the survey ([linux-survey.md](../research/linux-survey.md) section 12) and are planned
-when the phase starts.
+Goal: production-grade visibility and a hardened, fuzzed trust boundary. The early hardening block (60a-60c, done)
+ran beside phase 5; steps 60-66 ([Steps](#steps)) follow the survey ([linux-survey.md](../research/linux-survey.md)
+section 12): a panic dump, trace rings and a profiler, a debug handle, crash dumps, revocation, fuzzing, signed files,
+and the rest of the mitigations (PAC, BTI, MTE).
 
 ## Phase 10 early: hardening baseline
 
@@ -86,7 +86,7 @@ Sources, all read 2026-10-07:
 | v1 bounds bypass (CVE-2017-5753) | affected | affected | affected | 60b |
 | v2 branch target injection (CVE-2017-5715) | affected | not affected | hvf: not affected (host CSV2); TCG `cortex-a72`: vulnerable (no CSV2, no firmware) | phase 11, on real firmware: `ARCH_WORKAROUND_1` at Linux v6.18's sites: every context switch (`check_and_switch_context`), an EL0 instruction abort or PC fault on a kernel address, an EL0 breakpoint or single-step, an EL0 IRQ with a kernel PC |
 | v3 Meltdown (CVE-2017-5754) | not affected | not affected | not affected | no KPTI |
-| v3a system register read (CVE-2018-3640) | affected | not affected | as the model | in the sources, the only target is the kernel's location (VBAR_EL1): Linux builds its v3a capability only with KASLR, and its code fix is for KVM's EL2 vectors. So phase 6, with KASLR |
+| v3a system register read (CVE-2018-3640) | affected | affected (Linux's `proton-pack.c` lists every A72 revision) | as the model | in the sources, the only target is the kernel's location (VBAR_EL1): Linux builds its v3a capability only with KASLR, and its code fix is for KVM's EL2 vectors. So phase 6, with KASLR |
 | v4 speculative store bypass (CVE-2018-3639) | affected | affected | hvf `cortex-a72`: no SSBS (the model's PFR1 is 0), no firmware: vulnerable, as Linux reports | 60a: SSBS where present; A72's `ARCH_WORKAROUND_2` (Linux calls it on every kernel entry and exit) in phase 11 |
 | Spectre-BHB (CVE-2022-23960) | affected, k = 8 | affected, k = 8 | hvf: the k = 8 loop; TCG `cortex-a72`: not mitigated, since v2 is vulnerable | 60a |
 | Spectre-BSE (CVE-2024-10929) | affected | not affected | no firmware: vulnerable (Linux has no BSE handling) | Arm's only mitigation for A72 before r1p0 is firmware `ARCH_WORKAROUND_1` or `_3` (an EL3 MMU off/on); no Arm statement says the BHB loop covers it. So 60a reports it vulnerable without firmware, and phase 11's workaround-1 path covers it. Arm rates practical exploitation "very low" |
@@ -95,6 +95,54 @@ QEMU 9.2.1 answers no SMCCC call: under hvf and TCG a non-PSCI HVC returns -1, a
 is not supported. So SMCCC stays at 1.0 and no firmware workaround exists in either guest. Linux under hvf therefore
 reports `spectre_v2: Mitigation: CSV2, BHB` and `spec_store_bypass: Vulnerable`, the strings recorded in the cross-OS
 run.
+
+## Steps
+
+Done-whens name the e2e test, the benchmarks held and added, and the invariants (Step details); benchmarks and "hold"
+as in the early block. Step 62 needs nothing and can land now. 60 follows 62 (it uses 62's unwind decision);
+61 needs phase 9 steps 53 and 53a and phase 8's sockets; 62a needs 60 and 61; 63 needs 60; 65 needs phase 6's page
+cache and phase 9 step 53b; 66b needs phase 9 step 53, phase 6's memory objects and phase 11 step 71 (the first
+board with MTE); 64, 66 and 66a need nothing new and run late so they cover every surface.
+
+| # | Step | Done when |
+| --- | --- | --- |
+| 60 | Trace rings and profiler | Tracepoints in the kernel crate write fixed 32-byte records (a counter timestamp whose top 16 bits carry the event number, then three arguments; the core is the ring's) through a `Board` method into per-core rings that overwrite the oldest (a flight recorder, which 62a dumps). A tracepoint is off unless a global flag is set: one load and branch. A `trace` handle (init gets it) reads records through `io_submit_wait`; the `trace` program (`crates/user`) prints Chrome trace-event JSON, which the Perfetto UI opens. The profiler, while on, programs its own sampling deadline on each core (benchmarks run with the timer off, and phase 11 step 72 removes the periodic tick): EL1 or EL0 PC plus a frame-pointer unwind (user stacks through probed loads, bounded), as trace records; if 62 leaves frame pointers off, a `profile` cargo feature turns them on for profiling builds only; `scripts/flamegraph.sh` folds and symbolizes them. e2e `test=trace`: a traced `test=bench-pipe` yields switch, syscall and wake events in causal order per core; a profiled `test=bench-syscall` has the syscall entry among its top frames. |
+| 61 | Debug handle and gdbstub | A `debug` right on a process handle (only `spawn`'s caller gets it): `debug_read` and `debug_write` of the process's memory, `thread_regs` and `set_thread_regs`, `suspend` and `resume` (53a), single step (`MDSCR_EL1.SS` set only while the stepped thread runs, and `SPSR_EL1.SS` set on the `eret` into it; `OSLAR_EL1` cleared on each core at boot, or the OS lock blocks debug exceptions), and software breakpoints (`brk` written by `debug_write`). With a debugger attached, a fault, `brk` or step completes its `OP_EXCEPTION` op on the process handle and stops the thread before 53's in-process handler sees it. `gdbstub` (native) serves GDB's remote protocol over TCP. e2e: the test speaks the remote protocol through `hostfwd`: breaks at a function (address from the ELF), reads registers and memory, steps twice, continues, and the program exits with its normal code. |
+| 62 | Panic dump: registers and unwind | Frame pointers are measured first: `-C force-frame-pointers=yes` (today the kernel omits them: a dev build of main has 74 frame setups for 541 functions, `llvm-objdump`) against the tracked benchmarks. Within noise, they stay on and the dump unwinds the x29 chain; otherwise they stay off and the dump prints a raw window of the kernel stack that `scripts/symbolize.sh` unwinds offline from the ELF's CFI. A panic asks the other cores to park (an SGI, best effort: a core spinning masked never takes it, so the dump waits a bounded time and goes on) and prints, on the raw UART with no lock: the message; for an unhandled exception, ESR, FAR, ELR, SPSR, SP and x0-x30 from the trap frame; then the backtrace (or the stack window), each frame or word checked to lie inside the current kernel stack's bounds, at most 64 frames, each address as `kernel+0x<offset>` so phase 6's KASLR changes nothing. A panic inside the panic path prints one line and powers off. A user fault's line gains ELR and ESR. `scripts/symbolize.sh` turns the offsets into functions with Homebrew LLVM's `llvm-symbolizer` (already a C build dependency). e2e `test=panic-dump`: a panic three calls deep; the test symbolizes the dump against the built ELF and finds the three functions in order; `test=wx-text`'s fault dump shows ESR, FAR and x0-x30. |
+| 62a | Crash dumps that survive the reboot | On a panic the board writes a structured dump (62's text and registers, each core's last trace records, scheduler and process summary, a checksum) to a dedicated dump disk by a polled, interrupt-free virtio-blk path; the next boot finds a valid dump, prints it and clears it. User core dumps need no kernel code: a supervisor holding the debug handle takes `OP_EXCEPTION`, reads memory with `debug_read` and writes an ELF core (`coredump`, native). e2e: boot with `-drive file=dump.img`, panic, reboot, the dump lines match the first boot's; a faulting C program leaves a core whose PC and registers match the fault line. |
+| 63 | Revocation and audit | `dup_revocable(handle, rights)` returns a handle and a revoker; `revoke(revoker)` makes the handle, and every duplicate or transfer of it, fail with `EKEYREVOKED` from then on (a generation in a revocation slot charged to the revoker's owner). Closing the revoker's last handle revokes too, so a grant never outlives its grantor's power to end it, and the slot is freed. A plain handle's lookup is unchanged (its own enum variant); a revocable one adds one load and compare. Audit: grants (spawn transfers, `dup`, transfer) and denials (missing right, bad handle) are trace events (60), read by an `audit` program; no second log. e2e: a child's handle and its duplicates fail with `EKEYREVOKED` after the parent revokes, and after a second parent exits holding its revoker; each denial the test provokes appears once in the audit stream. |
+| 64 | Fuzzing | `test=fuzz` covers every native call added since phase 5 (futex, thread, sockets with a NetStack, signals, redirect, debug, revoke) and takes a seed range; host seeded-mutation fuzzers on stable (as `crates/net` does; `cargo-fuzz` needs nightly) for the ELF and cpio parsers, `crates/dtb`, MogFS mount and the compat runtime's Linux struct decoders; the shipped lock module (`crates/arch/src/aarch64/lock.rs`, already `core::sync::atomic`) model-checked with `loom` (a host-only dev-dependency): its atomics come through a `cfg(loom)` shim, a host stand-in replaces the `tpidr_el1` core index (its only asm), and its spin loops yield to loom. No `SeqCst` in it, since loom treats it as AcqRel. Phase 8's open hole closes here: a closed connection whose peer advertises a zero window stays in FIN-WAIT-1 forever (`crates/net` persists without limit), so released connections get the same bounded zero-window probes as orphans (at most 8), with a host test where a peer holds a zero window after our FIN and the slot is freed. `scripts/fuzz.sh <minutes>` runs them all; `docs/DEVELOPMENT.md` makes a clean 60-minute run part of every release. Each bug found leaves its seed as a regression test. |
+| 65 | Signed files | A MogFS file can be sealed: a SHA-256 Merkle tree over its 4 KiB blocks (fs-verity's layout), its root signed with Ed25519, the file read-only from then on. Ed25519 verification is `ed25519-dalek` (serial backend) behind a signature-verify port the board implements (its dependency tree has `unsafe`, and the project rule puts `unsafe` only in `arch` and board crates); SHA-256 is hand-written safe scalar code in the kernel crate, with the hardware compress function in `arch`. Every page-cache fill of a sealed file is checked against the tree, once per fill. A new `exec_signed` right on directory handles: `spawn` through it only runs sealed files whose root verifies against a public key built into the kernel image (`EKEYREJECTED` otherwise; the private key stays offline, outside the repository; rotation is a rebuild, with two public keys accepted during a transition; the e2e uses a fixed-seed test keypair); init gives shells this right instead of `exec`. SHA-256 uses the Armv8 SHA2 instructions inside an `arch` scope that saves the interrupted thread's FP state (53b's machinery), measured against scalar. e2e: a sealed binary runs; one byte changed on the disk image fails its read with `EIO` and its spawn with `EKEYREJECTED`; an unsealed binary through `exec_signed` is refused. |
+| 66 | Typed user values | 60b's exhaustive clamp list becomes a type: every user-derived integer reaches the kernel crate as `User<u64>`, which indexes nothing until `clamp(capacity)` (the `csel` and `csdb` from `arch`) returns a bounded index, so a missed clamp is a compile error, not a review finding. Zero run-time cost (a newtype); 60b's one-`csdb`-per-call rule unchanged. Every surface added in phases 6-9 (redirect, debug, trace reads, memory objects) is converted. e2e: all pass; syscall, pipe and `bench-syscalls` hold. |
+| 66a | PAC and BTI for user space | `SCTLR_EL1.EnIA/EnIB/EnDA/EnDB` and `BT0` where the CPU has them; per-process keys generated at `spawn` from phase 9 step 54a's generator and written on a switch between processes only; executable pages of ELFs carrying the `GNU_PROPERTY_AARCH64_FEATURE_1_BTI` note map with the GP bit. musl and the C programs build with clang's `-mbranch-protection=standard`, and musl's `.S` files and the crt objects gain `bti` landing pads and the property note, so the linked image keeps it. The kernel takes neither (Decided). e2e on TCG `-cpu max`: a C program that overwrites its saved return address faults instead of returning, and an indirect branch into a function's middle takes a BTI fault, both through 53's handler; on `cortex-a72` both programs run unprotected and the e2e records it. |
+| 66b | MTE for user memory (opt-in) | Follows phase 11 step 71 (the Orion O6 has MTE). A `tagged` flag on anonymous memory objects maps them Normal-Tagged; tag storage is accounting only (charged to the owner's budget, carved by firmware on hardware). The hidden work: `TCR_EL1.TBI0` and the tagged-address ABI, so `mask_user` and the user range checks ignore the tag byte; `TFSRE0_EL1` (async faults) checked at switch, never on the syscall path; a thread chooses sync, async or asymmetric checking with a call (`SCTLR_EL1.TCF0`), switched with the thread only when it differs; a tag-check fault reaches 53's handler with its own ESR code (libc: `SIGSEGV`, `SEGV_MTESERR`/`SEGV_MTEAERR`). Off by default; C programs opt in with Scudo (standalone, tagged mode, as Android uses it: developer.android.com/ndk/guides/arm-mte) instead of musl's mallocng. Scudo reserves large `PROT_NONE` ranges up front: the step's plan review checks them against no-overcommit `map` (a reservation must not charge the budget, phase 6's reserve/commit split) and the 39-bit user address space. e2e on TCG `-M virt,mte=on -cpu max`: a C program tags two buffers with `irg`/`stg`, an overflow from one into the other faults in sync mode and is reported in async mode. |
+
+### Step details
+
+- **60.** Benchmark: syscall, yield, pipe hold with tracing built in and off (the debt ledger's Tracing hooks row);
+  per-event cost with tracing on recorded. If the off-path load and branch is not within noise on a hot path, that
+  tracepoint becomes a cargo feature and only cold paths keep the run-time flag. Invariants: a writer never waits
+  (per-core ring, IRQs masked while writing one record); a reader without the `trace` right sees nothing. Avoids:
+  three tracing subsystems (ftrace, perf, BPF), code patching (static keys), and a text tracefs.
+- **61.** Benchmark: syscall, yield and pipe hold (a debugger is consulted only on the exception path). Invariants:
+  all control through the `debug` right, no system-wide policy knob; a stepped thread's `MDSCR_EL1` never leaks to
+  another. Avoids: ptrace's signal-based stops and `ptrace_scope` (M11).
+- **62.** Benchmark: syscall, yield, pipe and boot with frame pointers on against off (Linux arm64 always builds
+  with them, `select FRAME_POINTER` in `arch/arm64/Kconfig`); they stay on only if within noise. Invariants: the dump path takes no lock and allocates nothing; the unwind never dereferences outside the stack it
+  started on, so a corrupt chain ends the backtrace instead of faulting. Avoids: a kallsyms-style symbol table in the
+  image (symbolized on the host).
+- **62a.** Invariants: the dump path shares no lock or queue with the normal block path. Avoids: kdump's reserved
+  crash kernel.
+- **63.** Benchmark: syscall and pipe hold. Invariants: rights never grow through a revocable handle; revocation is
+  O(1) and leaves no dangling object. Avoids: a separate audit subsystem and LSM hooks.
+- **65.** Benchmark: sequential read of a sealed 64 MiB file against an unsealed one; `spawn` of a sealed binary.
+  Invariants: a sealed file never changes; a page fails verification before user space sees it.
+- **66a.** Benchmark: syscall, yield and pipe hold on `cortex-a72` (no keys written); the key switch is measured
+  on the Orion O6 (phase 11 step 71) and must hold the same benchmarks there. Invariants: no two processes
+  share keys; a key is never readable from EL0.
+- **66b.** Benchmark: yield, syscall and pipe hold for untagged processes; tagged costs recorded on the Orion O6.
+  Invariants: untagged memory behaves exactly as before. Avoids: kernel MTE or KASAN (safe Rust, as the
+  ledger's declined rows argue).
 
 ## Decided
 
@@ -105,8 +153,8 @@ run.
   - W^X with stack guards (60c)
 
   Firmware workarounds 1-3 are called only when SMCCC 1.1 discovery says they exist and are needed, that is in
-  phase 11 on real A72 firmware, where they are priced against Linux. No mitigation is left out because it is slow;
-  a costly one is measured and paid.
+  phase 11 on real firmware, where they are priced against Linux. No mitigation a CPU needs is left out because it
+  is slow; each takes its cheapest correct form, measured.
 - **No per-syscall kernel stack offset randomization.** The argument rests on memory safety alone, not on cost.
   - Linux's `RANDOMIZE_KSTACK_OFFSET` makes the kernel stack layout unpredictable across syscalls. That defeats
     attacks built on memory-safety bugs in kernel code: stack buffer overflows, uninitialized-stack reads, and stack
@@ -117,19 +165,57 @@ run.
   - With the attack's precondition ruled out, declining gives away no security. The ledger marks it declined, and
     the cross-OS rerun isolates Linux's share with `randomize_kstack_offset=off`.
   - Reopen it if `unsafe` code ever puts user-sized or uninitialized data on a kernel stack.
-- **KASLR stays in phase 6**, with the higher-half kernel (survey steps 32 and 38). It carries this question: A72
-  before r1p0 leaks VBAR_EL1 through v3a, and Linux forces KPTI with KASLR on CPUs without E0PD
-  (`kaslr_requires_kpti`). Phase 6 measures KPTI-style fixed vectors against a KASLR that randomizes only what v3a
-  cannot reveal. The mapping seal stays with KASLR there.
+- **KASLR stays in phase 6**, with the higher-half kernel (survey steps 32 and 38). A72 leaks VBAR_EL1 through v3a in
+  every revision, and Linux forces KPTI with KASLR on CPUs without E0PD (`kaslr_requires_kpti`). Phase 6 decided
+  (2026-10-07): no KPTI; KASLR is relied on only where E0PD exists, and on A72 the boot report marks KASLR weak. The
+  mapping seal moved to phase 9 with `protect` (step 54).
+- **Tracing is per-core flight-recorder rings behind a run-time flag, exported as Chrome trace-event JSON**
+  (coordinator, 2026-10-07): Linux's ftrace ring buffer is per-CPU with lock-free writers
+  (docs.kernel.org/trace/ring-buffer-design.html), and the Perfetto UI opens Chrome JSON directly
+  (perfetto.dev/docs/getting-started/other-formats), so no protobuf encoder is written. Linux's static keys patch
+  kernel text (docs.kernel.org/staging/static-keys.html), which a W^X kernel with no `unsafe` outside `arch` does not
+  do; a measured load and branch replaces them, and a cargo feature where that is not free.
+- **Frame pointers only if free** (step 62): Linux arm64 selects `FRAME_POINTER` unconditionally
+  (`arch/arm64/Kconfig`); rustc's target default for bare-metal AArch64 lets LLVM omit them (`FramePointer::MayOmit`),
+  and `-C force-frame-pointers` is stable (doc.rust-lang.org/rustc/codegen-options). They stay on if the tracked
+  benchmarks hold; otherwise the panic dump is unwound offline from CFI and frame pointers are a profiling feature.
+- **PAC and BTI for user space only** (step 66a): clang has `-mbranch-protection`. The kernel takes neither:
+  `SCTLR_EL1.EnIA` enables the IA key for EL1 and EL0 alike, so signing kernel asm would need kernel keys switched on
+  every entry and exit, and kernel BTI needs the GP bit on Rust-compiled text, which needs `-C branch-protection`,
+  still unstable (rust-lang/rust#113369, open, stabilization PR pending; stable-only is a project rule). Revisit when
+  it stabilizes.
+- **MTE is opt-in, user memory only** (step 66b): Linux's per-thread sync, async and asymmetric modes
+  (docs.kernel.org/arch/arm64/memory-tagging-extension.html) are copied; the measured cost ranges from modest to
+  6.64x on some SPEC benchmarks in sync mode on Pixel cores ("ARM MTE Performance in Practice", arXiv 2601.11786; read
+  from its abstract through search, not re-read), so it cannot be a default; the kernel takes no MTE or KASAN (safe
+  Rust). Allocator: Scudo standalone in tagged mode, opt-in (research, 2026-10-07: LLVM's hardened allocator with MTE
+  support); musl's mallocng stays the default.
+- **No "untrusted" flag for predictor scrubbing** (survey step 66's idea, dropped): on a CSV2 core branch predictors
+  are separated by context in hardware, and on an affected core Linux runs firmware workaround 1 on every context
+  switch (the variant table above), which phase 11 prices on real firmware. A per-process trust flag would be policy
+  with no safe default.
+- **Revocation by a generation slot** (step 63), not seL4's derivation tree: one load and compare on revocable
+  handles only, nothing on the rest, and no tree to walk at revoke.
+- **Signature and hash** (research, 2026-10-07, step 65): `ed25519-dalek` with its serial backend behind a board
+  port, since its dependency tree uses `unsafe` and the project rule allows `unsafe` only in `arch` and board crates; SHA-256 hand-written in safe Rust (a small, fixed algorithm, FIPS
+  180-4) with the compress function in `arch` on hardware that has the SHA2 instructions. One build-time key: the
+  public key is embedded, the private key is kept offline, rotation is a rebuild accepting two public keys for one
+  transition.
+- **Lock model checking with `loom`** (research, 2026-10-07, step 64): a host-only dev-dependency of the lock's crate,
+  as smoltcp is for `crates/net`, checking the shipped lock module itself; no `SeqCst` in it (loom treats it as
+  AcqRel). Rejected: shuttle (randomized, not exhaustive), Kani and TLA+ (a second model to keep in sync
+  with the code); Miri's GenMC mode to revisit when it is stable.
 
 ## Notes
 
 - Survey numbering ([linux-survey.md](../research/linux-survey.md) section 12) against this doc:
   - 60a and 60b take the "first Spectre baseline" (SMCCC workarounds, index clamping) from survey step 38. That step
-    keeps KASLR and the seal in phase 6.
+    keeps KASLR in phase 6; the seal moved to phase 9 step 54.
   - 60c takes the W^X kernel map from survey step 32. That step keeps the higher-half move.
-  - Survey steps 60-66 keep their numbers. Step 66 (mitigation completion: predictor scrub for untrusted processes,
-    side-channel regression tests) builds on 60a.
+  - Survey steps 60-66 keep their numbers. 62 splits into 62 (panic dump, on the console) and 62a (the dump that
+    survives a reboot, user cores); 66 (mitigation completion) becomes 66 (60b's clamps as a type: the side-channel
+    regression test runs at compile time), 66a (PAC, BTI) and 66b (MTE). The v2 firmware calls of survey 66 stay in
+    phase 11 (the variant table above).
 - What these steps cost and pay is tracked in `docs/BENCHMARKS.md`'s debt ledger, which also judges Linux's other
   hardening defaults. A cross-OS rerun after 60a compares MogOs-with-mitigations against the `Linux` column, not the
   `mitigations=off` one.
