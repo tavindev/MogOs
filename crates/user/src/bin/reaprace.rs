@@ -26,7 +26,7 @@ extern "C" fn _start() -> ! {
     for i in 0..ROUNDS {
         let child = match i % 3 {
             2 => {
-                let end = dup(write_end as u64, WRITE | TRANSFER);
+                let end = dup(write_end, WRITE | TRANSFER);
                 let child = spawn(pair, &[end as u64], PAIR_BUDGET);
                 // Both its threads spin once the byte is here.
                 if child >= 0 && read(read_end as u64, &mut [0]) != 1 {
