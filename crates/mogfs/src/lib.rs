@@ -1251,7 +1251,13 @@ impl<'a, D: Disk> Fs<'a, D> {
             // The item's delete releases nodes the next newest may hold: its bitmap first, then `newest`, which the
             // item's leaf must still satisfy when decoded.
             if next.is_none() {
-                self.load_snapshot(prev.map_or(0, |p| p.0))?;
+                match prev {
+                    Some(p) => self.load_snapshot(p.0)?,
+                    None => {
+                        let w = self.words;
+                        self.bits[SNAP * w..(SNAP + 1) * w].fill(0);
+                    }
+                }
             }
             self.forget_names();
             self.delete(Key::new(ROOT, ItemKind::Snapshot, Offset(g)))?;
@@ -1968,8 +1974,8 @@ impl<'a, D: Disk> Fs<'a, D> {
         Ok(pins)
     }
 
-    /// Whether `map` marks `b`; another slot's map holds only the words its own pages gave, the rest are the live
-    /// ones. Blocks past this disk's size are never allocated, so need no mark.
+    /// Whether `map` marks `b`, or for the older slot's map the live one does. Blocks past this disk's size are never
+    /// allocated, so need no mark.
     fn marked(&self, map: usize, b: Block) -> bool {
         let (w, i) = (self.words, (b.0 / 64) as usize);
         b.0 >= self.blocks
@@ -2863,6 +2869,7 @@ impl<'a, D: Disk> Fs<'a, D> {
                 ItemKind::Snapshot => {
                     inode == ROOT
                         && len == SNAP_LEN
+                        && 0 < o
                         && o < self.generation
                         && o <= self.newest
                         && le64(v, 16) <= o

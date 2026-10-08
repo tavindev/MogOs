@@ -1537,6 +1537,13 @@ fn snapshot_neighbours_are_found_across_leaves() {
     while !snaps.is_empty() {
         let g = snaps.remove(next(rng, snaps.len() as u64) as usize);
         fs.delete_snapshot(Snapshot(g)).unwrap();
+        // With none left, no release may test a deleted snapshot's bitmap.
+        if snaps.is_empty() {
+            assert!(
+                (0..fs.words).all(|i| fs.bits[SNAP * fs.words + i] == 0),
+                "deleted {g}"
+            );
+        }
         if snaps.len() % 10 == 0 {
             check_pinned(&mut fs, &snaps, &format!("deleted {g}"));
             fs.commit().unwrap();
