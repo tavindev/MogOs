@@ -698,7 +698,7 @@ fn lock_bench(cpus: usize, secs: u64) {
     }
     let first = lines
         .iter()
-        .find_map(|l| l.strip_prefix("lock: adder done at "))
+        .find_map(|l| l.strip_prefix("lock: adder overlapped at "))
         .expect("missing adder line")
         .parse::<u64>()
         .unwrap();

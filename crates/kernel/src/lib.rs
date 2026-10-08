@@ -21,8 +21,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::Write;
 use core::ops::Range;
-use core::sync::atomic::AtomicUsize;
-use core::sync::atomic::Ordering::Relaxed;
+use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+use core::sync::atomic::{AtomicU64, AtomicUsize};
 
 use dtb::Dtb;
 use handle::{INIT_ARCHIVE, Rights, SHELL_ARCHIVE};
@@ -202,8 +202,10 @@ const IPI_ROUND_TRIPS: u64 = 1000;
 const CONTENDED_LOCKS: u64 = 100_000;
 /// `test=bench-lock`'s adders that are done.
 static ADDERS_DONE: AtomicUsize = AtomicUsize::new(0);
-/// `test=bench-lock`'s adders past their first half.
+/// `test=bench-lock`'s adders past their first half in the overlap check.
 static ADDERS_HALFWAY: AtomicUsize = AtomicUsize::new(0);
+/// The count once every adder finished the timed run; the overlap check's counts are from it.
+static TIMED_COUNT: AtomicU64 = AtomicU64::new(0);
 /// `test=smp`'s kernel tasks that each take a core at once (the full N-task form is step 31's `test=limits`).
 const MAX_SPINNERS: usize = 32;
 /// `test=smp`'s spinners that have started, and those that have printed their core.
@@ -743,8 +745,9 @@ fn smp_bench<B: Board>(board: &mut B) {
 /// Times uncontended acquire + release of the ticket and the test-and-set lock, reading the core index and a per-CPU
 /// access; then the boot context and a task per other core (at least one,
 /// so the timer interleaves them on one) each adds `CONTENDED_LOCKS` to a counter under the board's lock, timed from
-/// their spawn until all are done, and the total must be exact. Each waits for every other's first half before its
-/// second (`add_in_halves`), so the adders overlap however the host schedules them.
+/// their spawn until all are done. Then, untimed, each adds `CONTENDED_LOCKS` again in halves, the second once every
+/// adder finished its first (`add_in_halves`), so they overlap however the host schedules them; that run's total must
+/// be exact.
 fn lock_bench<B: Board>(board: &mut B) {
     for (name, kind) in [
         ("ticket", RoundTrip::Ticket),
@@ -764,13 +767,20 @@ fn lock_bench<B: Board>(board: &mut B) {
         board.spawn(add_and_yield, adders).expect("spawn");
     }
     board.start_timer();
-    add_in_halves(board, adders);
-    while ADDERS_DONE.load(Relaxed) < adders - 1 {
+    board.add_locked(CONTENDED_LOCKS);
+    while ADDERS_DONE.load(Acquire) < adders - 1 {
         board.idle();
     }
     let ns = (board.uptime_us() - start) * 1000 / CONTENDED_LOCKS;
     let _ = writeln!(board.console(), "lock: contended {ns} ns/round-trip");
-    let count = board.add_locked(0);
+    TIMED_COUNT.store(board.add_locked(0), Relaxed);
+    // The adders start the overlap check once this count is out.
+    ADDERS_DONE.fetch_add(1, Release);
+    add_in_halves(board, adders);
+    while ADDERS_DONE.load(Acquire) < 2 * adders - 1 {
+        board.idle();
+    }
+    let count = board.add_locked(0) - TIMED_COUNT.load(Relaxed);
     let _ = writeln!(board.console(), "lock: count {count}");
 }
 
@@ -785,9 +795,15 @@ fn add_in_halves<B: Board>(board: &mut B, adders: usize) -> u64 {
 }
 
 fn add_and_yield<B: Board>(board: &mut B, adders: usize) -> ! {
-    let count = add_in_halves(board, adders);
+    let count = board.add_locked(CONTENDED_LOCKS);
     let _ = writeln!(board.console(), "lock: adder done at {count}");
-    ADDERS_DONE.fetch_add(1, Relaxed);
+    ADDERS_DONE.fetch_add(1, Release);
+    while ADDERS_DONE.load(Acquire) < adders {
+        board.yield_now();
+    }
+    let count = add_in_halves(board, adders) - TIMED_COUNT.load(Relaxed);
+    let _ = writeln!(board.console(), "lock: adder overlapped at {count}");
+    ADDERS_DONE.fetch_add(1, Release);
     loop {
         board.yield_now();
     }
