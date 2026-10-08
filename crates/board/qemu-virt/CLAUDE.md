@@ -111,9 +111,10 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
   `HEAP` is the only leaf (no witness, nothing taken under it). No step holds two locks of one level: `spawn` holds
   only the parent's and writes the unpublished child through `Lock::unpublished`. Each trap hook and `Board` method
   starts from `arch::root()`. A hook that switches takes `KERNEL` and returns holding it; the trap exit releases it
-  after `mov sp, x0`. A frame is never freed by the core running on it: a thread's stack and an ended process's release
-  are deferred per-CPU work (`DEFERRED`) the trap exit's `board_unlock_work` runs after `mov sp, x0` in the same trap;
-  a process index (its ASID) is freed only after `flush_asid` and `free_space`, and `wait` returns only after that. No
+  after `mov sp, x0`. A frame is never freed by the core running on it: a thread's own stack is deferred per-CPU work
+  (`DEFERRED`) the trap exit's `board_unlock_work` runs after `mov sp, x0` in the same trap; an ended process is
+  released in the hold that ended it, once no core runs it (`finish_release`); a process index (its ASID) is freed only
+  after `flush_asid` and `free_space`, and `wait` returns only after that. No
   hook holds a process lock across a switch (`io_wait` blocks in two holds). `Board` methods take `lock()` guards and
   never hold one across a switch (`run_others` drops it before `yield_now`). Fault, echo and every non-empty user
   `write` take `CONSOLE`, so each write is whole on any core; only panic output uses `UART0` directly, so a panic under
@@ -143,11 +144,14 @@ AArch64 register/table code (`crates/arch`). New policy goes in `kernel` as safe
   exit. `spawn_process` takes nothing on failure; a failed
   `spawn` or `thread` changes nothing.
 - A thread's end frees a kernel stack no core runs on at once, and parks the one its own core runs on (`DEFERRED`)
-  until the trap exit has left it. A process's last thread leaves its release to the trap exit of the core that ended
-  it: its handles (under its lock), then its memory (`flush_asid`, `free_space`), then `Scheduler::exited`, so it is
-  reapable, and its index free, only once nothing of it is left. Until then it is neither live (a `kill` ends nothing)
-  nor reapable, and counts as a task. A core that ended a process's last thread goes to its idle context
-  (`switch_after_end`) and picks a task after the release, which may wake a better one.
+  until the trap exit has left it. A process's last thread leaves its release to the end of the hook that ended it,
+  after that hook's switch away from it (`finish_release`), in the same hold of `KERNEL`: its handles (its lock is
+  reached through `Lock::unpublished`, as no thread of it is left to take it), then its memory (`flush_asid`,
+  `free_space`), then `Scheduler::exited`, so it is reapable, and its index free, only once nothing of it is left, and
+  no other core sees it half released. A core that ended its own process's last thread goes to its idle context for
+  the release (`switch_after_end`, `Scheduler::to_idle`) and then picks a task, which the release may have woken,
+  with no other core signalled for it; after a `kill` of another process it switches only if what the release woke
+  should run (it idles, runs the boot context, or a ready task outranks it).
 - Ending a process (`exit`, a fault, `kill`) ends every thread no other core runs (mutexes released, a lent boost
   dropped, stacks refunded) and marks the others, all before `switch` picks the next task.
 - Every new `Process` or `Thread` handle is counted (`Scheduler::held`): the one `spawn_process` hands out (the

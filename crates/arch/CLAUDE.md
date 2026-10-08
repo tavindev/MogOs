@@ -62,8 +62,8 @@ It is **NOT** board-specific: no MMIO addresses, no memory map, no drivers, no s
   through four `extern "C"` hooks the board must define: `task_switch`, `board_irq`,
   `board_syscall`, `board_user_fault`, each entered with IRQs masked and returning a `Resume` that says whether it holds
   the board's kernel lock (one that switched always does); right after `mov sp, x0` the trap exit releases it through
-  `board_unlock`, or through `board_unlock_work(frame)` when the hook left work, which returns a `Resume` of its own
-  that the exit loops on, so no other core can run the task whose stack this core just left. The `brk #0` self-test
+  `board_unlock`, or through `board_unlock_work` when the hook left work (a stack to free), so no other core can run the
+  task whose stack this core just left. The `brk #0` self-test
   runs no hook and holds no lock.
 - Built only for `aarch64-unknown-none-softfloat`; excluded from `cargo test-host`. Code lives under
   `#[cfg(target_arch = "aarch64")]`.

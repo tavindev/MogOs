@@ -22,23 +22,11 @@ use crate::{
     Sched, TICK_COUNTED, TICK_US, TICKED, TICKS, TIMER_IRQ, UART_IRQ, kick, send, send_sgi,
 };
 
-/// Frees a core does once off the stack it trapped on (`board_unlock`), from a hook that holds `KERNEL`.
-#[derive(Default)]
-pub(crate) struct Deferred {
-    /// The kernel stack of the thread this core ended while running on it (its process already refunded).
-    stack: Option<PhysAddr>,
-    /// A process whose last thread ended, and its code: its release (handles, then memory) ends with `exited`.
-    release: Option<(usize, u64)>,
-}
-
 #[unsafe(link_section = ".percpu")]
 // SAFETY: in `.percpu`.
-static DEFERRED: arch::PerCpu<Deferred> = unsafe {
-    arch::PerCpu::new(Deferred {
-        stack: None,
-        release: None,
-    })
-};
+/// The kernel stack of the thread this core ended while running on it (its process already refunded), freed once the
+/// trap exit has left it (`board_unlock_work`).
+static DEFERRED: arch::PerCpu<Option<PhysAddr>> = unsafe { arch::PerCpu::new(None) };
 
 /// # Safety
 /// Trap context (IRQs masked), and `frame` the current task's trap frame. Returns holding `KERNEL`.
@@ -67,55 +55,72 @@ unsafe extern "C" fn board_unlock() {
     unsafe { KERNEL.unlock() }
 }
 
-/// As `board_unlock`, then this core's `Deferred` work, now off the stack it trapped on; a core that idled for a
-/// release (`switch_after_end`) then picks a task from `frame`, its idle context's, as a hook does.
+/// As `board_unlock`, after freeing the stack this core parked (`DEFERRED`), now that the trap exit left it.
 ///
 /// # Safety
-/// As `board_unlock`, with `frame` the frame the trap exit moved to.
+/// As `board_unlock`.
 #[unsafe(no_mangle)]
-unsafe extern "C" fn board_unlock_work(frame: usize) -> Resume {
+unsafe extern "C" fn board_unlock_work() {
     // SAFETY: trap context.
-    let deferred = unsafe { DEFERRED.with_masked(core::mem::take) };
-    if let Some(stack) = deferred.stack {
+    if let Some(stack) = unsafe { DEFERRED.with_masked(Option::take) } {
         // Before `KERNEL` goes: core 0 cannot resume the boot context and count free frames until it is free.
         // SAFETY: the trap exit holds only `KERNEL`, and `FRAMES`, the one lock taken under this witness, comes after it.
         free_stack(&mut FRAMES.lock_masked(&mut unsafe { arch::root() }), stack);
     }
     // SAFETY: the caller's contract.
-    unsafe { KERNEL.unlock() };
-    let Some((index, code)) = deferred.release else {
-        return Resume::unlocked(frame);
-    };
-    // SAFETY: the trap exit, with `KERNEL` released above and no other lock held.
-    let mut root = unsafe { arch::root() };
-    // The handles first, under the process's lock, which comes before `KERNEL`.
-    let entry = &PROCESSES[index];
-    let handles = entry.handles.take(&mut entry.lock.lock_masked(&mut root));
-    let (kernel, mut w) = Guard::leak(KERNEL.lock_masked(&mut root));
-    let cpu = arch::cpu();
-    release_process(kernel, &mut w, (index, code), &handles);
-    let next = match kernel.sched.idle(cpu) {
-        // SAFETY: trap context, and `frame` this core's idle context's.
-        true => unsafe { switch(&mut kernel.sched, cpu, frame) },
-        false => frame,
-    };
-    // `board_irq` stopped the tick when this core went idle for the release.
-    if TICKS.load(Relaxed) && !kernel.sched.idle(cpu) {
-        arch::timer::arm(TICK_US);
-    }
-    kick(&mut kernel.sched, cpu);
-    Resume::locked(next, core::mem::take(&mut kernel.deferred))
+    unsafe { KERNEL.unlock() }
 }
 
-/// Releases the ended process at `index`, its last thread gone and its `handles` taken from its table: those handles,
-/// then its address space and ASID, and only then makes it reapable (`exited`), so
-/// `wait` returns after its frames are free and its index is not reused before.
-fn release_process(
+/// Releases the process whose last thread this hold ended (`Kernel::release`), once no core runs it: its handles, its
+/// address space and ASID, and only then makes it reapable (`exited`), all in the hold that ended it, so nothing sees it
+/// half released, `wait` returns after its frames are free and its index is not reused before. Then, from `next`, the
+/// frame this core resumes, switches again if what the release woke should run instead: this core idles or runs the
+/// boot context, or a ready task outranks it.
+///
+/// # Safety
+/// Trap context, holding `KERNEL` through `kernel`, every switch of this hook made, and `next` the frame it resumes.
+#[inline(always)]
+unsafe fn finish_release(
     kernel: &mut Kernel,
     w: &mut W<'_, level::Kernel>,
+    cpu: usize,
+    next: usize,
+) -> usize {
+    match kernel.release.take() {
+        None => next,
+        // SAFETY: the caller's contract.
+        Some(release) => unsafe { release_and_reschedule(kernel, w, cpu, next, release) },
+    }
+}
+
+/// `finish_release` once there is a release, out of line.
+///
+/// # Safety
+/// As `finish_release`.
+#[cold]
+#[inline(never)]
+unsafe fn release_and_reschedule(
+    kernel: &mut Kernel,
+    w: &mut W<'_, level::Kernel>,
+    cpu: usize,
+    next: usize,
     (index, code): (usize, u64),
-    handles: &Handles,
-) {
+) -> usize {
+    release_process(kernel, w, (index, code));
+    let sched = &kernel.sched;
+    if sched.idle(cpu) || sched.current(cpu).0 == 0 || sched.outranked(cpu) {
+        // SAFETY: the caller's contract.
+        return unsafe { switch(&mut kernel.sched, cpu, next) };
+    }
+    next
+}
+
+/// `finish_release`'s release.
+fn release_process(kernel: &mut Kernel, w: &mut W<'_, level::Kernel>, (index, code): (usize, u64)) {
+    let entry = &PROCESSES[index];
+    // SAFETY: the process's last thread ended under the `KERNEL` this hold has, so no thread of it holds or takes its
+    // lock, and no other process takes it.
+    let handles = entry.handles.take(unsafe { entry.lock.unpublished() });
     for object in handles.objects() {
         release(kernel, w, (object, index), None);
     }
@@ -145,20 +150,19 @@ unsafe fn switch(sched: &mut Sched, cpu: usize, frame: usize) -> usize {
     unsafe { enter(sched, frame, target) }
 }
 
-/// As `switch`, but a core that ended a process's last thread goes to its idle context: it releases the process at the
-/// trap exit, which may wake a task better than any it would pick now, and then reschedules (`release_process`).
+/// As `switch`, after ending threads: a core that ended a process's last thread goes to its idle context instead (off
+/// the process's address space), so `finish_release` releases the process and then picks the task to run, which the
+/// release may have woken, with no other core signalled for it.
 ///
 /// # Safety
 /// As `switch`.
-unsafe fn switch_after_end(sched: &mut Sched, cpu: usize, frame: usize) -> usize {
-    // SAFETY: the caller masked IRQs.
-    let releasing = unsafe { DEFERRED.with_masked(|deferred| deferred.release.is_some()) };
-    let target = match releasing {
-        true => sched.to_idle(cpu, frame),
-        false => sched.switch(cpu, frame),
+unsafe fn switch_after_end(kernel: &mut Kernel, cpu: usize, frame: usize) -> usize {
+    let target = match kernel.release {
+        Some(_) => kernel.sched.to_idle(cpu, frame),
+        None => kernel.sched.switch(cpu, frame),
     };
     // SAFETY: the caller's contract.
-    unsafe { enter(sched, frame, target) }
+    unsafe { enter(&mut kernel.sched, frame, target) }
 }
 
 /// Moves this core from `frame` to `next`, from process `from` to `to`, as `Scheduler::switch` chose.
@@ -185,9 +189,9 @@ unsafe fn enter(sched: &mut Sched, frame: usize, (next, from, to): (usize, usize
 }
 
 /// Ends the thread in `slot`, which no core but `cpu` runs, with `code`: frees the mutexes it owns, drops the boost it
-/// lent, and refunds its kernel stack to its process: at once, or, if `cpu` runs on it, once the trap exit left it. Its
-/// process's last thread leaves the process's release to the trap exit too. The boot context may wait for the task
-/// count to drop, so core 0 is signalled.
+/// lent, and refunds its kernel stack to its process, freeing its frames at once or, if `cpu` runs on it, once the trap
+/// exit left it. Its process's last thread leaves the process's release to the hook's `finish_release`. The boot
+/// context may wait for the task count to drop, so core 0 is signalled.
 fn end_thread(
     kernel: &mut Kernel,
     w: &mut W<'_, level::Kernel>,
@@ -198,6 +202,7 @@ fn end_thread(
         sched,
         mutexes,
         deferred,
+        release,
         ..
     } = kernel;
     let process = sched.process_of(slot);
@@ -221,21 +226,15 @@ fn end_thread(
     if !on_it {
         free_stack(&mut FRAMES.lock_masked(w), stack);
     }
-    if on_it || last {
+    if on_it {
         *deferred = true;
         // SAFETY: trap context, as for every caller.
-        unsafe {
-            DEFERRED.with_masked(|deferred| {
-                if on_it {
-                    debug_assert!(deferred.stack.is_none(), "two stacks in one trap");
-                    deferred.stack = Some(stack);
-                }
-                if last {
-                    debug_assert!(deferred.release.is_none(), "two releases in one trap");
-                    deferred.release = Some((process, code));
-                }
-            })
-        };
+        let parked = unsafe { DEFERRED.with_masked(|parked| parked.replace(stack)) };
+        debug_assert!(parked.is_none(), "two stacks in one trap");
+    }
+    if last {
+        debug_assert!(release.is_none(), "two releases in one hold");
+        *release = Some((process, code));
     }
     if cpu != 0 && sched.boot_waits() {
         send_sgi(0);
@@ -282,7 +281,7 @@ unsafe fn exit_process(
     // Before `switch` picks the next task, so a task this wakes can be it.
     end_process(kernel, w, cpu, index, code);
     // SAFETY: the caller's contract.
-    unsafe { switch_after_end(&mut kernel.sched, cpu, frame) }
+    unsafe { switch_after_end(kernel, cpu, frame) }
 }
 
 /// Ends `cpu`'s current thread with `code`, or its process with its last thread; returns the next task's frame.
@@ -303,7 +302,7 @@ unsafe fn exit_thread(
     let slot = kernel.sched.current(cpu).0;
     end_thread(kernel, w, (cpu, slot), code);
     // SAFETY: the caller's contract.
-    unsafe { switch_after_end(&mut kernel.sched, cpu, frame) }
+    unsafe { switch_after_end(kernel, cpu, frame) }
 }
 
 /// Blocks `cpu`'s current process on `event` with its `svc` rewound, so the call runs again once woken; returns the
@@ -472,6 +471,8 @@ unsafe extern "C" fn board_irq(frame: usize) -> Resume {
         None if tick || idle => unsafe { switch(&mut kernel.sched, cpu, frame) },
         None => frame,
     };
+    // SAFETY: trap context, and `next` the frame this hook resumes.
+    let next = unsafe { finish_release(kernel, &mut w, cpu, next) };
     // The tick only preempts a running task: an idle core takes none, and starts again once it runs one.
     if (tick || idle) && TICKS.load(Relaxed) && !kernel.sched.idle(cpu) {
         arch::timer::arm(TICK_US);
@@ -575,8 +576,14 @@ fn pipe_call(
             frame.x[0] = moved as u64;
             at
         }
-        // SAFETY: trap context, and `frame` the current process's (`board_syscall`'s contract).
-        None => unsafe { block(kernel, &mut w, cpu, frame, Event::Pipe(end.index as usize)) },
+        None => {
+            // SAFETY: trap context, and `frame` the current process's (`board_syscall`'s contract).
+            let next =
+                unsafe { block(kernel, &mut w, cpu, frame, Event::Pipe(end.index as usize)) };
+            // A marked thread ends instead of blocking, maybe its process's last.
+            // SAFETY: trap context, and `next` the frame this hook resumes.
+            unsafe { finish_release(kernel, &mut w, cpu, next) }
+        }
     };
     kick(&mut kernel.sched, cpu);
     Resume::locked(next, core::mem::take(&mut kernel.deferred))
@@ -599,6 +606,8 @@ fn kernel_call(
     let cpu = arch::cpu();
     // SAFETY: trap context, and `frame` the current process's (`board_syscall`'s contract).
     let next = unsafe { syscall(kernel, &mut w, cpu, frame, call) };
+    // SAFETY: trap context, and `next` the frame this hook resumes.
+    let next = unsafe { finish_release(kernel, &mut w, cpu, next) };
     kick(&mut kernel.sched, cpu);
     Resume::locked(next, core::mem::take(&mut kernel.deferred))
 }
@@ -696,6 +705,8 @@ unsafe fn block_switch(root: &mut W<'_, level::Unlocked>, frame: &mut arch::Trap
         // SAFETY: the caller's contract.
         None => unsafe { switch(&mut kernel.sched, cpu, at) },
     };
+    // SAFETY: trap context, and `next` the frame this hook resumes.
+    let next = unsafe { finish_release(kernel, &mut w, cpu, next) };
     kick(&mut kernel.sched, cpu);
     Resume::locked(next, core::mem::take(&mut kernel.deferred))
 }
@@ -1067,6 +1078,8 @@ unsafe extern "C" fn board_user_fault(frame: usize, ec: u64, far: u64) -> Resume
     );
     // SAFETY: the caller masked IRQs; `frame` is the current process's.
     let next = unsafe { exit_process(kernel, &mut w, cpu, frame, KILLED) };
+    // SAFETY: trap context, and `next` the frame this hook resumes.
+    let next = unsafe { finish_release(kernel, &mut w, cpu, next) };
     kick(&mut kernel.sched, cpu);
     Resume::locked(next, core::mem::take(&mut kernel.deferred))
 }

@@ -350,15 +350,14 @@ impl<const N: usize, const P: usize> Scheduler<N, P> {
         (self.frame[next], from, core.process)
     }
 
-    /// Saves `cpu`'s current task's `frame` and moves `cpu` to its idle context, whatever is ready: a core that ended a
-    /// process's last thread releases it before it picks a task, since the release may wake a better one. Returns as
-    /// `switch` does.
+    /// Saves `cpu`'s current task's `frame` and moves `cpu` to its idle context, whatever is ready, counted as signalled:
+    /// a core that ended a process's last thread releases it there and then picks a task itself, since the release may
+    /// wake the one to run. Returns as `switch` does.
     pub fn to_idle(&mut self, cpu: usize, frame: usize) -> (usize, usize, usize) {
         let core = &mut self.cores[cpu];
         let from = core.process;
         self.frame[core.current] = frame;
         self.on_core[core.current] = false;
-        // Counted as signalled: it picks a task itself once the release is done, so no other core sends it an SGI.
         (core.current, core.process, core.kicked) = (IDLE, 0, true);
         (core.idle, from, 0)
     }

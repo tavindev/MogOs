@@ -180,6 +180,7 @@ static KERNEL: Lock<Kernel, level::Kernel> = Lock::new(Kernel {
     mounted: false,
     opens: Opens::new(),
     deferred: false,
+    release: None,
 });
 
 struct Kernel {
@@ -191,8 +192,10 @@ struct Kernel {
     /// `fs` is mounted: boot-spawned processes get its root as handle 3.
     mounted: bool,
     opens: Opens<{ MAX_PROCESSES * MAX_HANDLES }>,
-    /// This hold left `trap::Deferred` work for the trap exit; taken by the hook's `Resume`.
+    /// This hold parked a kernel stack for the trap exit (`trap::DEFERRED`); taken by the hook's `Resume`.
     deferred: bool,
+    /// A process whose last thread this hold ended, and its code, for the hook's `trap::finish_release`.
+    release: Option<(usize, u64)>,
 }
 
 /// The free frames: one pass of the bitmap per `spawn` or `map`, which take every frame they need at once.

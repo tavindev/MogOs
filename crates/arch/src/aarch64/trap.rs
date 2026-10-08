@@ -113,17 +113,13 @@ aarch64_vectors:
     bl aarch64_exception
     mov sp, x0
     // Only once off the old stack: with the board's kernel lock free, another core may run the task that owns it.
-1:  cbz x1, 3f
+    cbz x1, 2f
     cmp x1, #1
-    b.ne 2f
+    b.ne 1f
     bl board_unlock
-    b 3f
-    // Work the hook left: it may pick another frame, which holds the lock again.
-2:  mov x0, sp
-    bl board_unlock_work
-    mov sp, x0
-    b 1b
-3:
+    b 2f
+1:  bl board_unlock_work
+2:
     ldp x30, x2, [sp, #240]
     msr elr_el1, x2
     ldr x2, [sp, #256]
@@ -174,7 +170,7 @@ unsafe extern "C" {
 
 /// What a trap hook returns: the frame to resume, and whether the hook holds the board's kernel lock, which the trap
 /// exit then releases once it has moved to that frame: 0 not held, 1 held (`board_unlock`), 2 held with work left
-/// (`board_unlock_work`, which returns the frame to resume after it, as a hook does).
+/// (`board_unlock_work`).
 #[repr(C)]
 pub struct Resume {
     frame: usize,
