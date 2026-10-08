@@ -33,7 +33,8 @@ can run any time after phase 5; 73 follows 72.
 
 - **67.** Benchmark: NVMe IOPS and latency at queue depth 1 and 32 against phase 7 step 45's numbers;
   interrupt-to-completion latency recorded. Invariants: an LPI is routed only to a core that owns the queue; ITS tables
-  are sized once at boot from the hardware's own limits. Avoids: interrupt sharing and a global vector allocator.
+  are sized once at boot: LPI IDs capped at 16 bits (the property table's size follows), the device table two-level,
+  each bounded by what `GITS_TYPER`/`GITS_BASER` report. Avoids: interrupt sharing and a global vector allocator.
 - **68.** Benchmark: boot (direct `-kernel`) holds; firmware boot time recorded. Invariants: one entry path after
   the first instructions, whatever the firmware; EL2 keeps only the stub, so phase 12's hypervisor can take it back;
   the image is signable for UEFI Secure Boot as is. Avoids: a separate bootloader (Linux's EFI stub shape: the kernel
