@@ -927,9 +927,7 @@ impl<'a, D: Disk> Fs<'a, D> {
             return Ok(());
         }
         let generation = self.generation.checked_add(1).ok_or(Error::Corrupt)?;
-        let r = self
-            .write_data()
-            .and_then(|()| self.write_commit(generation));
+        let r = self.write_commit(generation);
         self.broken |= r.is_err();
         r
     }
@@ -985,8 +983,31 @@ impl<'a, D: Disk> Fs<'a, D> {
             if (self.free as usize) < self.ndirty {
                 return Err(Error::NoSpace);
             }
-            self.start(self.ndirty)
+            // An unwritten data page leads the nodes' request: where it is if the blocks after it are free, else
+            // moved to the start of their run when the block after the run is free too.
+            match self.cached {
+                Some((d, ..)) if self.unwritten && self.run_free(d + 1, self.ndirty) => d + 1,
+                Some(_) if self.unwritten => {
+                    let b = self.start(self.ndirty);
+                    if self.run_free(b, self.ndirty + 1) && self.lead_data(b)? {
+                        b + 1
+                    } else {
+                        b
+                    }
+                }
+                _ => self.start(self.ndirty),
+            }
         };
+        let (mut first, mut n) = (1, 1);
+        match self.cached {
+            Some((d, ..)) if self.unwritten && !pages && start == d + 1 => {
+                let s = self.stage(&mut first, &mut n)?;
+                let (src, dst) = (&self.bufs[DATA], &mut self.cache[s]);
+                dst.copy_from_slice(src);
+                (self.blk[s], self.unwritten) = (d, false);
+            }
+            _ => self.write_data()?,
+        }
         // Blocks in the order they are written: the pages, the index bottom up, the nodes. A page's or index block's
         // goes into the pointer to it until its sum is known.
         let mut b = start;
@@ -1018,7 +1039,6 @@ impl<'a, D: Disk> Fs<'a, D> {
             }
         }
         self.finalize(generation);
-        let (mut first, mut n) = (1, 1);
         if pages {
             let words = self.blocks.div_ceil(64) as usize;
             let mut p = self.next_dirty(0);
@@ -1594,7 +1614,7 @@ impl<'a, D: Disk> Fs<'a, D> {
             self.bufs[DATA][at..at + n].copy_from_slice(&data[(pos - offset) as usize..][..n]);
             let b = match old_block {
                 Some(b) if !self.has(COMMITTED, b) => b,
-                _ => self.alloc()?,
+                _ => self.alloc(1)?,
             };
             let sum = checksum(b, &self.bufs[DATA]);
             self.set_page(inode, page, b, sum, old)?;
@@ -1861,13 +1881,16 @@ impl<'a, D: Disk> Fs<'a, D> {
         Ok(*n - 1)
     }
 
-    fn alloc(&mut self) -> Result<Block, Error> {
-        let b = self.next_free(self.hint);
+    /// A free block, the first of `k` free ones if there is such a run.
+    fn alloc(&mut self, k: usize) -> Result<Block, Error> {
+        let b = self.start(k);
         if b.0 >= self.blocks {
             return Err(Error::NoSpace);
         }
+        if b == self.next_free(self.hint) {
+            self.hint = b + 1;
+        }
         self.mark(b);
-        self.hint = b + 1;
         Ok(b)
     }
 
@@ -1884,6 +1907,37 @@ impl<'a, D: Disk> Fs<'a, D> {
             }
         }
         Block(self.blocks)
+    }
+
+    /// Moves the unwritten data page to free block `b` if an extent of its own maps it; false if not.
+    fn lead_data(&mut self, b: Block) -> Result<bool, Error> {
+        let Some((d, _, inode, page)) = self.cached else {
+            return Ok(false);
+        };
+        // Its extent's path may need new dirty nodes; a commit must never run short of space.
+        if self.reserve(1, 1, 0, true).is_err() {
+            return Ok(false);
+        }
+        let Some((off, _, 1)) = self.extent_at(inode, page)? else {
+            return Ok(false);
+        };
+        let (s, at) = self.value_mut(extent_key(inode, off))?;
+        let sum = checksum(b, &self.bufs[DATA]);
+        self.cache[s][at..at + 8].copy_from_slice(&b.0.to_le_bytes());
+        self.cache[s][at + 8..at + 16].copy_from_slice(&sum.0.to_le_bytes());
+        if b == self.next_free(self.hint) {
+            self.hint = b + 1;
+        }
+        self.mark(b);
+        (self.cached, self.unwritten) = (None, false);
+        self.release(d)?;
+        (self.cached, self.unwritten) = (Some((b, sum, inode, page)), true);
+        Ok(true)
+    }
+
+    /// Whether the `k` blocks from `b` on are free.
+    fn run_free(&self, b: Block, k: usize) -> bool {
+        (b.0..b.0 + k as u64).all(|c| c < self.blocks && !self.used(Block(c)))
     }
 
     /// The start of the first run of `k` free blocks, or of the first free block if no run is that long.

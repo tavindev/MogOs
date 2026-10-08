@@ -1199,10 +1199,10 @@ fn block_io_per_operation() {
     fs.write(b, 0, &[1; 100]).unwrap();
     fs.write(b, 100, &[2; 100]).unwrap();
     assert_eq!(io.take(), [0, 0, 0]);
-    // The data page, the dirty nodes in one request, then the superblock, its log holding the bitmap's changes,
-    // between two flushes.
+    // The data page and the dirty nodes after it in one request, then the superblock, its log holding the bitmap's
+    // changes, between two flushes.
     fs.commit().unwrap();
-    assert_eq!(io.take(), [0, 3, 2]);
+    assert_eq!(io.take(), [0, 2, 2]);
     fs.commit().unwrap();
     assert_eq!(io.take(), [0, 0, 0]);
     let a = fs.lookup(docs, b"a.txt").unwrap();
@@ -1233,6 +1233,34 @@ fn block_io_per_operation() {
     assert_eq!(io.take(), [0, 0, 0]);
     fs.commit().unwrap();
     assert_eq!(io.take(), [0, 2, 2]);
+}
+
+#[test]
+fn a_one_page_write_and_commit_write_two_blocks() {
+    let mut disk = MemDisk::new(1024);
+    let mut mem = Mem::new(1024, POOL);
+    let mut fs = format(&mut mem, &mut disk);
+    let f = fs.create(ROOT, b"f").unwrap();
+    fs.write(f, 0, &[1; 64]).unwrap();
+    for name in ["t", "r0"] {
+        fs.create(ROOT, name.as_bytes()).unwrap();
+    }
+    fs.commit().unwrap();
+    let io = Cell::new([0; 3]);
+    let mut fs = mem.fs(Counted(&mut disk, &io));
+    fs.mount().unwrap();
+    fs.write(f, 0, &[0; 64]).unwrap();
+    fs.commit().unwrap();
+    io.take();
+    // Each time the page leads the nodes' request, moved to a free run if the blocks after it are taken.
+    for i in 1..20 {
+        fs.write(f, 0, &[i; 64]).unwrap();
+        fs.commit().unwrap();
+        assert_eq!(io.take(), [0, 2, 2], "round {i}");
+    }
+    let mut buf = [0; 64];
+    assert_eq!(fs.read(f, 0, &mut buf), Ok(64));
+    assert_eq!(buf, [19; 64]);
 }
 
 #[test]
@@ -1568,8 +1596,8 @@ fn a_300_gib_file_system_lists_its_bitmap_through_an_index() {
     fs.disk().2 = [0; 3];
     fs.write(files[7], 0, b"small").unwrap();
     fs.commit().unwrap();
-    // The data page rewritten, then a small commit: the nodes in one request, the superblock between two flushes.
-    assert_eq!(fs.disk().2[1..], [3, 2]);
+    // A small commit: the data page and the nodes in one request, the superblock between two flushes.
+    assert_eq!(fs.disk().2[1..], [2, 2]);
     let mut mem = Mem::new(blocks as usize, POOL);
     let mut fs = mem.fs(&mut disk);
     fs.mount().unwrap();
