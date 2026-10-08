@@ -649,6 +649,12 @@ impl<'a, D: Disk> Fs<'a, D> {
                     return Err(e);
                 }
             }
+            // A larger older slot may mark blocks past this disk's size; they reserve nothing and must not count.
+            let end = self.blocks.div_ceil(64) as usize;
+            self.bits[COMMITTED * w + end..3 * w].fill(0);
+            if !self.blocks.is_multiple_of(64) {
+                self.bits[COMMITTED * w + end - 1] &= (1 << (self.blocks % 64)) - 1;
+            }
             self.bits.copy_within(..w, NEWEST * w);
             for i in 0..w {
                 self.bits[COMMITTED * w + i] |= self.bits[i];
