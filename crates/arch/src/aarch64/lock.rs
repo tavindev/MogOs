@@ -106,6 +106,7 @@ impl<T, L> Lock<T, L> {
             lock: self,
             irq: None,
             held: w.after(),
+            _data: PhantomData,
         }
     }
 
@@ -144,9 +145,20 @@ impl<T> Lock<T, Leaf> {
             lock: self,
             irq: Some(irq),
             held: lock_order::leaf(),
+            _data: PhantomData,
         }
     }
 }
+
+// `Guard` is `Sync` only for a `Sync` `T`: shared, it hands out the `&T` it derefs to (this fails to build otherwise).
+const _: () = {
+    trait AmbiguousIfSync<A> {
+        fn check() {}
+    }
+    impl<T: ?Sized> AmbiguousIfSync<()> for T {}
+    impl<T: ?Sized + Sync> AmbiguousIfSync<u8> for T {}
+    let _ = <Guard<'static, core::cell::Cell<u8>, Leaf> as AmbiguousIfSync<_>>::check;
+};
 
 /// Exclusive access to a `Lock`'s data until dropped; locks taken under it use its witness (`parts`).
 #[must_use = "dropping it releases the lock"]
@@ -156,6 +168,8 @@ pub struct Guard<'a, T, L> {
     irq: Option<irq::State>,
     /// The order proof, borrowing the witness the lock was taken under.
     held: Held<'a, L>,
+    /// Shared only where `T` may be, as the `&T` it derefs to is.
+    _data: PhantomData<&'a mut T>,
 }
 
 impl<'a, T, L> Guard<'a, T, L> {
