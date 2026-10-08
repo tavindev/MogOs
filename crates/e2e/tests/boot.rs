@@ -981,7 +981,12 @@ fn mogfs_image(test: &str, blocks: u64) -> PathBuf {
         .write(true)
         .open(&path)
         .unwrap();
-    mogfs::Fs::new(FileDisk(file, blocks)).format().unwrap();
+    let mut cache = vec![[0; 4096]; mogfs::cache_blocks(blocks, mogfs::MIN_POOL)];
+    let mut bits = vec![0; mogfs::bitmap_words(blocks)];
+    // A fixed seed, so a listing's hash order is the same every run.
+    mogfs::Fs::new(FileDisk(file, blocks), &mut cache, &mut bits)
+        .format(1)
+        .unwrap();
     path
 }
 
@@ -1081,7 +1086,8 @@ fn shell_files_survive_a_reboot_only_once_synced() {
             ("echo hi  there", &["hi there"]),
             ("sync", &[]),
             ("write docs/late.txt x", &[]),
-            ("ls docs", &["b.txt", "c.txt", "sub/", "late.txt"]),
+            // Name-hash order under `mogfs_image`'s seed.
+            ("ls docs", &["late.txt", "c.txt", "b.txt", "sub/"]),
             ("frob", &["msh: frob: command not found"]),
             // Archive programs outside msh's command table do not run.
             ("mid", &["msh: mid: command not found"]),
@@ -1121,7 +1127,7 @@ fn shell_files_survive_a_reboot_only_once_synced() {
         boot2,
         session(&[
             ("ls", &["docs/"]),
-            ("ls docs", &["b.txt", "c.txt", "sub/"]),
+            ("ls docs", &["c.txt", "b.txt", "sub/"]),
             ("cat docs/b.txt", &["hello"]),
             ("cat docs/c.txt", &["cross"]),
             ("cat ../x", &["msh: cat: EINVAL"]),
@@ -1159,6 +1165,45 @@ fn shell_files_survive_a_reboot_only_once_synced() {
             ("exit", &[]),
         ])
     );
+}
+
+#[test]
+fn long_names_large_files_and_many_files_survive_a_reboot() {
+    let image = mogfs_image("large", 4096);
+    let long = "n".repeat(200);
+    // 1000 files in `d`, and `big`, 1000 lines of 84 bytes appended one at a time.
+    let script = r#"sh -c 'x="0 1 2 3 4 5 6 7 8 9"; mkdir d; for i in $x; do for j in $x; do for k in $x; do echo $i$j$k > d/$i$j$k; echo $i$j$k $x $x $x $x >> big; done; done; done; sync'"#;
+    let write = format!("write {long} long");
+    let (status, boot1) = shell(&image, &[&write, script, "sync", "exit"]);
+    assert!(status.success(), "QEMU exited with {status}");
+    assert_eq!(
+        boot1,
+        session(&[(&write, &[]), (script, &[]), ("sync", &[]), ("exit", &[])])
+    );
+
+    let cat = format!("cat {long}");
+    // The append past 64 KiB finds the file's end.
+    let append = "sh -c 'echo end >> big; cat big'";
+    let (status, boot2) = shell(
+        &image,
+        &[&cat, append, "ls d", "sh -c 'ls -1 d'", "cat d/999", "exit"],
+    );
+    std::fs::remove_file(&image).unwrap();
+    assert!(status.success(), "QEMU exited with {status}");
+    let x = "0 1 2 3 4 5 6 7 8 9";
+    let names: Vec<String> = (0..1000).map(|n| format!("{n:03}")).collect();
+    let mut big: Vec<String> = names
+        .iter()
+        .map(|n| format!("{n} {x} {x} {x} {x}"))
+        .collect();
+    big.push("end".into());
+    let mut listed = boot2[2].1.clone();
+    listed.sort();
+    assert_eq!(boot2[0], (cat, vec!["long".to_string()]));
+    assert_eq!(boot2[1], (append.to_string(), big));
+    assert_eq!(listed, names, "native ls d");
+    assert_eq!(boot2[3].1, names, "busybox ls d");
+    assert_eq!(boot2[4].1, ["999"]);
 }
 
 #[test]

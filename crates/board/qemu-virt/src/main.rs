@@ -35,7 +35,7 @@ use kernel::syscall::{ENOENT, MAX_BUFFER};
 use kernel::{Event, FRAME_WORDS, Full, PRIORITIES, Program, RoundTrip, Scheduler, Violation};
 use linked_list_allocator::Heap;
 use mm::{FrameAllocator, PhysAddr};
-use mogfs::{Error, Fs};
+use mogfs::{BLOCK_SIZE, Buf, Error, Fs, MAX_BLOCKS, bitmap_words, cache_blocks};
 use process::{executable, spawn_init, user_program};
 use uart::Uart;
 use virtio_blk::VirtioBlk;
@@ -142,6 +142,8 @@ const MAX_PIPES: usize = 64;
 /// Mutexes: 8 processes' worth of handle tables, kept at its size before the interim 64 processes (each thread end
 /// scans it), until step 27 deletes them.
 const MAX_MUTEXES: usize = 8 * MAX_HANDLES;
+/// MogFS's node cache slots.
+const FS_POOL: usize = 64;
 
 #[global_allocator]
 static HEAP: KernelHeap = KernelHeap(Lock::new(Heap::empty()));
@@ -176,7 +178,7 @@ static KERNEL: Lock<Kernel> = Lock::new(Kernel {
     pipes: Pipes::new(),
     mutexes: Mutexes::new(),
     line: Line::new(),
-    fs: Fs::new(FsDisk(None)),
+    fs: Fs::new(FsDisk(None), &mut [], &mut []),
     mounted: false,
     buf: [0; 2 * MAX_BUFFER as usize],
 });
@@ -187,7 +189,7 @@ struct Kernel {
     pipes: Pipes<MAX_PIPES>,
     mutexes: Mutexes<MAX_MUTEXES>,
     line: Line,
-    fs: Fs<FsDisk>,
+    fs: Fs<'static, FsDisk>,
     /// `fs` is mounted: boot-spawned processes get its root as handle 3.
     mounted: bool,
     /// Where a syscall copies user inputs and stages outputs: room for `rename`'s two paths.
@@ -420,7 +422,21 @@ impl kernel::Board for QemuVirt {
 
     fn mount(&mut self, disk: VirtioBlk) -> Result<(), Error> {
         let mut kernel = KERNEL.lock();
-        *kernel.fs.disk() = FsDisk(Some(disk));
+        let blocks = kernel::Disk::blocks(&disk).min(MAX_BLOCKS);
+        let (cache, words) = (cache_blocks(blocks, FS_POOL), bitmap_words(blocks));
+        let frames = cache + (words * 8).div_ceil(BLOCK_SIZE);
+        let memory = kernel
+            .frames
+            .alloc_contiguous(frames)
+            .ok_or(Error::TooBig)?;
+        let at = memory.start.0 as usize;
+        // SAFETY: the first `cache` of the fresh identity-mapped frames, owned from now on by `KERNEL.fs` alone.
+        let cache = unsafe { slice::from_raw_parts_mut(at as *mut Buf, cache) };
+        // SAFETY: the rest of those frames, `words` u64s, likewise.
+        let bits = unsafe {
+            slice::from_raw_parts_mut((at + cache.len() * BLOCK_SIZE) as *mut u64, words)
+        };
+        kernel.fs = Fs::new(FsDisk(Some(disk)), cache, bits);
         let mounted = kernel.fs.mount();
         kernel.mounted = mounted.is_ok();
         mounted

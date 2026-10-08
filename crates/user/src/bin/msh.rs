@@ -194,7 +194,7 @@ fn cd(cwd: &mut Cwd, path: &[u8]) -> i64 {
             return dir;
         }
         // Only a directory lists; from past its end, it reads nothing.
-        let listed = readdir(dir as u64, &mut [], u64::MAX);
+        let (listed, _) = readdir(dir as u64, &mut [], u64::MAX);
         close(dir as u64);
         if listed < 0 {
             return listed;

@@ -14,6 +14,7 @@ pub use spec::*;
 pub use trap::*;
 
 global_asm!(include_str!("boot.s"));
+global_asm!(include_str!("mem.s"));
 
 unsafe extern "C" {
     fn aarch64_secondary() -> !;

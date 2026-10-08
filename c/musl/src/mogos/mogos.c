@@ -107,15 +107,18 @@ static int isdir(long h)
 	return r >= 0 || r == -EINVAL;
 }
 
-/* No stat call: the size is the first offset a one-byte read returns nothing at (files are under 64 KiB). */
+/* No stat call: the size is the first offset a one-byte read returns nothing at, bracketed by doubling from 64 KiB,
+   then bisected. */
 static long long size_of(long h)
 {
 	char c;
 	long long lo = 0, hi = 1 << 16;
+	long r;
+	for (; (r = svc(N_IO, h, 0, (long)&c, 1, hi, 0, 0)); lo = hi + 1, hi *= 2)
+		if (r < 0) return r;
 	while (lo < hi) {
 		long long mid = (lo + hi) / 2;
-		long r = svc(N_IO, h, 0, (long)&c, 1, mid, 0, 0);
-		if (r < 0) return r;
+		if ((r = svc(N_IO, h, 0, (long)&c, 1, mid, 0, 0)) < 0) return r;
 		if (r) lo = mid + 1;
 		else hi = mid;
 	}
@@ -332,41 +335,54 @@ static long do_lseek(int fd, long long off, int whence)
 	return f->off = base + off;
 }
 
-/* The native `name\n` (`name/\n` for a directory) entries as `struct dirent`s; the offset counts entries. */
-static long do_getdents(int fd, char *buf, size_t len)
-{
-	struct file *f = fd_file(fd);
-	char names[1024];
-	if (!f) return -EBADF;
-	if (f->kind != DIRECTORY) return -ENOTDIR;
-	long n = svc(N_READDIR, f->handle, (long)names, sizeof names, f->off, 0, 0, 0);
-	if (n < 0) return n;
-	size_t pos = 0;
-	long count = 0;
-	for (char *s = names, *nl; s < names + n; s = nl + 1) {
-		nl = memchr(s, '\n', names + n - s);
-		size_t namelen = nl - s, dir = namelen && s[namelen - 1] == '/';
-		namelen -= dir;
-		size_t rec = (offsetof(struct dirent, d_name) + namelen + 8) & ~7ul;
-		if (pos + rec > len) break;
-		struct dirent *d = (void *)(buf + pos);
-		d->d_ino = d->d_off = f->off + ++count;
-		d->d_reclen = rec;
-		d->d_type = dir ? DT_DIR : DT_REG;
-		memcpy(d->d_name, s, namelen);
-		d->d_name[namelen] = 0;
-		pos += rec;
-	}
-	if (n && !count) return -EINVAL;
-	f->off += count;
-	return pos;
-}
-
 static unsigned long hash(const char *s)
 {
 	unsigned long h = 14695981039346656037ul;
 	while (*s) h = (h ^ (unsigned char)*s++) * 1099511628211ul;
 	return h | 1;
+}
+
+/* `readdir` into `names`; the cursor to resume from goes to `next`. */
+static long list(long h, char *names, size_t len, long long cursor, long long *next)
+{
+	register long x0 __asm__("x0") = h, x1 __asm__("x1") = (long)names, x2 __asm__("x2") = len;
+	register long x3 __asm__("x3") = cursor, x8 __asm__("x8") = N_READDIR;
+	__asm__ __volatile__("svc 0" : "+r"(x0), "+r"(x1) : "r"(x2), "r"(x3), "r"(x8) : "memory");
+	*next = x1;
+	return x0;
+}
+
+/* The native `name\n` (`name/\n` for a directory) entries as `struct dirent`s; the offset is the native cursor, which
+   every entry of a call shares as its `d_off`. One native call, asking only for as many names as always fit `len` as
+   dirents: a dirent is at most 26 bytes over its name's line and at most 14 times it, and a call lists at most 64. */
+static long do_getdents(int fd, char *buf, size_t len)
+{
+	struct file *f = fd_file(fd);
+	char names[1024];
+	long long next;
+	if (!f) return -EBADF;
+	if (f->kind != DIRECTORY) return -ENOTDIR;
+	size_t want = len > 64 * 26 ? len - 64 * 26 : 0;
+	if (want < len / 14) want = len / 14;
+	if (want > sizeof names) want = sizeof names;
+	long n = list(f->handle, names, want, f->off, &next);
+	if (n < 0) return n;
+	size_t pos = 0;
+	for (char *s = names, *nl; s < names + n; s = nl + 1) {
+		nl = memchr(s, '\n', names + n - s);
+		size_t namelen = nl - s, dir = namelen && s[namelen - 1] == '/';
+		namelen -= dir;
+		struct dirent *d = (void *)(buf + pos);
+		d->d_reclen = (offsetof(struct dirent, d_name) + namelen + 8) & ~7ul;
+		d->d_type = dir ? DT_DIR : DT_REG;
+		d->d_off = next;
+		memcpy(d->d_name, s, namelen);
+		d->d_name[namelen] = 0;
+		d->d_ino = hash(d->d_name);
+		pos += d->d_reclen;
+	}
+	f->off = next;
+	return pos;
 }
 
 /* Kind from the open file or a probe; size from probes; the path's hash as inode (MogFS has no hard links). */
