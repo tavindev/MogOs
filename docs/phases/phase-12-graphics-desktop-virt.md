@@ -9,12 +9,12 @@ no implicit sync and no separate event API.
 
 Done-whens name the e2e test, the benchmarks held and added, and the invariants (Step details). Benchmarks are hvf
 medians of 21 interleaved boots against the step's base commit (`docs/BENCHMARKS.md`); "hold" means within noise, and
-a slowdown is a failure, removed or shown unavoidable with numbers. Screens are checked headless: the e2e takes the
+a slowdown is a failure, removed or shown unavoidable with numbers. Every device here is the virtio-mmio variant (`virtio-gpu-device`, `virtio-keyboard-device`, `virtio-tablet-device`, `virtio-sound-device`, `virtio-rng-device`, `virtio-serial-device`), so nothing waits on PCI or MSI-X; `cargo window`'s `virtio-tablet-pci` becomes `virtio-tablet-device`. Screens are checked headless: the e2e takes the
 scanout through QEMU's monitor (`screendump`) and compares a hash or sampled pixels, and sends input with
 `input-send-event`.
 
-Needs: memory objects (phase 6), AF_UNIX with handle passing and `poll` (phase 9 step 54a), hard-float C (phase 9
-step 53b), MSI-X on PCI (phase 11 step 67) for the `-pci` devices, the firmware entry with its EL2 stub (phase 11 step
+Needs: memory objects (phase 6), AF_UNIX with handle passing (phase 9 step 54c) and `poll` (phase 9 step 54a), hard-float C
+(phase 9 step 53b), the firmware entry with its EL2 stub (phase 11 step
 68) for 78. 74, 76, 77 and 78 are independent; 75 follows 74.
 
 | # | Step | Done when |
@@ -66,7 +66,8 @@ step 53b), MSI-X on PCI (phase 11 step 67) for the `-pci` devices, the firmware 
 
 - Survey numbering ([linux-survey.md](../research/linux-survey.md) section 12): 74-76 and 78 keep their numbers; 77
   keeps virtio-rng and the console only. Not scheduled: vsock (QEMU 9.2.1 here has no vsock device, so it cannot be
-  tested), the balloon (with no overcommit, a guest returning memory needs a budget model first), and survey 79's
+  tested here, and needs a Linux host's vhost-vsock), the balloon (it exists for overcommit, which MogOs does not
+  do), and survey 79's
   live update (drivers are in the kernel, ROADMAP Decided, and the user-space servers are few).
 - hvf nested virtualization: Apple exposes EL2 to guests on M3 and later with macOS 15 and later, and QEMU 11.1
   (August 2026) supports it on `virt`; both from secondary sources (linuxiac.com, search snippets), and Apple's
