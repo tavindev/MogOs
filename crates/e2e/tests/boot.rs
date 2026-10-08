@@ -37,13 +37,13 @@ fn boot_with(
     input: Option<(&str, &[&[u8]])>,
 ) -> (ExitStatus, Vec<String>) {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    // Once per run, then boots a private hard link: any `cargo build` replaces `mog_os` (a new inode), and one beside a
-    // booting test left QEMU no ELF.
+    // Built once per run; boots a private link, since any `cargo build` replaces `mog_os` and could leave QEMU no ELF.
     static KERNEL: OnceLock<PathBuf> = OnceLock::new();
     let kernel = KERNEL.get_or_init(|| {
         let build = Command::new(env!("CARGO"))
             .args(["build", "-p", "qemu-virt"])
             .current_dir(&root)
+            .env_remove("CARGO_TARGET_DIR")
             .status()
             .unwrap();
         assert!(build.success(), "kernel build failed");

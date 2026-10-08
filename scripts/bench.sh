@@ -12,16 +12,11 @@ set -eu
 [ $# -ge 3 ] || { sed -n '2,10s/^# //p' "$0"; exit 2; }
 root=$(cd "$(dirname "$0")/.." && pwd)
 
-# One benchmark at a time on this machine, across worktrees (the main checkout's target/bench.lock); waits its turn.
+# One benchmark at a time on this machine, across worktrees (bench.lock in the common git dir); waits its turn.
 if [ -z "${BENCH_LOCKED:-}" ]; then
-    lock=$(git -C "$root" rev-parse --path-format=absolute --git-common-dir)/../target/bench.lock
-    mkdir -p "${lock%/*}"
-    export BENCH_LOCKED=1
-    lockf -kst 0 "$lock" "$0" "$@" && exit 0 || status=$?
-    # 75: EX_TEMPFAIL, another benchmark holds the lock.
-    [ "$status" -eq 75 ] || exit "$status"
-    echo "bench.sh: waiting for another benchmark to finish ($lock)" >&2
-    exec lockf -k "$lock" "$0" "$@"
+    lock=$(git -C "$root" rev-parse --path-format=absolute --git-common-dir)/bench.lock
+    lockf -kst 0 "$lock" true || echo "bench.sh: waiting for another benchmark to finish ($lock)" >&2
+    BENCH_LOCKED=1 exec lockf -k "$lock" "$root/scripts/bench.sh" "$@"
 fi
 
 if [ "$1" = host ]; then

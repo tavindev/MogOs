@@ -28,12 +28,13 @@ Speed is a primary goal, so performance is tested like behavior: measured, recor
 
 ## Workflow
 
-- One benchmark at a time per machine: `scripts/bench.sh` and `scripts/oscompare.sh` hold `target/bench.lock` in the
-  main checkout (`lockf -k`, shared by every worktree, released when the run ends or is killed) and wait for it,
-  printing `waiting for another benchmark`. Any other benchmark run (a hand-run `cargo run -- -append test=bench-*`,
-  an ad hoc A/B script, `cargo bench-host`) goes under the same lock: `lockf -k "$(git rev-parse --path-format=absolute
-  --git-common-dir)/../target/bench.lock" <command>`. Agents do not write their own load-wait or poll loops: the
-  lock is the queue; run a long benchmark in the background and let its completion notify you.
+- One benchmark at a time per machine: `scripts/bench.sh` and `scripts/oscompare.sh` run under `lockf -k` on
+  `bench.lock` in the common git dir (shared by every worktree) and wait for it, printing `waiting for another
+  benchmark`. To stop a run, kill its process group (Ctrl-C), not one pid. Any other benchmark run (a hand-run
+  `cargo run -- -append test=bench-*`, an ad hoc A/B script, `cargo bench-host`) goes under the same lock:
+  `lockf -k "$(git rev-parse --path-format=absolute --git-common-dir)/bench.lock" env BENCH_LOCKED=1 <command>`
+  (`BENCH_LOCKED` stops a nested `bench.sh` from waiting on its own lock). Agents do not write load-wait or poll
+  loops: the lock is the queue; run a long benchmark in the background and let its completion notify you.
 
 - Kernel comparisons use hvf (`-accel hvf -cpu cortex-a72`): TCG run-to-run noise is about 10%, so TCG numbers are informational only and never gate a change.
 - Kernel: compare medians of at least 21 runs, before and after interleaved, on an otherwise idle machine. Host: 11

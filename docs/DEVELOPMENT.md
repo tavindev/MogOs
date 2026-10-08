@@ -68,15 +68,11 @@ libcalls. Needs: Homebrew `llvm` (clang 19 or later for `-mabi=aapcs-soft`), `gs
 | `clippy::multiple_unsafe_ops_per_block = "warn"` | `qemu-virt`, `arch`, `user` `[lints.clippy]` | Keeps unsafe blocks small so each `SAFETY` comment covers one operation. |
 
 Evaluated and not applied (all within noise on this crate): `debug = "line-tables-only"`, dev `codegen-units`, toggling `incremental`. No `rustfmt.toml`: defaults already pass.
-Also evaluated and not applied (2026-10-07, jobs 3, load 20-150): a cold build is 8 s and a cold `test-host --no-run`
-28-66 s, set by host load, and an edit rebuilds in 1-3 s, so compiling is not the slow part; contention from
-parallel QEMU runs is. Test `opt-level = 0` made host tests 10x slower (19 s to 185 s); dependencies alone at
-`opt-level = 0` cut a cold compile's CPU from 67 s to 49 s but slowed smoltcp's interop test from 0.07 s to 1.8 s.
-sccache (an environment `RUSTC_WRAPPER`, not repository config) only hits for the same target path, so never
-across worktrees; the installed 0.7.7 has no `SCCACHE_BASEDIRS` (0.18 does). nextest runs each e2e test in its own
-process, each running the kernel build; since e2e boots a private link of the kernel it passes (2 of 2 runs, one
-failed before), but it stays off: libtest is the runner. One shared target dir would serialize concurrent agents on
-cargo's lock.
+Also evaluated and not applied: compiling is not the slow part of the loop (a cold kernel build is 8 s, an edit
+rebuilds in 1-3 s); contention from parallel QEMU runs is. Test `opt-level = 0` made host tests 10x slower, and
+dependencies alone at 0 slowed smoltcp's interop test 25x. sccache (an environment `RUSTC_WRAPPER`) misses across
+worktrees, whose target paths differ. nextest passes since e2e boots a private kernel link, but libtest stays the
+runner. One shared target dir would serialize concurrent agents on cargo's lock.
 
 Re-measure (`time cargo build`, median) before changing any of the above.
 
@@ -206,7 +202,6 @@ keeps its spaces (`sh -c 'mkdir d; ls'`). A failure prints `msh: <command>: <err
 - `cargo run` must still boot and print the hello line.
 - Do not raise the `jobs` or linker `--threads` caps.
 - Benchmarks run one at a time under the machine-wide bench lock, never beside another (`docs/BENCHMARKS.md`, Workflow); no load-wait or poll loops.
-- Do not set `CARGO_TARGET_DIR` for `cargo test-host`: the e2e tests boot `target/` under the checkout, and the kernel build they run inherits it.
 - New crates use `[lints] workspace = true`. Never opt a crate out of `unsafe_code = "forbid"` unless it is an arch/board crate; put `unsafe` behind a safe API there.
 - Hot-path changes report before/after benchmark numbers; any regression fails unless no safe faster form exists (`docs/BENCHMARKS.md`).
 - Do not add dependencies without a stated reason.
