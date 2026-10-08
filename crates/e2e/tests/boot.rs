@@ -365,6 +365,23 @@ fn spec_line_counts_all_sixty_four_cores() {
     assert!(status.success(), "QEMU exited with {status}");
 }
 
+/// The boot table panics on an exception from EL0, so no core enters the kernel from EL0 before it chose its table.
+#[test]
+fn el0_before_the_vector_table_is_chosen_panics() {
+    let (status, lines) = boot(&["-smp", "1", "-append", "test=el0-before-spec"]);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l == "exception from EL0 before this core chose its vector table"),
+        "the boot table let EL0 in"
+    );
+    assert!(
+        !lines.iter().any(|l| l.starts_with("syscall: ")),
+        "the program ran to the end"
+    );
+    assert!(status.success(), "QEMU exited with {status}");
+}
+
 #[test]
 fn spec_line_matches_the_cpu() {
     for (cpu, spec) in [

@@ -10,7 +10,7 @@ touches memory through raw addresses: the board reads user buffers, copies pages
 
 ## Responsibilities
 
-- `Board` trait, `Clamp` port, `Violation` (`Board::violate`, `test=wx-*`) and `Program` enum (`src/lib.rs`); `run` drives boot and the `test=*` bootargs scenarios; the board turns on the MMU before calling it (its locks need the MMU), and `run` starts the other cores (`Board::start_cpus`) as the last step of boot, inside the `boot:` time; right after the `boot:` line it calls `Board::report_speculation` (the `spec:` line), which waits for every core, outside the boot time. The crate has no lock: its tables are plain data the board keeps under its locks, and a process's handle table is
+- `Board` trait, `Clamp` port, `Violation` (`Board::violate`, `test=wx-*`) and `Program` enum (`src/lib.rs`); `run` drives boot and the `test=*` bootargs scenarios; the board turns on the MMU before calling it (its locks need the MMU), and `run` starts the other cores (`Board::start_cpus`) as the last step of boot, inside the `boot:` time; right after the `boot:` line it calls `Board::report_speculation`, which chooses core 0's vector table (no EL0 code may run on core 0 before it; until then an exception from EL0 panics) and prints the `spec:` line once every core has chosen, outside the boot time. The crate has no lock: its tables are plain data the board keeps under its locks, and a process's handle table is
 safe atomics (`Table`, a seqlock per entry) the board reads without one.
 - `Disk` and `BLOCK_SIZE` (4096) are `mogfs`'s, re-exported (`src/lib.rs`): synchronous `read`/`write` of
   consecutive blocks, `flush`, `blocks`; every failure is `mogfs::Error::Io`. `Board::disk` is called once in `run`,

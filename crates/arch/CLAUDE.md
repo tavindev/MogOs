@@ -11,14 +11,15 @@ It is **NOT** board-specific: no MMIO addresses, no memory map, no drivers, no s
 
 ## Responsibilities
 
-- `install_vectors(conduit)` (each core, once: picks its table from its own MIDR and ID registers and the SMCCC
+- `install_boot_vectors` (core 0 at boot: the plain EL1 entries, EL0 entries that panic), `install_vectors(conduit)`
+  (each core, once, before it runs EL0 code: picks its table from its own MIDR and ID registers and the SMCCC
   workarounds behind the DT's PSCI conduit, in Linux v6.18 `proton-pack.c` order, writes `VBAR_EL1`, runs
   `msr ssbs, #0` where FEAT_SSBS exists; it reads an ID register, a trap under hvf, or asks the firmware only when the
   decision reaches it), `record_speculation(conduit)` (each core, once, off the boot path: returns its record, the table
   read back from `VBAR_EL1` with the v2, BHB, SSB, Meltdown and BSE states, which the board stores in its cores'
-  table), `speculation(records)` (the worst record and how many cores share it, once all have recorded), the vector asm (16 static tables, 2 KiB
+  table), `speculation(records)` (the worst record and how many cores share it, once all have recorded), the vector asm (17 static tables, 2 KiB
   apart in `spec::TABLES` order: plain, `clrbhb`, firmware workaround 3 by `hvc` and by `smc`, and the branch loop
-  for each Linux k (8, 11, 24, 32, 38, 132) with `dsb nsh; isb` or `sb`; only entries 8-15, from EL0, run the
+  for each Linux k (8, 11, 24, 32, 38, 132) with `dsb nsh; isb` or `sb`, then the boot table; only entries 8-15, from EL0, run the
   mitigation, before their first branch) and `aarch64_exception` routing: IRQ, EL0 `svc`, EL0 fault, EL1 `svc #0` (yield),
   EL1 `brk #0` (self-test); anything else panics with ESR/FAR/ELR.
 - `new_task`, `new_user_task`, `switch_el0_regs`, `TrapFrame::restart`.
@@ -76,7 +77,9 @@ It is **NOT** board-specific: no MMIO addresses, no memory map, no drivers, no s
 
 ## Invariants & rules
 
-- A core's vector table is chosen from that core's own registers and written once, never patched. An unlisted MIDR
+- A core's vector table is chosen from that core's own registers, never patched, before the core runs EL0 code:
+  core 0 runs on the boot table (`install_boot_vectors`, EL0 entries panic) until `report_speculation`, and a
+  secondary chooses in `kmain_secondary` before its interrupt controller is up. An unlisted MIDR
   without CSV2_3, ECBHB, CLRBHB or firmware workaround 3 gets the largest k (132), never "not affected"; with v2
   vulnerable no BHB mitigation runs (Linux: "no point mitigating Spectre-BHB alone"). A firmware workaround the
   kernel discovers but does not call yet (1 and 2, phase 11) never reads as mitigated.
@@ -108,7 +111,8 @@ It is **NOT** board-specific: no MMIO addresses, no memory map, no drivers, no s
 
 - No host tests. `cargo build` and `cargo clippy` must be clean (they build it for the bare-metal target).
 - End to end, `crates/e2e/tests/boot.rs`: `boots_and_powers_off` (vectors, MMU, the `spec:` line),
-  `spec_line_matches_the_cpu` (TCG `cortex-a72`, `cortex-a76` and `max` at `-smp 4`: each model's table on every core), `unmapped_access_reports_data_abort`,
+  `spec_line_matches_the_cpu` (TCG `cortex-a72`, `cortex-a76` and `max` at `-smp 4`: each model's table on every core),
+  `el0_before_the_vector_table_is_chosen_panics` (`test=el0-before-spec`: the boot table stops EL0), `unmapped_access_reports_data_abort`,
   `kernel_text_is_read_only_data_never_executes_and_the_boot_stack_has_a_guard` (W^X, the guard page),
   `tasks_alternate_on_yield`, `timer_preempts_spinning_task` (GIC, timer), `faulting_process_is_killed_and_others_keep_running`
   (EL0 faults, ASIDs), `syscall_bench_reports_round_trip`, `lock_bench_reports_round_trips_and_an_exact_count` (`Lock`),
