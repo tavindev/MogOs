@@ -15,28 +15,34 @@ type Group<'a> = BenchmarkGroup<'a, thread_time::ThreadTime>;
 
 struct MemDisk {
     blocks: Vec<Buf>,
+    /// Read, write and flush requests.
+    io: [usize; 3],
 }
 
 impl MemDisk {
     fn new(blocks: usize) -> Self {
         Self {
             blocks: vec![[0; BLOCK_SIZE]; blocks],
+            io: [0; 3],
         }
     }
 }
 
 impl Disk for &mut MemDisk {
     fn read(&mut self, block: u64, bufs: &mut [Buf]) -> Result<(), Error> {
+        self.io[0] += 1;
         bufs.copy_from_slice(&self.blocks[block as usize..][..bufs.len()]);
         Ok(())
     }
 
     fn write(&mut self, block: u64, bufs: &[Buf]) -> Result<(), Error> {
+        self.io[1] += 1;
         self.blocks[block as usize..][..bufs.len()].copy_from_slice(bufs);
         Ok(())
     }
 
     fn flush(&mut self) -> Result<(), Error> {
+        self.io[2] += 1;
         Ok(())
     }
 
@@ -93,6 +99,23 @@ fn small_files(g: &mut Group, blocks: usize) {
     let mut fs = Fs::new(&mut disk, &mut mem.cache, &mut mem.bits);
     fs.format(1).unwrap();
     create(&mut fs);
+    if blocks == 1024 {
+        let s = fs.snapshot().unwrap();
+        g.bench_function(
+            format!("lookup through a view ({FILES} entries), {blocks} blocks"),
+            |b| {
+                b.iter(|| {
+                    let mut v = fs.view(s).unwrap();
+                    for name in &names {
+                        black_box(v.lookup(ROOT, name.as_bytes()).unwrap());
+                    }
+                })
+            },
+        );
+        fs.delete_snapshot(s).unwrap();
+        fs.commit().unwrap();
+        fs.commit().unwrap();
+    }
     g.bench_function(format!("lookup (400 entries), {blocks} blocks"), |b| {
         b.iter(|| {
             for name in &names {
@@ -166,6 +189,92 @@ fn big_file(g: &mut Group) {
     });
 }
 
+/// Snapshots of a file system holding a 1 GiB file: create, delete (each timed alone, the other untimed), a 4 KiB
+/// overwrite + commit under a snapshot, mount with eight snapshots; the requests of a create and a delete go to stderr.
+fn snapshots(g: &mut Group) {
+    const SIZE: u64 = 1 << 30;
+    let blocks = (SIZE / BLOCK_SIZE as u64) as usize + 16384;
+    let mut disk = MemDisk::new(blocks);
+    let mut mem = Mem::new(blocks);
+    let mut fs = Fs::new(&mut disk, &mut mem.cache, &mut mem.bits);
+    fs.format(1).unwrap();
+    let f = fs.create(ROOT, b"big").unwrap();
+    let buf = vec![7u8; 1 << 20];
+    for at in (0..SIZE).step_by(buf.len()) {
+        fs.write(f, at, &buf).unwrap();
+    }
+    fs.commit().unwrap();
+    fs.commit().unwrap();
+    // A small change first, so the snapshot's bitmap copies the pages the log changed.
+    fs.write(f, 0, &[1; 100]).unwrap();
+    fs.commit().unwrap();
+    let before = fs.disk().io;
+    let s = fs.snapshot().unwrap();
+    let mid = fs.disk().io;
+    fs.delete_snapshot(s).unwrap();
+    fs.commit().unwrap();
+    let after = fs.disk().io;
+    fs.commit().unwrap();
+    let d = |a: [usize; 3], b: [usize; 3]| [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    eprintln!(
+        "snapshot requests on 1 GiB (read, write, flush): create {:?}, delete + commit {:?}",
+        d(before, mid),
+        d(mid, after)
+    );
+    g.bench_function("snapshot create, 1 GiB file", |b| {
+        b.iter_custom(|iters| {
+            (0..iters)
+                .map(|_| {
+                    let start = ThreadTime::now();
+                    let s = fs.snapshot().unwrap();
+                    let t = start.elapsed();
+                    fs.delete_snapshot(s).unwrap();
+                    fs.commit().unwrap();
+                    fs.commit().unwrap();
+                    t
+                })
+                .sum()
+        })
+    });
+    g.bench_function("snapshot delete + commit, 1 GiB file", |b| {
+        b.iter_custom(|iters| {
+            (0..iters)
+                .map(|_| {
+                    let s = fs.snapshot().unwrap();
+                    let start = ThreadTime::now();
+                    fs.delete_snapshot(s).unwrap();
+                    fs.commit().unwrap();
+                    let t = start.elapsed();
+                    fs.commit().unwrap();
+                    t
+                })
+                .sum()
+        })
+    });
+    // Over 4096 pages: each pins its old block once, then overwrites free what the snapshot does not hold.
+    let s = fs.snapshot().unwrap();
+    let mut page = 0u64;
+    g.bench_function(
+        "4 KiB overwrite + commit, 1 GiB file under a snapshot",
+        |b| {
+            b.iter(|| {
+                page = (page + 97) % 4096;
+                fs.write(f, page * BLOCK_SIZE as u64, &[3; BLOCK_SIZE])
+                    .unwrap();
+                fs.commit().unwrap();
+            })
+        },
+    );
+    for _ in 0..7 {
+        fs.write(f, 0, &[4; 100]).unwrap();
+        fs.snapshot().unwrap();
+    }
+    g.bench_function("mount, 1 GiB file, 8 snapshots", |b| {
+        b.iter(|| fs.mount().unwrap())
+    });
+    let _ = s;
+}
+
 /// Sequential read of a 64 MiB file written sequentially, and of one after random 4 KiB overwrites (16384, a whole
 /// file's worth) and a commit: copy-on-write data fragments.
 fn fragmentation(g: &mut Group) {
@@ -214,6 +323,7 @@ fn fs(c: &mut Criterion<thread_time::ThreadTime>) {
     big_directory(&mut g);
     big_file(&mut g);
     fragmentation(&mut g);
+    snapshots(&mut g);
 }
 
 criterion_group! {
