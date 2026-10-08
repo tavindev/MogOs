@@ -1129,3 +1129,29 @@ fn a_moved_data_page_keeps_its_block_when_its_extent_rewrite_spills() {
     assert_eq!(fs.read(c, 0, &mut got), Ok(BLOCK_SIZE));
     assert_eq!(got, [3; BLOCK_SIZE]);
 }
+
+/// Commits that write the pages, on a disk whose index and pages were written by earlier ones: releasing an old page or
+/// index block changes a page the pass already went by, which must be written too, every old block freed.
+#[test]
+fn pages_commits_on_an_aged_disk_release_every_old_block() {
+    for seed in 1..=4u64 {
+        let rng = &mut seed.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let blocks = 20000;
+        let mut disk = Guarded::new(vec![[0; BLOCK_SIZE]; blocks], true);
+        let mut mem = Mem::new(blocks);
+        let mut fs = mem.fs(&mut disk);
+        fs.format(seed).unwrap();
+        let f = fs.create(ROOT, b"f").unwrap();
+        fs.write(f, 0, &vec![1; 10000 * BLOCK_SIZE]).unwrap();
+        fs.commit().unwrap();
+        for step in 0..60 {
+            for _ in 0..1 + next(rng, 4) {
+                let at = next(rng, 10000) * BLOCK_SIZE as u64;
+                fs.write(f, at, &[step as u8; BLOCK_SIZE]).unwrap();
+            }
+            fs.commit().unwrap();
+            fs.mount().unwrap();
+            check(&mut fs, &format!("seed {seed} step {step}"));
+        }
+    }
+}

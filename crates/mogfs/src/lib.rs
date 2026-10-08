@@ -31,8 +31,8 @@
 //!   it back (parent, entry and kind). Extent (kind 2; offset: its first page): first block u64, then each of its 1
 //!   to 128 pages' sums.
 //! - Inode numbers come from the superblock's counter and are never reused.
-//! - Copy-on-write: no block reachable from either slot is written. Data pages are written at once to free blocks
-//!   (or over one written since the last commit). `commit` gives the dirty nodes consecutive free blocks, writes them
+//! - Copy-on-write: no block reachable from either slot is written. Data pages go to free blocks (or over one written
+//!   since the last commit), the last one written held in memory until its buffer is needed or the commit. `commit` gives the dirty nodes consecutive free blocks, writes them
 //!   in one request, flushes, writes the other slot with every word changed since the pages were written in its log,
 //!   and flushes; when the log would overflow, the changed pages and the index blocks above them join the nodes'
 //!   request and the log empties.
@@ -57,7 +57,8 @@ pub const MIN_POOL: usize = 32;
 /// The root directory.
 pub const ROOT: Inode = Inode(0);
 
-// Unit tests shrink pages, index blocks and the inline list, so small disks reach several index levels.
+// Unit tests shrink pages, index blocks, the inline list and the log, so small disks reach several index levels and
+// write their pages often.
 #[cfg(not(test))]
 const PAGE_BITS: u64 = 8 * BLOCK_SIZE as u64;
 #[cfg(test)]
@@ -73,6 +74,11 @@ const FAN: usize = 4;
 const INLINE: usize = 128;
 #[cfg(test)]
 const INLINE: usize = 2;
+/// Log entries a commit keeps before it writes the pages.
+#[cfg(not(test))]
+const LOG_CAP: usize = LOG_MAX;
+#[cfg(test)]
+const LOG_CAP: usize = 6;
 /// Index levels `mount` accepts; past `MAX_BLOCKS` with real sizes.
 const MAX_IX: usize = 24;
 const MAX_POOL: usize = 512;
@@ -978,9 +984,13 @@ impl<'a, D: Disk> Fs<'a, D> {
         let pages = self.full || self.nlog + self.ndirty > self.log_cap();
         let start = if pages {
             // Release the old copies of the pages that change and of the index blocks above them (each pointer zeroed
-            // once released), then find blocks for them and the nodes; claiming those blocks may change more pages,
-            // so repeat until it does not.
+            // once released), then find blocks for them and the nodes; releasing or claiming blocks may change more
+            // pages, so repeat until neither does.
+            let d = 3 * self.words..3 * self.words + self.pages.div_ceil(64);
+            let changed =
+                |bits: &[u64]| bits[d.clone()].iter().map(|w| w.count_ones()).sum::<u32>();
             loop {
+                let before = changed(self.bits);
                 let mut k = self.ndirty;
                 let mut p = self.next_dirty(0);
                 while let Some(q) = p {
@@ -1003,6 +1013,9 @@ impl<'a, D: Disk> Fs<'a, D> {
                         k += 1;
                         i = self.next_ix(l, j + 1);
                     }
+                }
+                if changed(self.bits) != before {
+                    continue;
                 }
                 if (self.free as usize) < k {
                     return Err(Error::NoSpace);
@@ -1860,7 +1873,7 @@ impl<'a, D: Disk> Fs<'a, D> {
 
     /// Log entries the superblock has room for after the page list.
     fn log_cap(&self) -> usize {
-        (END - SB_HDR) / 16 - self.list_entries()
+        min(LOG_CAP, (END - SB_HDR) / 16 - self.list_entries())
     }
 
     fn page_dirty(&self, p: usize) -> bool {
@@ -2460,6 +2473,7 @@ impl<'a, D: Disk> Fs<'a, D> {
             match count(&self.cache[r]) {
                 0 => {
                     self.cache[r][..HDR].fill(0);
+                    set_bottom(&mut self.cache[r], END);
                     self.height = 1;
                 }
                 1 => {
