@@ -113,9 +113,8 @@ aarch64_vectors:
     bl aarch64_exception
     mov sp, x0
     // Only once off the old stack: with the board's kernel lock free, another core may run the task that owns it.
+    tbnz x1, #1, 1f
     cbz x1, 2f
-    cmp x1, #1
-    b.ne 1f
     bl board_unlock
     b 2f
 1:  bl board_unlock_work

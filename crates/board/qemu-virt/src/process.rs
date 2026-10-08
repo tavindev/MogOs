@@ -1,6 +1,7 @@
 //! Process construction: address spaces, ELF and asm programs, spawn and its arguments.
 
 use core::arch::global_asm;
+use core::mem::MaybeUninit;
 use core::ops::{Deref, Range};
 use core::ptr;
 use core::slice;
@@ -165,13 +166,17 @@ where
     if !entry.budget.charge(count) {
         return None;
     }
-    let mut taken = [PhysAddr(0); MAP_FRAMES];
-    if !FRAMES.lock_masked(w).alloc_many(&mut taken[..count]) {
+    let mut taken = [MaybeUninit::uninit(); MAP_FRAMES];
+    if !FRAMES
+        .lock_masked(w)
+        .alloc_many(count, |i, frame| _ = taken[i].write(frame))
+    {
         entry.budget.refund(count);
         return None;
     }
-    let mut taken = taken[..count].iter().copied();
-    let mut take = || taken.next().expect("counted");
+    let mut taken = taken[..count].iter();
+    // SAFETY: `alloc_many` wrote the first `count`.
+    let mut take = || unsafe { taken.next().expect("counted").assume_init() };
     for va in (start..end).step_by(PAGE) {
         let page = take();
         map_filled((page, &mut take), (l1, va, UserAccess::ReadWrite), (0, &[]));
@@ -212,7 +217,7 @@ fn spawn_process(
     // first frame is written at its top, below which the list ends.
     // SAFETY: fresh identity-mapped frames nothing else references; `SPAWN_FRAMES` fit below the first frame.
     let taken = unsafe { slice::from_raw_parts_mut(stack.start.0 as *mut PhysAddr, count) };
-    if !frames.alloc_many(taken) {
+    if !frames.alloc_many(count, |i, frame| taken[i] = frame) {
         (stack.start.0..stack.end.0)
             .step_by(PAGE)
             .for_each(|f| frames.free(PhysAddr(f)));

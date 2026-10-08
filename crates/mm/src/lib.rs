@@ -120,27 +120,35 @@ impl<const WORDS: usize> FrameAllocator<WORDS> {
         Some(PhysAddr(self.base + (word * 64 + bit) as u64 * FRAME_SIZE))
     }
 
-    /// Fills `out` with free frames in one pass over the bitmap; false, taking none, if too few are free.
-    pub fn alloc_many(&mut self, out: &mut [PhysAddr]) -> bool {
-        if out.is_empty() {
-            return true;
+    /// Takes `count` free frames in one pass over the bitmap, handing each to `put` with its position, after a count of
+    /// the free bits from the hint on; false, taking none, if too few are free.
+    pub fn alloc_many(&mut self, count: usize, mut put: impl FnMut(usize, PhysAddr)) -> bool {
+        let mut free = 0;
+        let enough = (self.used[self.hint..].iter()).any(|w| {
+            free += w.count_zeros() as usize;
+            free >= count
+        });
+        if count == 0 || !enough {
+            return count == 0;
         }
         let mut taken = 0;
         for w in self.hint..WORDS {
             let word = &mut self.used[w];
-            while *word != u64::MAX && taken < out.len() {
+            while *word != u64::MAX {
                 let bit = word.trailing_ones() as usize;
                 *word |= 1 << bit;
-                out[taken] = PhysAddr(self.base + (w * 64 + bit) as u64 * FRAME_SIZE);
+                put(
+                    taken,
+                    PhysAddr(self.base + (w * 64 + bit) as u64 * FRAME_SIZE),
+                );
                 taken += 1;
-            }
-            if taken == out.len() {
-                self.hint = w;
-                return true;
+                if taken == count {
+                    self.hint = w;
+                    return true;
+                }
             }
         }
-        out[..taken].iter().for_each(|&f| self.free(f));
-        false
+        unreachable!("counted")
     }
 
     /// Panics if `frame` was not allocated from this allocator.
