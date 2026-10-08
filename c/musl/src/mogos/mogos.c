@@ -107,22 +107,22 @@ static int isdir(long h)
 	return r >= 0 || r == -EINVAL;
 }
 
-/* No stat call: the size is the first offset a one-byte read returns nothing at, bisected in [0, 64 KiB], then in
-   each doubled range while the top of the last one still reads. */
+/* No stat call: the size is the first offset a one-byte read returns nothing at, bracketed by doubling from 64 KiB,
+   then bisected. */
 static long long size_of(long h)
 {
 	char c;
-	long long lo = 0, top = 1 << 16, hi = top;
-	for (long r;; lo = top + 1, top *= 2, hi = top) {
-		while (lo < hi) {
-			long long mid = (lo + hi) / 2;
-			if ((r = svc(N_IO, h, 0, (long)&c, 1, mid, 0, 0)) < 0) return r;
-			if (r) lo = mid + 1;
-			else hi = mid;
-		}
-		if (lo < top || !(r = svc(N_IO, h, 0, (long)&c, 1, top, 0, 0))) return lo;
+	long long lo = 0, hi = 1 << 16;
+	long r;
+	for (; (r = svc(N_IO, h, 0, (long)&c, 1, hi, 0, 0)); lo = hi + 1, hi *= 2)
 		if (r < 0) return r;
+	while (lo < hi) {
+		long long mid = (lo + hi) / 2;
+		if ((r = svc(N_IO, h, 0, (long)&c, 1, mid, 0, 0)) < 0) return r;
+		if (r) lo = mid + 1;
+		else hi = mid;
 	}
+	return lo;
 }
 
 static struct file *fd_file(int fd)
@@ -353,7 +353,8 @@ static long list(long h, char *names, size_t len, long long cursor, long long *n
 }
 
 /* The native `name\n` (`name/\n` for a directory) entries as `struct dirent`s; the offset is the native cursor, which
-   every entry of a call shares as its `d_off`. */
+   every entry of a call shares as its `d_off`. One native call, asking only for as many names as always fit `len` as
+   dirents: a dirent is at most 26 bytes over its name's line and at most 14 times it, and a call lists at most 64. */
 static long do_getdents(int fd, char *buf, size_t len)
 {
 	struct file *f = fd_file(fd);
@@ -361,31 +362,25 @@ static long do_getdents(int fd, char *buf, size_t len)
 	long long next;
 	if (!f) return -EBADF;
 	if (f->kind != DIRECTORY) return -ENOTDIR;
-	long n = list(f->handle, names, sizeof names, f->off, &next);
+	size_t want = len > 64 * 26 ? len - 64 * 26 : 0;
+	if (want < len / 14) want = len / 14;
+	if (want > sizeof names) want = sizeof names;
+	long n = list(f->handle, names, want, f->off, &next);
 	if (n < 0) return n;
 	size_t pos = 0;
-	long count = 0;
-	char *s = names;
-	for (char *nl; s < names + n; s = nl + 1) {
+	for (char *s = names, *nl; s < names + n; s = nl + 1) {
 		nl = memchr(s, '\n', names + n - s);
 		size_t namelen = nl - s, dir = namelen && s[namelen - 1] == '/';
 		namelen -= dir;
-		size_t rec = (offsetof(struct dirent, d_name) + namelen + 8) & ~7ul;
-		if (pos + rec > len) break;
 		struct dirent *d = (void *)(buf + pos);
-		d->d_reclen = rec;
+		d->d_reclen = (offsetof(struct dirent, d_name) + namelen + 8) & ~7ul;
 		d->d_type = dir ? DT_DIR : DT_REG;
+		d->d_off = next;
 		memcpy(d->d_name, s, namelen);
 		d->d_name[namelen] = 0;
 		d->d_ino = hash(d->d_name);
-		pos += rec;
-		count++;
+		pos += d->d_reclen;
 	}
-	if (n && !count) return -EINVAL;
-	/* Not all fit: list just those that did again, for the cursor after them. */
-	if (s < names + n && (n = list(f->handle, names, s - names, f->off, &next)) < 0) return n;
-	for (size_t at = 0; at < pos; at += ((struct dirent *)(buf + at))->d_reclen)
-		((struct dirent *)(buf + at))->d_off = next;
 	f->off = next;
 	return pos;
 }

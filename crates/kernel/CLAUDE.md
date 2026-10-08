@@ -148,6 +148,9 @@ touches memory through raw addresses: the board reads user buffers, copies pages
   through MogFS's node cache, a `readdir` call lists at most 64 entries, and file I/O moves at most `MAX_BUFFER`. A
   directory `rename` across directories also walks the target's parents up to the root (mogfs's cycle check, one
   inode lookup each): the target's depth on a well-formed image, on a crafted one up to every directory on it.
+  `unlink` and `open(TRUNC)` of a file release its blocks one by one and delete its extents (at most 128 pages each), so
+  their work grows with the file: about 2048 extent deletes and 262144 releases for 1 GiB, all with IRQs masked, until
+  step 42 moves file work to the file-system task.
 - `Elf::parse` accepts only page-aligned, address-ordered, in-region `PT_LOAD`s, never W+X, entry in an executable one.
 - init's handles (`Handles::init`): 0 console (read, write, duplicate, transfer), 1 itself (kill), 2 the boot archive
   with `INIT_ARCHIVE` (read, exec); only msh (`test=shell`, `test=bench-shell`) and `nettest` (`test=sockets`, which hands it to a C program that spawns) get `SHELL_ARCHIVE` (also duplicate, transfer), since it

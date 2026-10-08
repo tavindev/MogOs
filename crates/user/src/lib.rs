@@ -305,7 +305,7 @@ pub fn readdir(dir: u64, buf: &mut [u8], cursor: u64) -> (i64, u64) {
         asm!("svc #0", inlateout("x0") dir => n, inlateout("x1") buf.as_mut_ptr() as u64 => next,
             in("x2") buf.len(), in("x3") cursor, in("x8") 14, options(nostack))
     };
-    (n, next)
+    (n, if n < 0 { u64::MAX } else { next })
 }
 
 /// Makes every change to the file system durable; `EIO` leaves it unknown whether it did.
