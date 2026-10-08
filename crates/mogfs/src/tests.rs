@@ -152,16 +152,12 @@ fn tree_nodes(disk: &[Buf], root: u64, sum: u64) -> Vec<(u64, Option<(u64, usize
 /// The extents (first block, pages, sums offset) a leaf's items hold; none if its items break the format's layout
 /// (bytes past the count, as a removed item leaves, are not items).
 fn extents(n: &Buf) -> Vec<(u64, usize, usize)> {
-    let (mut out, c, mut top) = (vec![], count(n), END);
-    if n[0] != 0 || c * ITEM > CAP {
+    let (mut out, c) = (vec![], count(n));
+    if n[0] != 0 || c * ITEM > CAP || !packed(n) {
         return out;
     }
     for i in 0..c {
         let (k, off, len) = (ikey(n, i).0, voff(n, i), vlen(n, i));
-        if off + len != top || off < HDR + ITEM * c {
-            return vec![];
-        }
-        top = off;
         if (k as u64) >> 62 == ItemKind::Extent as u64 && len >= 16 {
             out.push((le64(n, off), (len - 8) / 8, off + 8));
         }
@@ -727,7 +723,7 @@ fn mutate(disk: &mut [Buf], rng: &mut u64) -> bool {
             let stride = if n[0] == 0 { ITEM } else { ENTRY };
             let c = c.min(CAP / stride);
             let values = if n[0] == 0 && c > 0 {
-                voff(n, c - 1).min(END)
+                bottom(n).min(END)
             } else {
                 END
             };

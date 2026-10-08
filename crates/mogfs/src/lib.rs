@@ -20,8 +20,9 @@
 //!   its tree nodes and data, its bitmap pages and index blocks); a word is its log entry's value if it has one,
 //!   else its page's.
 //! - Tree: one B+tree keyed by u128 `inode << 64 | kind << 62 | offset`. Node header: level u8 (0 = leaf), zero u8,
-//!   count u16, 4 zero bytes. Leaf: `count` items (key u128, value offset u16, value length u16), values packed down
-//!   from byte 4088 in item order. Internal: `count` entries (key u128, block u64, sum u64, birth generation u64);
+//!   count u16, then for a leaf the offset of its lowest value u16, else zero, and 2 zero bytes. Leaf: `count` items
+//!   (key u128, value offset u16, value length u16); the values fill the bytes from the lowest up to byte 4088, in any
+//!   order, without overlap. Internal: `count` entries (key u128, block u64, sum u64, birth generation u64);
 //!   child `i` holds keys from entry `i`'s (the node's own lower bound for `i = 0`) up to entry `i + 1`'s.
 //! - Items. Inode (kind 0, offset 0): kind u8 (1 file, 2 directory, 3 symlink: reserved), zero u8, mode u16, links
 //!   u32, size u64, parent u64, entry u64 (the offset of the entry naming it in `parent`), mtime, ctime and btime u64
@@ -1966,7 +1967,8 @@ impl<'a, D: Disk> Fs<'a, D> {
             || checksum(p.block, &n[..END]) != p.sum
             || n[0] as usize != level
             || n[1] != 0
-            || n[4..HDR] != [0; 4];
+            || n[6..HDR] != [0; 2]
+            || (level > 0 && n[4..6] != [0; 2]);
         if bad {
             return Err(Error::Corrupt);
         }
@@ -1991,13 +1993,12 @@ impl<'a, D: Disk> Fs<'a, D> {
         if c * ITEM > CAP || (c == 0 && !root) {
             return Err(Error::Corrupt);
         }
-        let (mut top, mut prev_end) = (END, None);
+        if !packed(n) {
+            return Err(Error::Corrupt);
+        }
+        let mut prev_end = None;
         for i in 0..c {
             let (k, off, len) = (ikey(n, i), voff(n, i), vlen(n, i));
-            if off + len != top || off < HDR + ITEM * c {
-                return Err(Error::Corrupt);
-            }
-            top = off;
             if k < lo || k >= hi || prev.is_some_and(|q| k <= q) {
                 return Err(Error::Corrupt);
             }
@@ -2135,6 +2136,9 @@ impl<'a, D: Disk> Fs<'a, D> {
         let s = self.victim();
         (self.finger, self.start) = (None, (NONE, 0));
         self.cache[s][..HDR].copy_from_slice(&[level as u8, 0, 0, 0, 0, 0, 0, 0]);
+        if level == 0 {
+            set_bottom(&mut self.cache[s], END);
+        }
         (self.blk[s], self.dirt[s]) = (EMPTY, true);
         self.ndirty += 1;
         self.changed = true;
@@ -2601,7 +2605,7 @@ fn used(n: &[u8]) -> usize {
     let c = count(n);
     match (n[0], c) {
         (0, 0) => 0,
-        (0, _) => ITEM * c + END - voff(n, c - 1),
+        (0, _) => ITEM * c + END - bottom(n),
         _ => ENTRY * c,
     }
 }
@@ -2636,40 +2640,81 @@ fn route(n: &[u8], k: Key) -> usize {
     a - 1
 }
 
-/// Opens a `len`-byte value for item `k` at index `i`; returns its offset. The leaf must have room.
-fn leaf_insert(n: &mut [u8], i: usize, k: Key, len: usize) -> usize {
-    let c = count(n);
-    let top = if i == 0 { END } else { voff(n, i - 1) };
-    let bottom = if c == 0 { END } else { voff(n, c - 1) };
-    n.copy_within(bottom..top, bottom - len);
-    n.copy_within(HDR + ITEM * i..HDR + ITEM * c, HDR + ITEM * (i + 1));
-    for j in i + 1..=c {
-        let at = HDR + ITEM * j + 16;
-        let off = voff(n, j) - len;
-        n[at..at + 2].copy_from_slice(&(off as u16).to_le_bytes());
+/// The offset of a leaf's lowest value (`END` with none).
+fn bottom(n: &[u8]) -> usize {
+    le16(n, 4)
+}
+
+fn set_bottom(n: &mut [u8], b: usize) {
+    n[4..6].copy_from_slice(&(b as u16).to_le_bytes());
+}
+
+fn set_voff(n: &mut [u8], i: usize, off: usize) {
+    let at = HDR + ITEM * i + 16;
+    n[at..at + 2].copy_from_slice(&(off as u16).to_le_bytes());
+}
+
+/// Whether a leaf's values lie between its item array and `END`, filling the bytes from its lowest one up without
+/// overlap.
+fn packed(n: &[u8]) -> bool {
+    let (c, b) = (count(n), bottom(n));
+    let mut used = [0u64; BLOCK_SIZE / 64];
+    let mut total = 0;
+    if b < HDR + ITEM * c || b > END {
+        return false;
     }
+    for i in 0..c {
+        let (off, len) = (voff(n, i), vlen(n, i));
+        if off < b || off + len > END {
+            return false;
+        }
+        let mut at = off;
+        while at < off + len {
+            let (w, lo) = (at / 64, at % 64);
+            let hi = min(64, off + len - 64 * w);
+            let mask = (u64::MAX >> (64 - (hi - lo))) << lo;
+            if used[w] & mask != 0 {
+                return false;
+            }
+            used[w] |= mask;
+            at = 64 * w + hi;
+        }
+        total += len;
+    }
+    total == END - b
+}
+
+/// Opens a `len`-byte value for item `k` at index `i`, below the others; returns its offset. The leaf must have room.
+fn leaf_insert(n: &mut [u8], i: usize, k: Key, len: usize) -> usize {
+    let (c, off) = (count(n), bottom(n) - len);
+    n.copy_within(HDR + ITEM * i..HDR + ITEM * c, HDR + ITEM * (i + 1));
     let at = HDR + ITEM * i;
     n[at..at + 16].copy_from_slice(&k.0.to_le_bytes());
-    n[at + 16..at + 18].copy_from_slice(&((top - len) as u16).to_le_bytes());
     n[at + 18..at + 20].copy_from_slice(&(len as u16).to_le_bytes());
+    set_voff(n, i, off);
     set_count(n, c + 1);
-    top - len
+    set_bottom(n, off);
+    off
 }
 
+/// Removes item `i`; the values below it move up into its place.
 fn leaf_remove(n: &mut [u8], i: usize) {
-    let c = count(n);
-    let (off, len, bottom) = (voff(n, i), vlen(n, i), voff(n, c - 1));
-    n.copy_within(bottom..off, bottom + len);
+    let (c, b) = (count(n), bottom(n));
+    let (off, len) = (voff(n, i), vlen(n, i));
+    n.copy_within(b..off, b + len);
     n.copy_within(HDR + ITEM * (i + 1)..HDR + ITEM * c, HDR + ITEM * i);
-    for j in i..c - 1 {
-        let at = HDR + ITEM * j + 16;
-        let off = voff(n, j) + len;
-        n[at..at + 2].copy_from_slice(&(off as u16).to_le_bytes());
+    for j in 0..c - 1 {
+        let o = voff(n, j);
+        if o < off {
+            set_voff(n, j, o + len);
+        }
     }
     set_count(n, c - 1);
+    set_bottom(n, b + len);
 }
 
-/// Appends `src`'s items from `from` on to `dst`, which must have room, and drops them from `src`.
+/// Appends `src`'s items from `from` on to `dst`, which must have room, and drops them from `src`, whose values pack
+/// up again.
 fn leaf_move(src: &mut [u8], from: usize, dst: &mut [u8]) {
     for i in from..count(src) {
         let len = vlen(src, i);
@@ -2677,6 +2722,19 @@ fn leaf_move(src: &mut [u8], from: usize, dst: &mut [u8]) {
         dst[at..at + len].copy_from_slice(value(src, i));
     }
     set_count(src, from);
+    // Highest value first, each moved up to just below the last: it never reaches a lower one not yet moved.
+    let (mut top, mut below) = (END, END);
+    loop {
+        let next = (0..from)
+            .filter(|&i| voff(src, i) < below)
+            .max_by_key(|&i| voff(src, i));
+        let Some(i) = next else { break };
+        let (off, len) = (voff(src, i), vlen(src, i));
+        src.copy_within(off..off + len, top - len);
+        set_voff(src, i, top - len);
+        (top, below) = (top - len, off);
+    }
+    set_bottom(src, top);
 }
 
 fn internal_insert(n: &mut [u8], i: usize, k: Key, p: Ptr) {
