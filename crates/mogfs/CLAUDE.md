@@ -52,7 +52,7 @@ or a device driver.
   log, flushes (`[0, 2, 2]` while a run fits and the staging slots hold them). When the log would overflow, the
   pages changed since they were last written, then the index blocks above them bottom up, join that request ahead of
   the nodes (after their old copies are released, each pointer zeroed so it is released once) and the log empties.
-  Mount reads blocks 0 to 7 in its first request (the superblocks, and on a fresh or small image the bitmap page
+  Mount reads blocks 0 to 3 in its first request (the superblocks, and on a fresh image the bitmap page
   and the root, which then cost nothing more), the live index, each live page that is not all zero, and the
   rightmost path; the
   older slot's pages only where it does not share them (same block and sum), rebuilding a shared page's older words

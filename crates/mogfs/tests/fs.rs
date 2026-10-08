@@ -1169,16 +1169,16 @@ fn small_commits_log_the_bitmap_until_the_log_fills() {
 }
 
 #[test]
-fn a_small_image_mounts_in_one_request() {
-    // The superblocks, the bitmap page and the root leaf all lie in blocks 0 to 7.
-    let mut disk = hello();
+fn a_fresh_image_mounts_in_one_request() {
+    // The superblocks, the bitmap page and the root leaf are blocks 0 to 3.
+    let mut disk = MemDisk::new(1024);
+    format(&mut Mem::new(1024, POOL), &mut disk);
     let io = Cell::new([0; 3]);
-    let mut mem = Mem::new(64, POOL);
+    let mut mem = Mem::new(1024, POOL);
     let mut fs = mem.fs(Counted(&mut disk, &io));
     fs.mount().unwrap();
     assert_eq!(io.take(), [1, 0, 0]);
-    let docs = fs.lookup(ROOT, b"docs").unwrap();
-    assert_eq!(fs.lookup(docs, b"a.txt").map(|_| ()), Ok(()));
+    assert_eq!(names(&mut fs, ROOT), Vec::<String>::new());
 }
 
 #[test]

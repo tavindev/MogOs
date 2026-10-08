@@ -79,9 +79,9 @@ const MAX_POOL: usize = 512;
 /// Cache slots that stage a commit's request (the last also the mount's pre-log words), after the scratch slot.
 const STAGE: usize = 32;
 const MAX_CACHE: usize = 1 + STAGE + MAX_POOL;
-/// Blocks `mount` reads from block 0 in its first request, into the staging slots from `AHEAD_AT`: on a fresh or small
-/// image they hold the bitmap page and the root beside the superblocks.
-const AHEAD: usize = 8;
+/// Blocks `mount` reads from block 0 in its first request, into the staging slots from `AHEAD_AT`: on a fresh image
+/// they hold the bitmap page and the root beside the superblocks (8 blocks measured slower at boot).
+const AHEAD: usize = 4;
 const AHEAD_AT: usize = STAGE - AHEAD;
 /// Superblock bytes before the page list: the header and a root table of one root.
 const SB_HDR: usize = 120;
