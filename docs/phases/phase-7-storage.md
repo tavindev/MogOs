@@ -221,7 +221,7 @@ Filled in as each step lands.
   and here. Numbers (release kernels, 63 interleaved hvf rounds with an A/A first, load 5-11): every call and shell
   command within its A/A spread against `ddcbacd`; boot within noise over six runs (medians -21 to +10 us; a timer
   around mount: 1297 against 1332 ticks median, 989 against 897 min). Host (11 rounds, A/A within 0.6%): mount of a
-  1 GiB file -33%, create+write+commit, 1 GiB read and write within noise; lookup +1.7..2.7% in three runs while the
-  kernel's lookup path runs the same TCG instruction count (`open` 619 both) and `open` is -1.0% on hvf: host codegen,
-  open for the coordinator. New rows: snapshot create 10.9 us, delete + commit 20.7 us, a 4 KiB overwrite + commit
+  1 GiB file -33%, create+write+commit, 1 GiB read and write within noise; lookup +1.7..2.7% in three runs, recorded as
+  layout: the bench build's lookup path is the same 733 instructions as `ddcbacd`'s with only `Fs` field offsets
+  differing, the kernel's runs the same TCG instruction count (`open` 619 both) and `open` is -1.0% on hvf. New rows: snapshot create 10.9 us, delete + commit 20.7 us, a 4 KiB overwrite + commit
   under a snapshot 10.4 us, mount with 8 snapshots 14.1 us, 400 lookups through a view 58.7 us (all 1 GiB file).
