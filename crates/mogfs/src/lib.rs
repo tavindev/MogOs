@@ -765,12 +765,23 @@ impl<'a, D: Disk> Fs<'a, D> {
         {
             return Err(Error::NotEmpty);
         }
-        let bytes = self.extent_bytes(inode)?;
+        // As in `truncate`: an empty file or a directory has no extents.
+        let bytes = if it.size > 0 {
+            self.extent_bytes(inode)?
+        } else {
+            0
+        };
         self.reserve(0, 4, bytes, true)?;
         self.forget_names();
         let r = self
             .delete(Key::new(dir, ItemKind::Entry, off))
-            .and_then(|()| self.remove_extents(inode))
+            .and_then(|()| {
+                if it.size > 0 {
+                    self.remove_extents(inode)
+                } else {
+                    Ok(())
+                }
+            })
             .and_then(|()| {
                 self.items = [None; 2];
                 self.delete(Key::new(inode, ItemKind::Inode, Offset(0)))
